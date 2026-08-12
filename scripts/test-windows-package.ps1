@@ -210,7 +210,10 @@ function Get-ReleaseMetadata {
   if ($VerifyCurrentSource) {
     $verificationArguments += $workspace
   }
-  & cargo @verificationArguments
+  # Native stdout is part of a PowerShell function's return stream. Send the
+  # verifier's diagnostic output directly to the host so callers receive only
+  # the parsed release metadata object below.
+  & cargo @verificationArguments | Out-Host
   if ($LASTEXITCODE -ne 0) {
     throw "Release provenance metadata failed Rust verification."
   }

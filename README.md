@@ -34,6 +34,8 @@ business webview -> narrow Tauri command -> Rust controller
 业务 WebView 的发布方签名来源边界见 [docs/origin-policy.md](docs/origin-policy.md)：正式策略使用 schema 2，把权限精确收敛到 origin、service 和 method，拒绝无范围或通配授权。
 SSO 的 HTTPS-only、禁止重定向、输入/响应上限和 WebView 权限隔离见 [docs/sso-security.md](docs/sso-security.md)。
 当前完成范围、上线门槛和必须由真实环境验证的项目见 [docs/migration-readiness.md](docs/migration-readiness.md)。
+
+分层完成度、原平台能力覆盖、DLL 映射可视化和更新机制评估见 [docs/completion-assessment.md](docs/completion-assessment.md)。
 旧 Electron ssdev-desktop 的逐项替代决策见 [docs/electron-parity.md](docs/electron-parity.md)。
 Go WebPlus 的逐项替代决策见 [docs/webplus-parity.md](docs/webplus-parity.md)。
 旧配置、插件目录、脚本快捷键以及外部浏览器本地 HTTP 依赖的安全盘点方式见 [docs/migration-audit.md](docs/migration-audit.md)。

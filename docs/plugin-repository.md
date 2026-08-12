@@ -93,3 +93,9 @@ cargo run --locked -p ssdev-plugin-tool -- catalog `
   "pluginCatalogSignatureUrl": "https://plugins.example.internal/catalog.sig.json"
 }
 ```
+
+## 客户端检查与安装交互
+
+本地控制台的“检查更新”只下载并验证短期目录，不下载或激活插件。它展示已安装版本、签名目录中的最高版本和是否存在升级；未安装插件也可以按精确插件 ID 查询。只有用户确认目录给出的目标版本后，控制台才把该精确 SemVer 交给安装命令，安装命令会重新获取并验签目录、按该版本选择条目，再执行上述下载、宿主预检、原子激活和失败回滚流程。
+
+业务 WebView 没有目录查询或安装权限；检查与安装命令都只授予内置 `control` 窗口。客户端不会把查询结果中的下载 URL 暴露为可执行输入，也不会因为一次“检查更新”自动改变当前插件。

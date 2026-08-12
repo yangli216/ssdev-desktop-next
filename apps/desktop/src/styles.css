@@ -67,11 +67,25 @@ h1 { margin: 0; font-family: Georgia, "Songti SC", serif; font-size: clamp(42px,
 .plugin-list article header small { color: #718078; font-size: 12px; }
 .plugin-list button { padding: 8px 11px; border: 1px solid #9eaaa2; border-radius: 8px; background: #fff; color: #274735; cursor: pointer; }
 .plugin-list button:disabled { cursor: wait; opacity: .55; }
-.catalog-install { display: flex; gap: 10px; }
+.catalog-install { display: flex; flex-wrap: wrap; gap: 10px; }
 .catalog-install input { min-width: 0; flex: 1; padding: 10px 12px; border: 1px solid #bfc9c1; border-radius: 9px; }
+.plugin-update-results { display: grid; gap: 8px; padding: 12px; border: 1px solid #c8d4ca; border-radius: 10px; background: #f3f6f1; }
+.plugin-update-results > div { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
+.plugin-update-results span { display: grid; gap: 3px; }
+.plugin-update-results small { color: #718078; }
+.plugin-update-results em { color: #607168; font-size: 12px; font-style: normal; }
 .plugin-list ul { margin: 0; padding: 0; list-style: none; }
 .plugin-list li { display: flex; justify-content: space-between; gap: 18px; padding: 11px 18px; border-top: 1px solid #edf0eb; color: #68766d; font-size: 12px; }
 .plugin-list code { color: #1e4934; font-size: 12px; overflow-wrap: anywhere; }
+.service-mapping { border-top: 1px solid #edf0eb; }
+.service-mapping summary { display: flex; justify-content: space-between; gap: 18px; padding: 12px 18px; color: #68766d; font-size: 12px; cursor: pointer; }
+.service-mapping[open] summary { background: #fafbf8; }
+.service-mapping dl { display: grid; gap: 7px; margin: 0; padding: 12px 18px; border-top: 1px dashed #e0e5df; background: #fcfdfb; }
+.service-mapping dl div { display: grid; grid-template-columns: 86px 1fr; gap: 12px; }
+.service-mapping dt { color: #7a867f; font-size: 11px; }
+.service-mapping dd { min-width: 0; margin: 0; color: #4f6057; font-size: 12px; overflow-wrap: anywhere; }
+.method-mapping { display: grid; grid-template-columns: minmax(92px, .7fr) 16px minmax(92px, .7fr) 1fr; gap: 8px; align-items: center; padding: 9px 18px; border-top: 1px solid #edf0eb; color: #829087; font-size: 12px; }
+.method-mapping small { color: #718078; text-align: right; }
 .plugin-list .empty { margin: 0; padding: 18px; border: 1px dashed #b9c4bb; border-radius: 12px; color: #718078; }
 .quarantined { padding: 14px 18px; border-radius: 12px; background: #f8e8e3; color: #81382f; font-size: 12px; }
 .quarantined summary { cursor: pointer; font-weight: 700; }
@@ -93,6 +107,9 @@ h1 { margin: 0; font-family: Georgia, "Songti SC", serif; font-size: clamp(42px,
   .boundary { grid-template-columns: 1fr; gap: 32px; }
   .operations { grid-template-columns: 1fr; gap: 32px; }
   .plugin-inventory { grid-template-columns: 1fr; gap: 32px; }
+  .plugin-update-results > div, .service-mapping summary { align-items: flex-start; flex-direction: column; }
+  .method-mapping { grid-template-columns: 1fr 16px 1fr; }
+  .method-mapping small { grid-column: 1 / -1; text-align: left; }
   .environment-row { grid-template-columns: auto 1fr auto auto; }
   .environment-row input[type="url"] { grid-column: 2 / -1; }
 }

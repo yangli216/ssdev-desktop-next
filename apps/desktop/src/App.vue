@@ -121,10 +121,35 @@ type PluginInventory = {
       serviceId: string
       architecture: 'x86' | 'x64'
       mainType: string
+      mainClass: string
+      callingConvention: string
+      charset: string
+      cacheable: boolean
+      timeoutMs: number
+      dependencyCount: number
       methodCount: number
+      methods: Array<{
+        requestName: string
+        nativeName: string
+        returnType: string
+        parameterCount: number
+        timeoutMs: number
+      }>
     }>
   }>
   quarantined: string[]
+}
+
+type PluginUpdateCheck = {
+  catalogIssuedAt: number
+  catalogExpiresAt: number
+  updates: Array<{
+    pluginId: string
+    installedVersion?: string
+    availableVersion?: string
+    catalogAvailable: boolean
+    updateAvailable: boolean
+  }>
 }
 
 type AppUpdateCheck = {
@@ -151,6 +176,7 @@ const status = ref<BridgeStatus | null>(null)
 const snapshot = ref<ConfigSnapshot | null>(null)
 const inventory = ref<PluginInventory | null>(null)
 const catalogPluginId = ref('')
+const pluginUpdates = ref<PluginUpdateCheck | null>(null)
 const appUpdate = ref<AppUpdateCheck | null>(null)
 const updateProgress = ref('')
 const error = ref('')
@@ -316,21 +342,45 @@ async function reloadPlugins() {
   }, '插件目录已重新校验并热加载。')
 }
 
-async function installFromCatalog(requestedPluginId?: string) {
-  const pluginId = (requestedPluginId ?? catalogPluginId.value).trim()
-  if (!pluginId) {
-    error.value = '请先填写插件 ID。'
+async function checkPluginUpdates(requestedPluginId?: string) {
+  const pluginId = requestedPluginId?.trim()
+  if (requestedPluginId !== undefined && !pluginId) {
+    error.value = '请先填写要查询的插件 ID。'
+    return
+  }
+  let result: PluginUpdateCheck | undefined
+  await run(async () => {
+    result = await invoke<PluginUpdateCheck>('check_plugin_updates', {
+      pluginId: pluginId || null,
+    })
+    pluginUpdates.value = result
+  }, '')
+  if (!result) return
+  const available = result.updates.filter((item) => item.updateAvailable)
+  if (result.updates.length === 0) {
+    notice.value = '当前没有已安装插件可检查。'
+  } else if (available.length === 0) {
+    notice.value = '签名仓库中未发现可安装的新版本。'
+  } else {
+    notice.value = `发现 ${available.length} 个可安装的插件版本，请确认目标版本后安装。`
+  }
+}
+
+async function installFromCatalog(pluginId: string, version?: string) {
+  if (!pluginId.trim() || !version) {
+    error.value = '请先检查仓库并选择明确的插件版本。'
     return
   }
   let result: PluginInstallResult | undefined
   await run(async () => {
     result = await invoke<PluginInstallResult>('install_plugin_from_catalog', {
       pluginId,
-      version: null,
+      version,
     })
-    ;[status.value, inventory.value] = await Promise.all([
+    ;[status.value, inventory.value, pluginUpdates.value] = await Promise.all([
       invoke<BridgeStatus>('bridge_status'),
       invoke<PluginInventory>('plugin_inventory'),
+      invoke<PluginUpdateCheck>('check_plugin_updates', { pluginId }),
     ])
   }, '')
   if (result) {
@@ -606,21 +656,50 @@ async function exportDiagnostics() {
         <p>只展示重新发现并通过当前信任库验签的插件；隔离项不会进入服务路由。</p>
       </div>
       <div class="plugin-list">
-        <form class="catalog-install" @submit.prevent="installFromCatalog()">
+        <form class="catalog-install" @submit.prevent="checkPluginUpdates(catalogPluginId)">
           <input v-model.trim="catalogPluginId" type="text" placeholder="输入签名仓库中的插件 ID" />
-          <button type="submit" :disabled="busy">从仓库安装最新版</button>
+          <button type="submit" :disabled="busy">查询仓库版本</button>
+          <button type="button" :disabled="busy" @click="checkPluginUpdates()">检查全部已安装插件</button>
         </form>
+        <div v-if="pluginUpdates" class="plugin-update-results" aria-live="polite">
+          <div v-for="update in pluginUpdates.updates" :key="update.pluginId">
+            <span>
+              <strong>{{ update.pluginId }}</strong>
+              <small>已安装 {{ update.installedVersion ?? '无' }} · 仓库 {{ update.availableVersion ?? '无匹配版本' }}</small>
+            </span>
+            <button
+              v-if="update.updateAvailable && update.availableVersion"
+              type="button"
+              :disabled="busy"
+              @click="installFromCatalog(update.pluginId, update.availableVersion)"
+            >
+              {{ update.installedVersion ? `安装更新 ${update.availableVersion}` : `安装 ${update.availableVersion}` }}
+            </button>
+            <em v-else>{{ update.catalogAvailable ? '已是最新版本' : '仓库未收录' }}</em>
+          </div>
+        </div>
         <article v-for="plugin in inventory?.plugins ?? []" :key="plugin.pluginId">
           <header>
             <span><strong>{{ plugin.displayName }}</strong><small>{{ plugin.pluginId }} · {{ plugin.version ?? '旧版未知版本' }}</small></span>
-            <button type="button" :disabled="busy" @click="installFromCatalog(plugin.pluginId)">检查更新</button>
+            <button type="button" :disabled="busy" @click="checkPluginUpdates(plugin.pluginId)">检查更新</button>
           </header>
-          <ul>
-            <li v-for="service in plugin.services" :key="service.serviceId">
+          <details v-for="service in plugin.services" :key="service.serviceId" class="service-mapping">
+            <summary>
               <code>{{ service.serviceId }}</code>
               <span>{{ service.architecture }} / {{ service.mainType }} / {{ service.methodCount }} 个方法</span>
-            </li>
-          </ul>
+            </summary>
+            <dl>
+              <div><dt>原生目标</dt><dd><code>{{ service.mainClass }}</code></dd></div>
+              <div><dt>调用约定</dt><dd>{{ service.callingConvention || '默认' }} · {{ service.charset || '默认字符集' }}</dd></div>
+              <div><dt>服务策略</dt><dd>{{ service.timeoutMs || '默认' }} ms · {{ service.cacheable ? '缓存实例' : '按需实例' }} · {{ service.dependencyCount }} 个依赖</dd></div>
+            </dl>
+            <div class="method-mapping" v-for="method in service.methods" :key="`${service.serviceId}:${method.requestName}`">
+              <code>{{ method.requestName }}</code>
+              <span aria-hidden="true">→</span>
+              <code>{{ method.nativeName }}</code>
+              <small>{{ method.returnType || '默认返回类型' }} · {{ method.parameterCount }} 参数 · {{ method.timeoutMs || '默认' }} ms</small>
+            </div>
+          </details>
         </article>
         <p v-if="inventory && inventory.plugins.length === 0" class="empty">尚未安装通过验签的插件。</p>
         <details v-if="inventory?.quarantined.length" class="quarantined">

@@ -40,10 +40,10 @@ use tauri_plugin_global_shortcut::Builder as ShortcutBuilder;
 use webplus_controller::{
     PluginController, PluginTrust, SupervisorConfig, DEFAULT_MAX_IN_FLIGHT_INVOCATIONS,
 };
-use webplus_plugin_config::discover_plugins;
+use webplus_plugin_config::{discover_plugins, PluginManifest, ServiceDefinition};
 use webplus_plugin_package::{recover_incomplete_activations, PreparedPlugin, RecoveryReport};
 use webplus_plugin_repository::{
-    download_package, fetch_catalog, secure_http_client, CatalogEntry,
+    download_package, fetch_catalog, secure_http_client, CatalogEntry, PluginCatalog,
 };
 use webplus_plugin_trust::TrustStore;
 use webplus_protocol::{InvokeRequest, InvokeResponse, PluginArchitecture, HOST_PROTOCOL_VERSION};
@@ -358,7 +358,42 @@ struct ServiceInventoryItem {
     service_id: String,
     architecture: PluginArchitecture,
     main_type: String,
+    main_class: String,
+    calling_convention: String,
+    charset: String,
+    cacheable: bool,
+    timeout_ms: u64,
+    dependency_count: usize,
     method_count: usize,
+    methods: Vec<MethodInventoryItem>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MethodInventoryItem {
+    request_name: String,
+    native_name: String,
+    return_type: String,
+    parameter_count: usize,
+    timeout_ms: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginUpdateCheckResult {
+    catalog_issued_at: u64,
+    catalog_expires_at: u64,
+    updates: Vec<PluginUpdateItem>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginUpdateItem {
+    plugin_id: String,
+    installed_version: Option<String>,
+    available_version: Option<String>,
+    catalog_available: bool,
+    update_available: bool,
 }
 
 #[tauri::command]
@@ -440,6 +475,99 @@ async fn install_plugin_from_catalog(
     .await?;
     verify_catalog_identity(&entry, &prepared)?;
     activate_prepared_plugin(&bridge_state, &trust_store, prepared).await
+}
+
+#[tauri::command]
+async fn check_plugin_updates(
+    caller: WebviewWindow,
+    bridge_state: State<'_, BridgeState>,
+    desktop_state: State<'_, desktop::DesktopState>,
+    plugin_id: Option<String>,
+) -> Result<PluginUpdateCheckResult, String> {
+    desktop::require_control(&caller)?;
+    let requested_plugin_id = plugin_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|plugin_id| !plugin_id.is_empty());
+    if plugin_id.is_some() && requested_plugin_id.is_none() {
+        return Err("插件 ID 不能为空".to_owned());
+    }
+
+    let _install = bridge_state.install_lock.lock().await;
+    recover_plugin_store(&bridge_state)?;
+    let trust_store = bridge_state
+        .trust_store
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "开发态未签名模式不允许使用插件仓库".to_owned())?;
+    let (catalog_url, signature_url) = desktop_state
+        .config
+        .snapshot()
+        .plugin_catalog_urls()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "尚未配置签名插件仓库".to_owned())?;
+    let catalog = fetch_catalog(
+        &bridge_state.repository_client,
+        &catalog_url,
+        &signature_url,
+        &trust_store,
+        SystemTime::now(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let installed = inspect_plugins(&bridge_state.plugin_root, Some(&trust_store))?;
+    let updates = collect_plugin_updates(&installed.manifests, &catalog, requested_plugin_id);
+    Ok(PluginUpdateCheckResult {
+        catalog_issued_at: catalog.issued_at(),
+        catalog_expires_at: catalog.expires_at(),
+        updates,
+    })
+}
+
+fn collect_plugin_updates(
+    installed: &[PluginManifest],
+    catalog: &PluginCatalog,
+    requested_plugin_id: Option<&str>,
+) -> Vec<PluginUpdateItem> {
+    let mut plugin_ids = if let Some(plugin_id) = requested_plugin_id {
+        vec![plugin_id.to_owned()]
+    } else {
+        installed
+            .iter()
+            .map(|manifest| manifest.plugin_id.clone())
+            .collect()
+    };
+    plugin_ids.sort();
+    plugin_ids.dedup();
+    plugin_ids
+        .into_iter()
+        .map(|plugin_id| {
+            let installed_version = installed
+                .iter()
+                .find(|manifest| manifest.plugin_id == plugin_id)
+                .and_then(|manifest| manifest.metadata.as_ref())
+                .map(|metadata| &metadata.version);
+            let available_version = catalog.select(&plugin_id, None).map(|entry| &entry.version);
+            PluginUpdateItem {
+                plugin_id,
+                installed_version: installed_version.map(ToString::to_string),
+                available_version: available_version.map(ToString::to_string),
+                catalog_available: available_version.is_some(),
+                update_available: is_plugin_update_available(installed_version, available_version),
+            }
+        })
+        .collect()
+}
+
+fn is_plugin_update_available(
+    installed: Option<&semver::Version>,
+    available: Option<&semver::Version>,
+) -> bool {
+    match (installed, available) {
+        (Some(installed), Some(available)) => available > installed,
+        (None, Some(_)) => true,
+        (_, None) => false,
+    }
 }
 
 async fn prepare_local_package(
@@ -667,16 +795,7 @@ async fn plugin_inventory(
             let services = manifest
                 .services
                 .into_iter()
-                .map(|service| {
-                    let main_type = service.resolved_main_type().to_ascii_lowercase();
-                    let method_count = service.methods.len();
-                    ServiceInventoryItem {
-                        service_id: service.service_id,
-                        architecture: service.architecture,
-                        main_type,
-                        method_count,
-                    }
-                })
+                .map(service_inventory_item)
                 .collect();
             PluginInventoryItem {
                 plugin_id: manifest.plugin_id,
@@ -690,6 +809,34 @@ async fn plugin_inventory(
         plugins,
         quarantined: inspected.failures,
     })
+}
+
+fn service_inventory_item(service: ServiceDefinition) -> ServiceInventoryItem {
+    let main_type = service.resolved_main_type().to_ascii_lowercase();
+    let methods = service
+        .methods
+        .into_iter()
+        .map(|method| MethodInventoryItem {
+            request_name: method.alias.unwrap_or_else(|| method.name.clone()),
+            native_name: method.name,
+            return_type: method.return_type,
+            parameter_count: method.parameters.len(),
+            timeout_ms: method.timeout,
+        })
+        .collect::<Vec<_>>();
+    ServiceInventoryItem {
+        service_id: service.service_id,
+        architecture: service.architecture,
+        main_type,
+        main_class: service.main_class,
+        calling_convention: service.calling_convention,
+        charset: service.charset,
+        cacheable: service.cacheable,
+        timeout_ms: service.timeout,
+        dependency_count: service.deps.len(),
+        method_count: methods.len(),
+        methods,
+    }
 }
 
 #[tauri::command]
@@ -1048,6 +1195,7 @@ pub fn run() {
             bridge_status,
             install_plugin_package,
             install_plugin_from_catalog,
+            check_plugin_updates,
             reload_plugins,
             plugin_inventory,
             plugin_invoke,
@@ -1362,9 +1510,13 @@ fn select_runtime_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_upgrade_allowed, legacy_config_candidates, select_runtime_path};
+    use super::{
+        ensure_upgrade_allowed, is_plugin_update_available, legacy_config_candidates,
+        select_runtime_path, service_inventory_item,
+    };
     use semver::Version;
     use std::path::PathBuf;
+    use webplus_plugin_config::ServiceDefinition;
 
     #[test]
     fn plugin_install_rejects_downgrade_but_allows_repair() {
@@ -1373,6 +1525,54 @@ mod tests {
         assert!(ensure_upgrade_allowed(Some(&current), &Version::new(2, 4, 0)).is_ok());
         assert!(ensure_upgrade_allowed(Some(&current), &Version::new(3, 0, 0)).is_ok());
         assert!(ensure_upgrade_allowed(None, &Version::new(1, 0, 0)).is_ok());
+    }
+
+    #[test]
+    fn plugin_update_check_only_marks_newer_or_uninstalled_versions() {
+        let current = Version::new(2, 4, 0);
+        let older = Version::new(2, 3, 9);
+        let same = Version::new(2, 4, 0);
+        let newer = Version::new(2, 5, 0);
+
+        assert!(!is_plugin_update_available(Some(&current), Some(&older)));
+        assert!(!is_plugin_update_available(Some(&current), Some(&same)));
+        assert!(is_plugin_update_available(Some(&current), Some(&newer)));
+        assert!(is_plugin_update_available(None, Some(&newer)));
+        assert!(!is_plugin_update_available(Some(&current), None));
+    }
+
+    #[test]
+    fn inventory_exposes_request_to_native_mapping_without_plugin_root() {
+        let service: ServiceDefinition = serde_json::from_value(serde_json::json!({
+            "serviceId": "reader",
+            "mainClass": "native/reader.dll",
+            "mainType": "dll",
+            "architecture": "x86",
+            "charset": "gbk",
+            "callingConvention": "cdecl",
+            "cacheable": true,
+            "timeout": 2500,
+            "deps": ["native/helper.dll"],
+            "methods": [{
+                "name": "ReadCardW",
+                "alias": "readCard",
+                "timeout": 1200,
+                "returnType": "string",
+                "parameters": ["port"]
+            }]
+        }))
+        .expect("service fixture must be valid");
+
+        let item = service_inventory_item(service);
+        assert_eq!(item.main_class, "native/reader.dll");
+        assert_eq!(item.calling_convention, "cdecl");
+        assert_eq!(item.charset, "gbk");
+        assert_eq!(item.dependency_count, 1);
+        assert_eq!(item.methods.len(), 1);
+        assert_eq!(item.methods[0].request_name, "readCard");
+        assert_eq!(item.methods[0].native_name, "ReadCardW");
+        assert_eq!(item.methods[0].parameter_count, 1);
+        assert!(!item.main_class.contains("plugins/reader"));
     }
 
     #[test]

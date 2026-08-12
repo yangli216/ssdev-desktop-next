@@ -10,6 +10,7 @@
     "allow-bridge-status",
     "allow-install-plugin-package",
     "allow-install-plugin-from-catalog",
+    "allow-check-plugin-updates",
     "allow-reload-plugins",
     "allow-plugin-inventory",
     "allow-desktop-config",
