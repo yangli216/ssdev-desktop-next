@@ -1,0 +1,16 @@
+[package]
+name = "ssdev-cutover-evidence"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ssdev-release-manifest.workspace = true
+tempfile = "3"
+thiserror.workspace = true
+webplus-plugin-trust.workspace = true

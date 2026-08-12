@@ -1,0 +1,242 @@
+name: Build and test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ssdev-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Rust and frontend quality
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-node@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            apps/desktop/package-lock.json
+            packages/web-bridge/package-lock.json
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev \
+            pkg-config libclang-dev libxcb1-dev libxrandr-dev \
+            libdbus-1-dev libpipewire-0.3-dev libwayland-dev libegl-dev
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Rust build products
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: .
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run strict Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run Rust tests
+        run: cargo test --workspace --all-targets --locked
+      - name: Check release-only desktop security boundaries
+        run: cargo test -p ssdev-desktop-core --all-targets --release --locked
+      - name: Run strict release Clippy for the desktop shell
+        run: cargo clippy -p ssdev-desktop-core --all-targets --release --locked -- -D warnings
+      - name: Install and build desktop frontend
+        run: |
+          npm ci --prefix apps/desktop
+          npm run build --prefix apps/desktop
+      - name: Test typed Web Bridge SDK
+        run: |
+          npm ci --prefix packages/web-bridge
+          npm test --prefix packages/web-bridge
+      - name: Test release metadata tooling
+        run: node --test scripts/test/*.test.mjs
+
+  windows-native:
+    name: Windows x86 and x64 native matrix
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Rust build products
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: .
+      - name: Run Windows native gate
+        shell: powershell
+        run: ./scripts/test-windows.ps1
+
+  windows-packages:
+    name: Windows ${{ matrix.arch }} NSIS and MSI
+    needs:
+      - quality
+      - windows-native
+    runs-on: windows-2022
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+          - arch: x86
+            target: i686-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-node@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Rust build products
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: .
+      - name: Install pinned CycloneDX generator
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+      - name: Install frontend dependencies
+        run: npm ci --prefix apps/desktop
+      - name: Generate ephemeral updater signing key
+        shell: powershell
+        run: |
+          $key = Join-Path $env:RUNNER_TEMP "ssdev-ci-update-${{ matrix.arch }}.key"
+          npm run tauri --prefix ./apps/desktop -- signer generate --ci -p "ssdev-ci-only" -w $key
+          "TAURI_SIGNING_PRIVATE_KEY=$key" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=ssdev-ci-only" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SSDEV_CI_UPDATE_PUBLIC_KEY=$key.pub" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Build unsigned synthetic previous installers
+        shell: powershell
+        run: >-
+          ./scripts/build-windows.ps1
+          -DesktopTarget ${{ matrix.target }}
+          -PluginTrustStore ./fixtures/ci/plugin-trust.json
+          -OriginPolicy ./fixtures/ci/origin-policy.json
+          -OriginPolicySignature ./fixtures/ci/origin-policy.sig.json
+          -AppUpdatePublicKey $env:SSDEV_CI_UPDATE_PUBLIC_KEY
+          -AppUpdateEndpoint "https://updates.invalid/ssdev/latest.json"
+          -AppVersion "0.0.1"
+          -AllowUnsignedTestBuild
+          -SkipTests
+      - name: Preserve synthetic previous bundle
+        shell: powershell
+        run: |
+          $source = Resolve-Path "./target/${{ matrix.target }}/release/bundle"
+          $destination = Join-Path $env:RUNNER_TEMP "ssdev-previous-${{ matrix.arch }}-bundle"
+          Copy-Item -LiteralPath $source.Path -Destination $destination -Recurse
+          "SSDEV_CI_PREVIOUS_BUNDLE=$destination" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Build unsigned candidate installers
+        shell: powershell
+        run: >-
+          ./scripts/build-windows.ps1
+          -DesktopTarget ${{ matrix.target }}
+          -PluginTrustStore ./fixtures/ci/plugin-trust.json
+          -OriginPolicy ./fixtures/ci/origin-policy.json
+          -OriginPolicySignature ./fixtures/ci/origin-policy.sig.json
+          -AppUpdatePublicKey $env:SSDEV_CI_UPDATE_PUBLIC_KEY
+          -AppUpdateEndpoint "https://updates.invalid/ssdev/latest.json"
+          -AllowUnsignedTestBuild
+          -SkipTests
+      - name: Upgrade, launch, and uninstall NSIS and MSI packages
+        shell: powershell
+        run: >-
+          ./scripts/test-windows-package.ps1
+          -DesktopTarget ${{ matrix.target }}
+          -PreviousBundleRoot $env:SSDEV_CI_PREVIOUS_BUNDLE
+          -ExpectedAppUpdatePublicKey $env:SSDEV_CI_UPDATE_PUBLIC_KEY
+          -EvidenceOutput (Join-Path $env:RUNNER_TEMP "ssdev-windows-${{ matrix.arch }}-package-evidence.json")
+          -EvidenceEnvironment github-windows-${{ matrix.arch }}-package-smoke
+      - name: Upload unsigned Windows test packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ssdev-windows-${{ matrix.arch }}-unsigned
+          path: |
+            target/${{ matrix.target }}/release/bundle/**
+            ${{ runner.temp }}/ssdev-windows-${{ matrix.arch }}-package-evidence.json
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-package:
+    name: Linux x64 DEB and AppImage
+    needs: quality
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-node@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev \
+            pkg-config libclang-dev libxcb1-dev libxrandr-dev \
+            libdbus-1-dev libpipewire-0.3-dev libwayland-dev libegl-dev
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Rust build products
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: .
+      - name: Build Linux packages
+        run: |
+          npm ci --prefix apps/desktop
+          npm run tauri --prefix apps/desktop -- build --bundles deb,appimage
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ssdev-linux-x64-unsigned
+          path: target/release/bundle/**
+          if-no-files-found: error
+          retention-days: 14
+
+  macos-package:
+    name: macOS x64 DMG
+    needs: quality
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/setup-node@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Rust build products
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: .
+      - name: Build macOS package
+        run: |
+          npm ci --prefix apps/desktop
+          npm run tauri --prefix apps/desktop -- build --bundles dmg
+      - name: Upload macOS package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ssdev-macos-x64-unsigned
+          path: target/release/bundle/**
+          if-no-files-found: error
+          retention-days: 14

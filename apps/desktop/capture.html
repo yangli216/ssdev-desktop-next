@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>选择截图区域</title>
+  </head>
+  <body>
+    <main id="capture" aria-label="区域截图">
+      <img id="snapshot" alt="当前显示器截图" draggable="false" />
+      <div id="shade"></div>
+      <div id="selection" hidden></div>
+      <div id="hint" role="status">拖动鼠标选择区域 · Esc 取消</div>
+      <div id="actions" hidden>
+        <button id="confirm" type="button">使用此区域</button>
+        <button id="cancel" type="button">取消</button>
+      </div>
+      <p id="error" role="alert" hidden></p>
+    </main>
+    <script type="module" src="/src/capture.ts"></script>
+  </body>
+</html>

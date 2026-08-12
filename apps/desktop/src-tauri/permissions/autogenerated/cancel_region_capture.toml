@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cancel-region-capture"
+description = "Enables the cancel_region_capture command without any pre-configured scope."
+commands.allow = ["cancel_region_capture"]
+
+[[permission]]
+identifier = "deny-cancel-region-capture"
+description = "Denies the cancel_region_capture command without any pre-configured scope."
+commands.deny = ["cancel_region_capture"]

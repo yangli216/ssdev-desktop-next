@@ -1,0 +1,48 @@
+[package]
+name = "ssdev-desktop-core"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+base64.workspace = true
+image.workspace = true
+minisign-verify = "0.2.5"
+reqwest.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ssdev-config.workspace = true
+ssdev-diagnostics.workspace = true
+ssdev-invocation-ledger.workspace = true
+ssdev-origin-policy.workspace = true
+ssdev-process-policy.workspace = true
+tauri = { workspace = true, features = ["tray-icon"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-dialog.workspace = true
+tauri-plugin-autostart = "2"
+tauri-plugin-opener.workspace = true
+tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
+tempfile = "3"
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+xcap.workspace = true
+webplus-controller.workspace = true
+webplus-plugin-config.workspace = true
+webplus-plugin-package.workspace = true
+webplus-plugin-repository.workspace = true
+webplus-plugin-trust.workspace = true
+webplus-protocol.workspace = true
+
+[dev-dependencies]
+tauri = { workspace = true, features = ["test", "tray-icon"] }

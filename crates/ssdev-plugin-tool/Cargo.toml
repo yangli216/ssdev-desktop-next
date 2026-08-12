@@ -1,0 +1,24 @@
+[package]
+name = "ssdev-plugin-tool"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+base64.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile = "3"
+thiserror.workspace = true
+webplus-plugin-config.workspace = true
+webplus-plugin-package.workspace = true
+webplus-plugin-repository.workspace = true
+webplus-plugin-trust.workspace = true
+webplus-protocol.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+ed25519-dalek.workspace = true

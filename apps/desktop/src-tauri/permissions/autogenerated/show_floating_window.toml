@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-show-floating-window"
+description = "Enables the show_floating_window command without any pre-configured scope."
+commands.allow = ["show_floating_window"]
+
+[[permission]]
+identifier = "deny-show-floating-window"
+description = "Denies the show_floating_window command without any pre-configured scope."
+commands.deny = ["show_floating_window"]

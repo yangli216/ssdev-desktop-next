@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 3,
+  "protocolVersion": 1,
+  "methods": [
+    "invokePlugin",
+    "getSystemInfo",
+    "captureWindow",
+    "openExternal",
+    "openWindow",
+    "showFloating",
+    "closeFloating"
+  ],
+  "optionalMethods": [
+    "invokePluginTracked",
+    "getPluginInvocation"
+  ],
+  "capabilities": {
+    "schemaVersion": 1,
+    "trackedInvocations": [
+      "supported",
+      "available",
+      "accepting",
+      "errorCode",
+      "limits"
+    ],
+    "trackedInvocationLimits": [
+      "maxRuntimeOperations",
+      "maxRetainedResponseBytes",
+      "runtimeResultRetentionSeconds",
+      "maxDurableOperations",
+      "maxDurableOperationsPerScope",
+      "completedRetentionSeconds",
+      "indeterminateRetentionSeconds"
+    ]
+  },
+  "events": [
+    "ssdev-capture",
+    "ssdev-floating-action"
+  ]
+}

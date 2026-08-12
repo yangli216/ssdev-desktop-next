@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "draft": true,
+  "cases": [
+    {
+      "name": "读卡器正常读取",
+      "enabled": true,
+      "request": {
+        "serviceId": "reader",
+        "method": "readCard",
+        "parameters": {
+          "timeout": 5
+        }
+      },
+      "expected": {
+        "ResCode": 0,
+        "ResData": {
+          "ReturnValue": "replace-with-redacted-golden-value"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-complete-region-capture"
+description = "Enables the complete_region_capture command without any pre-configured scope."
+commands.allow = ["complete_region_capture"]
+
+[[permission]]
+identifier = "deny-complete-region-capture"
+description = "Denies the complete_region_capture command without any pre-configured scope."
+commands.deny = ["complete_region_capture"]

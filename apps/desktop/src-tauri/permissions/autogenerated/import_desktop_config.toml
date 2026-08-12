@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-import-desktop-config"
+description = "Enables the import_desktop_config command without any pre-configured scope."
+commands.allow = ["import_desktop_config"]
+
+[[permission]]
+identifier = "deny-import-desktop-config"
+description = "Denies the import_desktop_config command without any pre-configured scope."
+commands.deny = ["import_desktop_config"]

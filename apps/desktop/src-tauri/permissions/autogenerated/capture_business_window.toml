@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-capture-business-window"
+description = "Enables the capture_business_window command without any pre-configured scope."
+commands.allow = ["capture_business_window"]
+
+[[permission]]
+identifier = "deny-capture-business-window"
+description = "Denies the capture_business_window command without any pre-configured scope."
+commands.deny = ["capture_business_window"]

@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "capture-overlay",
+  "description": "The bundled region capture overlay receives core IPC but no dialog, opener, shell, or filesystem plugins.",
+  "windows": ["capture-overlay-*"],
+  "permissions": [
+    "core:default",
+    "allow-capture-region-snapshot",
+    "allow-complete-region-capture",
+    "allow-cancel-region-capture"
+  ]
+}

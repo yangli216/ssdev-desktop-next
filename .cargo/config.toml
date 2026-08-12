@@ -1,0 +1,15 @@
+[build]
+# Keep this workspace's large Rust/Tauri artifacts off the system disk.
+target-dir = "/Volumes/mac_ext/CargoTarget/ssdev-desktop-next"
+
+[profile.dev]
+# Preserve file/line diagnostics without full dependency debug symbols.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+# Release caches are large and rarely benefit from incremental compilation.
+incremental = false
+strip = true

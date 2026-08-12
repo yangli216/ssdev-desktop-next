@@ -1,0 +1,14 @@
+node_modules/
+dist/
+/target/
+.DS_Store
+.env
+.env.*
+*.key
+*.p12
+*.pfx
+/apps/desktop/dist/
+/packages/*/dist/
+/packages/*/node_modules/
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/resources/windows/*.exe

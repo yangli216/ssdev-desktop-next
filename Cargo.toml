@@ -1,0 +1,88 @@
+[workspace]
+members = [
+  "apps/desktop/src-tauri",
+  "crates/webplus-controller",
+  "crates/ssdev-config",
+  "crates/ssdev-cutover-evidence",
+  "crates/ssdev-process-policy",
+  "crates/ssdev-origin-policy",
+  "crates/ssdev-diagnostics",
+  "crates/ssdev-invocation-ledger",
+  "crates/ssdev-migration-audit",
+  "crates/ssdev-plugin-tool",
+  "crates/ssdev-release-manifest",
+  "crates/ssdev-release-signing",
+  "crates/webplus-ipc",
+  "crates/webplus-plugin-config",
+  "crates/webplus-plugin-package",
+  "crates/webplus-plugin-repository",
+  "crates/webplus-plugin-trust",
+  "crates/webplus-plugin-host",
+  "crates/webplus-native",
+  "crates/webplus-native-fixture",
+  "crates/webplus-protocol",
+]
+default-members = [
+  "crates/ssdev-config",
+  "crates/ssdev-cutover-evidence",
+  "crates/ssdev-process-policy",
+  "crates/ssdev-migration-audit",
+  "crates/ssdev-plugin-tool",
+  "crates/ssdev-release-manifest",
+  "crates/ssdev-release-signing",
+  "crates/webplus-controller",
+  "crates/webplus-ipc",
+  "crates/webplus-plugin-config",
+  "crates/webplus-plugin-package",
+  "crates/webplus-plugin-repository",
+  "crates/webplus-plugin-trust",
+  "crates/webplus-plugin-host",
+  "crates/webplus-native",
+  "crates/webplus-native-fixture",
+  "crates/webplus-protocol",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "LicenseRef-BSOFT-Proprietary"
+rust-version = "1.91"
+version = "0.1.0"
+
+[workspace.dependencies]
+base64 = "0.22"
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
+semver = { version = "1", features = ["serde"] }
+ssdev-config = { path = "crates/ssdev-config" }
+ssdev-cutover-evidence = { path = "crates/ssdev-cutover-evidence" }
+ssdev-process-policy = { path = "crates/ssdev-process-policy" }
+ssdev-origin-policy = { path = "crates/ssdev-origin-policy" }
+ssdev-release-signing = { path = "crates/ssdev-release-signing" }
+ssdev-release-manifest = { path = "crates/ssdev-release-manifest" }
+ssdev-diagnostics = { path = "crates/ssdev-diagnostics" }
+ssdev-invocation-ledger = { path = "crates/ssdev-invocation-ledger" }
+tauri = { version = "2.11.5" }
+tauri-build = { version = "2.6.3" }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+xcap = "0.9.8"
+zip = { version = "8.1.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+webplus-controller = { path = "crates/webplus-controller" }
+webplus-ipc = { path = "crates/webplus-ipc" }
+webplus-native = { path = "crates/webplus-native" }
+webplus-plugin-config = { path = "crates/webplus-plugin-config" }
+webplus-plugin-package = { path = "crates/webplus-plugin-package" }
+webplus-plugin-repository = { path = "crates/webplus-plugin-repository" }
+webplus-plugin-trust = { path = "crates/webplus-plugin-trust" }
+webplus-protocol = { path = "crates/webplus-protocol" }

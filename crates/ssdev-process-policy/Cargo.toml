@@ -1,0 +1,25 @@
+[package]
+name = "ssdev-process-policy"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+webplus-plugin-trust.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
+tempfile = "3"

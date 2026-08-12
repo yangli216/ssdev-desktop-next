@@ -1,0 +1,165 @@
+#[cfg(any(windows, test))]
+mod arguments;
+mod com;
+mod dll;
+mod process;
+
+use thiserror::Error;
+use webplus_plugin_config::PluginManifest;
+use webplus_protocol::{InvokeRequest, InvokeResponse};
+
+pub struct NativePlugin {
+    manifest: PluginManifest,
+    com: com::ComAdapter,
+    dll: dll::DllAdapter,
+}
+
+impl NativePlugin {
+    pub fn new(manifest: PluginManifest) -> Self {
+        Self {
+            manifest,
+            com: com::ComAdapter::new(),
+            dll: dll::DllAdapter::new(),
+        }
+    }
+
+    /// Pumps pending messages for apartment-threaded COM components.
+    ///
+    /// The plugin host calls this while its dedicated native thread is idle.
+    pub fn pump_messages(&mut self) {
+        self.com.pump_messages();
+    }
+
+    pub fn invoke(&mut self, request: &InvokeRequest) -> InvokeResponse {
+        match self.try_invoke(request) {
+            Ok(response) => response,
+            Err(error) => InvokeResponse::error(error.code(), error.to_string()),
+        }
+    }
+
+    fn try_invoke(&mut self, request: &InvokeRequest) -> Result<InvokeResponse, NativeError> {
+        request
+            .validate()
+            .map_err(|error| NativeError::InvalidRequest(error.to_string()))?;
+        let service = self
+            .manifest
+            .service(&request.service_id)
+            .ok_or_else(|| NativeError::ServiceNotFound(request.service_id.clone()))?;
+        let method =
+            service
+                .method(&request.method)
+                .ok_or_else(|| NativeError::MethodNotFound {
+                    service_id: request.service_id.clone(),
+                    method: request.method.clone(),
+                })?;
+
+        match service.resolved_main_type().to_ascii_lowercase().as_str() {
+            "dll" => self.dll.invoke(
+                &self.manifest.plugin_dir,
+                service,
+                method,
+                &request.parameters,
+            ),
+            "exe" | "bat" => process::invoke(
+                &self.manifest.plugin_dir,
+                service,
+                method,
+                &request.parameters,
+            ),
+            "ocx" | "com" => self.com.invoke(service, method, &request.parameters),
+            other => Err(NativeError::Unsupported(format!(
+                "mainClass type [{other}] is not supported"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum NativeError {
+    #[error("invalid invoke request: {0}")]
+    InvalidRequest(String),
+    #[error("service [{0}] could not find!")]
+    ServiceNotFound(String),
+    #[error("method [{method}] does not exist on service [{service_id}]")]
+    MethodNotFound { service_id: String, method: String },
+    #[error("native component path escaped the plugin directory: {0:?}")]
+    PathEscape(std::path::PathBuf),
+    #[error("native component does not exist: {0:?}")]
+    MissingComponent(std::path::PathBuf),
+    #[error("invalid parameter [{name}]: {message}")]
+    InvalidParameter { name: String, message: String },
+    #[error("unsupported native operation: {0}")]
+    Unsupported(String),
+    #[error("native DLL error: {0}")]
+    Dll(String),
+    #[error("native COM/OCX error: {0}")]
+    Com(String),
+    #[error("native process error: {0}")]
+    Process(String),
+}
+
+impl NativeError {
+    fn code(&self) -> i32 {
+        match self {
+            Self::InvalidRequest(_) | Self::InvalidParameter { .. } => -32602,
+            Self::ServiceNotFound(_) | Self::MethodNotFound { .. } => -32601,
+            Self::Unsupported(_) => -32004,
+            Self::PathEscape(_)
+            | Self::MissingComponent(_)
+            | Self::Dll(_)
+            | Self::Com(_)
+            | Self::Process(_) => -32005,
+        }
+    }
+}
+
+fn resolve_component(
+    plugin_dir: &std::path::Path,
+    main_class: &str,
+) -> Result<std::path::PathBuf, NativeError> {
+    let root = plugin_dir
+        .canonicalize()
+        .map_err(|_| NativeError::MissingComponent(plugin_dir.to_path_buf()))?;
+    let candidate = plugin_dir.join(main_class);
+    let component = candidate
+        .canonicalize()
+        .map_err(|_| NativeError::MissingComponent(candidate.clone()))?;
+    if !component.starts_with(&root) {
+        return Err(NativeError::PathEscape(component));
+    }
+    Ok(component)
+}
+
+fn resolve_component_with_extension(
+    plugin_dir: &std::path::Path,
+    main_class: &str,
+    extension: &str,
+) -> Result<std::path::PathBuf, NativeError> {
+    let direct = plugin_dir.join(main_class);
+    if direct.is_file()
+        || main_class
+            .to_ascii_lowercase()
+            .ends_with(&format!(".{extension}"))
+    {
+        return resolve_component(plugin_dir, main_class);
+    }
+    resolve_component(plugin_dir, &format!("{main_class}.{extension}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn resolves_legacy_component_names_without_an_extension() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("reader.dll"), b"fixture").unwrap();
+
+        let component =
+            resolve_component_with_extension(directory.path(), "reader", "dll").unwrap();
+
+        assert!(component.ends_with("reader.dll"));
+    }
+}

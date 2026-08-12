@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-plugin-invocation-status"
+description = "Enables the plugin_invocation_status command without any pre-configured scope."
+commands.allow = ["plugin_invocation_status"]
+
+[[permission]]
+identifier = "deny-plugin-invocation-status"
+description = "Denies the plugin_invocation_status command without any pre-configured scope."
+commands.deny = ["plugin_invocation_status"]

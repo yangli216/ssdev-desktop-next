@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 2,
+  "businessGrants": [
+    {
+      "origin": "https://business.invalid",
+      "services": [
+        {
+          "serviceId": "ci.health",
+          "methods": [
+            "probe"
+          ]
+        }
+      ]
+    }
+  ],
+  "navigationOrigins": [
+    "https://sso.invalid"
+  ],
+  "externalOrigins": [
+    "https://help.invalid"
+  ],
+  "allowInsecureHttp": false
+}

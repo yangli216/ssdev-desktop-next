@@ -1,0 +1,62 @@
+name: Dependency security
+
+on:
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "**/package.json"
+      - "**/package-lock.json"
+      - "**/.npmrc"
+      - ".github/workflows/supply-chain.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "**/package.json"
+      - "**/package-lock.json"
+      - "**/.npmrc"
+      - ".github/workflows/supply-chain.yml"
+  schedule:
+    - cron: "23 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ssdev-dependency-security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Audit locked Rust and npm dependencies
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Cache Rust registry and audit build products
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: .
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit Cargo.lock and production Windows dependency graphs
+        run: bash ./scripts/audit-rust-windows.sh
+      - uses: actions/setup-node@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            apps/desktop/package-lock.json
+            packages/web-bridge/package-lock.json
+      - name: Audit desktop npm lockfile
+        working-directory: apps/desktop
+        run: npm audit --audit-level=high
+      - name: Audit Web Bridge npm lockfile
+        working-directory: packages/web-bridge
+        run: npm audit --audit-level=high

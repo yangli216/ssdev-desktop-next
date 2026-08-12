@@ -1,0 +1,32 @@
+[package]
+name = "webplus-controller"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+webplus-ipc.workspace = true
+webplus-plugin-config.workspace = true
+webplus-protocol.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_Pipes",
+  "Win32_System_Threading",
+] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ssdev-cutover-evidence.workspace = true
+ssdev-release-manifest.workspace = true
+tempfile = "3"
+webplus-plugin-trust.workspace = true

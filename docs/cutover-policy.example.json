@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "targetSourceRevision": "0123456789abcdef0123456789abcdef01234567",
+  "expectedAppVersion": "1.0.0",
+  "maximumEvidenceAgeSeconds": 604800,
+  "pluginMatrixSignerKeyId": "hospital-a-plugin-matrix-qa-2026",
+  "migrationAuditSignerKeyId": "hospital-a-migration-audit-qa-2026",
+  "windowsPackageSignerKeyId": "hospital-a-windows-package-qa-2026",
+  "cutoverDecisionSignerKeyId": "central-release-approval-2026"
+}

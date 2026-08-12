@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 2,
+  "keys": [
+    {
+      "keyId": "ci-rfc8032-test-only",
+      "algorithm": "ed25519",
+      "publicKey": "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+      "purposes": ["plugin", "plugin-catalog", "origin-policy", "process-policy"],
+      "status": "active"
+    }
+  ]
+}

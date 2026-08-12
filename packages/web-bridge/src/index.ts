@@ -1,0 +1,289 @@
+export const CURRENT_BRIDGE_PROTOCOL_VERSION = 1 as const
+// Backward-compatible export for existing business applications.
+export const CURRENT_PROTOCOL_VERSION = CURRENT_BRIDGE_PROTOCOL_VERSION
+export const CURRENT_DESKTOP_CAPABILITIES_SCHEMA_VERSION = 1 as const
+
+export type JsonPrimitive = string | number | boolean | null
+export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue }
+export type JsonObject = { [key: string]: JsonValue }
+
+export interface InvokeResponse<T = JsonValue> {
+  ResCode: number
+  ResData: T
+}
+
+export type TrackedInvocationStatus<T = JsonValue> =
+  | { state: 'unknown' }
+  | { state: 'pending' }
+  | { state: 'completed'; response: InvokeResponse<T>; durable: boolean }
+  | { state: 'indeterminate' }
+  | { state: 'completedWithoutResult' }
+
+export interface TrackedInvocationLimits {
+  maxRuntimeOperations: number
+  maxRetainedResponseBytes: number
+  runtimeResultRetentionSeconds: number
+  maxDurableOperations: number
+  maxDurableOperationsPerScope: number
+  completedRetentionSeconds: number
+  indeterminateRetentionSeconds: number
+}
+
+export interface TrackedInvocationCapabilities {
+  supported: boolean
+  available: boolean
+  accepting: boolean
+  errorCode: string | null
+  limits: TrackedInvocationLimits
+}
+
+export interface DesktopCapabilities {
+  schemaVersion: typeof CURRENT_DESKTOP_CAPABILITIES_SCHEMA_VERSION
+  trackedInvocations: TrackedInvocationCapabilities
+}
+
+export interface SystemDeclaration {
+  os: string
+  architecture: string
+  appVersion: string
+  protocolVersion: number
+  /** Absent on desktop clients released before explicit capability negotiation. */
+  capabilities?: DesktopCapabilities
+}
+
+export interface SecondaryWindowRequest {
+  url: string
+  title?: string
+  screenIndex?: number
+  context?: JsonObject
+  /** Must be provided together with height. Supplying a size opens a non-maximized window. */
+  width?: number
+  /** Must be provided together with width. */
+  height?: number
+  /** Desktop logical coordinate; must be provided together with top. */
+  left?: number
+  /** Desktop logical coordinate; must be provided together with left. */
+  top?: number
+}
+
+export interface FloatingWindowRequest {
+  id: string
+  url: string
+  durationMs?: number
+  width?: number
+  height?: number
+  context?: JsonObject
+}
+
+export interface SsdevDesktopBridge {
+  invokePlugin<T = JsonValue>(
+    serviceId: string,
+    method: string,
+    parameters?: JsonObject,
+  ): Promise<InvokeResponse<T>>
+  invokePluginTracked?<T = JsonValue>(
+    operationId: string,
+    serviceId: string,
+    method: string,
+    parameters?: JsonObject,
+  ): Promise<TrackedInvocationStatus<T>>
+  getPluginInvocation?<T = JsonValue>(
+    operationId: string,
+    serviceId: string,
+    method: string,
+  ): Promise<TrackedInvocationStatus<T>>
+  getSystemInfo(): Promise<SystemDeclaration>
+  captureWindow(): Promise<string>
+  openExternal(url: string): Promise<void>
+  openWindow(request: SecondaryWindowRequest): Promise<string>
+  showFloating(request: FloatingWindowRequest): Promise<string>
+  closeFloating(id: string): Promise<void>
+}
+
+export const BRIDGE_METHODS = [
+  'invokePlugin',
+  'getSystemInfo',
+  'captureWindow',
+  'openExternal',
+  'openWindow',
+  'showFloating',
+  'closeFloating',
+] as const satisfies readonly (keyof SsdevDesktopBridge)[]
+
+export const TRACKED_INVOCATION_METHODS = [
+  'invokePluginTracked',
+  'getPluginInvocation',
+] as const satisfies readonly (keyof SsdevDesktopBridge)[]
+
+export const BRIDGE_EVENTS = [
+  'ssdev-capture',
+  'ssdev-floating-action',
+] as const
+
+export type DesktopBridgeEvent = (typeof BRIDGE_EVENTS)[number]
+
+export interface DesktopConnection {
+  readonly bridge: SsdevDesktopBridge
+  readonly system: Readonly<SystemDeclaration>
+  readonly context: Readonly<JsonObject>
+}
+
+export interface ConnectOptions {
+  supportedProtocolVersions?: readonly number[]
+}
+
+export class DesktopBridgeUnavailableError extends Error {
+  override readonly name = 'DesktopBridgeUnavailableError'
+
+  constructor() {
+    super('SSDEV Desktop bridge is unavailable; open this page inside an authorized desktop business window')
+  }
+}
+
+export class UnsupportedDesktopProtocolError extends Error {
+  override readonly name = 'UnsupportedDesktopProtocolError'
+  readonly actualVersion: number
+  readonly supportedVersions: readonly number[]
+
+  constructor(actualVersion: number, supportedVersions: readonly number[]) {
+    super(`SSDEV Desktop protocol ${actualVersion} is not supported; expected one of [${supportedVersions.join(', ')}]`)
+    this.actualVersion = actualVersion
+    this.supportedVersions = supportedVersions
+  }
+}
+
+export class TrackedInvocationsUnavailableError extends Error {
+  override readonly name = 'TrackedInvocationsUnavailableError'
+  readonly errorCode: string | undefined
+
+  constructor(errorCode?: string) {
+    super(errorCode
+      ? `SSDEV Desktop tracked plugin invocations are unavailable (${errorCode})`
+      : 'SSDEV Desktop tracked plugin invocations are unavailable; update the desktop client before using operation IDs')
+    this.errorCode = errorCode
+  }
+}
+
+export type TrackedInvocationBridge = SsdevDesktopBridge & {
+  invokePluginTracked: NonNullable<SsdevDesktopBridge['invokePluginTracked']>
+  getPluginInvocation: NonNullable<SsdevDesktopBridge['getPluginInvocation']>
+}
+
+type DesktopGlobals = typeof globalThis & {
+  ssdevDesktop?: SsdevDesktopBridge
+  webPlusInvoke?: SsdevDesktopBridge['invokePlugin']
+  ssdevDesktopContext?: JsonObject
+}
+
+function globals(): DesktopGlobals {
+  return globalThis as DesktopGlobals
+}
+
+function isCompleteBridge(value: unknown): value is SsdevDesktopBridge {
+  if (typeof value !== 'object' || value === null) return false
+  const bridge = value as Record<string, unknown>
+  return BRIDGE_METHODS.every((method) => typeof bridge[method] === 'function')
+}
+
+export function isDesktopBridgeAvailable(): boolean {
+  return isCompleteBridge(globals().ssdevDesktop)
+}
+
+export function requireDesktopBridge(): SsdevDesktopBridge {
+  const bridge = globals().ssdevDesktop
+  if (!isCompleteBridge(bridge)) {
+    throw new DesktopBridgeUnavailableError()
+  }
+  return bridge
+}
+
+export function supportsTrackedPluginInvocations(
+  bridge: SsdevDesktopBridge = requireDesktopBridge(),
+  system?: SystemDeclaration,
+): bridge is TrackedInvocationBridge {
+  const candidate = bridge as unknown as Record<string, unknown>
+  if (!TRACKED_INVOCATION_METHODS.every((method) => typeof candidate[method] === 'function')) {
+    return false
+  }
+  if (system === undefined) {
+    return true
+  }
+  const capability = getTrackedInvocationCapabilities(system)
+  return capability?.supported === true
+    && capability.available
+    && capability.accepting
+}
+
+export function requireTrackedPluginInvocations(
+  bridge: SsdevDesktopBridge = requireDesktopBridge(),
+  system?: SystemDeclaration,
+): TrackedInvocationBridge {
+  if (!supportsTrackedPluginInvocations(bridge, system)) {
+    const capability = system === undefined
+      ? null
+      : getTrackedInvocationCapabilities(system)
+    const errorCode = capability === null
+      ? (system === undefined ? undefined : 'tracked-capability-undeclared')
+      : capability.errorCode
+        ?? (!capability.supported
+          ? 'tracked-invocation-unsupported'
+          : !capability.available
+            ? 'tracked-invocation-unavailable'
+            : 'tracked-invocation-stopping')
+    throw new TrackedInvocationsUnavailableError(errorCode)
+  }
+  return bridge
+}
+
+export function getTrackedInvocationCapabilities(
+  system: SystemDeclaration,
+): Readonly<TrackedInvocationCapabilities> | null {
+  const capabilities = system.capabilities
+  if (capabilities?.schemaVersion !== CURRENT_DESKTOP_CAPABILITIES_SCHEMA_VERSION) {
+    return null
+  }
+  return capabilities.trackedInvocations
+}
+
+export function createPluginOperationId(): string {
+  const randomUUID = globalThis.crypto?.randomUUID
+  if (typeof randomUUID !== 'function') {
+    throw new TrackedInvocationsUnavailableError()
+  }
+  return randomUUID.call(globalThis.crypto)
+}
+
+export async function connectDesktop(options: ConnectOptions = {}): Promise<DesktopConnection> {
+  const bridge = requireDesktopBridge()
+  const system = await bridge.getSystemInfo()
+  const supported = options.supportedProtocolVersions ?? [CURRENT_BRIDGE_PROTOCOL_VERSION]
+  if (!supported.includes(system.protocolVersion)) {
+    throw new UnsupportedDesktopProtocolError(system.protocolVersion, supported)
+  }
+  const context = globals().ssdevDesktopContext ?? {}
+  const frozenSystem: Readonly<SystemDeclaration> = system.capabilities === undefined
+    ? Object.freeze({ ...system })
+    : Object.freeze({
+        ...system,
+        capabilities: Object.freeze({
+          ...system.capabilities,
+          trackedInvocations: Object.freeze({
+            ...system.capabilities.trackedInvocations,
+            limits: Object.freeze({ ...system.capabilities.trackedInvocations.limits }),
+          }),
+        }),
+      })
+  return Object.freeze({
+    bridge,
+    system: frozenSystem,
+    context: Object.freeze({ ...context }),
+  })
+}
+
+declare global {
+  interface Window {
+    readonly ssdevDesktop?: SsdevDesktopBridge
+    readonly webPlusInvoke?: SsdevDesktopBridge['invokePlugin']
+    readonly ssdevDesktopContext?: Readonly<JsonObject>
+  }
+}

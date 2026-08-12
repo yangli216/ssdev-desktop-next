@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-system-declaration"
+description = "Enables the system_declaration command without any pre-configured scope."
+commands.allow = ["system_declaration"]
+
+[[permission]]
+identifier = "deny-system-declaration"
+description = "Denies the system_declaration command without any pre-configured scope."
+commands.deny = ["system_declaration"]

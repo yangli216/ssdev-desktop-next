@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resolve-floating-window"
+description = "Enables the resolve_floating_window command without any pre-configured scope."
+commands.allow = ["resolve_floating_window"]
+
+[[permission]]
+identifier = "deny-resolve-floating-window"
+description = "Denies the resolve_floating_window command without any pre-configured scope."
+commands.deny = ["resolve_floating_window"]
