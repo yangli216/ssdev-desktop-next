@@ -13,7 +13,6 @@ tauri-build.workspace = true
 
 [dependencies]
 base64.workspace = true
-image.workspace = true
 minisign-verify = "0.2.5"
 reqwest.workspace = true
 semver.workspace = true
@@ -36,13 +35,16 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
-xcap.workspace = true
 webplus-controller.workspace = true
 webplus-plugin-config.workspace = true
 webplus-plugin-package.workspace = true
 webplus-plugin-repository.workspace = true
 webplus-plugin-trust.workspace = true
 webplus-protocol.workspace = true
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+image.workspace = true
+xcap.workspace = true
 
 [dev-dependencies]
 tauri = { workspace = true, features = ["test", "tray-icon"] }

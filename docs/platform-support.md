@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | Windows 10/11 x64 | NSIS、MSI、updater | 主要生产目标 | x86/x64 DLL、COM、EXE |
 | Windows 10/11 x86 | NSIS、MSI、updater | 兼容目标 | x86 DLL、COM、EXE；包内仍携带双宿主 |
-| Linux x64 | DEB、AppImage | 开发预览 | 不支持 Windows DLL/COM |
+| Linux x64 | DEB、AppImage | 开发预览 | 不支持 Windows DLL/COM 和桌面截图 |
 | macOS x64 | DMG | 开发预览 | 不支持 Windows DLL/COM |
 | Windows 7/8/8.1 | 不发布 | 实验性研究 | 当前安全工具链不承诺支持 |
 

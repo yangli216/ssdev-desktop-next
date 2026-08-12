@@ -1,4 +1,8 @@
 mod app_update;
+#[cfg(any(windows, target_os = "macos"))]
+mod capture;
+#[cfg(not(any(windows, target_os = "macos")))]
+#[path = "capture_unsupported.rs"]
 mod capture;
 #[allow(dead_code)]
 // The shared build/runtime ACL declaration intentionally has target-specific subsets.
