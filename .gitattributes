@@ -1,0 +1,3 @@
+# Detached signatures cover exact document bytes. Keep JSON checkout content
+# stable across Windows, macOS, and Linux so signatures remain reproducible.
+*.json text eol=lf

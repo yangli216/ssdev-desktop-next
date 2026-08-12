@@ -266,6 +266,9 @@ try {
         --document $bundledProcessPolicy `
         --envelope $bundledProcessPolicySignature `
         --trust-store $bundledTrustStore
+      if ($LASTEXITCODE -ne 0) {
+        throw "Bundled process policy signature verification failed."
+      }
     } finally {
       Pop-Location
     }
@@ -278,6 +281,9 @@ try {
       --document $bundledOriginPolicy `
       --envelope $bundledOriginPolicySignature `
       --trust-store $bundledTrustStore
+    if ($LASTEXITCODE -ne 0) {
+      throw "Bundled origin policy signature verification failed."
+    }
   } finally {
     Pop-Location
   }
