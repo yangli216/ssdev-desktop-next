@@ -462,7 +462,12 @@ try {
   if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $artifactManifest -PathType Leaf)) {
     throw "Failed to create the release artifact manifest."
   }
-  & npm run tauri --prefix $desktopDir -- signer sign $artifactManifest
+  if ($env:TAURI_SIGNING_PRIVATE_KEY -and (Test-Path -LiteralPath $env:TAURI_SIGNING_PRIVATE_KEY -PathType Leaf)) {
+    & npm run tauri --prefix $desktopDir -- signer sign --private-key-path $env:TAURI_SIGNING_PRIVATE_KEY $artifactManifest
+  }
+  else {
+    & npm run tauri --prefix $desktopDir -- signer sign $artifactManifest
+  }
   if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $artifactManifestSignature -PathType Leaf)) {
     throw "Failed to sign the release artifact manifest."
   }
