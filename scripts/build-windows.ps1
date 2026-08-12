@@ -360,7 +360,13 @@ try {
   Push-Location $workspace
   $pushedWorkspace = $true
   cargo build --locked --release -p webplus-plugin-host --target i686-pc-windows-msvc
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to build the x86 native plugin host."
+  }
   cargo build --locked --release -p webplus-plugin-host --target x86_64-pc-windows-msvc
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to build the x64 native plugin host."
+  }
 
   $x86Host = Join-Path $workspace "target/i686-pc-windows-msvc/release/webplus-plugin-host.exe"
   $x64Host = Join-Path $workspace "target/x86_64-pc-windows-msvc/release/webplus-plugin-host.exe"
@@ -381,8 +387,33 @@ try {
   }
 
   npm ci --prefix $desktopDir
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to install the desktop frontend dependencies."
+  }
   npm run build --prefix $desktopDir
-  npm run tauri --prefix $desktopDir -- build --target $DesktopTarget --config $updateBuildConfig
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to build the desktop frontend."
+  }
+
+  # Tauri's bundle updater reads private-key contents from TAURI_SIGNING_PRIVATE_KEY.
+  # The signer subcommand also supports a file-backed key, so expand that path only
+  # for the bundle command and restore the caller's environment immediately after it.
+  $originalTauriSigningPrivateKey = $env:TAURI_SIGNING_PRIVATE_KEY
+  try {
+    if (-not $originalTauriSigningPrivateKey -and $env:TAURI_SIGNING_PRIVATE_KEY_PATH) {
+      if (-not (Test-Path -LiteralPath $env:TAURI_SIGNING_PRIVATE_KEY_PATH -PathType Leaf)) {
+        throw "TAURI_SIGNING_PRIVATE_KEY_PATH does not reference a regular file."
+      }
+      $env:TAURI_SIGNING_PRIVATE_KEY = [System.IO.File]::ReadAllText($env:TAURI_SIGNING_PRIVATE_KEY_PATH)
+    }
+    npm run tauri --prefix $desktopDir -- build --target $DesktopTarget --config $updateBuildConfig
+    if ($LASTEXITCODE -ne 0) {
+      throw "Failed to build the Tauri Windows bundles."
+    }
+  }
+  finally {
+    $env:TAURI_SIGNING_PRIVATE_KEY = $originalTauriSigningPrivateKey
+  }
 
   $metadataDirectory = Join-Path $bundleRoot "metadata"
   New-Item -ItemType Directory -Force -Path $metadataDirectory | Out-Null
@@ -524,10 +555,20 @@ try {
 }
 
 $finalReleaseMetadata = Join-Path $bundleRoot "metadata/release.json"
-& cargo run --quiet --locked --manifest-path (Join-Path $workspace "Cargo.toml") `
-  -p ssdev-release-manifest -- metadata-verify `
-  $finalReleaseMetadata `
-  $workspace
+if ($AllowUnsignedTestBuild) {
+  # Synthetic CI packages may intentionally inject a version and unsigned test
+  # resources. Validate the embedded provenance structure, while reserving the
+  # exact post-build workspace comparison for production artifacts.
+  & cargo run --quiet --locked --manifest-path (Join-Path $workspace "Cargo.toml") `
+    -p ssdev-release-manifest -- metadata-verify `
+    $finalReleaseMetadata
+}
+else {
+  & cargo run --quiet --locked --manifest-path (Join-Path $workspace "Cargo.toml") `
+    -p ssdev-release-manifest -- metadata-verify `
+    $finalReleaseMetadata `
+    $workspace
+}
 if ($LASTEXITCODE -ne 0) {
   throw "Release provenance changed while the Windows bundle was being built."
 }
