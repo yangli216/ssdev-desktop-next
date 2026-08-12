@@ -249,11 +249,32 @@ function Assert-TrustKeyLifecycle {
   }
 }
 
+function Normalize-RegistryPath {
+  param(
+    [Parameter(Mandatory = $true)][string]$Value,
+    [Parameter(Mandatory = $true)][string]$Name
+  )
+  $value = $Value.Trim()
+  $startsQuoted = $value.StartsWith('"')
+  $endsQuoted = $value.EndsWith('"')
+  if ($startsQuoted -ne $endsQuoted) {
+    throw "Windows uninstall registration [$Name] contains unmatched quotes."
+  }
+  if ($startsQuoted) {
+    $value = $value.Substring(1, $value.Length - 2)
+  }
+  if (-not $value -or $value.Contains('"')) {
+    throw "Windows uninstall registration [$Name] is not a plain path."
+  }
+  return $value
+}
+
 function Resolve-InstalledExecutable {
   param([Parameter(Mandatory = $true)]$Registration)
   $candidates = [System.Collections.Generic.List[string]]::new()
   $installLocation = Get-OptionalProperty $Registration "InstallLocation"
   if ($installLocation) {
+    $installLocation = Normalize-RegistryPath $installLocation "InstallLocation"
     $candidates.Add((Join-Path $installLocation $MainExecutableName))
   }
   $displayIcon = Get-OptionalProperty $Registration "DisplayIcon"
