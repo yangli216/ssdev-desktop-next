@@ -162,7 +162,7 @@ function Get-AppRegistrations {
   return @(
     foreach ($registryPath in $registryPaths) {
       Get-ItemProperty -Path $registryPath -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -eq $ProductName }
+        Where-Object { (Get-OptionalProperty $_ "DisplayName") -eq $ProductName }
     }
   )
 }
