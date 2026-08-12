@@ -40,8 +40,8 @@ try {
     cargo run --locked -p webplus-native --example dll_roundtrip --target $target -- $fixture
     cargo run --locked -p webplus-native --example com_roundtrip --target $target
 
-    $host = Join-Path $workspace "target/$target/debug/webplus-plugin-host.exe"
-    cargo run --locked -p webplus-controller --example host_roundtrip --target $target -- $host
+    $pluginHostPath = Join-Path $workspace "target/$target/debug/webplus-plugin-host.exe"
+    cargo run --locked -p webplus-controller --example host_roundtrip --target $target -- $pluginHostPath
   }
 } finally {
   Pop-Location
