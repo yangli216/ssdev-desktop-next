@@ -285,8 +285,8 @@ try {
   if (-not $AppUpdatePublicKey -or -not $AppUpdateEndpoint) {
     throw "Production builds require -AppUpdatePublicKey and -AppUpdateEndpoint (or their SSDEV_APP_UPDATE_* environment variables)."
   }
-  if (-not $env:TAURI_SIGNING_PRIVATE_KEY) {
-    throw "Production builds require TAURI_SIGNING_PRIVATE_KEY so updater artifacts are signed."
+  if (-not $env:TAURI_SIGNING_PRIVATE_KEY -and -not $env:TAURI_SIGNING_PRIVATE_KEY_PATH) {
+    throw "Production builds require TAURI_SIGNING_PRIVATE_KEY or TAURI_SIGNING_PRIVATE_KEY_PATH so updater artifacts are signed."
   }
   $resolvedUpdatePublicKey = (Resolve-Path $AppUpdatePublicKey).Path
   $updatePublicKeyText = (Get-Content -Raw $resolvedUpdatePublicKey).Trim()
@@ -463,7 +463,14 @@ try {
     throw "Failed to create the release artifact manifest."
   }
   if ($env:TAURI_SIGNING_PRIVATE_KEY -and (Test-Path -LiteralPath $env:TAURI_SIGNING_PRIVATE_KEY -PathType Leaf)) {
-    & npm run tauri --prefix $desktopDir -- signer sign --private-key-path $env:TAURI_SIGNING_PRIVATE_KEY $artifactManifest
+    $privateKeyPath = $env:TAURI_SIGNING_PRIVATE_KEY
+    $env:TAURI_SIGNING_PRIVATE_KEY = $null
+    try {
+      & npm run tauri --prefix $desktopDir -- signer sign --private-key-path $privateKeyPath $artifactManifest
+    }
+    finally {
+      $env:TAURI_SIGNING_PRIVATE_KEY = $privateKeyPath
+    }
   }
   else {
     & npm run tauri --prefix $desktopDir -- signer sign $artifactManifest

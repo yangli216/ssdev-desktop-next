@@ -119,7 +119,7 @@ jobs:
         run: |
           $key = Join-Path $env:RUNNER_TEMP "ssdev-ci-update-${{ matrix.arch }}.key"
           npm run tauri --prefix ./apps/desktop -- signer generate --ci -p "ssdev-ci-only" -w $key
-          "TAURI_SIGNING_PRIVATE_KEY=$key" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TAURI_SIGNING_PRIVATE_KEY_PATH=$key" | Out-File -FilePath $env:GITHUB_ENV -Append
           "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=ssdev-ci-only" | Out-File -FilePath $env:GITHUB_ENV -Append
           "SSDEV_CI_UPDATE_PUBLIC_KEY=$key.pub" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Build unsigned synthetic previous installers
