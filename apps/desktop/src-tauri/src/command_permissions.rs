@@ -165,4 +165,26 @@ mod tests {
         assert!(!PRODUCTION_CSP.contains("https:"));
         assert!(!PRODUCTION_CSP.contains("ws:"));
     }
+
+    #[test]
+    fn bundled_runtime_resources_match_the_paths_used_by_the_desktop() {
+        let config = serde_json::from_str::<serde_json::Value>(include_str!("../tauri.conf.json"))
+            .expect("Tauri config must be valid JSON");
+        let resources = config["bundle"]["resources"]
+            .as_object()
+            .expect("bundle.resources must use explicit destination mappings");
+
+        assert_eq!(
+            resources
+                .get("resources/*.json")
+                .and_then(serde_json::Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            resources
+                .get("resources/windows/")
+                .and_then(serde_json::Value::as_str),
+            Some("windows/")
+        );
+    }
 }

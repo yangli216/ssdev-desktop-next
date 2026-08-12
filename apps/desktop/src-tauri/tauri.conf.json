@@ -27,7 +27,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["resources/*.json", "resources/windows/"],
+    "resources": {
+      "resources/*.json": "",
+      "resources/windows/": "windows/"
+    },
     "targets": ["nsis", "msi"],
     "windows": {
       "webviewInstallMode": {
