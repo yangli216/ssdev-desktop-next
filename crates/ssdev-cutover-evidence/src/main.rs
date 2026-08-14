@@ -122,12 +122,9 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
         ));
     }
 
-    let (nsis_install_verified, msi_install_verified) = match installer_kind.as_str() {
-        "Both" => (true, true),
-        "Nsis" => (true, false),
-        "Msi" => (false, true),
-        _ => return Err(invalid_input("installer kind must be Both, Nsis, or Msi")),
-    };
+    if installer_kind != "Nsis" {
+        return Err(invalid_input("installer kind must be Nsis"));
+    }
     let executed_at_unix_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| invalid_input("system clock is before the Unix epoch"))?
@@ -148,8 +145,9 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
             app_version: current.app_version,
             authenticode_required: current.authenticode_required,
             authenticode_verified,
-            nsis_install_verified,
-            msi_install_verified,
+            nsis_install_verified: true,
+            // Retained in the evidence schema so existing signed records remain readable.
+            msi_install_verified: false,
             launch_verified,
             upgrade_verified: previous.is_some(),
             previous_app_version: previous.map(|metadata| metadata.app_version),
@@ -327,5 +325,5 @@ fn invalid_input(message: &str) -> Box<dyn Error> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Both|Nsis|Msi> <launch-verified> <authenticode-verified> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
+    "usage:\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
 }

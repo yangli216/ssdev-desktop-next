@@ -719,8 +719,8 @@ pub fn evaluate_production_cutover(
     if !windows.authenticode_required || !windows.authenticode_verified {
         blockers.insert("windows-authenticode-not-verified".into());
     }
-    if !windows.nsis_install_verified || !windows.msi_install_verified {
-        blockers.insert("windows-installers-not-fully-verified".into());
+    if !windows.nsis_install_verified {
+        blockers.insert("windows-nsis-not-verified".into());
     }
     if !windows.launch_verified {
         blockers.insert("windows-launch-not-verified".into());
@@ -1044,7 +1044,7 @@ mod tests {
             authenticode_required: true,
             authenticode_verified: true,
             nsis_install_verified: true,
-            msi_install_verified: true,
+            msi_install_verified: false,
             launch_verified: true,
             upgrade_verified: true,
             previous_app_version: Some("1.2.2".into()),
@@ -1079,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_package_evidence_preserves_partial_runs_for_the_final_gate() {
+    fn windows_package_evidence_preserves_legacy_installer_fields() {
         let mut evidence = valid_windows_package();
         evidence.msi_install_verified = false;
         evidence.launch_verified = false;

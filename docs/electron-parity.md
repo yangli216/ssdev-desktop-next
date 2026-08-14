@@ -30,4 +30,4 @@
 
 - `dllWinTop`、OCX 注册、驱动安装、厂商弹窗和 `installRun` 必须用真实签名插件在隔离 Windows 环境验证，不能恢复旧版 100ms 全局抢焦点轮询来假定兼容。
 - 普通 Chrome/Edge 是否仍依赖两个旧 localhost 端点，必须以代表性关键流程 HAR 判断；Tauri 自身不会依赖 HTTP。
-- NSIS/MSI、x86/x64 宿主、升级保留、Authenticode、真实启动、插件黄金矩阵和最终切换审批必须产生独立签名证据后才能 GO。
+- NSIS、x86/x64 宿主、升级保留、Authenticode、真实启动、插件黄金矩阵和最终切换审批必须产生独立签名证据后才能 GO。

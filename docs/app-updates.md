@@ -49,11 +49,11 @@ $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD="<由 CI secret 注入>"
   -ExpectedSignerSubject "<完整证书主题 DN>"
 ```
 
-也可以用 `-WindowsSignCommand "artifact-signing-cli ... %1"` 接入 HSM/KMS；命令必须包含 Tauri 约定的 `%1` 文件占位符，并通过环境身份认证，不应把密钥写进命令行。证书模式会验证证书具有私钥、代码签名 EKU、未过期和时间戳端点；两种模式都会先签名 x86/x64 插件宿主，并在构建后验证全部 EXE/MSI 的 Authenticode 发布者。
+也可以用 `-WindowsSignCommand "artifact-signing-cli ... %1"` 接入 HSM/KMS；命令必须包含 Tauri 约定的 `%1` 文件占位符，并通过环境身份认证，不应把密钥写进命令行。证书模式会验证证书具有私钥、代码签名 EKU、未过期和时间戳端点；两种模式都会先签名 x86/x64 插件宿主，并在构建后验证全部 EXE 的 Authenticode 发布者。
 
 Windows 发布机还必须安装固定版 `cargo-cyclonedx 0.5.9`。构建会为桌面主程序、x86/x64 插件宿主及 npm 前端生成 CycloneDX 1.5 SBOM，移除工作区绝对路径和随机标识；随后生成覆盖整个 bundle 的规范化路径、长度和 SHA-256 清单，并用同一受控 Tauri 更新密钥签名。发布清单不依赖包内自声明公钥建立信任，验收时必须通过 `-ExpectedAppUpdatePublicKey` 独立提供组织更新公钥；更新密钥轮换期间，上一包通过 `-PreviousExpectedAppUpdatePublicKey` 使用独立旧公钥验证。
 
-默认构建使用 `-InstallerKind Both -WebViewInstallMode OfflineInstaller`，同时生成离线 NSIS 与 MSI。在线轻量渠道使用 `-InstallerKind Nsis -WebViewInstallMode DownloadBootstrapper`；已有 WebView2 时复用系统运行时，缺失时安装过程需要访问 Microsoft 下载服务。构建只允许这两种 WebView2 策略，不开放可能在运行时缺失时直接启动失败的 `skip`。安装器类型、架构和 WebView2 模式写入 `metadata/package-profile.json` 并进入签名产物清单；验收脚本必须通过 `-InstallerKind` 和 `-ExpectedWebViewInstallMode` 与其精确匹配。
+Windows 构建只生成 NSIS。默认使用 `-WebViewInstallMode OfflineInstaller` 生成离线版；在线轻量渠道使用 `-WebViewInstallMode DownloadBootstrapper`，已有 WebView2 时复用系统运行时，缺失时安装过程需要访问 Microsoft 下载服务。构建只允许这两种 WebView2 策略，不开放可能在运行时缺失时直接启动失败的 `skip`。安装器类型、架构和 WebView2 模式写入 `metadata/package-profile.json` 并进入签名产物清单；验收脚本通过 `-ExpectedWebViewInstallMode` 与其精确匹配。
 
 缺少更新公钥、HTTPS 端点、更新私钥或 Windows 代码签名配置时，正式打包脚本会直接失败。只有 `CI=true` 且显式传入 `-AllowUnsignedTestBuild` 时才能生成不可分发的未签名测试包。
 
@@ -62,8 +62,8 @@ Windows 发布机还必须安装固定版 `cargo-cyclonedx 0.5.9`。构建会为
 ## 发布门禁
 
 - 安装包版本必须高于当前版本，发布说明不得包含敏感信息。
-- 在隔离 Windows 账户运行 `scripts/test-windows-package.ps1 -ExpectedAppUpdatePublicKey <独立公钥文件> -EvidenceOutput <工作区和 bundle 外的新文件> -EvidenceEnvironment <验证环境标签> -RequireAuthenticode -ExpectedSignerSubject "<完整证书主题 DN>"`；门禁先验证签名的全产物清单、源码提交/锁文件/工具链溯源、SBOM、updater 包、信任密钥生命周期及来源/可选进程策略的 active 密钥签名，再要求 NSIS/MSI 均通过安装、架构/资源/注入策略一致性/签名检查、启动诊断和卸载，且所有 Authenticode 签名者主题必须精确匹配；成功后才写出绑定本次结果且不可覆盖的包验收证据。
-- CI 使用同一源码构建较低的 `0.0.1` 合成版本，对 NSIS/MSI 自动验证原位升级、候选版本启动和配置哨兵保留；正式发布还必须通过 `-PreviousBundleRoot` 输入真实上一生产版本重复该门禁。
+- 在隔离 Windows 账户运行 `scripts/test-windows-package.ps1 -ExpectedAppUpdatePublicKey <独立公钥文件> -EvidenceOutput <工作区和 bundle 外的新文件> -EvidenceEnvironment <验证环境标签> -RequireAuthenticode -ExpectedSignerSubject "<完整证书主题 DN>"`；门禁先验证签名的全产物清单、源码提交/锁文件/工具链溯源、SBOM、updater 包、信任密钥生命周期及来源/可选进程策略的 active 密钥签名，再要求 NSIS 通过安装、架构/资源/注入策略一致性/签名检查、启动诊断和卸载，且所有 Authenticode 签名者主题必须精确匹配；成功后才写出绑定本次结果且不可覆盖的包验收证据。
+- CI 使用同一源码构建较低的 `0.0.1` 合成版本，对 NSIS 自动验证原位升级、候选版本启动和配置哨兵保留；正式发布还必须通过 `-PreviousBundleRoot` 输入真实上一生产版本重复该门禁。
 - 先在隔离 Windows 验证机测试下载、签名错误、网络中断、安装失败和配置保留。
 - 分批发布时由更新服务控制可见范围，不在客户端实现任意降级。
 - 需要回滚时优先发布更高版本号的修复包；紧急降级必须通过重新构建的受控恢复安装包完成。

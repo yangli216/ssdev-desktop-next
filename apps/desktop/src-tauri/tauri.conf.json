@@ -31,7 +31,7 @@
       "resources/*.json": "",
       "resources/windows/": "windows/"
     },
-    "targets": ["nsis", "msi"],
+    "targets": ["nsis"],
     "windows": {
       "webviewInstallMode": {
         "type": "offlineInstaller"

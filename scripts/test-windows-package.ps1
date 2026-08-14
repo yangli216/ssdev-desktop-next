@@ -3,8 +3,6 @@ param(
   [string]$PreviousBundleRoot,
   [ValidateSet("x86_64-pc-windows-msvc", "i686-pc-windows-msvc")]
   [string]$DesktopTarget = "x86_64-pc-windows-msvc",
-  [ValidateSet("Both", "Nsis", "Msi")]
-  [string]$InstallerKind = "Both",
   [ValidateSet("OfflineInstaller", "DownloadBootstrapper")]
   [string]$ExpectedWebViewInstallMode = "OfflineInstaller",
   [string]$ProductName = "SSDEV Desktop",
@@ -511,7 +509,7 @@ function Test-ReleaseArtifactManifest {
   if (
     $packageProfile.schemaVersion -ne 1 -or
     $packageProfile.desktopTarget -ne $DesktopTarget -or
-    $packageProfile.installerKind -ne $InstallerKind -or
+    $packageProfile.installerKind -ne "Nsis" -or
     $packageProfile.webviewInstallMode -ne $ExpectedWebViewInstallMode
   ) {
     throw "Release package profile does not match the requested architecture, installer kind, or WebView2 mode."
@@ -673,7 +671,6 @@ function Invoke-ApplicationSmoke {
 
 function Install-ApplicationPackage {
   param(
-    [Parameter(Mandatory = $true)][ValidateSet("Nsis", "Msi")][string]$Kind,
     [Parameter(Mandatory = $true)][string]$Installer,
     [string]$SignerSubject = $ExpectedSignerSubject,
     [switch]$AllowExisting
@@ -682,13 +679,8 @@ function Install-ApplicationPackage {
     throw "[$ProductName] is already installed; package smoke requires an isolated Windows account or clean runner."
   }
   Assert-Authenticode $Installer $SignerSubject
-  if ($Kind -eq "Nsis") {
-    $install = Start-Process -FilePath $Installer -ArgumentList "/S" -Wait -PassThru
-  } else {
-    $quotedInstaller = '"' + $Installer.Replace('"', '""') + '"'
-    $install = Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", $quotedInstaller, "/quiet", "/norestart") -Wait -PassThru
-  }
-  Assert-ExitCode $install "$Kind installation"
+  $install = Start-Process -FilePath $Installer -ArgumentList "/S" -Wait -PassThru
+  Assert-ExitCode $install "NSIS installation"
   $registration = Wait-AppRegistration
   $executable = Resolve-InstalledExecutable $registration
   return $executable
@@ -696,23 +688,16 @@ function Install-ApplicationPackage {
 
 function Uninstall-ApplicationPackage {
   param(
-    [Parameter(Mandatory = $true)][ValidateSet("Nsis", "Msi")][string]$Kind,
-    [Parameter(Mandatory = $true)][string]$Installer,
     [Parameter(Mandatory = $true)][string]$Executable,
     [string]$SignerSubject = $ExpectedSignerSubject
   )
-  if ($Kind -eq "Nsis") {
-    $uninstaller = Join-Path (Split-Path -Parent $Executable) "uninstall.exe"
-    if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
-      throw "NSIS uninstaller was not installed at [$uninstaller]."
-    }
-    Assert-Authenticode $uninstaller $SignerSubject
-    $uninstall = Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -PassThru
-  } else {
-    $quotedInstaller = '"' + $Installer.Replace('"', '""') + '"'
-    $uninstall = Start-Process -FilePath "msiexec.exe" -ArgumentList @("/x", $quotedInstaller, "/quiet", "/norestart") -Wait -PassThru
+  $uninstaller = Join-Path (Split-Path -Parent $Executable) "uninstall.exe"
+  if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
+    throw "NSIS uninstaller was not installed at [$uninstaller]."
   }
-  Assert-ExitCode $uninstall "$Kind uninstall"
+  Assert-Authenticode $uninstaller $SignerSubject
+  $uninstall = Start-Process -FilePath $uninstaller -ArgumentList "/S" -Wait -PassThru
+  Assert-ExitCode $uninstall "NSIS uninstall"
   Wait-ApplicationRemoved $Executable
 }
 
@@ -730,25 +715,24 @@ function Wait-ApplicationRemoved {
 
 function Test-Installer {
   param(
-    [Parameter(Mandatory = $true)][ValidateSet("Nsis", "Msi")][string]$Kind,
     [Parameter(Mandatory = $true)][string]$Installer
   )
   $dataPaths = Get-ApplicationDataPaths
   Assert-ApplicationDataClean $dataPaths
   $executable = $null
   try {
-    $executable = Install-ApplicationPackage $Kind $Installer
+    $executable = Install-ApplicationPackage $Installer
     Assert-InstalledLayout $executable $metadataDirectory
     Invoke-ApplicationSmoke $executable $script:CandidateRelease.appVersion
-    Uninstall-ApplicationPackage $Kind $Installer $executable
+    Uninstall-ApplicationPackage $executable
     $executable = $null
-    Write-Host "PASS $Kind install, layout, launch, and uninstall"
+    Write-Host "PASS NSIS install, layout, launch, and uninstall"
   } finally {
     if ($executable -and @(Get-AppRegistrations).Count -gt 0) {
       try {
-        Uninstall-ApplicationPackage $Kind $Installer $executable
+        Uninstall-ApplicationPackage $executable
       } catch {
-        Write-Warning "Best-effort cleanup after a failed $Kind package smoke also failed."
+        Write-Warning "Best-effort cleanup after a failed NSIS package smoke also failed."
       }
     }
     Remove-OwnedApplicationData $dataPaths
@@ -757,7 +741,6 @@ function Test-Installer {
 
 function Test-Upgrade {
   param(
-    [Parameter(Mandatory = $true)][ValidateSet("Nsis", "Msi")][string]$Kind,
     [Parameter(Mandatory = $true)][string]$PreviousInstaller,
     [Parameter(Mandatory = $true)][string]$CandidateInstaller,
     [Parameter(Mandatory = $true)][string]$PreviousMetadataDirectory
@@ -776,35 +759,35 @@ function Test-Upgrade {
       ([ordered]@{ upgradeSentinel = $sentinel } | ConvertTo-Json),
       [System.Text.UTF8Encoding]::new($false)
     )
-    $previousExecutable = Install-ApplicationPackage $Kind $PreviousInstaller $previousSignerSubject
+    $previousExecutable = Install-ApplicationPackage $PreviousInstaller $previousSignerSubject
     $activeExecutable = $previousExecutable
     Assert-InstalledLayout $previousExecutable $PreviousMetadataDirectory $previousSignerSubject
     Invoke-ApplicationSmoke $previousExecutable $script:PreviousRelease.appVersion
 
-    $candidateExecutable = Install-ApplicationPackage $Kind $CandidateInstaller $ExpectedSignerSubject -AllowExisting
+    $candidateExecutable = Install-ApplicationPackage $CandidateInstaller $ExpectedSignerSubject -AllowExisting
     $activeExecutable = $candidateExecutable
     $activeInstaller = $CandidateInstaller
     Assert-InstalledLayout $candidateExecutable $metadataDirectory
     $preserved = Get-Content -Raw -LiteralPath $dataPaths.ConfigPath | ConvertFrom-Json
     if ((Get-OptionalProperty $preserved "upgradeSentinel") -ne $sentinel) {
-      throw "$Kind upgrade did not preserve the existing desktop configuration."
+      throw "NSIS upgrade did not preserve the existing desktop configuration."
     }
     Invoke-ApplicationSmoke $candidateExecutable $script:CandidateRelease.appVersion
     $preserved = Get-Content -Raw -LiteralPath $dataPaths.ConfigPath | ConvertFrom-Json
     if ((Get-OptionalProperty $preserved "upgradeSentinel") -ne $sentinel) {
-      throw "$Kind candidate startup did not preserve unknown configuration fields."
+      throw "NSIS candidate startup did not preserve unknown configuration fields."
     }
 
-    Uninstall-ApplicationPackage $Kind $CandidateInstaller $candidateExecutable
+    Uninstall-ApplicationPackage $candidateExecutable
     $activeExecutable = $null
-    Write-Host "PASS $Kind upgrade, configuration preservation, launch, and uninstall"
+    Write-Host "PASS NSIS upgrade, configuration preservation, launch, and uninstall"
   } finally {
     if ($activeExecutable -and @(Get-AppRegistrations).Count -gt 0) {
       try {
         $cleanupSignerSubject = if ($activeInstaller -eq $PreviousInstaller) { $previousSignerSubject } else { $ExpectedSignerSubject }
-        Uninstall-ApplicationPackage $Kind $activeInstaller $activeExecutable $cleanupSignerSubject
+        Uninstall-ApplicationPackage $activeExecutable $cleanupSignerSubject
       } catch {
-        Write-Warning "Best-effort cleanup after a failed $Kind upgrade also failed."
+        Write-Warning "Best-effort cleanup after a failed NSIS upgrade also failed."
       }
     }
     Remove-OwnedApplicationData $dataPaths
@@ -830,23 +813,12 @@ if ($PreviousBundleRoot) {
   Test-UpdaterSignatures $PreviousBundleRoot $previousMetadataDirectory $script:PreviousExpectedUpdatePublicKeyText
 }
 
-if ($InstallerKind -in @("Both", "Nsis")) {
-  $nsisInstaller = Get-SingleArtifact (Join-Path $BundleRoot "nsis") "*-setup.exe" "NSIS"
-  if ($PreviousBundleRoot) {
-    $previousNsisInstaller = Get-SingleArtifact (Join-Path $PreviousBundleRoot "nsis") "*-setup.exe" "previous NSIS"
-    Test-Upgrade "Nsis" $previousNsisInstaller $nsisInstaller $previousMetadataDirectory
-  } else {
-    Test-Installer "Nsis" $nsisInstaller
-  }
-}
-if ($InstallerKind -in @("Both", "Msi")) {
-  $msiInstaller = Get-SingleArtifact (Join-Path $BundleRoot "msi") "*.msi" "MSI"
-  if ($PreviousBundleRoot) {
-    $previousMsiInstaller = Get-SingleArtifact (Join-Path $PreviousBundleRoot "msi") "*.msi" "previous MSI"
-    Test-Upgrade "Msi" $previousMsiInstaller $msiInstaller $previousMetadataDirectory
-  } else {
-    Test-Installer "Msi" $msiInstaller
-  }
+$nsisInstaller = Get-SingleArtifact (Join-Path $BundleRoot "nsis") "*-setup.exe" "NSIS"
+if ($PreviousBundleRoot) {
+  $previousNsisInstaller = Get-SingleArtifact (Join-Path $PreviousBundleRoot "nsis") "*-setup.exe" "previous NSIS"
+  Test-Upgrade $previousNsisInstaller $nsisInstaller $previousMetadataDirectory
+} else {
+  Test-Installer $nsisInstaller
 }
 
 if (Test-Path -LiteralPath $EvidenceOutput) {
@@ -860,7 +832,7 @@ $evidenceArguments = @(
   (Join-Path $metadataDirectory "artifacts.json"),
   $EvidenceOutput,
   $EvidenceEnvironment,
-  $InstallerKind,
+  "Nsis",
   (-not $SkipLaunch).ToString().ToLowerInvariant(),
   $RequireAuthenticode.ToString().ToLowerInvariant()
 )

@@ -13,8 +13,6 @@ param(
   [string]$ExpectedSignerSubject = $env:SSDEV_WINDOWS_SIGNER_SUBJECT,
   [ValidateSet("x86_64-pc-windows-msvc", "i686-pc-windows-msvc")]
   [string]$DesktopTarget = "x86_64-pc-windows-msvc",
-  [ValidateSet("Both", "Nsis", "Msi")]
-  [string]$InstallerKind = "Both",
   [ValidateSet("OfflineInstaller", "DownloadBootstrapper")]
   [string]$WebViewInstallMode = "OfflineInstaller",
   [string]$AppVersion,
@@ -209,11 +207,7 @@ try {
 
   Assert-CycloneDxTool
   $baseTauriConfig = Get-Content -Raw (Join-Path $workspace "apps/desktop/src-tauri/tauri.conf.json") | ConvertFrom-Json
-  $bundleTargets = switch ($InstallerKind) {
-    "Both" { @("nsis", "msi") }
-    "Nsis" { @("nsis") }
-    "Msi" { @("msi") }
-  }
+  $bundleTargets = @("nsis")
   $webViewInstallModeType = switch ($WebViewInstallMode) {
     "OfflineInstaller" { "offlineInstaller" }
     "DownloadBootstrapper" { "downloadBootstrapper" }
@@ -439,21 +433,11 @@ try {
     $env:TAURI_SIGNING_PRIVATE_KEY = $originalTauriSigningPrivateKey
   }
 
-  $expectedBundleArtifacts = @()
-  if ($InstallerKind -in @("Both", "Nsis")) {
-    $nsisBundles = @(Get-ChildItem -Path (Join-Path $bundleRoot "nsis") -Filter "*-setup.exe" -File -ErrorAction SilentlyContinue)
-    if ($nsisBundles.Count -ne 1) {
-      throw "Expected exactly one NSIS installer, found $($nsisBundles.Count)."
-    }
-    $expectedBundleArtifacts += $nsisBundles[0]
+  $nsisBundles = @(Get-ChildItem -Path (Join-Path $bundleRoot "nsis") -Filter "*-setup.exe" -File -ErrorAction SilentlyContinue)
+  if ($nsisBundles.Count -ne 1) {
+    throw "Expected exactly one NSIS installer, found $($nsisBundles.Count)."
   }
-  if ($InstallerKind -in @("Both", "Msi")) {
-    $msiBundles = @(Get-ChildItem -Path (Join-Path $bundleRoot "msi") -Filter "*.msi" -File -ErrorAction SilentlyContinue)
-    if ($msiBundles.Count -ne 1) {
-      throw "Expected exactly one MSI installer, found $($msiBundles.Count)."
-    }
-    $expectedBundleArtifacts += $msiBundles[0]
-  }
+  $expectedBundleArtifacts = @($nsisBundles[0])
   if ($WebViewInstallMode -eq "DownloadBootstrapper") {
     $onlineLightweightMaxInstallerBytes = 128MB
     foreach ($bundle in $expectedBundleArtifacts) {
@@ -468,7 +452,7 @@ try {
   $packageProfile = [ordered]@{
     schemaVersion = 1
     desktopTarget = $DesktopTarget
-    installerKind = $InstallerKind
+    installerKind = "Nsis"
     webviewInstallMode = $WebViewInstallMode
   }
   [System.IO.File]::WriteAllText(

@@ -20,7 +20,7 @@ business webview -> narrow Tauri command -> Rust controller
 - controller 最多接受 8 个在途插件调用；容量饱和时在进入原生宿主前快速拒绝，不建立无界等待队列。
 - localhost HTTP 仅作为可关闭的旧浏览器兼容网关，不是新架构内部依赖。
 
-每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归，并分别为 x64 与 x86 桌面构建 `0.0.1` 合成旧版本和当前候选版本，对离线 NSIS/MSI 执行原位升级、配置保留、布局/架构检查、真实启动和卸载；随后额外构建只含 NSIS 的在线轻量版并执行安装、启动和卸载冒烟。工作流还构建 Linux DEB/AppImage 和 macOS DMG 开发预览包。CI 使用临时更新密钥且明确跳过平台代码签名，只验证工程链路，产物不能分发。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
+每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归，并分别为 x64 与 x86 桌面构建 `0.0.1` 合成旧版本和当前候选版本，对离线 NSIS 执行原位升级、配置保留、布局/架构检查、真实启动和卸载；随后额外构建在线轻量 NSIS 并执行安装、启动和卸载冒烟。工作流还构建 Linux DEB/AppImage 和 macOS DMG 开发预览包。CI 使用临时更新密钥且明确跳过平台代码签名，只验证工程链路，产物不能分发。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
 
 架构决策和迁移门槛见 [docs/adr/0001-target-architecture.md](docs/adr/0001-target-architecture.md)。
 业务页面从 localhost HTTP 切换到窄桥接接口的方式见 [docs/web-bridge-migration.md](docs/web-bridge-migration.md)。
@@ -132,7 +132,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
   -ExpectedSignerSubject "<完整证书主题 DN>"
 ```
 
-默认构建生成携带 WebView2 离线安装程序的 NSIS 与 MSI：NSIS 面向普通用户交互安装，MSI 面向组策略、Intune/SCCM 等企业批量部署，同一台机器只需选择一种。大多数 Windows 10/11 设备已有 WebView2 时，可额外构建仅含 NSIS 的在线轻量版；已有运行时会直接复用，缺失时安装程序联网下载：
+Windows 只生成面向普通用户的 NSIS 安装器。默认离线版携带 WebView2 离线安装程序；大多数 Windows 10/11 设备已有 WebView2 时，可额外构建在线轻量版，已有运行时会直接复用，缺失时安装程序联网下载：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
@@ -145,7 +145,6 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
   -WindowsCertificateThumbprint "<40位代码签名证书指纹>" `
   -WindowsTimestampUrl https://timestamp.example.internal `
   -ExpectedSignerSubject "<完整证书主题 DN>" `
-  -InstallerKind Nsis `
   -WebViewInstallMode DownloadBootstrapper
 ```
 
@@ -153,7 +152,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
 
 正式构建强制要求经过组织 Ed25519 签名的业务来源策略。用户配置只能在该策略批准的业务、SSO 导航和系统浏览器外链来源内选择；HTTP 来源必须由签名策略显式启用。构建脚本只临时注入信任库、进程策略、来源策略和更新配置，结束或失败时会恢复工作区原始资源。
 
-正式构建必须选择证书指纹或带 `%1` 文件占位符的 HSM/KMS 自定义签名命令。脚本会先对两个原生插件宿主做 Authenticode 签名和发布者校验，再放入只读资源目录；随后由 Tauri 签名主程序、NSIS 与 MSI，并生成更新包及其 `.sig`。插件宿主进程会加入带 `KILL_ON_JOB_CLOSE` 的 Windows Job Object，主程序异常退出时不会遗留后台宿主。
+正式构建必须选择证书指纹或带 `%1` 文件占位符的 HSM/KMS 自定义签名命令。脚本会先对两个原生插件宿主做 Authenticode 签名和发布者校验，再放入只读资源目录；随后由 Tauri 签名主程序与 NSIS，并生成更新包及其 `.sig`。插件宿主进程会加入带 `KILL_ON_JOB_CLOSE` 的 Windows Job Object，主程序异常退出时不会遗留后台宿主。
 
 构建后在隔离 Windows 验证账户执行：
 
@@ -166,7 +165,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
   -ExpectedSignerSubject "<完整证书主题 DN>"
 ```
 
-该门禁先要求包内更新公钥与独立输入的组织公钥逐字节一致，再验证签名的全产物 SHA-256 清单、源码提交/锁文件/工具链溯源、Rust/npm CycloneDX SBOM、updater Minisign、信任密钥生命周期以及来源/可选进程策略的 active 密钥签名；随后分别安装 NSIS/MSI，验证 x64 主程序、x86/x64 宿主、注入策略及 Authenticode 发布者，启动到 `app-started` 诊断事件，最后静默卸载并确认程序与注册项清理完成。只有全部请求项成功后，才会以不覆盖方式在源码和 bundle 之外写出绑定发布元数据、产物清单、版本、安装器覆盖、启动、升级和签名结果的 Windows 包证据。
+该门禁先要求包内更新公钥与独立输入的组织公钥逐字节一致，再验证签名的全产物 SHA-256 清单、源码提交/锁文件/工具链溯源、Rust/npm CycloneDX SBOM、updater Minisign、信任密钥生命周期以及来源/可选进程策略的 active 密钥签名；随后安装 NSIS，验证 x64 主程序、x86/x64 宿主、注入策略及 Authenticode 发布者，启动到 `app-started` 诊断事件，最后静默卸载并确认程序与注册项清理完成。只有全部请求项成功后，才会以不覆盖方式在源码和 bundle 之外写出绑定发布元数据、产物清单、版本、安装器覆盖、启动、升级和签名结果的 Windows 包证据。
 
 若要验证覆盖升级，将上一正式版本解包目录作为额外输入：
 
