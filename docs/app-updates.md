@@ -53,6 +53,8 @@ $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD="<由 CI secret 注入>"
 
 Windows 发布机还必须安装固定版 `cargo-cyclonedx 0.5.9`。构建会为桌面主程序、x86/x64 插件宿主及 npm 前端生成 CycloneDX 1.5 SBOM，移除工作区绝对路径和随机标识；随后生成覆盖整个 bundle 的规范化路径、长度和 SHA-256 清单，并用同一受控 Tauri 更新密钥签名。发布清单不依赖包内自声明公钥建立信任，验收时必须通过 `-ExpectedAppUpdatePublicKey` 独立提供组织更新公钥；更新密钥轮换期间，上一包通过 `-PreviousExpectedAppUpdatePublicKey` 使用独立旧公钥验证。
 
+默认构建使用 `-InstallerKind Both -WebViewInstallMode OfflineInstaller`，同时生成离线 NSIS 与 MSI。在线轻量渠道使用 `-InstallerKind Nsis -WebViewInstallMode DownloadBootstrapper`；已有 WebView2 时复用系统运行时，缺失时安装过程需要访问 Microsoft 下载服务。构建只允许这两种 WebView2 策略，不开放可能在运行时缺失时直接启动失败的 `skip`。安装器类型、架构和 WebView2 模式写入 `metadata/package-profile.json` 并进入签名产物清单；验收脚本必须通过 `-InstallerKind` 和 `-ExpectedWebViewInstallMode` 与其精确匹配。
+
 缺少更新公钥、HTTPS 端点、更新私钥或 Windows 代码签名配置时，正式打包脚本会直接失败。只有 `CI=true` 且显式传入 `-AllowUnsignedTestBuild` 时才能生成不可分发的未签名测试包。
 
 更新服务可以返回 Tauri 静态 JSON，也可以使用动态端点。发布前必须验证目标键为 `windows-x86_64`，其中 `signature` 是生成的 `.sig` 文件内容，不是文件路径。

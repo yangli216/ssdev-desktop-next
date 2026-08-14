@@ -5,6 +5,8 @@ param(
   [string]$DesktopTarget = "x86_64-pc-windows-msvc",
   [ValidateSet("Both", "Nsis", "Msi")]
   [string]$InstallerKind = "Both",
+  [ValidateSet("OfflineInstaller", "DownloadBootstrapper")]
+  [string]$ExpectedWebViewInstallMode = "OfflineInstaller",
   [string]$ProductName = "SSDEV Desktop",
   [string]$MainExecutableName = "ssdev-desktop-core.exe",
   [string]$ApplicationIdentifier = "com.bsoft.ssdev.desktop",
@@ -499,6 +501,20 @@ function Test-ReleaseArtifactManifest {
     -p ssdev-release-manifest -- verify $ReleaseBundleRoot $manifestRelative
   if ($LASTEXITCODE -ne 0) {
     throw "Release artifact manifest does not exactly match the release bundle."
+  }
+
+  $packageProfilePath = Join-Path $ReleaseMetadataDirectory "package-profile.json"
+  if (-not (Test-Path -LiteralPath $packageProfilePath -PathType Leaf)) {
+    throw "Release metadata does not contain package-profile.json."
+  }
+  $packageProfile = Get-Content -Raw -LiteralPath $packageProfilePath | ConvertFrom-Json
+  if (
+    $packageProfile.schemaVersion -ne 1 -or
+    $packageProfile.desktopTarget -ne $DesktopTarget -or
+    $packageProfile.installerKind -ne $InstallerKind -or
+    $packageProfile.webviewInstallMode -ne $ExpectedWebViewInstallMode
+  ) {
+    throw "Release package profile does not match the requested architecture, installer kind, or WebView2 mode."
   }
 
   $desktopArchitecture = if ($DesktopTarget -eq "i686-pc-windows-msvc") { "x86" } else { "x64" }

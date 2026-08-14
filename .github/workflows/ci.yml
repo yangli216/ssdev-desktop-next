@@ -83,7 +83,7 @@ jobs:
         run: ./scripts/test-windows.ps1
 
   windows-packages:
-    name: Windows ${{ matrix.arch }} NSIS and MSI
+    name: Windows ${{ matrix.arch }} offline NSIS/MSI and online NSIS
     needs:
       - quality
       - windows-native
@@ -133,6 +133,8 @@ jobs:
           -AppUpdatePublicKey $env:SSDEV_CI_UPDATE_PUBLIC_KEY
           -AppUpdateEndpoint "https://updates.invalid/ssdev/latest.json"
           -AppVersion "0.0.1"
+          -InstallerKind Both
+          -WebViewInstallMode OfflineInstaller
           -AllowUnsignedTestBuild
           -SkipTests
       - name: Preserve synthetic previous bundle
@@ -152,6 +154,8 @@ jobs:
           -OriginPolicySignature ./fixtures/ci/origin-policy.sig.json
           -AppUpdatePublicKey $env:SSDEV_CI_UPDATE_PUBLIC_KEY
           -AppUpdateEndpoint "https://updates.invalid/ssdev/latest.json"
+          -InstallerKind Both
+          -WebViewInstallMode OfflineInstaller
           -AllowUnsignedTestBuild
           -SkipTests
       - name: Upgrade, launch, and uninstall NSIS and MSI packages
@@ -163,13 +167,48 @@ jobs:
           -ExpectedAppUpdatePublicKey $env:SSDEV_CI_UPDATE_PUBLIC_KEY
           -EvidenceOutput (Join-Path $env:RUNNER_TEMP "ssdev-windows-${{ matrix.arch }}-package-evidence.json")
           -EvidenceEnvironment github-windows-${{ matrix.arch }}-package-smoke
-      - name: Upload unsigned Windows test packages
+          -InstallerKind Both
+          -ExpectedWebViewInstallMode OfflineInstaller
+      - name: Upload unsigned offline Windows test packages
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ssdev-windows-${{ matrix.arch }}-unsigned
+          name: ssdev-windows-${{ matrix.arch }}-offline-unsigned
           path: |
             target/${{ matrix.target }}/release/bundle/**
             ${{ runner.temp }}/ssdev-windows-${{ matrix.arch }}-package-evidence.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Build unsigned online-light NSIS installer
+        shell: powershell
+        run: >-
+          ./scripts/build-windows.ps1
+          -DesktopTarget ${{ matrix.target }}
+          -PluginTrustStore ./fixtures/ci/plugin-trust.json
+          -OriginPolicy ./fixtures/ci/origin-policy.json
+          -OriginPolicySignature ./fixtures/ci/origin-policy.sig.json
+          -AppUpdatePublicKey $env:SSDEV_CI_UPDATE_PUBLIC_KEY
+          -AppUpdateEndpoint "https://updates.invalid/ssdev/latest.json"
+          -InstallerKind Nsis
+          -WebViewInstallMode DownloadBootstrapper
+          -AllowUnsignedTestBuild
+          -SkipTests
+      - name: Install, launch, and uninstall online-light NSIS package
+        shell: powershell
+        run: >-
+          ./scripts/test-windows-package.ps1
+          -DesktopTarget ${{ matrix.target }}
+          -ExpectedAppUpdatePublicKey $env:SSDEV_CI_UPDATE_PUBLIC_KEY
+          -EvidenceOutput (Join-Path $env:RUNNER_TEMP "ssdev-windows-${{ matrix.arch }}-online-light-evidence.json")
+          -EvidenceEnvironment github-windows-${{ matrix.arch }}-online-light-smoke
+          -InstallerKind Nsis
+          -ExpectedWebViewInstallMode DownloadBootstrapper
+      - name: Upload unsigned online-light Windows test package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ssdev-windows-${{ matrix.arch }}-online-light-unsigned
+          path: |
+            target/${{ matrix.target }}/release/bundle/**
+            ${{ runner.temp }}/ssdev-windows-${{ matrix.arch }}-online-light-evidence.json
           if-no-files-found: error
           retention-days: 14
 
