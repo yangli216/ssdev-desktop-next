@@ -557,10 +557,11 @@ function Test-ReleaseArtifactManifest {
   }
 }
 
-function Get-StartupEventCount {
+function Get-DiagnosticEventCount {
   param(
     [Parameter(Mandatory = $true)][string]$DiagnosticLog,
-    [Parameter(Mandatory = $true)][string]$ExpectedVersion
+    [Parameter(Mandatory = $true)][string]$ExpectedVersion,
+    [Parameter(Mandatory = $true)][string]$EventCode
   )
   if (-not (Test-Path -LiteralPath $DiagnosticLog -PathType Leaf)) {
     return 0
@@ -569,7 +570,7 @@ function Get-StartupEventCount {
   foreach ($line in @(Get-Content -LiteralPath $DiagnosticLog -Tail 1000 -ErrorAction SilentlyContinue)) {
     try {
       $event = $line | ConvertFrom-Json
-      if ($event.event_code -eq "app-started" -and $event.app_version -eq $ExpectedVersion) {
+      if ($event.event_code -eq $EventCode -and $event.app_version -eq $ExpectedVersion) {
         $count += 1
       }
     } catch {
@@ -642,10 +643,10 @@ function Invoke-ApplicationSmoke {
   $application = $null
   try {
     $diagnosticLog = $dataPaths.DiagnosticLog
-    $startupEventsBefore = Get-StartupEventCount $diagnosticLog $ExpectedVersion
+    $frontendEventsBefore = Get-DiagnosticEventCount $diagnosticLog $ExpectedVersion "frontend-ready"
     $application = Start-Process -FilePath $Executable -PassThru
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
-    $startedEventObserved = $false
+    $frontendReadyObserved = $false
     do {
       Start-Sleep -Milliseconds 250
       $application.Refresh()
@@ -653,13 +654,13 @@ function Invoke-ApplicationSmoke {
         throw "Installed application exited during startup with code $($application.ExitCode)."
       }
       if (Test-Path -LiteralPath $diagnosticLog -PathType Leaf) {
-        if ((Get-StartupEventCount $diagnosticLog $ExpectedVersion) -gt $startupEventsBefore) {
-          $startedEventObserved = $true
+        if ((Get-DiagnosticEventCount $diagnosticLog $ExpectedVersion "frontend-ready") -gt $frontendEventsBefore) {
+          $frontendReadyObserved = $true
         }
       }
-    } while (-not $startedEventObserved -and [DateTime]::UtcNow -lt $deadline)
-    if (-not $startedEventObserved) {
-      throw "Installed application stayed alive but did not emit the app-started diagnostic event."
+    } while (-not $frontendReadyObserved -and [DateTime]::UtcNow -lt $deadline)
+    if (-not $frontendReadyObserved) {
+      throw "Installed application stayed alive, but the control frontend did not mount and reach native IPC."
     }
   } finally {
     if ($application -and -not $application.HasExited) {

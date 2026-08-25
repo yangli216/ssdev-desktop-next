@@ -34,6 +34,8 @@ const HOST_START_TIMEOUT: Duration = Duration::from_secs(120);
 const HOST_RESTART_BACKOFF: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const HOST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginDescriptor {
@@ -1077,7 +1079,8 @@ impl PluginWorker {
             .arg("--ipc-pipe")
             .arg(&pipe_name)
             .arg("--controller-pid")
-            .arg(std::process::id().to_string());
+            .arg(std::process::id().to_string())
+            .creation_flags(CREATE_NO_WINDOW);
 
         command
             .current_dir(&descriptor.plugin_dir)

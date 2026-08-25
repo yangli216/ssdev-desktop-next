@@ -2,6 +2,9 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::thread;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use serde_json::{Map, Value};
 use webplus_plugin_config::{MethodDefinition, ServiceDefinition};
 use webplus_protocol::InvokeResponse;
@@ -9,6 +12,8 @@ use webplus_protocol::InvokeResponse;
 use crate::{resolve_component_with_extension, NativeError};
 
 const MAX_PROCESS_OUTPUT_BYTES: usize = 1024 * 1024;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub(crate) fn invoke(
     plugin_dir: &std::path::Path,
@@ -39,6 +44,8 @@ pub(crate) fn invoke(
         command
     };
     command.current_dir(plugin_dir).stdin(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
 
     let wait = method
         .extensions

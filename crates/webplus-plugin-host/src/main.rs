@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::env;
 use std::process::ExitCode;
 use std::sync::mpsc::{self, RecvTimeoutError};

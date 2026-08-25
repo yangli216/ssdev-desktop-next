@@ -1,5 +1,6 @@
 pub const APP_COMMANDS: &[&str] = &[
     "bridge_status",
+    "frontend_ready",
     "install_plugin_package",
     "install_plugin_from_catalog",
     "check_plugin_updates",
@@ -32,6 +33,7 @@ pub const APP_COMMANDS: &[&str] = &[
 
 pub const CONTROL_PERMISSIONS: &[&str] = &[
     "allow-bridge-status",
+    "allow-frontend-ready",
     "allow-install-plugin-package",
     "allow-install-plugin-from-catalog",
     "allow-check-plugin-updates",

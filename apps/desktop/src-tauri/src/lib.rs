@@ -76,6 +76,17 @@ struct DiagnosticsRuntime {
     startup_error: Option<&'static str>,
 }
 
+#[tauri::command]
+fn frontend_ready(caller: WebviewWindow, app: AppHandle) -> Result<(), String> {
+    desktop::require_control(&caller)?;
+    tracing::info!(
+        event_code = "frontend-ready",
+        app_version = %app.package_info().version,
+        "control frontend mounted and reached native IPC"
+    );
+    Ok(())
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BridgeStatus {
@@ -1193,6 +1204,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             bridge_status,
+            frontend_ready,
             install_plugin_package,
             install_plugin_from_catalog,
             check_plugin_updates,

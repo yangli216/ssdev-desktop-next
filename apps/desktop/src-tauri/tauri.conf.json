@@ -37,5 +37,11 @@
         "type": "offlineInstaller"
       }
     }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": []
+    }
   }
 }

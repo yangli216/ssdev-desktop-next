@@ -4,6 +4,9 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -13,6 +16,8 @@ const MAX_POLICY_BYTES: u64 = 1024 * 1024;
 const MAX_EXECUTABLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_PROCESSES: usize = 64;
 const PROCESS_POLICY_DOMAIN: &[u8] = b"SSDEV-PROCESS-POLICY\0";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -231,6 +236,8 @@ fn launch(process: &ManagedProcess) -> Result<LaunchDisposition, PolicyError> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
     if let Some(working_directory) = &process.working_directory {
         let working_directory =
             working_directory

@@ -202,6 +202,7 @@ function applySsoStatus(code?: string, active = false) {
 
 onMounted(async () => {
   try {
+    await invoke('frontend_ready')
     unlistenSsoStatus = await listen<SsoStatusEvent>('desktop://sso-status', (event) => {
       ssoStatusEventSeen = true
       applySsoStatus(event.payload.code, event.payload.active)

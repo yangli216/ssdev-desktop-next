@@ -9,6 +9,19 @@ const tauriConfigUrl = new URL(
   "../../apps/desktop/src-tauri/tauri.conf.json",
   import.meta.url,
 );
+const desktopMainUrl = new URL(
+  "../../apps/desktop/src-tauri/src/main.rs",
+  import.meta.url,
+);
+const pluginHostMainUrl = new URL(
+  "../../crates/webplus-plugin-host/src/main.rs",
+  import.meta.url,
+);
+const controllerUrl = new URL(
+  "../../crates/webplus-controller/src/lib.rs",
+  import.meta.url,
+);
+const controlHtmlUrl = new URL("../../apps/desktop/index.html", import.meta.url);
 
 test("Windows build exposes only the supported installer and WebView2 profiles", async () => {
   const script = await readFile(buildScriptUrl, "utf8");
@@ -69,4 +82,28 @@ test("base Tauri configuration bundles only NSIS on Windows", async () => {
   const config = JSON.parse(await readFile(tauriConfigUrl, "utf8"));
 
   assert.deepEqual(config.bundle.targets, ["nsis"]);
+  assert.deepEqual(config.plugins.updater, { pubkey: "", endpoints: [] });
+});
+
+test("Windows release executables and native hosts do not open consoles", async () => {
+  const [desktopMain, pluginHostMain, controller] = await Promise.all([
+    readFile(desktopMainUrl, "utf8"),
+    readFile(pluginHostMainUrl, "utf8"),
+    readFile(controllerUrl, "utf8"),
+  ]);
+
+  assert.match(desktopMain, /windows_subsystem = "windows"/);
+  assert.match(pluginHostMain, /windows_subsystem = "windows"/);
+  assert.match(controller, /\.creation_flags\(CREATE_NO_WINDOW\)/);
+});
+
+test("Windows package smoke requires a rendered frontend IPC signal", async () => {
+  const [packageTest, controlHtml] = await Promise.all([
+    readFile(packageTestUrl, "utf8"),
+    readFile(controlHtmlUrl, "utf8"),
+  ]);
+
+  assert.match(packageTest, /"frontend-ready"/);
+  assert.doesNotMatch(packageTest, /Get-StartupEventCount/);
+  assert.match(controlHtml, /SSDEV Desktop 正在启动/);
 });
