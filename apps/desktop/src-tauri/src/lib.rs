@@ -1011,7 +1011,7 @@ fn system_declaration<R: tauri::Runtime>(
 pub fn run() {
     let shortcut_plugin = ShortcutBuilder::<tauri::Wry>::new().build();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
@@ -1142,6 +1142,7 @@ pub fn run() {
                         tracing::error!(
                             event_code = "tracked-invocation-ledger-unavailable",
                             error_code = code,
+                            error_detail = %error,
                             "durable tracked invocation ledger is unavailable"
                         );
                         (None, Some(code))
@@ -1176,12 +1177,26 @@ pub fn run() {
                 repository_client,
             });
             let desktop_state = desktop::DesktopState::new(config, origin_policy);
-            desktop_state
-                .ensure_business_ipc_capabilities(app.handle(), &initial_config)
-                .map_err(std::io::Error::other)?;
+            if let Err(error) =
+                desktop_state.ensure_business_ipc_capabilities(app.handle(), &initial_config)
+            {
+                tracing::warn!(
+                    event_code = "startup-business-origin-unavailable",
+                    error_code = "origin-policy-rejected-config",
+                    error_detail = %error,
+                    "configured business origins are unavailable; the local control window will continue"
+                );
+            }
             app.manage(desktop_state);
-            shortcuts::replace(app.handle(), &initial_config.key_bindings, &[])
-                .map_err(std::io::Error::other)?;
+            if let Err(error) = shortcuts::replace(app.handle(), &initial_config.key_bindings, &[])
+            {
+                tracing::warn!(
+                    event_code = "startup-shortcuts-unavailable",
+                    error_code = "global-shortcut-registration-failed",
+                    error_detail = %error,
+                    "global shortcuts are unavailable; the desktop will continue"
+                );
+            }
             if desktop::replace_autostart(app.handle(), initial_config.auto_start).is_err() {
                 tracing::warn!(
                     event_code = "autostart-sync-failed",
@@ -1189,7 +1204,14 @@ pub fn run() {
                 );
             }
             desktop::setup_control_window(app)?;
-            desktop::setup_tray(app)?;
+            if let Err(error) = desktop::setup_tray(app) {
+                tracing::warn!(
+                    event_code = "startup-tray-unavailable",
+                    error_code = "tray-initialization-failed",
+                    error_detail = %error,
+                    "system tray is unavailable; the control window will continue"
+                );
+            }
             sso::start_from_process_arguments(app.handle());
             tracing::info!(
                 event_code = "app-started",
@@ -1234,15 +1256,26 @@ pub fn run() {
             app_update::install_app_update,
             export_diagnostics,
         ])
-        .build(app_context())
-        .expect("failed to build ssdev desktop")
-        .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
-                if desktop::intercept_exit_request(app, code.unwrap_or_default()) {
-                    api.prevent_exit();
-                }
+        .build(app_context());
+    let app = match app {
+        Ok(app) => app,
+        Err(error) => {
+            tracing::error!(
+                event_code = "desktop-build-failed",
+                error_code = "tauri-build-error",
+                error_detail = %error,
+                "desktop initialization failed"
+            );
+            return;
+        }
+    };
+    app.run(|app, event| {
+        if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+            if desktop::intercept_exit_request(app, code.unwrap_or_default()) {
+                api.prevent_exit();
             }
-        });
+        }
+    });
 }
 
 fn app_context<R: tauri::Runtime>() -> tauri::Context<R> {
