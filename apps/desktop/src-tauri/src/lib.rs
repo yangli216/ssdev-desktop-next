@@ -1142,7 +1142,6 @@ pub fn run() {
                         tracing::error!(
                             event_code = "tracked-invocation-ledger-unavailable",
                             error_code = code,
-                            error_detail = %error,
                             "durable tracked invocation ledger is unavailable"
                         );
                         (None, Some(code))
@@ -1177,23 +1176,22 @@ pub fn run() {
                 repository_client,
             });
             let desktop_state = desktop::DesktopState::new(config, origin_policy);
-            if let Err(error) =
+            if let Err(_error) =
                 desktop_state.ensure_business_ipc_capabilities(app.handle(), &initial_config)
             {
                 tracing::warn!(
                     event_code = "startup-business-origin-unavailable",
                     error_code = "origin-policy-rejected-config",
-                    error_detail = %error,
                     "configured business origins are unavailable; the local control window will continue"
                 );
             }
             app.manage(desktop_state);
-            if let Err(error) = shortcuts::replace(app.handle(), &initial_config.key_bindings, &[])
+            if let Err(_error) =
+                shortcuts::replace(app.handle(), &initial_config.key_bindings, &[])
             {
                 tracing::warn!(
                     event_code = "startup-shortcuts-unavailable",
                     error_code = "global-shortcut-registration-failed",
-                    error_detail = %error,
                     "global shortcuts are unavailable; the desktop will continue"
                 );
             }
@@ -1204,11 +1202,10 @@ pub fn run() {
                 );
             }
             desktop::setup_control_window(app)?;
-            if let Err(error) = desktop::setup_tray(app) {
+            if let Err(_error) = desktop::setup_tray(app) {
                 tracing::warn!(
                     event_code = "startup-tray-unavailable",
                     error_code = "tray-initialization-failed",
-                    error_detail = %error,
                     "system tray is unavailable; the control window will continue"
                 );
             }
@@ -1259,11 +1256,10 @@ pub fn run() {
         .build(app_context());
     let app = match app {
         Ok(app) => app,
-        Err(error) => {
+        Err(_error) => {
             tracing::error!(
                 event_code = "desktop-build-failed",
                 error_code = "tauri-build-error",
-                error_detail = %error,
                 "desktop initialization failed"
             );
             return;

@@ -6,6 +6,15 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: Platforms to package
+        required: true
+        default: windows
+        type: choice
+        options:
+          - windows
+          - all
 
 permissions:
   contents: read
@@ -84,9 +93,7 @@ jobs:
 
   windows-packages:
     name: Windows ${{ matrix.arch }} offline and online-light NSIS
-    needs:
-      - quality
-      - windows-native
+    needs: windows-native
     runs-on: windows-2022
     timeout-minutes: 150
     strategy:
@@ -209,6 +216,7 @@ jobs:
 
   linux-package:
     name: Linux x64 DEB and AppImage
+    if: github.event_name == 'workflow_dispatch' && inputs.platforms == 'all'
     needs: quality
     runs-on: ubuntu-22.04
     timeout-minutes: 90
@@ -247,6 +255,7 @@ jobs:
 
   macos-package:
     name: macOS x64 DMG
+    if: github.event_name == 'workflow_dispatch' && inputs.platforms == 'all'
     needs: quality
     runs-on: macos-15
     timeout-minutes: 90
