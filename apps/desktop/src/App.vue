@@ -318,6 +318,8 @@ const ssoActive = ref(false)
 const ssoError = ref('')
 const notice = ref('')
 const busy = ref(false)
+const mappingDraftDirty = ref(false)
+const mappingWorkspaceRevision = ref(0)
 type ConsoleSection = 'overview' | 'configuration' | 'native' | 'plugins' | 'security'
 const activeSection = ref<ConsoleSection>('overview')
 const sections: Array<{ id: ConsoleSection; label: string; description: string }> = [
@@ -498,6 +500,7 @@ async function importSelectedProjectBundle() {
     error.value = '请先选择并预检项目部署包。'
     return
   }
+  if (mappingDraftDirty.value && !window.confirm('当前原生映射工作台有未保存更改。导入项目会刷新工作台并丢弃这些更改，确定继续吗？')) return
   const source = selectedProjectBundle.value
   const expectedPlanId = projectBundlePreview.value.planId
   let result: ProjectBundleImportResult | undefined
@@ -506,6 +509,8 @@ async function importSelectedProjectBundle() {
       source,
       expectedPlanId,
     })
+    mappingWorkspaceRevision.value += 1
+    mappingDraftDirty.value = false
     ;[status.value, snapshot.value, inventory.value, deploymentCheck.value] = await Promise.all([
       invoke<BridgeStatus>('bridge_status'),
       invoke<ConfigSnapshot>('desktop_config'),
@@ -1008,7 +1013,12 @@ async function exportDeploymentCheck() {
 
       <section v-show="activeSection === 'native'" class="page page-native" aria-labelledby="native-title">
         <header class="section-header"><div><p class="eyebrow">NATIVE MAPPING STUDIO</p><h1 id="native-title">原生映射</h1><p>发现本机组件、配置调用映射，并在发布前完成受控调试。</p></div><span class="section-chip">本机管理员能力</span></header>
-        <LocalMappingStudio :disabled="busy" @changed="refreshPluginsAfterMapping" />
+        <LocalMappingStudio
+          :key="mappingWorkspaceRevision"
+          :disabled="busy"
+          @changed="refreshPluginsAfterMapping"
+          @dirty="mappingDraftDirty = $event"
+        />
       </section>
 
       <section v-show="activeSection === 'plugins'" class="page" aria-labelledby="plugins-title">

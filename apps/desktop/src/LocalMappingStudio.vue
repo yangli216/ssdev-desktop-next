@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 type Architecture = 'x86' | 'x64'
 type MainType = 'dll' | 'com' | 'ocx' | 'exe' | 'bat'
@@ -107,7 +107,7 @@ type DebugCaseRunResult = {
 }
 
 const props = defineProps<{ disabled?: boolean }>()
-const emit = defineEmits<{ changed: [] }>()
+const emit = defineEmits<{ changed: []; dirty: [value: boolean] }>()
 
 const inventory = ref<MappingInventory>({ mappings: [], failures: [] })
 const draft = ref<LocalMappingDefinition>(newMapping())
@@ -202,6 +202,32 @@ function mappingForSave(): LocalMappingDefinition {
   return payload
 }
 
+const savedDraft = ref<LocalMappingDefinition>(clone(mappingForSave()))
+const draftDirty = computed(() => JSON.stringify(mappingForSave()) !== JSON.stringify(savedDraft.value))
+
+watch(draftDirty, (value) => emit('dirty', value), { immediate: true })
+
+function markDraftSaved() {
+  savedDraft.value = clone(mappingForSave())
+}
+
+function markDebugCasesSaved(debugCases: DebugCaseDefinition[]) {
+  savedDraft.value = {
+    ...clone(savedDraft.value),
+    debugCases: clone(debugCases),
+  }
+}
+
+function confirmDiscardDraft(): boolean {
+  return !draftDirty.value || window.confirm('当前映射有未保存更改，继续将丢弃这些更改。确定继续吗？')
+}
+
+function beforeUnload(event: BeforeUnloadEvent) {
+  if (!draftDirty.value) return
+  event.preventDefault()
+  event.returnValue = ''
+}
+
 function reasonText(reason: unknown): string {
   return reason instanceof Error ? reason.message : String(reason)
 }
@@ -224,6 +250,7 @@ async function loadInventory() {
 }
 
 onMounted(async () => {
+  window.addEventListener('beforeunload', beforeUnload)
   try {
     await loadInventory()
   } catch (reason) {
@@ -231,26 +258,12 @@ onMounted(async () => {
   }
 })
 
-function resetEditor() {
-  draft.value = newMapping()
-  serviceIndex.value = 0
-  methodIndex.value = 0
-  inspection.value = null
-  comQuery.value = ''
-  comDiscovery.value = null
-  debugResult.value = null
-  debugValues.value = {}
-  debugCaseName.value = ''
-  expectedResCode.value = 0
-  assertResData.value = false
-  expectedResDataText.value = ''
-  suggestedExpectedDataText.value = ''
-  regressionResults.value = []
-  error.value = ''
-  notice.value = ''
-}
+onBeforeUnmount(() => {
+  window.removeEventListener('beforeunload', beforeUnload)
+  emit('dirty', false)
+})
 
-function editMapping(mapping: LocalMappingDefinition) {
+function replaceDraft(mapping: LocalMappingDefinition, editNotice = '') {
   draft.value = normalizeMapping(mapping)
   serviceIndex.value = 0
   methodIndex.value = 0
@@ -266,7 +279,18 @@ function editMapping(mapping: LocalMappingDefinition) {
   suggestedExpectedDataText.value = ''
   regressionResults.value = []
   error.value = ''
-  notice.value = `正在编辑 ${mapping.displayName || mapping.pluginId}`
+  notice.value = editNotice
+  markDraftSaved()
+}
+
+function resetEditor(force = false) {
+  if (!force && !confirmDiscardDraft()) return
+  replaceDraft(newMapping())
+}
+
+function editMapping(mapping: LocalMappingDefinition) {
+  if (!confirmDiscardDraft()) return
+  replaceDraft(mapping, `正在编辑 ${mapping.displayName || mapping.pluginId}`)
 }
 
 function selectService(index: number) {
@@ -412,7 +436,8 @@ async function saveMapping() {
     })
     await loadInventory()
     const saved = inventory.value.mappings.find((item) => item.pluginId === result.pluginId)
-    if (saved) editMapping(saved)
+    if (saved) replaceDraft(saved)
+    else markDraftSaved()
     notice.value = `映射已保存并热加载：${result.serviceCount} 个服务，${result.preflightedHosts} 个宿主预检通过。`
     emit('changed')
   })
@@ -423,7 +448,7 @@ async function deleteMapping(pluginId: string) {
   await run(async () => {
     await invoke('delete_local_mapping', { pluginId })
     await loadInventory()
-    if (draft.value.pluginId === pluginId) resetEditor()
+    if (draft.value.pluginId === pluginId) resetEditor(true)
     notice.value = `本地映射 ${pluginId} 已删除并从路由卸载。`
     emit('changed')
   })
@@ -476,11 +501,13 @@ async function importMapping() {
     filters: [{ name: 'SSDEV 本地映射包', extensions: ['ssdev-mapping'] }],
   })
   if (typeof source !== 'string') return
+  if (!confirmDiscardDraft()) return
   await run(async () => {
     const result = await invoke<{ pluginId: string; serviceCount: number; preflightedHosts: number }>('import_local_mapping', { source })
     await loadInventory()
     const imported = inventory.value.mappings.find((item) => item.pluginId === result.pluginId)
-    if (imported) editMapping(imported)
+    if (imported) replaceDraft(imported)
+    else markDraftSaved()
     notice.value = `映射包已导入并热加载：${result.serviceCount} 个服务。`
     emit('changed')
   })
@@ -585,6 +612,7 @@ async function saveDebugCase() {
       },
     })
     draft.value.debugCases = normalizeDebugCases(debugCases)
+    markDebugCasesSaved(draft.value.debugCases)
     const stored = inventory.value.mappings.find((item) => item.pluginId === draft.value.pluginId)
     if (stored) stored.debugCases = clone(draft.value.debugCases)
     regressionResults.value = []
@@ -620,6 +648,7 @@ async function deleteDebugCase(caseName: string) {
       caseName,
     })
     draft.value.debugCases = normalizeDebugCases(debugCases)
+    markDebugCasesSaved(draft.value.debugCases)
     const stored = inventory.value.mappings.find((item) => item.pluginId === draft.value.pluginId)
     if (stored) stored.debugCases = clone(draft.value.debugCases)
     regressionResults.value = []
@@ -651,7 +680,7 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
       <p class="eyebrow">NATIVE MAPPING STUDIO</p>
       <h2>DLL 动态映射与调试</h2>
       <p>选择 DLL/EXE/BAT，或填写 COM/OCX 标识；配置服务和方法后即可热加载，无需重新打包客户端。</p>
-      <button type="button" :disabled="busy || disabled" @click="resetEditor">新建映射</button>
+      <button type="button" :disabled="busy || disabled" @click="resetEditor()">新建映射</button>
       <button type="button" :disabled="busy || disabled" @click="importMapping">导入映射包</button>
       <div class="mapping-cards">
         <article v-for="mapping in inventory.mappings" :key="mapping.pluginId">
@@ -670,6 +699,7 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
     </div>
 
     <form class="mapping-editor" @submit.prevent="saveMapping">
+      <div v-if="draftDirty" class="draft-dirty" role="status">当前草稿有未保存更改</div>
       <div class="mapping-heading">
         <label><span>映射 ID</span><input v-model.trim="draft.pluginId" required pattern="[A-Za-z0-9._-]+" placeholder="hospital-device" /></label>
         <label><span>显示名称</span><input v-model.trim="draft.displayName" required placeholder="院内设备接口" /></label>
@@ -836,6 +866,7 @@ button:disabled { cursor: wait; opacity: .55; }
 .mapping-failures { margin-top: 14px; color: #8b3c31; font-size: 12px; }
 .mapping-failures li { margin: 8px 0; overflow-wrap: anywhere; }
 .mapping-editor { display: grid; min-width: 0; gap: 16px; }
+.draft-dirty { justify-self: start; padding: 5px 9px; border: 1px solid #d5b36a; border-radius: 999px; background: #fff6dd; color: #795718; font-size: 12px; font-weight: 800; }
 .mapping-heading, .field-grid { display: grid; gap: 12px; }
 .mapping-heading { grid-template-columns: .8fr 1.2fr; }
 .field-grid.three { grid-template-columns: repeat(3, 1fr); }
