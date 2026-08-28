@@ -5,6 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::{Builder as TempBuilder, NamedTempFile, TempDir};
 use uuid::Uuid;
 use webplus_plugin_config::{
@@ -403,6 +404,10 @@ impl PreparedLocalMapping {
         &self.definition.plugin_id
     }
 
+    pub(crate) fn definition(&self) -> &LocalMappingDefinition {
+        &self.definition
+    }
+
     pub(crate) fn activate(self, root: &Path) -> Result<ActivatedLocalMapping, String> {
         let plugin_id = self.definition.plugin_id.clone();
         let target = bounded_plugin_target(root, &plugin_id)?;
@@ -663,6 +668,30 @@ pub(crate) fn prepare_import(root: &Path, source: &Path) -> Result<PreparedLocal
         definition,
         manifest,
     })
+}
+
+pub(crate) fn import_bundle_sha256(source: &Path) -> Result<String, String> {
+    let metadata = bounded_regular_file(source)?;
+    if metadata.len() > MAX_BUNDLE_BYTES {
+        return Err("映射包超过 1 GiB 导入上限".into());
+    }
+    let mut file = File::open(source).map_err(|error| format!("无法打开映射包: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("无法计算映射包摘要: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 pub(crate) fn load_definition(plugin_dir: &Path) -> Result<LocalMappingDefinition, String> {
@@ -1809,6 +1838,8 @@ mod tests {
         let bundle = export_dir.path().join("reader.ssdev-mapping");
         export_bundle(active_root.path(), "reader.local", &bundle).unwrap();
         assert!(bundle.is_file());
+        let exported_sha256 = import_bundle_sha256(&bundle).unwrap();
+        assert_eq!(exported_sha256.len(), 64);
 
         let import_root = tempfile::tempdir().unwrap();
         let imported = prepare_import(import_root.path(), &bundle).unwrap();
@@ -1819,6 +1850,9 @@ mod tests {
             .plugin_dir
             .join(&imported.manifest().services[0].main_class)
             .is_file());
+        fs::write(&bundle, b"changed bundle").unwrap();
+        assert_ne!(exported_sha256, import_bundle_sha256(&bundle).unwrap());
+        assert!(import_bundle_sha256(export_dir.path()).is_err());
     }
 
     #[test]

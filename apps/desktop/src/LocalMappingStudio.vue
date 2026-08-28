@@ -59,6 +59,22 @@ type MappingInventory = {
   failures: string[]
 }
 
+type LocalMappingImportPreview = {
+  planId: string
+  pluginId: string
+  displayName: string
+  action: 'install' | 'replace'
+  serviceCount: number
+  methodCount: number
+  debugCaseCount: number
+  services: Array<{
+    serviceId: string
+    architecture: Architecture
+    mainType: string
+    methodCount: number
+  }>
+}
+
 type NativeInspection = {
   fileName: string
   fileBytes: number
@@ -110,6 +126,8 @@ const props = defineProps<{ disabled?: boolean }>()
 const emit = defineEmits<{ changed: []; dirty: [value: boolean] }>()
 
 const inventory = ref<MappingInventory>({ mappings: [], failures: [] })
+const mappingImportPreview = ref<LocalMappingImportPreview | null>(null)
+const selectedMappingImport = ref('')
 const draft = ref<LocalMappingDefinition>(newMapping())
 const serviceIndex = ref(0)
 const methodIndex = ref(0)
@@ -494,23 +512,49 @@ async function exportReleaseSource(pluginId: string) {
   })
 }
 
-async function importMapping() {
+async function inspectMappingImport() {
   const source = await open({
     multiple: false,
     directory: false,
     filters: [{ name: 'SSDEV 本地映射包', extensions: ['ssdev-mapping'] }],
   })
   if (typeof source !== 'string') return
+  mappingImportPreview.value = null
+  selectedMappingImport.value = ''
+  await run(async () => {
+    mappingImportPreview.value = await invoke<LocalMappingImportPreview>('inspect_local_mapping_import', { source })
+    selectedMappingImport.value = source
+    notice.value = '映射包已完成只读结构校验，尚未加载原生代码；请核对服务范围后再确认。'
+  })
+}
+
+async function confirmMappingImport() {
+  const preview = mappingImportPreview.value
+  const source = selectedMappingImport.value
+  if (!preview || !source) {
+    error.value = '请先选择并预检映射包。'
+    return
+  }
+  if (!window.confirm(`映射包「${preview.displayName || preview.pluginId}」不验证发布者签名，确认信任其原生代码并${preview.action === 'replace' ? '替换现有映射' : '安装'}吗？`)) return
   if (!confirmDiscardDraft()) return
   await run(async () => {
-    const result = await invoke<{ pluginId: string; serviceCount: number; preflightedHosts: number }>('import_local_mapping', { source })
+    const result = await invoke<{ pluginId: string; serviceCount: number; preflightedHosts: number }>('import_local_mapping', {
+      source,
+      expectedPlanId: preview.planId,
+    })
     await loadInventory()
     const imported = inventory.value.mappings.find((item) => item.pluginId === result.pluginId)
     if (imported) replaceDraft(imported)
     else markDraftSaved()
-    notice.value = `映射包已导入并热加载：${result.serviceCount} 个服务。`
+    mappingImportPreview.value = null
+    selectedMappingImport.value = ''
+    notice.value = `映射包已复核并热加载：${result.serviceCount} 个服务，${result.preflightedHosts} 个宿主预检通过。`
     emit('changed')
   })
+}
+
+function mappingImportActionLabel(action: LocalMappingImportPreview['action']): string {
+  return action === 'replace' ? '替换现有映射' : '安装新映射'
 }
 
 function debugInputType(type: string): string {
@@ -681,7 +725,19 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
       <h2>DLL 动态映射与调试</h2>
       <p>选择 DLL/EXE/BAT，或填写 COM/OCX 标识；配置服务和方法后即可热加载，无需重新打包客户端。</p>
       <button type="button" :disabled="busy || disabled" @click="resetEditor()">新建映射</button>
-      <button type="button" :disabled="busy || disabled" @click="importMapping">导入映射包</button>
+      <button type="button" :disabled="busy || disabled" @click="inspectMappingImport">选择并预检映射包</button>
+      <section v-if="mappingImportPreview" class="mapping-import-preview" aria-label="映射包导入计划">
+        <strong>{{ mappingImportPreview.displayName || mappingImportPreview.pluginId }}</strong>
+        <small>{{ mappingImportPreview.pluginId }} · {{ mappingImportActionLabel(mappingImportPreview.action) }}</small>
+        <p>{{ mappingImportPreview.serviceCount }} 个服务 · {{ mappingImportPreview.methodCount }} 个方法 · {{ mappingImportPreview.debugCaseCount }} 个合成用例</p>
+        <ul>
+          <li v-for="item in mappingImportPreview.services" :key="item.serviceId">
+            <span>{{ item.serviceId }}</span><small>{{ item.architecture }} · {{ item.mainType.toUpperCase() }} · {{ item.methodCount }} 个方法</small>
+          </li>
+        </ul>
+        <p class="mapping-import-warning">本地映射包不提供发布者签名；确认后才会在隔离宿主加载并预检原生代码。仅导入来源可信且已核对摘要的项目文件。</p>
+        <button class="primary" type="button" :disabled="busy || disabled" @click="confirmMappingImport">确认计划并热加载</button>
+      </section>
       <div class="mapping-cards">
         <article v-for="mapping in inventory.mappings" :key="mapping.pluginId">
           <button type="button" :disabled="busy || disabled" @click="editMapping(mapping)">
@@ -857,6 +913,15 @@ button { padding: 8px 11px; border: 1px solid #9eaaa2; border-radius: 8px; backg
 button:disabled { cursor: wait; opacity: .55; }
 .mapping-cards { display: grid; gap: 8px; margin-top: 18px; }
 .studio-copy > button + button { margin-left: 6px; }
+.mapping-import-preview { display: grid; gap: 7px; margin-top: 14px; padding: 13px; border: 1px solid #d5b36a; border-radius: 10px; background: #fffaf0; }
+.mapping-import-preview > strong, .mapping-import-preview > small { overflow-wrap: anywhere; }
+.mapping-import-preview > small { color: #718078; }
+.mapping-import-preview > p { margin: 0; color: #58665e; font-size: 12px; line-height: 1.5; }
+.mapping-import-preview ul { display: grid; gap: 5px; max-height: 180px; margin: 2px 0; padding: 0; overflow: auto; list-style: none; }
+.mapping-import-preview li { display: grid; gap: 2px; padding: 7px 8px; border-radius: 7px; background: rgba(255,255,255,.8); font-size: 12px; }
+.mapping-import-preview li small { color: #718078; }
+.mapping-import-preview .mapping-import-warning { color: #8b5b22; }
+.mapping-import-preview .primary { justify-self: start; border-color: #173e2d; background: #173e2d; color: #fff; }
 .mapping-cards article { display: grid; grid-template-columns: 1fr auto; gap: 6px; align-items: stretch; }
 .mapping-cards article > button:first-child { display: grid; gap: 4px; text-align: left; }
 .mapping-cards article > span { display: flex; gap: 5px; }

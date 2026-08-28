@@ -28,6 +28,7 @@
     "allow-export-local-mapping",
     "allow-export-local-mapping-typescript",
     "allow-export-local-mapping-release-source",
+    "allow-inspect-local-mapping-import",
     "allow-import-local-mapping",
     "allow-delete-local-mapping",
     "allow-debug-plugin-invoke",

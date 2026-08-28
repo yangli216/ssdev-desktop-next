@@ -2046,6 +2046,33 @@ struct LocalMappingSaveResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct LocalMappingImportPreview {
+    plan_id: String,
+    plugin_id: String,
+    display_name: String,
+    action: &'static str,
+    service_count: usize,
+    method_count: usize,
+    debug_case_count: usize,
+    services: Vec<LocalMappingImportServicePreview>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalMappingImportServicePreview {
+    service_id: String,
+    architecture: PluginArchitecture,
+    main_type: String,
+    method_count: usize,
+}
+
+struct LocalMappingImportContext {
+    current_state_sha256: String,
+    action: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PluginDebugResult {
     elapsed_ms: u128,
     response: InvokeResponse,
@@ -2696,6 +2723,68 @@ fn ensure_local_plugin_install_plan_matches(expected: &str, actual: &str) -> Res
     Ok(())
 }
 
+fn local_mapping_import_plan_id(
+    bundle_sha256: &str,
+    current_state_sha256: &str,
+    desktop_version: &semver::Version,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-LOCAL-MAPPING-IMPORT-PLAN\0");
+    hash_plan_field(&mut hasher, bundle_sha256.as_bytes());
+    hash_plan_field(&mut hasher, current_state_sha256.as_bytes());
+    hash_plan_field(&mut hasher, desktop_version.to_string().as_bytes());
+    lowercase_hex(&hasher.finalize())
+}
+
+fn ensure_local_mapping_import_plan_matches(expected: &str, actual: &str) -> Result<(), String> {
+    if expected != actual {
+        return Err("映射包或当前映射状态在确认后发生变化，请重新选择映射包并预检".to_owned());
+    }
+    Ok(())
+}
+
+fn local_mapping_import_state_digest(
+    root: &std::path::Path,
+    plugin_id: &str,
+    installed: Option<&PluginManifest>,
+) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-LOCAL-MAPPING-IMPORT-STATE\0");
+    hash_plan_field(&mut hasher, plugin_id.as_bytes());
+    match installed {
+        Some(manifest) => {
+            if manifest.plugin_id != plugin_id || !is_local_manifest(manifest, root) {
+                return Err("映射导入基线不属于目标本地映射目录".to_owned());
+            }
+            let temporary = tempfile::Builder::new()
+                .prefix(".mapping-import-state-")
+                .tempdir()
+                .map_err(|error| format!("无法创建映射导入基线暂存目录: {error}"))?;
+            let package = temporary.path().join("current.ssdev-mapping");
+            local_mappings::export_bundle(root, plugin_id, &package)?;
+            hash_plan_field(&mut hasher, b"installed");
+            hash_plan_file(&mut hasher, &package)?;
+        }
+        None => {
+            let target = root.join(plugin_id);
+            match fs::symlink_metadata(&target) {
+                Ok(_) => {
+                    return Err(format!(
+                        "映射 [{plugin_id}] 的本机目录存在但未通过校验；请先处理隔离项再导入"
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    hash_plan_field(&mut hasher, b"not-installed");
+                }
+                Err(error) => {
+                    return Err(format!("无法读取映射 [{plugin_id}] 的导入基线: {error}"));
+                }
+            }
+        }
+    }
+    Ok(lowercase_hex(&hasher.finalize()))
+}
+
 fn classify_local_plugin_install_action(
     current: Option<&semver::Version>,
     candidate: &semver::Version,
@@ -3264,7 +3353,7 @@ async fn save_local_mapping(
     let prepared = tokio::task::spawn_blocking(move || local_mappings::prepare(&root, definition))
         .await
         .map_err(|_| "本地映射准备任务异常终止".to_owned())??;
-    activate_prepared_local_mapping(&state, prepared).await
+    activate_prepared_local_mapping(&state, prepared, None).await
 }
 
 #[tauri::command]
@@ -3319,30 +3408,161 @@ async fn export_local_mapping_release_source(
 }
 
 #[tauri::command]
+async fn inspect_local_mapping_import(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    source: PathBuf,
+) -> Result<LocalMappingImportPreview, String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    recover_plugin_store(&state)?;
+    let (prepared, bundle_sha256) =
+        prepare_local_mapping_import(state.local_mapping_root.clone(), source).await?;
+    let context = local_mapping_import_context(&state, &prepared).await?;
+    let plan_id = local_mapping_import_plan_id(
+        &bundle_sha256,
+        &context.current_state_sha256,
+        &state.desktop_version,
+    );
+    let services = prepared
+        .manifest()
+        .services
+        .iter()
+        .map(|service| LocalMappingImportServicePreview {
+            service_id: service.service_id.clone(),
+            architecture: service.architecture,
+            main_type: service.resolved_main_type().to_ascii_lowercase(),
+            method_count: service.methods.len(),
+        })
+        .collect::<Vec<_>>();
+    let method_count = services.iter().map(|service| service.method_count).sum();
+    tracing::info!(
+        event_code = "local-mapping-import-inspected",
+        plugin_id = prepared.plugin_id(),
+        action = context.action,
+        service_count = services.len(),
+        method_count,
+        "local mapping package structurally inspected without loading native code"
+    );
+    Ok(LocalMappingImportPreview {
+        plan_id,
+        plugin_id: prepared.plugin_id().to_owned(),
+        display_name: prepared.definition().display_name.clone(),
+        action: context.action,
+        service_count: services.len(),
+        method_count,
+        debug_case_count: prepared.definition().debug_cases.len(),
+        services,
+    })
+}
+
+#[tauri::command]
 async fn import_local_mapping(
     caller: WebviewWindow,
     state: State<'_, BridgeState>,
     source: PathBuf,
+    expected_plan_id: String,
 ) -> Result<LocalMappingSaveResult, String> {
     desktop::require_control(&caller)?;
+    if !is_lowercase_sha256(&expected_plan_id) {
+        return Err("映射导入确认标识无效，请重新选择映射包并预检".to_owned());
+    }
     let _install = state.install_lock.lock().await;
-    let root = state.local_mapping_root.clone();
-    let prepared =
-        tokio::task::spawn_blocking(move || local_mappings::prepare_import(&root, &source))
-            .await
-            .map_err(|_| "映射导入任务异常终止".to_owned())??;
-    if state.plugin_root.join(prepared.plugin_id()).exists() {
+    recover_plugin_store(&state)?;
+    let (prepared, bundle_sha256) =
+        prepare_local_mapping_import(state.local_mapping_root.clone(), source).await?;
+    let context = local_mapping_import_context(&state, &prepared).await?;
+    let actual_plan_id = local_mapping_import_plan_id(
+        &bundle_sha256,
+        &context.current_state_sha256,
+        &state.desktop_version,
+    );
+    ensure_local_mapping_import_plan_matches(&expected_plan_id, &actual_plan_id)?;
+    activate_prepared_local_mapping(&state, prepared, Some(&context.current_state_sha256)).await
+}
+
+async fn prepare_local_mapping_import(
+    root: PathBuf,
+    source: PathBuf,
+) -> Result<(local_mappings::PreparedLocalMapping, String), String> {
+    tokio::task::spawn_blocking(move || {
+        let before = local_mappings::import_bundle_sha256(&source)?;
+        let prepared = local_mappings::prepare_import(&root, &source)?;
+        let after = local_mappings::import_bundle_sha256(&source)?;
+        if before != after {
+            return Err("映射包在读取期间发生变化，请重新选择并预检".to_owned());
+        }
+        Ok((prepared, after))
+    })
+    .await
+    .map_err(|_| "映射导入任务异常终止".to_owned())?
+}
+
+async fn local_mapping_import_context(
+    state: &BridgeState,
+    prepared: &local_mappings::PreparedLocalMapping,
+) -> Result<LocalMappingImportContext, String> {
+    let plugin_id = prepared.plugin_id();
+    let current = inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+        &state.desktop_version,
+    )?;
+    let active_matches = state
+        .controller
+        .manifests_match_active_routes(&current.manifests)
+        .await
+        .map_err(|error| format!("无法核对当前插件运行状态 ({})", error.diagnostic_code()))?;
+    if !active_matches {
+        return Err("插件目录与当前运行路由不一致，请先重新扫描并处理隔离项后再导入".to_owned());
+    }
+    if contains_plugin_id(&current.discovered_plugin_ids, plugin_id) {
         return Err(format!(
-            "映射 ID [{}] 与签名插件冲突，请先调整映射包",
-            prepared.plugin_id()
+            "映射 ID [{plugin_id}] 与签名插件冲突，请先调整映射包"
         ));
     }
-    activate_prepared_local_mapping(&state, prepared).await
+    let installed = current.manifests.iter().find(|manifest| {
+        is_local_manifest(manifest, &state.local_mapping_root)
+            && normalized_plugin_id(&manifest.plugin_id) == normalized_plugin_id(plugin_id)
+    });
+    if current
+        .local_mapping_ids
+        .contains(&normalized_plugin_id(plugin_id))
+        && installed.is_none()
+    {
+        return Err(format!(
+            "映射 [{plugin_id}] 的本机目录存在但未通过校验；请先处理隔离项再导入"
+        ));
+    }
+    if installed.is_some_and(|manifest| manifest.plugin_id != plugin_id) {
+        return Err(format!(
+            "映射 ID [{plugin_id}] 与现有映射仅大小写不同，请保持 ID 完全一致或使用新 ID"
+        ));
+    }
+    let current_state_sha256 =
+        local_mapping_import_state_digest(&state.local_mapping_root, plugin_id, installed)?;
+    let action = if installed.is_some() {
+        "replace"
+    } else {
+        "install"
+    };
+    let mut candidates = current.manifests;
+    candidates.retain(|manifest| {
+        normalized_plugin_id(&manifest.plugin_id) != normalized_plugin_id(plugin_id)
+    });
+    candidates.push(prepared.manifest().clone());
+    PluginController::validate_manifests(&candidates).map_err(|error| error.to_string())?;
+    Ok(LocalMappingImportContext {
+        current_state_sha256,
+        action,
+    })
 }
 
 async fn activate_prepared_local_mapping(
     state: &BridgeState,
     prepared: local_mappings::PreparedLocalMapping,
+    expected_current_state_sha256: Option<&str>,
 ) -> Result<LocalMappingSaveResult, String> {
     let plugin_id = prepared.plugin_id().to_owned();
     let current = inspect_all_plugins(
@@ -3351,8 +3571,58 @@ async fn activate_prepared_local_mapping(
         state.trust_store.as_deref(),
         &state.desktop_version,
     )?;
+    let active_matches = state
+        .controller
+        .manifests_match_active_routes(&current.manifests)
+        .await
+        .map_err(|error| format!("无法核对当前插件运行状态 ({})", error.diagnostic_code()))?;
+    if !active_matches {
+        return Err(
+            "插件目录与当前运行路由不一致，请先重新扫描并处理隔离项后再保存映射".to_owned(),
+        );
+    }
+    if contains_plugin_id(&current.discovered_plugin_ids, &plugin_id) {
+        return Err(format!(
+            "映射 ID [{plugin_id}] 与签名插件冲突，请使用其他 ID"
+        ));
+    }
+    let previous_manifest = current
+        .manifests
+        .iter()
+        .find(|manifest| {
+            is_local_manifest(manifest, &state.local_mapping_root)
+                && normalized_plugin_id(&manifest.plugin_id) == normalized_plugin_id(&plugin_id)
+        })
+        .cloned();
+    if previous_manifest
+        .as_ref()
+        .is_some_and(|manifest| manifest.plugin_id != plugin_id)
+    {
+        return Err(format!(
+            "映射 ID [{plugin_id}] 与现有映射仅大小写不同，请保持 ID 完全一致或使用新 ID"
+        ));
+    }
+    if let Some(expected) = expected_current_state_sha256 {
+        if current
+            .local_mapping_ids
+            .contains(&normalized_plugin_id(&plugin_id))
+            && previous_manifest.is_none()
+        {
+            return Err(format!(
+                "映射 [{plugin_id}] 的本机目录在确认后进入隔离状态，请重新预检"
+            ));
+        }
+        let actual = local_mapping_import_state_digest(
+            &state.local_mapping_root,
+            &plugin_id,
+            previous_manifest.as_ref(),
+        )?;
+        ensure_local_mapping_import_plan_matches(expected, &actual)?;
+    }
     let mut candidates = current.manifests.clone();
-    candidates.retain(|manifest| manifest.plugin_id != plugin_id);
+    candidates.retain(|manifest| {
+        normalized_plugin_id(&manifest.plugin_id) != normalized_plugin_id(&plugin_id)
+    });
     candidates.push(prepared.manifest().clone());
     PluginController::validate_manifests(&candidates).map_err(|error| error.to_string())?;
     let preflight = state
@@ -3368,7 +3638,51 @@ async fn activate_prepared_local_mapping(
                 error.diagnostic_code(),
             )
         })?;
-    let maintenance = state.controller.begin_maintenance().await;
+    if let Some(expected) = expected_current_state_sha256 {
+        let latest = inspect_all_plugins(
+            &state.plugin_root,
+            &state.local_mapping_root,
+            state.trust_store.as_deref(),
+            &state.desktop_version,
+        )?;
+        if contains_plugin_id(&latest.discovered_plugin_ids, &plugin_id) {
+            return Err(format!(
+                "映射 ID [{plugin_id}] 在宿主预检期间与签名插件发生冲突，请重新预检"
+            ));
+        }
+        let latest_manifest = latest.manifests.iter().find(|manifest| {
+            is_local_manifest(manifest, &state.local_mapping_root)
+                && normalized_plugin_id(&manifest.plugin_id) == normalized_plugin_id(&plugin_id)
+        });
+        if latest
+            .local_mapping_ids
+            .contains(&normalized_plugin_id(&plugin_id))
+            && latest_manifest.is_none()
+        {
+            return Err(format!(
+                "映射 [{plugin_id}] 在宿主预检期间进入隔离状态，请重新预检"
+            ));
+        }
+        if latest_manifest.is_some_and(|manifest| manifest.plugin_id != plugin_id) {
+            return Err("目标映射 ID 的大小写在宿主预检期间发生变化，请重新预检".to_owned());
+        }
+        let actual = local_mapping_import_state_digest(
+            &state.local_mapping_root,
+            &plugin_id,
+            latest_manifest,
+        )?;
+        ensure_local_mapping_import_plan_matches(expected, &actual)?;
+    }
+    let maintenance = state
+        .controller
+        .begin_plugin_maintenance(&plugin_id)
+        .await
+        .map_err(|error| {
+            format!(
+                "映射维护窗口不可用 ({})，未修改当前映射",
+                error.diagnostic_code()
+            )
+        })?;
     let root = state.local_mapping_root.clone();
     let activated = tokio::task::spawn_blocking(move || prepared.activate(&root))
         .await
@@ -3385,18 +3699,51 @@ async fn activate_prepared_local_mapping(
                 .rollback()
                 .map_err(|rollback| format!("映射加载失败: {error}; 回滚同时失败: {rollback}"))?;
             maintenance
-                .replace_manifests(&current.manifests)
+                .replace_manifest(previous_manifest.as_ref())
                 .await
                 .map_err(|reload| format!("映射加载失败: {error}; 恢复旧路由失败: {reload}"))?;
             return Err(format!("映射加载失败，已恢复旧映射: {error}"));
         }
     };
-    if let Err(error) = maintenance.replace_manifests(&installed.manifests).await {
+    if !same_manifest_contracts(&candidates, &installed.manifests) {
+        activated.rollback().map_err(|rollback| {
+            format!("映射激活后插件清单发生意外变化；恢复原映射同时失败: {rollback}")
+        })?;
+        maintenance
+            .replace_manifest(previous_manifest.as_ref())
+            .await
+            .map_err(|reload| {
+                format!("映射激活后插件清单发生意外变化；恢复旧路由失败: {reload}")
+            })?;
+        return Err("映射激活后插件清单发生意外变化，已恢复原映射；请重新预检".into());
+    }
+    let Some(installed_manifest) = installed
+        .manifests
+        .iter()
+        .find(|manifest| {
+            manifest.plugin_id == plugin_id
+                && is_local_manifest(manifest, &state.local_mapping_root)
+        })
+        .cloned()
+    else {
+        activated.rollback().map_err(|rollback| {
+            format!("新映射未进入已验证清单；恢复原映射同时失败: {rollback}")
+        })?;
+        maintenance
+            .replace_manifest(previous_manifest.as_ref())
+            .await
+            .map_err(|reload| format!("新映射未进入已验证清单；恢复旧路由失败: {reload}"))?;
+        return Err("新映射未进入已验证清单，已恢复原映射".into());
+    };
+    if let Err(error) = maintenance
+        .replace_manifest(Some(&installed_manifest))
+        .await
+    {
         activated
             .rollback()
             .map_err(|rollback| format!("新映射路由无效: {error}; 回滚同时失败: {rollback}"))?;
         maintenance
-            .replace_manifests(&current.manifests)
+            .replace_manifest(previous_manifest.as_ref())
             .await
             .map_err(|reload| format!("新映射路由无效: {error}; 恢复旧路由失败: {reload}"))?;
         return Err(format!("新映射路由无效，已恢复旧映射: {error}"));
@@ -3405,7 +3752,7 @@ async fn activate_prepared_local_mapping(
         Ok(manifest) => manifest,
         Err(error) => {
             maintenance
-                .replace_manifests(&current.manifests)
+                .replace_manifest(previous_manifest.as_ref())
                 .await
                 .map_err(|reload| format!("映射事务提交失败: {error}; 恢复旧路由失败: {reload}"))?;
             return Err(format!("映射事务提交失败: {error}"));
@@ -4099,6 +4446,7 @@ pub fn run() {
             export_local_mapping,
             export_local_mapping_typescript,
             export_local_mapping_release_source,
+            inspect_local_mapping_import,
             import_local_mapping,
             delete_local_mapping,
             debug_plugin_invoke,
@@ -4323,6 +4671,21 @@ fn contains_plugin_id(plugin_ids: &std::collections::HashSet<String>, plugin_id:
 
 fn is_local_manifest(manifest: &PluginManifest, root: &std::path::Path) -> bool {
     manifest.plugin_dir.starts_with(root)
+}
+
+fn same_manifest_contracts(left: &[PluginManifest], right: &[PluginManifest]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut left = left.iter().collect::<Vec<_>>();
+    let mut right = right.iter().collect::<Vec<_>>();
+    left.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
+    right.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
+    left.into_iter().zip(right).all(|(left, right)| {
+        left.plugin_id == right.plugin_id
+            && left.metadata == right.metadata
+            && left.services == right.services
+    })
 }
 
 fn ensure_upgrade_allowed(
@@ -4770,18 +5133,21 @@ mod tests {
     use super::{
         classify_local_plugin_install_action, classify_project_component_action,
         collect_plugin_updates, desktop, ensure_config_signed_plugin_route_coverage,
-        ensure_local_plugin_install_plan_matches, ensure_plugin_update_plan_matches,
-        ensure_plugin_version_change_allowed, ensure_project_export_active_manifests_match,
-        ensure_project_export_runtime_matches, ensure_signed_plugin_compatible,
-        ensure_signed_plugin_route_coverage, ensure_upgrade_allowed, inspect_all_plugins,
-        is_lowercase_sha256, is_plugin_update_available, legacy_config_candidates,
-        local_plugin_install_plan_id, open_project_bundle_for_mode,
-        persist_startup_failure_document, plugin_update_installed_state_digest,
-        plugin_update_plan_id, project_bundle, project_import_plan_id, project_import_state_digest,
-        resolve_startup_failure_document, select_runtime_path, service_inventory_item,
+        ensure_local_mapping_import_plan_matches, ensure_local_plugin_install_plan_matches,
+        ensure_plugin_update_plan_matches, ensure_plugin_version_change_allowed,
+        ensure_project_export_active_manifests_match, ensure_project_export_runtime_matches,
+        ensure_signed_plugin_compatible, ensure_signed_plugin_route_coverage,
+        ensure_upgrade_allowed, inspect_all_plugins, is_lowercase_sha256,
+        is_plugin_update_available, legacy_config_candidates, local_mapping_import_plan_id,
+        local_mapping_import_state_digest, local_plugin_install_plan_id,
+        open_project_bundle_for_mode, persist_startup_failure_document,
+        plugin_update_installed_state_digest, plugin_update_plan_id, project_bundle,
+        project_import_plan_id, project_import_state_digest, resolve_startup_failure_document,
+        same_manifest_contracts, select_runtime_path, service_inventory_item,
         signed_plugin_route_policy_coverage, startup_failure_message,
         validate_signed_plugin_activation_routes, CatalogWithdrawalReason, FrontendRuntime,
-        InspectedPlugins, PluginInstallBlocker, PluginInstallSource, PluginPackagePreview,
+        InspectedPlugins, LocalMappingImportPreview, LocalMappingImportServicePreview,
+        PluginInstallBlocker, PluginInstallSource, PluginPackagePreview,
         PluginPackageServicePreview, ProjectBundlePreview, StartupFailureDocument, StartupStage,
         FRONTEND_READY_TIMEOUT,
     };
@@ -5770,6 +6136,83 @@ mod tests {
         );
         assert!(ensure_local_plugin_install_plan_matches(&base, &base).is_ok());
         assert!(ensure_local_plugin_install_plan_matches(&base, &"44".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn local_mapping_import_plan_binds_bundle_state_and_desktop_version() {
+        let desktop = Version::new(0, 1, 5);
+        let bundle = "11".repeat(32);
+        let state = "22".repeat(32);
+        let base = local_mapping_import_plan_id(&bundle, &state, &desktop);
+        assert!(is_lowercase_sha256(&base));
+        assert_ne!(
+            base,
+            local_mapping_import_plan_id(&"33".repeat(32), &state, &desktop)
+        );
+        assert_ne!(
+            base,
+            local_mapping_import_plan_id(&bundle, &"44".repeat(32), &desktop)
+        );
+        assert_ne!(
+            base,
+            local_mapping_import_plan_id(&bundle, &state, &Version::new(0, 2, 0))
+        );
+        assert!(ensure_local_mapping_import_plan_matches(&base, &base).is_ok());
+        assert!(ensure_local_mapping_import_plan_matches(&base, &"55".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn local_mapping_import_state_binds_absence_and_rejects_unvalidated_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let absent = local_mapping_import_state_digest(root.path(), "reader.local", None).unwrap();
+        assert!(is_lowercase_sha256(&absent));
+        fs::create_dir(root.path().join("reader.local")).unwrap();
+        assert!(local_mapping_import_state_digest(root.path(), "reader.local", None).is_err());
+    }
+
+    #[test]
+    fn local_mapping_import_preview_omits_source_and_component_paths() {
+        let preview = LocalMappingImportPreview {
+            plan_id: "11".repeat(32),
+            plugin_id: "reader.local".to_owned(),
+            display_name: "Reader".to_owned(),
+            action: "replace",
+            service_count: 1,
+            method_count: 2,
+            debug_case_count: 1,
+            services: vec![LocalMappingImportServicePreview {
+                service_id: "card.reader".to_owned(),
+                architecture: PluginArchitecture::X86,
+                main_type: "dll".to_owned(),
+                method_count: 2,
+            }],
+        };
+        let value = serde_json::to_value(preview).unwrap();
+        let encoded = serde_json::to_string(&value).unwrap();
+        assert!(!value.as_object().unwrap().contains_key("source"));
+        assert!(!value.as_object().unwrap().contains_key("preflightedHosts"));
+        assert!(!encoded.contains("mainClass"));
+        assert!(!encoded.contains("componentPath"));
+        assert_eq!(value["action"], "replace");
+        assert_eq!(value["services"][0]["architecture"], "x86");
+    }
+
+    #[test]
+    fn manifest_contract_comparison_ignores_roots_but_detects_route_drift() {
+        let left = PluginManifest {
+            plugin_id: "reader.local".to_owned(),
+            plugin_dir: PathBuf::from("staging/reader.local"),
+            metadata: None,
+            services: Vec::new(),
+        };
+        let mut installed = left.clone();
+        installed.plugin_dir = PathBuf::from("installed/reader.local");
+        assert!(same_manifest_contracts(
+            std::slice::from_ref(&left),
+            std::slice::from_ref(&installed)
+        ));
+        installed.plugin_id = "changed.local".to_owned();
+        assert!(!same_manifest_contracts(&[left], &[installed]));
     }
 
     #[test]
