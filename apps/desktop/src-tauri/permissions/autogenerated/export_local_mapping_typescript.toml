@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-export-local-mapping-typescript"
+description = "Enables the export_local_mapping_typescript command without any pre-configured scope."
+commands.allow = ["export_local_mapping_typescript"]
+
+[[permission]]
+identifier = "deny-export-local-mapping-typescript"
+description = "Denies the export_local_mapping_typescript command without any pre-configured scope."
+commands.deny = ["export_local_mapping_typescript"]

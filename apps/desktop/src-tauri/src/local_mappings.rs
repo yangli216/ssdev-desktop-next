@@ -5,11 +5,13 @@ use std::path::{Component, Path, PathBuf};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use tempfile::{Builder as TempBuilder, TempDir};
+use tempfile::{Builder as TempBuilder, NamedTempFile, TempDir};
 use uuid::Uuid;
 use webplus_plugin_config::{
-    PluginManifest, PluginMetadata, ServiceDefinition, API_FILENAME, PLUGIN_METADATA_FILENAME,
+    ParameterDefinition, PluginManifest, PluginMetadata, ServiceDefinition, API_FILENAME,
+    PLUGIN_METADATA_FILENAME,
 };
+use webplus_protocol::InvokeRequest;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
@@ -19,6 +21,7 @@ const MAX_EXPORTS: usize = 4096;
 const MAX_PE_INSPECTION_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_BUNDLE_ENTRIES: usize = 512;
+const MAX_DEBUG_CASES: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -28,6 +31,19 @@ pub(crate) struct LocalMappingDefinition {
     #[serde(default)]
     pub display_name: String,
     pub services: Vec<ServiceDefinition>,
+    #[serde(default)]
+    pub debug_cases: Vec<DebugCaseDefinition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DebugCaseDefinition {
+    pub name: String,
+    pub service_id: String,
+    pub method: String,
+    #[serde(default)]
+    pub parameters: serde_json::Map<String, serde_json::Value>,
+    pub expected_res_code: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -345,6 +361,91 @@ pub(crate) fn load_definition(plugin_dir: &Path) -> Result<LocalMappingDefinitio
     Ok(definition)
 }
 
+pub(crate) fn upsert_debug_case(
+    root: &Path,
+    plugin_id: &str,
+    debug_case: DebugCaseDefinition,
+) -> Result<Vec<DebugCaseDefinition>, String> {
+    let plugin_dir = installed_mapping_dir(root, plugin_id)?;
+    let mut definition = load_validated_stored_definition(&plugin_dir, plugin_id)?;
+    if definition.plugin_id != plugin_id {
+        return Err("本地映射目录身份与映射定义不一致".into());
+    }
+    if let Some(existing) = definition
+        .debug_cases
+        .iter_mut()
+        .find(|existing| existing.name == debug_case.name)
+    {
+        *existing = debug_case;
+    } else {
+        definition.debug_cases.push(debug_case);
+    }
+    validate_definition_header(&definition)?;
+    write_json_atomic(plugin_dir.join(LOCAL_MAPPING_FILENAME), &definition)?;
+    Ok(definition.debug_cases)
+}
+
+pub(crate) fn delete_debug_case(
+    root: &Path,
+    plugin_id: &str,
+    case_name: &str,
+) -> Result<Vec<DebugCaseDefinition>, String> {
+    let plugin_dir = installed_mapping_dir(root, plugin_id)?;
+    let mut definition = load_validated_stored_definition(&plugin_dir, plugin_id)?;
+    let previous_len = definition.debug_cases.len();
+    definition
+        .debug_cases
+        .retain(|debug_case| debug_case.name != case_name);
+    if definition.debug_cases.len() == previous_len {
+        return Err(format!("调试用例 [{case_name}] 不存在"));
+    }
+    validate_definition_header(&definition)?;
+    write_json_atomic(plugin_dir.join(LOCAL_MAPPING_FILENAME), &definition)?;
+    Ok(definition.debug_cases)
+}
+
+pub(crate) fn load_debug_cases(
+    root: &Path,
+    plugin_id: &str,
+) -> Result<Vec<DebugCaseDefinition>, String> {
+    let plugin_dir = installed_mapping_dir(root, plugin_id)?;
+    let definition = load_validated_stored_definition(&plugin_dir, plugin_id)?;
+    Ok(definition.debug_cases)
+}
+
+pub(crate) fn export_typescript(
+    root: &Path,
+    plugin_id: &str,
+    destination: &Path,
+) -> Result<(), String> {
+    let plugin_dir = installed_mapping_dir(root, plugin_id)?;
+    let definition = load_validated_stored_definition(&plugin_dir, plugin_id)?;
+    if destination.extension().and_then(|value| value.to_str()) != Some("ts") {
+        return Err("TypeScript 导出目标必须使用 .ts 扩展名".into());
+    }
+    let parent = destination.parent().ok_or("导出目标缺少父目录")?;
+    if !parent.is_dir() {
+        return Err("TypeScript 导出目录不存在".into());
+    }
+    let source = generate_typescript(&definition)?;
+    let mut temporary = TempBuilder::new()
+        .prefix(".ssdev-types-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|error| format!("无法创建 TypeScript 暂存文件: {error}"))?;
+    temporary
+        .write_all(source.as_bytes())
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|error| format!("无法持久化 TypeScript 文件: {error}"))?;
+    temporary.persist_noclobber(destination).map_err(|error| {
+        format!(
+            "无法保存 TypeScript 文件（不会覆盖已有文件）: {}",
+            error.error
+        )
+    })?;
+    Ok(())
+}
+
 pub(crate) fn validate_installed_manifest(manifest: &PluginManifest) -> Result<(), String> {
     let definition = load_stored_definition(&manifest.plugin_dir)?;
     validate_definition_header(&definition)?;
@@ -390,7 +491,210 @@ fn validate_definition_header(definition: &LocalMappingDefinition) -> Result<(),
     if definition.display_name.trim().is_empty() || definition.display_name.chars().count() > 128 {
         return Err("映射显示名称必须是 1 到 128 个字符".into());
     }
+    validate_debug_cases(definition)
+}
+
+fn validate_debug_cases(definition: &LocalMappingDefinition) -> Result<(), String> {
+    if definition.debug_cases.len() > MAX_DEBUG_CASES {
+        return Err(format!("每个映射最多保存 {MAX_DEBUG_CASES} 个调试用例"));
+    }
+    let mut names = HashSet::new();
+    for debug_case in &definition.debug_cases {
+        if debug_case.name.trim().is_empty()
+            || debug_case.name.chars().count() > 128
+            || !names.insert(debug_case.name.as_str())
+        {
+            return Err(format!(
+                "调试用例名称为空、重复或超过 128 个字符 [{}]",
+                debug_case.name
+            ));
+        }
+        let service = definition
+            .services
+            .iter()
+            .find(|service| service.service_id == debug_case.service_id)
+            .ok_or_else(|| format!("调试用例 [{}] 引用了不存在的服务", debug_case.name))?;
+        let method = service
+            .method(&debug_case.method)
+            .ok_or_else(|| format!("调试用例 [{}] 引用了不存在的方法", debug_case.name))?;
+        let allowed = method
+            .parameters
+            .iter()
+            .map(ParameterDefinition::name)
+            .filter(|name| !name.starts_with('$'))
+            .collect::<HashSet<_>>();
+        if let Some(unexpected) = debug_case
+            .parameters
+            .keys()
+            .find(|name| !allowed.contains(name.as_str()))
+        {
+            return Err(format!(
+                "调试用例 [{}] 包含未声明的输入参数 [{unexpected}]",
+                debug_case.name
+            ));
+        }
+        InvokeRequest {
+            service_id: debug_case.service_id.clone(),
+            method: debug_case.method.clone(),
+            parameters: debug_case.parameters.clone(),
+        }
+        .validate()
+        .map_err(|error| format!("调试用例 [{}] 无效: {error}", debug_case.name))?;
+    }
     Ok(())
+}
+
+fn installed_mapping_dir(root: &Path, plugin_id: &str) -> Result<PathBuf, String> {
+    let plugin_dir = bounded_plugin_target(root, plugin_id)?;
+    let metadata = fs::symlink_metadata(&plugin_dir)
+        .map_err(|error| format!("无法读取本地映射 [{plugin_id}]: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("本地映射 [{plugin_id}] 不存在或目录不安全"));
+    }
+    Ok(plugin_dir)
+}
+
+fn load_validated_stored_definition(
+    plugin_dir: &Path,
+    plugin_id: &str,
+) -> Result<LocalMappingDefinition, String> {
+    let definition = load_stored_definition(plugin_dir)?;
+    validate_definition_header(&definition)?;
+    let manifest =
+        PluginManifest::load(plugin_id, plugin_dir).map_err(|error| error.to_string())?;
+    validate_stored_manifest(&manifest, &definition)?;
+    Ok(definition)
+}
+
+fn generate_typescript(definition: &LocalMappingDefinition) -> Result<String, String> {
+    let mut output = String::from(
+        "// Generated by SSDEV Desktop. Do not edit generated route constants.\n\
+import type { InvokeResponse, JsonObject, JsonValue, SsdevDesktopBridge } from '@bsoft/ssdev-web-bridge'\n\n",
+    );
+    let mut methods = Vec::new();
+    for (service_index, service) in definition.services.iter().enumerate() {
+        for (method_index, method) in service.methods.iter().enumerate() {
+            let request_name = method.alias.as_deref().unwrap_or(&method.name);
+            let stem = format!(
+                "{}{}{}{}",
+                ts_pascal_identifier(&service.service_id),
+                service_index + 1,
+                ts_pascal_identifier(request_name),
+                method_index + 1
+            );
+            let parameters_type = format!("{stem}Parameters");
+            let data_type = format!("{stem}Data");
+            output.push_str(&format!(
+                "export type {parameters_type} = JsonObject & {{\n"
+            ));
+            for parameter in method
+                .parameters
+                .iter()
+                .filter(|parameter| !parameter.name().starts_with('$'))
+            {
+                output.push_str(&format!(
+                    "  {}: {}\n",
+                    ts_property(parameter.name())?,
+                    ts_parameter_type(parameter)
+                ));
+            }
+            output.push_str("}\n\n");
+            output.push_str(&format!("export type {data_type} = JsonObject & {{\n"));
+            output.push_str(&format!(
+                "  ReturnValue: {}\n",
+                ts_native_type(&method.return_type)
+            ));
+            for parameter in method
+                .parameters
+                .iter()
+                .filter(|parameter| parameter.name().starts_with('$'))
+            {
+                let name = parameter.name().trim_start_matches('$');
+                output.push_str(&format!(
+                    "  {}: {}\n",
+                    ts_property(name)?,
+                    ts_parameter_type(parameter)
+                ));
+            }
+            output.push_str("}\n\n");
+            methods.push((
+                format!(
+                    "{}{}{}{}",
+                    ts_camel_identifier(&service.service_id),
+                    service_index + 1,
+                    ts_pascal_identifier(request_name),
+                    method_index + 1
+                ),
+                parameters_type,
+                data_type,
+                service.service_id.clone(),
+                request_name.to_owned(),
+            ));
+        }
+    }
+    output.push_str(&format!(
+        "export class {}Client {{\n  constructor(private readonly bridge: SsdevDesktopBridge) {{}}\n\n",
+        ts_pascal_identifier(&definition.display_name)
+    ));
+    for (name, parameters_type, data_type, service_id, method) in methods {
+        output.push_str(&format!(
+            "  {name}(parameters: {parameters_type}): Promise<InvokeResponse<{data_type}>> {{\n    return this.bridge.invokePlugin<{data_type}>({}, {}, parameters)\n  }}\n\n",
+            serde_json::to_string(&service_id).map_err(|error| error.to_string())?,
+            serde_json::to_string(&method).map_err(|error| error.to_string())?,
+        ));
+    }
+    output.push_str("}\n");
+    Ok(output)
+}
+
+fn ts_parameter_type(parameter: &ParameterDefinition) -> &'static str {
+    match parameter {
+        ParameterDefinition::Name(_) => "JsonValue",
+        ParameterDefinition::Detailed(detail) => ts_native_type(&detail.parameter_type),
+    }
+}
+
+fn ts_native_type(native: &str) -> &'static str {
+    match native.trim().to_ascii_lowercase().as_str() {
+        "string" => "string",
+        "bool" | "boolean" => "boolean",
+        "int" | "int32" | "long" | "uint" | "uint32" | "dword" | "float" | "double" => "number",
+        "void" => "null",
+        _ => "JsonValue",
+    }
+}
+
+fn ts_property(value: &str) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|error| error.to_string())
+}
+
+fn ts_pascal_identifier(value: &str) -> String {
+    let mut output = String::new();
+    let mut uppercase = true;
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            if uppercase {
+                output.push(character.to_ascii_uppercase());
+                uppercase = false;
+            } else {
+                output.push(character);
+            }
+        } else {
+            uppercase = true;
+        }
+    }
+    if output.is_empty() || output.starts_with(|character: char| character.is_ascii_digit()) {
+        output.insert_str(0, "Generated");
+    }
+    output
+}
+
+fn ts_camel_identifier(value: &str) -> String {
+    let mut output = ts_pascal_identifier(value);
+    if let Some(first) = output.get_mut(0..1) {
+        first.make_ascii_lowercase();
+    }
+    output
 }
 
 fn validate_stored_manifest(
@@ -608,6 +912,22 @@ fn write_json(path: PathBuf, value: &impl Serialize) -> Result<(), String> {
         .map_err(|error| format!("无法持久化映射文件: {error}"))
 }
 
+fn write_json_atomic(path: PathBuf, value: &impl Serialize) -> Result<(), String> {
+    let parent = path.parent().ok_or("映射定义缺少父目录")?;
+    let mut temporary = NamedTempFile::new_in(parent)
+        .map_err(|error| format!("无法创建映射定义暂存文件: {error}"))?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), value)
+        .map_err(|error| format!("无法序列化映射定义: {error}"))?;
+    temporary
+        .write_all(b"\n")
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|error| format!("无法持久化映射定义: {error}"))?;
+    temporary
+        .persist(&path)
+        .map_err(|error| format!("无法替换映射定义: {}", error.error))?;
+    Ok(())
+}
+
 struct PeInspection {
     architecture: Option<&'static str>,
     exports: Vec<String>,
@@ -808,5 +1128,73 @@ mod tests {
         definition["displayName"] = serde_json::json!("tampered");
         fs::write(&definition_path, serde_json::to_vec(&definition).unwrap()).unwrap();
         assert!(validate_installed_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn debug_cases_are_validated_and_updated_atomically() {
+        let source = tempfile::tempdir().unwrap();
+        let component = source.path().join("reader.bat");
+        fs::write(&component, b"@echo off\r\n").unwrap();
+        let active_root = tempfile::tempdir().unwrap();
+        prepare(active_root.path(), fixture_definition(&component))
+            .unwrap()
+            .activate(active_root.path())
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        let debug_case = DebugCaseDefinition {
+            name: "synthetic port".into(),
+            service_id: "ReaderService".into(),
+            method: "read".into(),
+            parameters: serde_json::from_value(serde_json::json!({ "port": "TEST" })).unwrap(),
+            expected_res_code: 0,
+        };
+        assert_eq!(
+            upsert_debug_case(active_root.path(), "reader.local", debug_case.clone()).unwrap(),
+            vec![debug_case]
+        );
+        assert!(upsert_debug_case(
+            active_root.path(),
+            "reader.local",
+            DebugCaseDefinition {
+                name: "invalid".into(),
+                service_id: "ReaderService".into(),
+                method: "read".into(),
+                parameters: serde_json::from_value(serde_json::json!({ "secret": "value" }))
+                    .unwrap(),
+                expected_res_code: 0,
+            }
+        )
+        .is_err());
+        assert!(
+            delete_debug_case(active_root.path(), "reader.local", "synthetic port")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn generated_typescript_uses_bridge_types_and_public_routes() {
+        let source = tempfile::tempdir().unwrap();
+        let component = source.path().join("reader.bat");
+        fs::write(&component, b"@echo off\r\n").unwrap();
+        let mut definition = fixture_definition(&component);
+        definition.services[0].methods[0].parameters.push(
+            serde_json::from_value(serde_json::json!({
+                "name": "$message",
+                "type": "string",
+                "len": 256
+            }))
+            .unwrap(),
+        );
+        let source = generate_typescript(&definition).unwrap();
+        assert!(source.contains("from '@bsoft/ssdev-web-bridge'"));
+        assert!(source.contains("\"port\": string"));
+        assert!(source.contains("\"message\": string"));
+        assert!(source.contains(
+            "invokePlugin<ReaderService1Read1Data>(\"ReaderService\", \"read\", parameters)"
+        ));
+        assert!(!source.contains("$message"));
     }
 }

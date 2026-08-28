@@ -41,6 +41,15 @@ type LocalMappingDefinition = {
   pluginId: string
   displayName: string
   services: ServiceDefinition[]
+  debugCases: DebugCaseDefinition[]
+}
+
+type DebugCaseDefinition = {
+  name: string
+  serviceId: string
+  method: string
+  parameters: Record<string, unknown>
+  expectedResCode: number
 }
 
 type MappingInventory = {
@@ -66,6 +75,16 @@ type DebugResult = {
   }
 }
 
+type DebugCaseRunResult = {
+  name: string
+  serviceId: string
+  method: string
+  expectedResCode: number
+  actualResCode: number
+  elapsedMs: number
+  passed: boolean
+}
+
 const props = defineProps<{ disabled?: boolean }>()
 const emit = defineEmits<{ changed: [] }>()
 
@@ -76,6 +95,9 @@ const methodIndex = ref(0)
 const inspection = ref<NativeInspection | null>(null)
 const debugValues = ref<Record<string, string | boolean | number>>({})
 const debugResult = ref<DebugResult | null>(null)
+const debugCaseName = ref('')
+const expectedResCode = ref(0)
+const regressionResults = ref<DebugCaseRunResult[]>([])
 const busy = ref(false)
 const error = ref('')
 const notice = ref('')
@@ -83,6 +105,7 @@ const notice = ref('')
 const service = computed(() => draft.value.services[serviceIndex.value])
 const method = computed(() => service.value?.methods[methodIndex.value])
 const callableParameters = computed(() => (method.value?.parameters ?? []).filter((item): item is ParameterDefinition => typeof item !== 'string' && !item.name.startsWith('$')))
+const mappingIsInstalled = computed(() => inventory.value.mappings.some((item) => item.pluginId === draft.value.pluginId))
 
 function newMethod(name = ''): MethodDefinition {
   return { name, alias: '', timeout: 0, returnType: 'string', parameters: [], props: [] }
@@ -104,7 +127,7 @@ function newService(): ServiceDefinition {
 }
 
 function newMapping(): LocalMappingDefinition {
-  return { schemaVersion: 1, pluginId: '', displayName: '', services: [newService()] }
+  return { schemaVersion: 1, pluginId: '', displayName: '', services: [newService()], debugCases: [] }
 }
 
 function clone<T>(value: T): T {
@@ -113,6 +136,7 @@ function clone<T>(value: T): T {
 
 function normalizeMapping(mapping: LocalMappingDefinition): LocalMappingDefinition {
   const normalized = clone(mapping)
+  normalized.debugCases ||= []
   for (const item of normalized.services) {
     item.mainType = (item.mainType || 'dll').toLowerCase() as MainType
     item.charset ||= 'utf8'
@@ -179,6 +203,9 @@ function resetEditor() {
   inspection.value = null
   debugResult.value = null
   debugValues.value = {}
+  debugCaseName.value = ''
+  expectedResCode.value = 0
+  regressionResults.value = []
   error.value = ''
   notice.value = ''
 }
@@ -190,6 +217,9 @@ function editMapping(mapping: LocalMappingDefinition) {
   inspection.value = null
   debugResult.value = null
   debugValues.value = {}
+  debugCaseName.value = ''
+  expectedResCode.value = 0
+  regressionResults.value = []
   error.value = ''
   notice.value = `正在编辑 ${mapping.displayName || mapping.pluginId}`
 }
@@ -200,6 +230,9 @@ function selectService(index: number) {
   inspection.value = null
   debugResult.value = null
   debugValues.value = {}
+  debugCaseName.value = ''
+  expectedResCode.value = 0
+  regressionResults.value = []
 }
 
 function addService() {
@@ -326,6 +359,18 @@ async function exportMapping(pluginId: string) {
   })
 }
 
+async function exportTypescript(pluginId: string) {
+  const destination = await save({
+    defaultPath: `${pluginId}.client.ts`,
+    filters: [{ name: 'TypeScript 客户端', extensions: ['ts'] }],
+  })
+  if (typeof destination !== 'string') return
+  await run(async () => {
+    await invoke('export_local_mapping_typescript', { pluginId, destination })
+    notice.value = `类型化调用代码已导出：${destination}`
+  })
+}
+
 async function importMapping() {
   const source = await open({
     multiple: false,
@@ -360,6 +405,10 @@ function convertedValue(parameter: ParameterDefinition): unknown {
   return raw === undefined ? '' : String(raw)
 }
 
+function currentDebugParameters(): Record<string, unknown> {
+  return Object.fromEntries(callableParameters.value.map((item) => [item.name, convertedValue(item)]))
+}
+
 async function invokeDebug() {
   if (!service.value || !method.value) return
   const serviceId = service.value.serviceId.trim()
@@ -369,11 +418,84 @@ async function invokeDebug() {
     return
   }
   await run(async () => {
-    const parameters = Object.fromEntries(callableParameters.value.map((item) => [item.name, convertedValue(item)]))
     debugResult.value = await invoke<DebugResult>('debug_plugin_invoke', {
-      request: { serviceId, method: methodName, parameters },
+      request: { serviceId, method: methodName, parameters: currentDebugParameters() },
     })
+    expectedResCode.value = debugResult.value.response.ResCode
     notice.value = `调用完成，用时 ${debugResult.value.elapsedMs} ms。`
+  })
+}
+
+async function saveDebugCase() {
+  if (!service.value || !method.value || !mappingIsInstalled.value) {
+    error.value = '请先保存并热加载映射，再保存调试用例。'
+    return
+  }
+  const name = debugCaseName.value.trim()
+  if (!name) {
+    error.value = '请输入调试用例名称。'
+    return
+  }
+  const methodName = (method.value.alias || method.value.name).trim()
+  await run(async () => {
+    const debugCases = await invoke<DebugCaseDefinition[]>('save_local_mapping_debug_case', {
+      pluginId: draft.value.pluginId,
+      debugCase: {
+        name,
+        serviceId: service.value?.serviceId.trim(),
+        method: methodName,
+        parameters: currentDebugParameters(),
+        expectedResCode: Number(expectedResCode.value),
+      },
+    })
+    draft.value.debugCases = debugCases
+    const stored = inventory.value.mappings.find((item) => item.pluginId === draft.value.pluginId)
+    if (stored) stored.debugCases = clone(debugCases)
+    regressionResults.value = []
+    notice.value = `已保存合成调试用例「${name}」。`
+  })
+}
+
+function loadDebugCase(debugCase: DebugCaseDefinition) {
+  const targetServiceIndex = draft.value.services.findIndex((item) => item.serviceId === debugCase.serviceId)
+  if (targetServiceIndex < 0) return
+  serviceIndex.value = targetServiceIndex
+  const targetService = draft.value.services[targetServiceIndex]
+  const targetMethodIndex = targetService.methods.findIndex((item) => item.name === debugCase.method || item.alias === debugCase.method)
+  if (targetMethodIndex < 0) return
+  methodIndex.value = targetMethodIndex
+  debugValues.value = Object.fromEntries(Object.entries(debugCase.parameters).map(([name, value]) => {
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return [name, value]
+    return [name, JSON.stringify(value)]
+  }))
+  debugCaseName.value = debugCase.name
+  expectedResCode.value = debugCase.expectedResCode
+  debugResult.value = null
+  notice.value = `已载入调试用例「${debugCase.name}」。`
+}
+
+async function deleteDebugCase(caseName: string) {
+  await run(async () => {
+    const debugCases = await invoke<DebugCaseDefinition[]>('delete_local_mapping_debug_case', {
+      pluginId: draft.value.pluginId,
+      caseName,
+    })
+    draft.value.debugCases = debugCases
+    const stored = inventory.value.mappings.find((item) => item.pluginId === draft.value.pluginId)
+    if (stored) stored.debugCases = clone(debugCases)
+    regressionResults.value = []
+    notice.value = `已删除调试用例「${caseName}」。`
+  })
+}
+
+async function runDebugCases() {
+  if (!mappingIsInstalled.value || draft.value.debugCases.length === 0) return
+  await run(async () => {
+    regressionResults.value = await invoke<DebugCaseRunResult[]>('run_local_mapping_debug_cases', {
+      pluginId: draft.value.pluginId,
+    })
+    const passed = regressionResults.value.filter((item) => item.passed).length
+    notice.value = `回归执行完成：${passed}/${regressionResults.value.length} 通过。`
   })
 }
 </script>
@@ -392,7 +514,7 @@ async function invokeDebug() {
             <strong>{{ mapping.displayName || mapping.pluginId }}</strong>
             <small>{{ mapping.pluginId }} · {{ mapping.services.length }} 个服务</small>
           </button>
-          <span><button type="button" :disabled="busy || disabled" @click="exportMapping(mapping.pluginId)">导出</button><button class="danger-link" type="button" :disabled="busy || disabled" @click="deleteMapping(mapping.pluginId)">删除</button></span>
+          <span><button type="button" :disabled="busy || disabled" @click="exportTypescript(mapping.pluginId)">TS</button><button type="button" :disabled="busy || disabled" @click="exportMapping(mapping.pluginId)">导出</button><button class="danger-link" type="button" :disabled="busy || disabled" @click="deleteMapping(mapping.pluginId)">删除</button></span>
         </article>
         <p v-if="inventory.mappings.length === 0" class="empty">尚未创建本地映射。</p>
       </div>
@@ -483,7 +605,7 @@ async function invokeDebug() {
 
         <fieldset v-if="method" class="debug-panel">
           <legend>现场调试</legend>
-          <p>请先保存映射，再在这里输入测试参数。以 <code>$</code> 开头的输出参数无需输入。</p>
+          <p>请先保存映射，再输入测试参数。以 <code>$</code> 开头的输出参数无需输入；保存用例时只使用合成数据，不要录入患者、账号或生产密钥。</p>
           <div class="debug-inputs">
             <label v-for="parameter in callableParameters" :key="parameter.name"><span>{{ parameter.name || '未命名参数' }} <small>{{ parameter.type }}</small></span><input v-model="debugValues[parameter.name]" :type="debugInputType(parameter.type)" /></label>
             <p v-if="callableParameters.length === 0">此方法没有输入参数。</p>
@@ -492,6 +614,30 @@ async function invokeDebug() {
           <div v-if="debugResult" class="debug-result" :class="{ failed: debugResult.response.ResCode !== 0 }">
             <strong>ResCode: {{ debugResult.response.ResCode }}</strong><small>{{ debugResult.elapsedMs }} ms</small>
             <pre>{{ JSON.stringify(debugResult.response.ResData, null, 2) }}</pre>
+          </div>
+          <div class="debug-case-editor">
+            <label><span>用例名称</span><input v-model.trim="debugCaseName" maxlength="128" placeholder="例如：模拟设备正常返回" /></label>
+            <label><span>期望 ResCode</span><input v-model.number="expectedResCode" type="number" /></label>
+            <button type="button" :disabled="busy || disabled || !mappingIsInstalled" @click="saveDebugCase">保存为回归用例</button>
+          </div>
+          <div class="debug-case-list">
+            <div class="debug-case-heading">
+              <strong>已保存回归用例（{{ draft.debugCases.length }}/32）</strong>
+              <button type="button" :disabled="busy || disabled || draft.debugCases.length === 0" @click="runDebugCases">顺序运行全部</button>
+            </div>
+            <article v-for="item in draft.debugCases" :key="item.name">
+              <button type="button" :disabled="busy || disabled" @click="loadDebugCase(item)">
+                <strong>{{ item.name }}</strong><small>{{ item.serviceId }} / {{ item.method }} · 期望 {{ item.expectedResCode }}</small>
+              </button>
+              <button class="danger-link" type="button" :disabled="busy || disabled" @click="deleteDebugCase(item.name)">删除</button>
+            </article>
+            <p v-if="draft.debugCases.length === 0" class="empty">尚未保存合成回归用例。</p>
+          </div>
+          <div v-if="regressionResults.length" class="regression-results">
+            <div v-for="item in regressionResults" :key="item.name" :class="{ failed: !item.passed }">
+              <strong>{{ item.passed ? '通过' : '失败' }} · {{ item.name }}</strong>
+              <small>{{ item.serviceId }} / {{ item.method }} · {{ item.actualResCode }} / {{ item.expectedResCode }} · {{ item.elapsedMs }} ms</small>
+            </div>
           </div>
         </fieldset>
 
@@ -563,6 +709,16 @@ legend { padding: 0 7px; color: #355746; font-size: 13px; font-weight: 800; }
 .debug-result { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-top: 12px; padding: 12px; border-radius: 9px; background: #e1efe5; }
 .debug-result.failed { background: #f8e1dc; color: #8b2e22; }
 .debug-result pre { grid-column: 1 / -1; max-height: 230px; margin: 0; padding: 10px; overflow: auto; border-radius: 7px; background: rgba(255,255,255,.7); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+.debug-case-editor { display: grid; grid-template-columns: 1fr 150px auto; gap: 9px; align-items: end; margin-top: 14px; padding-top: 14px; border-top: 1px solid #d1d9d2; }
+.debug-case-list { display: grid; gap: 7px; margin-top: 16px; }
+.debug-case-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #355746; font-size: 12px; }
+.debug-case-list article { display: grid; grid-template-columns: 1fr auto; gap: 7px; }
+.debug-case-list article > button:first-child { display: grid; gap: 3px; text-align: left; }
+.debug-case-list article small { color: #718078; }
+.regression-results { display: grid; gap: 6px; margin-top: 12px; }
+.regression-results div { display: flex; justify-content: space-between; gap: 10px; padding: 9px 11px; border-radius: 8px; background: #e1efe5; }
+.regression-results div.failed { background: #f8e1dc; color: #8b2e22; }
+.regression-results small { text-align: right; }
 .editor-actions { display: flex; gap: 9px; }
 .editor-actions .primary { border-color: #173e2d; background: #173e2d; color: #fff; }
 .mapping-notice, .mapping-error { margin: 0; padding: 12px; border-radius: 9px; }
@@ -571,5 +727,7 @@ legend { padding: 0 7px; color: #355746; font-size: 13px; font-weight: 800; }
 @media (max-width: 1100px) {
   .mapping-studio { grid-template-columns: 1fr; }
   .field-grid.four { grid-template-columns: repeat(2, 1fr); }
+  .debug-case-editor { grid-template-columns: 1fr 150px; }
+  .debug-case-editor button { grid-column: 1 / -1; }
 }
 </style>

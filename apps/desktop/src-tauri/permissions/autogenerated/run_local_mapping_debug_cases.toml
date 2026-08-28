@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-run-local-mapping-debug-cases"
+description = "Enables the run_local_mapping_debug_cases command without any pre-configured scope."
+commands.allow = ["run_local_mapping_debug_cases"]
+
+[[permission]]
+identifier = "deny-run-local-mapping-debug-cases"
+description = "Denies the run_local_mapping_debug_cases command without any pre-configured scope."
+commands.deny = ["run_local_mapping_debug_cases"]

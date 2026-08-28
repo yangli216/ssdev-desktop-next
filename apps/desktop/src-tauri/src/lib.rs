@@ -881,6 +881,18 @@ struct PluginDebugResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct DebugCaseRunResult {
+    name: String,
+    service_id: String,
+    method: String,
+    expected_res_code: i32,
+    actual_res_code: i32,
+    elapsed_ms: u128,
+    passed: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PluginUpdateCheckResult {
     catalog_issued_at: u64,
     catalog_expires_at: u64,
@@ -1410,6 +1422,23 @@ async fn export_local_mapping(
 }
 
 #[tauri::command]
+async fn export_local_mapping_typescript(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    plugin_id: String,
+    destination: PathBuf,
+) -> Result<(), String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    let root = state.local_mapping_root.clone();
+    tokio::task::spawn_blocking(move || {
+        local_mappings::export_typescript(&root, &plugin_id, &destination)
+    })
+    .await
+    .map_err(|_| "TypeScript 导出任务异常终止".to_owned())?
+}
+
+#[tauri::command]
 async fn import_local_mapping(
     caller: WebviewWindow,
     state: State<'_, BridgeState>,
@@ -1584,6 +1613,87 @@ async fn debug_plugin_invoke(
         elapsed_ms: started.elapsed().as_millis(),
         response,
     })
+}
+
+#[tauri::command]
+async fn save_local_mapping_debug_case(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    plugin_id: String,
+    debug_case: local_mappings::DebugCaseDefinition,
+) -> Result<Vec<local_mappings::DebugCaseDefinition>, String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    let root = state.local_mapping_root.clone();
+    tokio::task::spawn_blocking(move || {
+        local_mappings::upsert_debug_case(&root, &plugin_id, debug_case)
+    })
+    .await
+    .map_err(|_| "调试用例保存任务异常终止".to_owned())?
+}
+
+#[tauri::command]
+async fn delete_local_mapping_debug_case(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    plugin_id: String,
+    case_name: String,
+) -> Result<Vec<local_mappings::DebugCaseDefinition>, String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    let root = state.local_mapping_root.clone();
+    tokio::task::spawn_blocking(move || {
+        local_mappings::delete_debug_case(&root, &plugin_id, &case_name)
+    })
+    .await
+    .map_err(|_| "调试用例删除任务异常终止".to_owned())?
+}
+
+#[tauri::command]
+async fn run_local_mapping_debug_cases(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    plugin_id: String,
+) -> Result<Vec<DebugCaseRunResult>, String> {
+    desktop::require_control(&caller)?;
+    let cases = {
+        let _install = state.install_lock.lock().await;
+        let root = state.local_mapping_root.clone();
+        let plugin_id = plugin_id.clone();
+        tokio::task::spawn_blocking(move || local_mappings::load_debug_cases(&root, &plugin_id))
+            .await
+            .map_err(|_| "调试用例读取任务异常终止".to_owned())??
+    };
+    let mut results = Vec::with_capacity(cases.len());
+    for debug_case in cases {
+        let started = std::time::Instant::now();
+        let response = state
+            .controller
+            .invoke(InvokeRequest {
+                service_id: debug_case.service_id.clone(),
+                method: debug_case.method.clone(),
+                parameters: debug_case.parameters,
+            })
+            .await;
+        results.push(DebugCaseRunResult {
+            name: debug_case.name,
+            service_id: debug_case.service_id,
+            method: debug_case.method,
+            expected_res_code: debug_case.expected_res_code,
+            actual_res_code: response.res_code,
+            elapsed_ms: started.elapsed().as_millis(),
+            passed: response.res_code == debug_case.expected_res_code,
+        });
+    }
+    let passed = results.iter().filter(|result| result.passed).count();
+    tracing::info!(
+        event_code = "local-mapping-regression-completed",
+        plugin_id,
+        case_count = results.len(),
+        passed_count = passed,
+        "local mapping synthetic regression completed"
+    );
+    Ok(results)
 }
 
 fn service_inventory_item(service: ServiceDefinition) -> ServiceInventoryItem {
@@ -2013,9 +2123,13 @@ pub fn run() {
             local_mapping_inventory,
             save_local_mapping,
             export_local_mapping,
+            export_local_mapping_typescript,
             import_local_mapping,
             delete_local_mapping,
             debug_plugin_invoke,
+            save_local_mapping_debug_case,
+            delete_local_mapping_debug_case,
+            run_local_mapping_debug_cases,
             plugin_invoke,
             plugin_invoke_tracked,
             plugin_invocation_status,
