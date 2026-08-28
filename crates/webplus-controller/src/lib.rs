@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -240,6 +240,29 @@ impl PluginController {
 
     pub async fn service_count(&self) -> usize {
         self.routes.read().await.len()
+    }
+
+    pub async fn active_manifests(&self) -> Result<Vec<PluginManifest>, ControllerError> {
+        let routes = self.routes.read().await;
+        let mut manifests = BTreeMap::<String, Arc<PluginManifest>>::new();
+        for route in routes.values() {
+            let manifest = route.manifest.as_ref().ok_or_else(|| {
+                ControllerError::MissingActiveManifest(route.descriptor.plugin_id.clone())
+            })?;
+            if let Some(existing) = manifests.get(&manifest.plugin_id) {
+                if existing.as_ref() != manifest.as_ref() {
+                    return Err(ControllerError::InconsistentActiveManifest(
+                        manifest.plugin_id.clone(),
+                    ));
+                }
+            } else {
+                manifests.insert(manifest.plugin_id.clone(), Arc::clone(manifest));
+            }
+        }
+        Ok(manifests
+            .into_values()
+            .map(|manifest| manifest.as_ref().clone())
+            .collect())
     }
 
     pub async fn manifests_match_active_routes(
@@ -1346,6 +1369,10 @@ pub enum ControllerError {
     EmptyPluginId,
     #[error("service [{0}] is already routed to a different plugin")]
     DuplicateService(String),
+    #[error("active routes for plugin [{0}] do not share one manifest snapshot")]
+    InconsistentActiveManifest(String),
+    #[error("active routes for plugin [{0}] do not retain a manifest snapshot")]
+    MissingActiveManifest(String),
     #[error("service [{0}] is not active for plugin host preflight")]
     PreflightRouteMismatch(String),
     #[error("plugin host candidate preflight is unavailable during reload or shutdown")]
@@ -1403,6 +1430,8 @@ impl ControllerError {
             Self::EmptyServiceId => "empty-service-id",
             Self::EmptyPluginId => "empty-plugin-id",
             Self::DuplicateService(_) => "duplicate-service",
+            Self::InconsistentActiveManifest(_) => "active-manifest-inconsistent",
+            Self::MissingActiveManifest(_) => "active-manifest-missing",
             Self::PreflightRouteMismatch(_) => "preflight-route-mismatch",
             Self::PreflightUnavailable => "preflight-unavailable",
             Self::MaintenanceUnavailable => "maintenance-unavailable",
@@ -1897,6 +1926,10 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(matches!(
+            controller.active_manifests().await,
+            Err(ControllerError::MissingActiveManifest(plugin_id)) if plugin_id == "plugin-a"
+        ));
         let error = controller
             .register_service(
                 "reader",
@@ -1941,6 +1974,10 @@ mod tests {
             .manifests_match_active_routes(std::slice::from_ref(&manifest))
             .await
             .unwrap());
+        assert_eq!(
+            controller.active_manifests().await.unwrap(),
+            vec![manifest.clone()]
+        );
         assert_eq!(controller.service_count().await, 1);
 
         let mut contract_drift = manifest.clone();
@@ -1955,6 +1992,10 @@ mod tests {
             .manifests_match_active_routes(std::slice::from_ref(&contract_drift))
             .await
             .unwrap());
+        assert_eq!(
+            controller.active_manifests().await.unwrap(),
+            vec![contract_drift.clone()]
+        );
 
         let mut version_drift = contract_drift.clone();
         version_drift.metadata.as_mut().unwrap().version = "1.0.1".parse().unwrap();
@@ -1963,6 +2004,27 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(controller.service_count().await, 1);
+
+        let split_controller = PluginController::new(config()).unwrap();
+        let mut two_services = manifest.clone();
+        let mut second_service = two_services.services[0].clone();
+        second_service.service_id = "printer".into();
+        two_services.services.push(second_service);
+        split_controller
+            .replace_manifests(std::slice::from_ref(&two_services))
+            .await
+            .unwrap();
+        let mut partial_replacement = contract_drift;
+        partial_replacement.services.truncate(1);
+        split_controller
+            .register_manifest(&partial_replacement)
+            .await
+            .unwrap();
+        assert!(matches!(
+            split_controller.active_manifests().await,
+            Err(ControllerError::InconsistentActiveManifest(plugin_id))
+                if plugin_id == "reader-plugin"
+        ));
     }
 
     #[test]

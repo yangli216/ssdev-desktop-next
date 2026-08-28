@@ -1635,6 +1635,18 @@ fn validate_signed_plugin_activation_routes(
     manifests: &[PluginManifest],
     local_mapping_root: &std::path::Path,
 ) -> Result<(), String> {
+    let config = desktop_state.config.snapshot();
+    let coverage =
+        signed_plugin_route_policy_coverage(desktop_state, &config, manifests, local_mapping_root)?;
+    ensure_signed_plugin_route_coverage(coverage)
+}
+
+fn signed_plugin_route_policy_coverage(
+    desktop_state: &desktop::DesktopState,
+    config: &ssdev_config::DesktopConfig,
+    manifests: &[PluginManifest],
+    local_mapping_root: &std::path::Path,
+) -> Result<ssdev_origin_policy::InvocationPolicyCoverage, String> {
     PluginController::validate_manifests(manifests).map_err(|error| error.to_string())?;
     // Local mappings must remain usable while an implementation engineer is still
     // defining its policy. Project delivery and deployment checks gate the combined
@@ -1644,9 +1656,7 @@ fn validate_signed_plugin_activation_routes(
         .filter(|manifest| !is_local_manifest(manifest, local_mapping_root))
         .cloned()
         .collect::<Vec<_>>();
-    let config = desktop_state.config.snapshot();
-    let coverage = desktop_state.plugin_route_policy_coverage(&config, &signed_manifests)?;
-    ensure_signed_plugin_route_coverage(coverage)
+    desktop_state.plugin_route_policy_coverage(config, &signed_manifests)
 }
 
 fn ensure_signed_plugin_route_coverage(
@@ -1666,6 +1676,57 @@ fn ensure_signed_plugin_route_coverage(
         "候选签名插件有 {} 条调用路由未被当前业务来源策略授权；请先发布并配置匹配的来源策略",
         coverage.uncovered_route_count
     ))
+}
+
+fn ensure_config_signed_plugin_route_coverage(
+    coverage: ssdev_origin_policy::InvocationPolicyCoverage,
+) -> Result<(), String> {
+    if coverage.uncovered_route_count == 0 {
+        return Ok(());
+    }
+    tracing::warn!(
+        event_code = "desktop-config-policy-blocked",
+        error_code = "config-plugin-route-policy-uncovered",
+        route_count = coverage.route_count,
+        uncovered_routes = coverage.uncovered_route_count,
+        "desktop configuration replacement was blocked by incomplete plugin route authorization"
+    );
+    Err(format!(
+        "候选配置会使 {} 条现有签名插件调用路由失去全部业务来源授权；请改用完整项目部署包，或先保留匹配的业务来源",
+        coverage.uncovered_route_count
+    ))
+}
+
+pub(crate) async fn validate_config_signed_plugin_route_change(
+    desktop_state: &desktop::DesktopState,
+    bridge_state: &BridgeState,
+    candidate: &ssdev_config::DesktopConfig,
+) -> Result<(), String> {
+    desktop_state.authorize_config(candidate)?;
+    let current_origins = desktop_state
+        .config
+        .snapshot()
+        .business_origins()
+        .map_err(|error| error.to_string())?;
+    let candidate_origins = candidate
+        .business_origins()
+        .map_err(|error| error.to_string())?;
+    if current_origins == candidate_origins {
+        return Ok(());
+    }
+
+    let manifests = bridge_state
+        .controller
+        .active_manifests()
+        .await
+        .map_err(|error| format!("无法核对当前插件运行状态 ({})", error.diagnostic_code()))?;
+    let coverage = signed_plugin_route_policy_coverage(
+        desktop_state,
+        candidate,
+        &manifests,
+        &bridge_state.local_mapping_root,
+    )?;
+    ensure_config_signed_plugin_route_coverage(coverage)
 }
 
 fn ensure_project_export_runtime_matches(
@@ -4708,16 +4769,17 @@ fn select_runtime_path(
 mod tests {
     use super::{
         classify_local_plugin_install_action, classify_project_component_action,
-        collect_plugin_updates, desktop, ensure_local_plugin_install_plan_matches,
-        ensure_plugin_update_plan_matches, ensure_plugin_version_change_allowed,
-        ensure_project_export_active_manifests_match, ensure_project_export_runtime_matches,
-        ensure_signed_plugin_compatible, ensure_signed_plugin_route_coverage,
-        ensure_upgrade_allowed, inspect_all_plugins, is_lowercase_sha256,
-        is_plugin_update_available, legacy_config_candidates, local_plugin_install_plan_id,
-        open_project_bundle_for_mode, persist_startup_failure_document,
-        plugin_update_installed_state_digest, plugin_update_plan_id, project_bundle,
-        project_import_plan_id, project_import_state_digest, resolve_startup_failure_document,
-        select_runtime_path, service_inventory_item, startup_failure_message,
+        collect_plugin_updates, desktop, ensure_config_signed_plugin_route_coverage,
+        ensure_local_plugin_install_plan_matches, ensure_plugin_update_plan_matches,
+        ensure_plugin_version_change_allowed, ensure_project_export_active_manifests_match,
+        ensure_project_export_runtime_matches, ensure_signed_plugin_compatible,
+        ensure_signed_plugin_route_coverage, ensure_upgrade_allowed, inspect_all_plugins,
+        is_lowercase_sha256, is_plugin_update_available, legacy_config_candidates,
+        local_plugin_install_plan_id, open_project_bundle_for_mode,
+        persist_startup_failure_document, plugin_update_installed_state_digest,
+        plugin_update_plan_id, project_bundle, project_import_plan_id, project_import_state_digest,
+        resolve_startup_failure_document, select_runtime_path, service_inventory_item,
+        signed_plugin_route_policy_coverage, startup_failure_message,
         validate_signed_plugin_activation_routes, CatalogWithdrawalReason, FrontendRuntime,
         InspectedPlugins, PluginInstallBlocker, PluginInstallSource, PluginPackagePreview,
         PluginPackageServicePreview, ProjectBundlePreview, StartupFailureDocument, StartupStage,
@@ -4953,6 +5015,9 @@ mod tests {
                 "businessGrants": [{
                     "origin": "https://business.example.test",
                     "services": [{"serviceId": "authorized", "methods": ["invoke"]}]
+                }, {
+                    "origin": "https://replacement.example.test",
+                    "services": [{"serviceId": "replacement-only", "methods": ["invoke"]}]
                 }]
             }))
             .unwrap(),
@@ -5002,6 +5067,27 @@ mod tests {
             &local_mapping_root
         )
         .is_ok());
+
+        let replacement = DesktopConfig {
+            website: Some("https://replacement.example.test/app".into()),
+            ..DesktopConfig::default()
+        };
+        let coverage = signed_plugin_route_policy_coverage(
+            &desktop_state,
+            &replacement,
+            &[create_manifest(
+                "candidate-plugin",
+                root.path().join("plugins/candidate-plugin"),
+                "authorized",
+            )],
+            &local_mapping_root,
+        )
+        .unwrap();
+        assert_eq!(coverage.uncovered_route_count, 1);
+        let error = ensure_config_signed_plugin_route_coverage(coverage).unwrap_err();
+        assert!(error.contains("1 条现有签名插件调用路由"));
+        assert!(!error.contains("authorized"));
+        assert!(!error.contains("replacement.example.test"));
     }
 
     #[test]

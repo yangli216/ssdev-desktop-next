@@ -300,6 +300,7 @@ pub(crate) async fn save_desktop_config(
 ) -> Result<(), String> {
     require_control(&caller)?;
     let _install = bridge_state.install_lock.lock().await;
+    crate::validate_config_signed_plugin_route_change(&state, &bridge_state, &config).await?;
     replace_desktop_config(&app, &state, config)
 }
 
@@ -313,7 +314,7 @@ pub(crate) async fn inspect_desktop_config_import(
     require_control(&caller)?;
     let _install = bridge_state.install_lock.lock().await;
     let candidate = ssdev_config::load_config_file(&source).map_err(|error| error.to_string())?;
-    state.authorize_config(&candidate)?;
+    crate::validate_config_signed_plugin_route_change(&state, &bridge_state, &candidate).await?;
     let preview = build_config_import_preview(&state.config.snapshot(), &candidate)?;
     tracing::info!(
         event_code = "desktop-config-import-inspected",
@@ -387,7 +388,7 @@ pub(crate) async fn import_desktop_config(
         return Err("配置导入计划标识无效，请重新预检".into());
     }
     let candidate = ssdev_config::load_config_file(&source).map_err(|error| error.to_string())?;
-    state.authorize_config(&candidate)?;
+    crate::validate_config_signed_plugin_route_change(&state, &bridge_state, &candidate).await?;
     let preview = build_config_import_preview(&state.config.snapshot(), &candidate)?;
     if preview.plan_id != expected_plan_id {
         return Err("导入文件或当前配置已在预检后变化，请重新预检后确认导入".into());
