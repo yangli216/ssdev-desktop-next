@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
+import { execFile } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import test from 'node:test'
 
 import {
@@ -9,6 +12,7 @@ import {
   CURRENT_BRIDGE_PROTOCOL_VERSION,
   CURRENT_PROTOCOL_VERSION,
   DesktopBridgeUnavailableError,
+  InvalidDesktopDeclarationError,
   PLUGIN_INVOCATION_CONTROL_CODES,
   UnsupportedDesktopProtocolError,
   TRACKED_INVOCATION_METHODS,
@@ -28,6 +32,10 @@ import {
 const contract = JSON.parse(
   await readFile(new URL('../bridge-contract.json', import.meta.url), 'utf8'),
 )
+const packageManifest = JSON.parse(
+  await readFile(new URL('../package.json', import.meta.url), 'utf8'),
+)
+const execFileAsync = promisify(execFile)
 
 function clearBridge() {
   delete globalThis.ssdevDesktop
@@ -223,4 +231,113 @@ test('connects only to an explicitly supported protocol', async () => {
     connectDesktop({ supportedProtocolVersions: [2] }),
     UnsupportedDesktopProtocolError,
   )
+})
+
+test('rejects malformed desktop declarations with stable reasons', async () => {
+  const bridge = {
+    invokePlugin: async () => ({ ResCode: 0, ResData: null }),
+    getSystemInfo: async () => null,
+    captureWindow: async () => '',
+    openExternal: async () => {},
+    openWindow: async () => 'business-2',
+    showFloating: async () => 'floating-3',
+    closeFloating: async () => {},
+  }
+  globalThis.ssdevDesktop = bridge
+  await assert.rejects(
+    connectDesktop(),
+    (error) => error instanceof InvalidDesktopDeclarationError
+      && error.reason === 'declaration-not-object',
+  )
+
+  bridge.getSystemInfo = async () => ({
+    os: 'windows',
+    architecture: 'x86_64',
+    appVersion: '1.2.3',
+    protocolVersion: Number.NaN,
+  })
+  await assert.rejects(
+    connectDesktop(),
+    (error) => error instanceof InvalidDesktopDeclarationError
+      && error.reason === 'invalid-protocol-version',
+  )
+
+  bridge.getSystemInfo = async () => ({
+    os: 'windows',
+    architecture: 'x86_64',
+    appVersion: '1.2.3',
+    protocolVersion: 1,
+    capabilities: {
+      schemaVersion: 1,
+      trackedInvocations: {
+        supported: true,
+        available: true,
+        accepting: true,
+        errorCode: null,
+      },
+    },
+  })
+  await assert.rejects(
+    connectDesktop(),
+    (error) => error instanceof InvalidDesktopDeclarationError
+      && error.reason === 'invalid-tracked-invocations',
+  )
+})
+
+test('preserves unknown future capability schemas without claiming tracked support', async () => {
+  globalThis.ssdevDesktop = {
+    invokePlugin: async () => ({ ResCode: 0, ResData: null }),
+    invokePluginTracked: async () => ({ state: 'unknown' }),
+    getPluginInvocation: async () => ({ state: 'unknown' }),
+    getSystemInfo: async () => ({
+      os: 'windows',
+      architecture: 'x86_64',
+      appVersion: '2.0.0',
+      protocolVersion: 1,
+      capabilities: {
+        schemaVersion: 2,
+        futureCapability: { enabled: true },
+      },
+    }),
+    captureWindow: async () => '',
+    openExternal: async () => {},
+    openWindow: async () => 'business-2',
+    showFloating: async () => 'floating-3',
+    closeFloating: async () => {},
+  }
+
+  const connection = await connectDesktop()
+  assert.equal(connection.system.capabilities.schemaVersion, 2)
+  assert.deepEqual(connection.system.capabilities.futureCapability, { enabled: true })
+  assert.equal(getTrackedInvocationCapabilities(connection.system), null)
+  assert.equal(supportsTrackedPluginInvocations(connection.bridge, connection.system), false)
+  assert.equal(Object.isFrozen(connection.system.capabilities), true)
+})
+
+test('packs only the installable bridge contract and compiled SDK', async () => {
+  const packageRoot = fileURLToPath(new URL('..', import.meta.url))
+  const npmCli = process.env.npm_execpath
+  assert.equal(typeof npmCli, 'string')
+  const { stdout } = await execFileAsync(
+    process.execPath,
+    [npmCli, 'pack', '--dry-run', '--json'],
+    { cwd: packageRoot, maxBuffer: 1024 * 1024 },
+  )
+  const [packed] = JSON.parse(stdout)
+  assert.equal(packed.name, packageManifest.name)
+  assert.equal(packed.version, packageManifest.version)
+  assert.equal(packed.entryCount, 6)
+  assert.equal(packed.unpackedSize < 128 * 1024, true)
+  assert.deepEqual(
+    packed.files.map((file) => file.path).sort(),
+    [
+      'README.md',
+      'bridge-contract.json',
+      'dist/index.d.ts',
+      'dist/index.d.ts.map',
+      'dist/index.js',
+      'package.json',
+    ],
+  )
+  assert.deepEqual(packed.bundled, [])
 })

@@ -11,7 +11,9 @@ const result = await bridge.invokePlugin('card.reader', 'readCard', {
 })
 ```
 
-`connectDesktop()` 会先读取最小系统声明并检查协议版本。页面不在授权桌面窗口中时抛出 `DesktopBridgeUnavailableError`；协议不兼容时抛出 `UnsupportedDesktopProtocolError`，业务代码不应静默切换到 HTTP。
+`connectDesktop()` 会先读取并运行时校验最小系统声明，再检查协议版本。页面不在授权桌面窗口中时抛出 `DesktopBridgeUnavailableError`；系统声明损坏或与当前能力 schema 自相矛盾时抛出带稳定 `reason` 的 `InvalidDesktopDeclarationError`；协议不兼容时抛出 `UnsupportedDesktopProtocolError`。业务代码应显示客户端升级或修复提示，不要把这些错误静默切换到 HTTP。
+
+能力 schema 与桥接协议独立演进。SDK 对当前 schema 严格检查布尔状态、错误码和全部容量边界；遇到更高的未知 schema 时保留并冻结原声明，但 `getTrackedInvocationCapabilities()` 返回 `null`，不会仅因可选 JavaScript 方法存在就误报持久调用可用。升级 SDK 后才能使用新 schema 的能力。
 
 SDK 显式导出 `CURRENT_BRIDGE_PROTOCOL_VERSION`；旧名称 `CURRENT_PROTOCOL_VERSION` 仅作为源码兼容别名保留。该版本只治理注入业务页面的公开桥接，不与 controller/plugin-host 的内部命名管道协议绑定。
 
@@ -46,4 +48,4 @@ if (canRetryPluginInvocationWithBackoff(response)) {
 
 签名插件安装或热更新排空期间，只有发往目标插件的新请求返回 `{ ResCode: -32010, ResData: "native plugin controller is reloading; request was not executed" }`，其他插件继续服务；显式完整重新扫描时该错误可能覆盖全部插件。请求不会跨越一次路由/插件版本切换后再意外执行；业务页可以在维护结束后重新发起，但必须有退避上限，不能持续轮询压测客户端。
 
-发布到组织内部 npm 仓库前，将 `private` 改为 `false`，并由发布流水线执行 `npm test`、生成制品摘要和包签名。当前仓库保持私有，避免尚未完成生产版本治理时被误发布。
+尚未接入组织 npm 仓库时，可以在本目录执行 `npm test && npm pack`，把生成的 `.tgz` 作为有摘要的受控制品交给业务项目安装；回归会实际执行 `npm pack --dry-run`，固定包内只能包含 README、共享契约、编译后的 ESM/类型声明和 package manifest，不得夹带源码、测试或 `node_modules`。发布到组织内部 npm 仓库前再由正式发布变更把 `private` 改为 `false`，并生成制品摘要和组织签名。当前仓库保持私有，避免尚未完成版本治理时被误发布。

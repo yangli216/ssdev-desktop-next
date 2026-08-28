@@ -32,6 +32,8 @@ const system = await window.ssdevDesktop.getSystemInfo()
 
 这里的 `protocolVersion` 只表示业务 Web Bridge 契约版本，不是 controller 与 x86/x64 插件宿主之间的私有帧协议版本。业务 SDK 升级和内部宿主协议升级分别治理，不能用一个版本号同时代表两层边界。
 
+`connectDesktop()` 不把 TypeScript 类型当成运行时证明。它会限制并检查系统声明中的操作系统、架构、版本、协议号，以及当前能力 schema 的布尔状态、错误码和全部容量字段；损坏或自相矛盾的声明抛出带稳定 `reason` 的 `InvalidDesktopDeclarationError`，而不是在业务初始化后产生无上下文的 `TypeError`。能力 schema 高于 SDK 当前版本时仍允许基础桥接连接并保留原声明，但 `getTrackedInvocationCapabilities()` 返回 `null`，可选方法存在也不能启用持久调用；业务应提示升级 SDK，而不是降级到 HTTP。
+
 同一窄桥接对象还提供经过来源与参数校验的桌面能力：
 
 ```js
@@ -135,7 +137,7 @@ controller 对所有入口统一限制最多 8 个在途插件调用，不建立
 - Tauri 自身只为当前配置启用的精确业务来源注册七个窄应用命令；SSO 导航来源没有远程 ACL，业务页也拿不到控制台、插件安装、更新或诊断命令。
 - 本地控制台与截图遮罩只接受精确内置页面 URL，导航到其他页面会被阻止且高权限命令会二次拒绝。
 - 远程页面不获得 Shell、任意文件读写或通用 Tauri API 权限。
-- 类型化 SDK 不实现 localhost HTTP 回退；桌面环境或协议不可用时会抛出明确错误。
+- 类型化 SDK 不实现 localhost HTTP 回退；桌面环境、系统声明或协议不可用时会抛出可分类错误。未知未来能力 schema 只保留基础桥接，不会被猜测为当前能力可用。
 - `getSystemInfo()` 只返回操作系统类别、CPU 架构、客户端版本和桥接协议版本，不构建设备指纹。
 - 第三方 DLL/COM 仍只进入隔离的 x86/x64 插件宿主，不进入 Tauri 主进程。
 - 已接纳的插件调用不依赖页面等待者存活；页面离开不会中断或重放潜在非幂等的原生操作。

@@ -132,13 +132,22 @@ export interface DesktopCapabilities {
   trackedInvocations: TrackedInvocationCapabilities
 }
 
+export interface UnknownDesktopCapabilities {
+  schemaVersion: number
+  [capability: string]: unknown
+}
+
+export type DesktopCapabilitiesDeclaration =
+  | DesktopCapabilities
+  | UnknownDesktopCapabilities
+
 export interface SystemDeclaration {
   os: string
   architecture: string
   appVersion: string
   protocolVersion: number
   /** Absent on desktop clients released before explicit capability negotiation. */
-  capabilities?: DesktopCapabilities
+  capabilities?: DesktopCapabilitiesDeclaration
 }
 
 export interface SecondaryWindowRequest {
@@ -237,6 +246,25 @@ export class UnsupportedDesktopProtocolError extends Error {
   }
 }
 
+export type InvalidDesktopDeclarationReason =
+  | 'declaration-not-object'
+  | 'invalid-os'
+  | 'invalid-architecture'
+  | 'invalid-app-version'
+  | 'invalid-protocol-version'
+  | 'invalid-capabilities'
+  | 'invalid-tracked-invocations'
+
+export class InvalidDesktopDeclarationError extends Error {
+  override readonly name = 'InvalidDesktopDeclarationError'
+  readonly reason: InvalidDesktopDeclarationReason
+
+  constructor(reason: InvalidDesktopDeclarationReason) {
+    super(`SSDEV Desktop returned an invalid system declaration (${reason})`)
+    this.reason = reason
+  }
+}
+
 export class TrackedInvocationsUnavailableError extends Error {
   override readonly name = 'TrackedInvocationsUnavailableError'
   readonly errorCode: string | undefined
@@ -324,10 +352,9 @@ export function getTrackedInvocationCapabilities(
   system: SystemDeclaration,
 ): Readonly<TrackedInvocationCapabilities> | null {
   const capabilities = system.capabilities
-  if (capabilities?.schemaVersion !== CURRENT_DESKTOP_CAPABILITIES_SCHEMA_VERSION) {
-    return null
-  }
-  return capabilities.trackedInvocations
+  return isCurrentDesktopCapabilities(capabilities)
+    ? capabilities.trackedInvocations
+    : null
 }
 
 export function createPluginOperationId(): string {
@@ -338,29 +365,125 @@ export function createPluginOperationId(): string {
   return randomUUID.call(globalThis.crypto)
 }
 
+type UnknownRecord = Record<string, unknown>
+
+const TRACKED_INVOCATION_LIMIT_FIELDS = [
+  'maxRuntimeOperations',
+  'maxRetainedResponseBytes',
+  'runtimeResultRetentionSeconds',
+  'maxDurableOperations',
+  'maxDurableOperationsPerScope',
+  'completedRetentionSeconds',
+  'indeterminateRetentionSeconds',
+] as const satisfies readonly (keyof TrackedInvocationLimits)[]
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isBoundedIdentifier(value: unknown, maximumLength: number): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= maximumLength
+    && !value.includes('\0')
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+function isTrackedInvocationLimits(value: unknown): value is TrackedInvocationLimits {
+  if (!isRecord(value)) return false
+  return TRACKED_INVOCATION_LIMIT_FIELDS.every((field) => isNonNegativeSafeInteger(value[field]))
+}
+
+function isTrackedInvocationCapabilities(value: unknown): value is TrackedInvocationCapabilities {
+  if (!isRecord(value)) return false
+  if (typeof value.supported !== 'boolean'
+    || typeof value.available !== 'boolean'
+    || typeof value.accepting !== 'boolean') {
+    return false
+  }
+  if (value.available && !value.supported) return false
+  if (value.accepting && !value.available) return false
+  if (value.errorCode !== null && !isBoundedIdentifier(value.errorCode, 128)) return false
+  return isTrackedInvocationLimits(value.limits)
+}
+
+function isCurrentDesktopCapabilities(value: unknown): value is DesktopCapabilities {
+  return isRecord(value)
+    && value.schemaVersion === CURRENT_DESKTOP_CAPABILITIES_SCHEMA_VERSION
+    && isTrackedInvocationCapabilities(value.trackedInvocations)
+}
+
+function validateSystemDeclaration(value: unknown): SystemDeclaration {
+  if (!isRecord(value)) {
+    throw new InvalidDesktopDeclarationError('declaration-not-object')
+  }
+  if (!isBoundedIdentifier(value.os, 64)) {
+    throw new InvalidDesktopDeclarationError('invalid-os')
+  }
+  if (!isBoundedIdentifier(value.architecture, 64)) {
+    throw new InvalidDesktopDeclarationError('invalid-architecture')
+  }
+  if (!isBoundedIdentifier(value.appVersion, 128)) {
+    throw new InvalidDesktopDeclarationError('invalid-app-version')
+  }
+  if (!isNonNegativeSafeInteger(value.protocolVersion)
+    || value.protocolVersion === 0
+    || value.protocolVersion > 65_535) {
+    throw new InvalidDesktopDeclarationError('invalid-protocol-version')
+  }
+  if (value.capabilities === undefined) {
+    return value as unknown as SystemDeclaration
+  }
+  if (!isRecord(value.capabilities)
+    || !isNonNegativeSafeInteger(value.capabilities.schemaVersion)
+    || value.capabilities.schemaVersion === 0
+    || value.capabilities.schemaVersion > 65_535) {
+    throw new InvalidDesktopDeclarationError('invalid-capabilities')
+  }
+  if (value.capabilities.schemaVersion === CURRENT_DESKTOP_CAPABILITIES_SCHEMA_VERSION
+    && !isTrackedInvocationCapabilities(value.capabilities.trackedInvocations)) {
+    throw new InvalidDesktopDeclarationError('invalid-tracked-invocations')
+  }
+  return value as unknown as SystemDeclaration
+}
+
+function freezeSystemDeclaration(system: SystemDeclaration): Readonly<SystemDeclaration> {
+  const capabilities = system.capabilities
+  if (capabilities === undefined) {
+    return Object.freeze({ ...system })
+  }
+  if (!isCurrentDesktopCapabilities(capabilities)) {
+    return Object.freeze({
+      ...system,
+      capabilities: Object.freeze({ ...capabilities }),
+    })
+  }
+  return Object.freeze({
+    ...system,
+    capabilities: Object.freeze({
+      ...capabilities,
+      trackedInvocations: Object.freeze({
+        ...capabilities.trackedInvocations,
+        limits: Object.freeze({ ...capabilities.trackedInvocations.limits }),
+      }),
+    }),
+  })
+}
+
 export async function connectDesktop(options: ConnectOptions = {}): Promise<DesktopConnection> {
   const bridge = requireDesktopBridge()
-  const system = await bridge.getSystemInfo()
+  const system = validateSystemDeclaration(await bridge.getSystemInfo())
   const supported = options.supportedProtocolVersions ?? [CURRENT_BRIDGE_PROTOCOL_VERSION]
   if (!supported.includes(system.protocolVersion)) {
     throw new UnsupportedDesktopProtocolError(system.protocolVersion, supported)
   }
   const context = globals().ssdevDesktopContext ?? {}
-  const frozenSystem: Readonly<SystemDeclaration> = system.capabilities === undefined
-    ? Object.freeze({ ...system })
-    : Object.freeze({
-        ...system,
-        capabilities: Object.freeze({
-          ...system.capabilities,
-          trackedInvocations: Object.freeze({
-            ...system.capabilities.trackedInvocations,
-            limits: Object.freeze({ ...system.capabilities.trackedInvocations.limits }),
-          }),
-        }),
-      })
   return Object.freeze({
     bridge,
-    system: frozenSystem,
+    system: freezeSystemDeclaration(system),
     context: Object.freeze({ ...context }),
   })
 }

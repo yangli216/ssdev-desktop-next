@@ -7,7 +7,7 @@
 | Tauri 内部通信 | 完成 | 远程业务页使用窄 Tauri command，不启动 localhost HTTP |
 | WebPlus 请求/响应 | 完成 | 保留 `serviceId`、`method`、`parameters`、`ResCode`、`ResData`；Rust、共享契约和 TypeScript SDK 共同固定四种“保证未执行”拒绝码，SDK 区分可有界退避、需等待重启和不得自动重试，不再要求业务复制魔法数字 |
 | 非幂等调用协调 | 完成实现 | 兼容调用保持不变；可选 UUID v4 操作 ID 在执行前持久接纳，相同来源/请求并发或刷新只执行一次，换参数硬冲突；响应有界内存保留，账本只存域分离哈希；过期维护按下一到期时间触发而非每次 O(n) 扫描，来源级配额防止单一业务来源耗尽全局容量；崩溃后恢复 `indeterminate`/`completedWithoutResult` 并禁止自动重放，不虚假承诺物理设备 exactly-once |
-| 协议独立演进 | 完成 | 业务 Web Bridge 与 controller/plugin-host 私有帧协议使用独立常量、状态和诊断字段；`getSystemInfo()` 使用向后兼容的版本化能力声明，区分接口存在、账本运行可用和停机准入，并从实现常量公开容量/保留边界；SDK 契约测试不依赖内部宿主版本 |
+| 协议独立演进 | 完成 | 业务 Web Bridge 与 controller/plugin-host 私有帧协议使用独立常量、状态和诊断字段；`getSystemInfo()` 使用向后兼容的版本化能力声明，区分接口存在、账本运行可用和停机准入，并从实现常量公开容量/保留边界；SDK 在连接时运行时验证基础声明和当前能力 schema，以稳定原因拒绝损坏状态，对未来未知 schema 保留基础桥接但不误报持久能力；契约测试不依赖内部宿主版本 |
 | 插件隔离 | 完成 | Tauri 主进程不加载第三方组件；每个插件和架构使用独立宿主进程；Windows 控制协议走随机命名、双方 PID 认证的专用管道，与插件标准输出分离 |
 | x86 / x64 | 完成实现 | 两个 MSVC 目标均通过交叉编译；真实运行由 Windows 门禁覆盖 |
 | DLL | 完成实现 | cdecl/system、字符串/GBK、整数、输出缓冲区、显式依赖和 `deps: ["*"]` |
