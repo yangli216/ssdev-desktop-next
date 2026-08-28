@@ -42,6 +42,7 @@
     "allow-reload-business-windows",
     "allow-check-app-update",
     "allow-install-app-update",
-    "allow-export-diagnostics"
+    "allow-export-diagnostics",
+    "allow-open-diagnostics-directory"
   ]
 }

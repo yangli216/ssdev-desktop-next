@@ -48,6 +48,7 @@ pub const APP_COMMANDS: &[&str] = &[
     "check_app_update",
     "install_app_update",
     "export_diagnostics",
+    "open_diagnostics_directory",
 ];
 
 pub const CONTROL_PERMISSIONS: &[&str] = &[
@@ -87,6 +88,7 @@ pub const CONTROL_PERMISSIONS: &[&str] = &[
     "allow-check-app-update",
     "allow-install-app-update",
     "allow-export-diagnostics",
+    "allow-open-diagnostics-directory",
 ];
 
 pub const BUSINESS_PERMISSIONS: &[&str] = &[
@@ -170,6 +172,7 @@ mod tests {
             "allow-run-local-mapping-debug-cases",
             "allow-install-app-update",
             "allow-export-diagnostics",
+            "allow-open-diagnostics-directory",
         ] {
             assert!(
                 !business.contains(forbidden),

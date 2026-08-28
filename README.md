@@ -45,6 +45,7 @@ Go WebPlus 的逐项替代决策见 [docs/webplus-parity.md](docs/webplus-parity
 应用本体签名更新的发布与密钥要求见 [docs/app-updates.md](docs/app-updates.md)。
 Windows 安装包与源码提交、锁文件和工具链的签名绑定见 [docs/release-provenance.md](docs/release-provenance.md)。
 有界结构化日志、隐私契约和本地诊断包导出见 [docs/diagnostics.md](docs/diagnostics.md)。
+Release 启动失败和控制页面空白由原生错误提示覆盖；正常控制台也可以直接打开当前用户的固定日志目录，不依赖终端窗口。
 项目交付前的一键环境检查、阻塞条件和处理建议见 [docs/deployment-check.md](docs/deployment-check.md)。
 将项目配置、签名插件、本地映射和联合路由作为一个有组织旁签、带导入差异计划且可崩溃恢复的原子单元迁移到目标机器，见 [docs/project-bundles.md](docs/project-bundles.md)。
 单独导入普通桌面配置同样采用只读变更预检和确认标识，确认时重新绑定候选文件与当前已保存状态，不再在选择文件后立即覆盖。

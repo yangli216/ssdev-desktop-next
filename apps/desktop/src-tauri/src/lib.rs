@@ -25,10 +25,10 @@ const DESKTOP_CAPABILITIES_SCHEMA_VERSION: u16 = 1;
 pub use app_update::verify_update_artifact_files;
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
@@ -44,7 +44,9 @@ use ssdev_process_policy::ProcessPolicy;
 use ssdev_project_bundle as project_bundle;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 use tauri_plugin_autostart::MacosLauncher;
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_global_shortcut::Builder as ShortcutBuilder;
+use tauri_plugin_opener::OpenerExt;
 use webplus_controller::{
     PluginController, PluginTrust, SupervisorConfig, DEFAULT_MAX_IN_FLIGHT_INVOCATIONS,
 };
@@ -61,6 +63,111 @@ use invocations::{
     InvocationCoordinator, TrackedInvocationStatus, MAX_RETAINED_RESPONSE_BYTES,
     MAX_RUNTIME_OPERATIONS, RUNTIME_RESULT_RETENTION,
 };
+
+const FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(15);
+const STARTUP_FAILURE_FILE_NAME: &str = "startup-failure.json";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum StartupStage {
+    Bootstrap = 0,
+    RuntimePaths = 1,
+    Diagnostics = 2,
+    LocalStorage = 3,
+    TrustPolicy = 4,
+    PluginRuntime = 5,
+    CoreServices = 6,
+    DesktopShell = 7,
+    SetupComplete = 8,
+}
+
+impl StartupStage {
+    fn current() -> Self {
+        match STARTUP_STAGE.load(Ordering::Acquire) {
+            1 => Self::RuntimePaths,
+            2 => Self::Diagnostics,
+            3 => Self::LocalStorage,
+            4 => Self::TrustPolicy,
+            5 => Self::PluginRuntime,
+            6 => Self::CoreServices,
+            7 => Self::DesktopShell,
+            8 => Self::SetupComplete,
+            _ => Self::Bootstrap,
+        }
+    }
+
+    fn enter(self) {
+        STARTUP_STAGE.store(self as u8, Ordering::Release);
+    }
+
+    fn failure(self) -> StartupFailure {
+        match self {
+            Self::RuntimePaths => StartupFailure {
+                code: "startup-runtime-paths",
+                summary: "无法确定当前用户的应用数据目录。",
+                action: "请确认 Windows 用户配置文件可用，并尝试重新登录系统。",
+            },
+            Self::Diagnostics => StartupFailure {
+                code: "startup-diagnostics",
+                summary: "无法初始化本地诊断记录。",
+                action: "请检查用户应用数据目录的写入权限和剩余磁盘空间。",
+            },
+            Self::LocalStorage => StartupFailure {
+                code: "startup-local-storage",
+                summary: "无法读取或恢复桌面配置及本地组件数据。",
+                action: "请先保留应用数据目录，再检查目录权限、磁盘空间或联系实施人员。",
+            },
+            Self::TrustPolicy => StartupFailure {
+                code: "startup-trust-policy",
+                summary: "安装包中的签名信任或业务来源策略无效。",
+                action: "请使用组织正式发布的完整安装包修复安装，不要手工替换策略文件。",
+            },
+            Self::PluginRuntime => StartupFailure {
+                code: "startup-plugin-runtime",
+                summary: "原生插件运行环境初始化失败。",
+                action: "请修复 SSDEV Desktop 安装，并确认 x86/x64 插件宿主文件未被安全软件隔离。",
+            },
+            Self::CoreServices => StartupFailure {
+                code: "startup-core-services",
+                summary: "桌面核心服务初始化失败。",
+                action: "请查看启动日志中的稳定错误码，并将诊断文件交给实施人员。",
+            },
+            Self::DesktopShell => StartupFailure {
+                code: "startup-desktop-shell",
+                summary: "控制窗口或系统桌面集成初始化失败。",
+                action: "请修复 Microsoft Edge WebView2 Runtime 后重试；仍失败时修复 SSDEV Desktop 安装。",
+            },
+            Self::SetupComplete | Self::Bootstrap => StartupFailure {
+                code: "startup-framework",
+                summary: "桌面运行框架初始化失败。",
+                action: "请重新启动；仍失败时修复 SSDEV Desktop 安装并查看启动日志。",
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StartupFailure {
+    code: &'static str,
+    summary: &'static str,
+    action: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupFailureDocument {
+    schema_version: u8,
+    generated_at_unix_ms: u128,
+    event_code: &'static str,
+    error_code: &'static str,
+    summary: &'static str,
+    action: &'static str,
+}
+
+static STARTUP_STAGE: AtomicU8 = AtomicU8::new(StartupStage::Bootstrap as u8);
+static STARTUP_COMPLETE: AtomicBool = AtomicBool::new(false);
+static STARTUP_FAILURE_REPORTED: AtomicBool = AtomicBool::new(false);
+static STARTUP_LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 struct BridgeState {
     controller: Arc<PluginController>,
@@ -89,17 +196,48 @@ struct BridgeState {
 struct DiagnosticsRuntime {
     state: Option<DiagnosticsState>,
     startup_error: Option<&'static str>,
+    log_dir: PathBuf,
+}
+
+#[derive(Default)]
+struct FrontendRuntime {
+    ready: AtomicBool,
+    timeout_reported: AtomicBool,
 }
 
 #[tauri::command]
-fn frontend_ready(caller: WebviewWindow, app: AppHandle) -> Result<(), String> {
+fn frontend_ready(
+    caller: WebviewWindow,
+    app: AppHandle,
+    frontend: State<'_, FrontendRuntime>,
+) -> Result<(), String> {
     desktop::require_control(&caller)?;
+    let was_ready = frontend.ready.swap(true, Ordering::AcqRel);
     tracing::info!(
         event_code = "frontend-ready",
         app_version = %app.package_info().version,
+        recovered_after_timeout = frontend.timeout_reported.load(Ordering::Acquire),
+        duplicate_signal = was_ready,
         "control frontend mounted and reached native IPC"
     );
     Ok(())
+}
+
+#[tauri::command]
+fn open_diagnostics_directory(
+    caller: WebviewWindow,
+    app: AppHandle,
+    diagnostics: State<'_, DiagnosticsRuntime>,
+) -> Result<(), String> {
+    desktop::require_control(&caller)?;
+    fs::create_dir_all(&diagnostics.log_dir)
+        .map_err(|_| "无法创建诊断日志目录，请检查应用数据目录权限".to_owned())?;
+    app.opener()
+        .open_path(
+            diagnostics.log_dir.to_string_lossy().into_owned(),
+            None::<&str>,
+        )
+        .map_err(|_| "无法使用系统文件管理器打开诊断日志目录".to_owned())
 }
 
 #[derive(Serialize)]
@@ -156,6 +294,7 @@ struct BridgeStatus {
     origin_policy_error: Option<String>,
     diagnostics_available: bool,
     diagnostics_error: Option<&'static str>,
+    diagnostics_log_dir: PathBuf,
     diagnostics: Option<DiagnosticsStats>,
 }
 
@@ -236,6 +375,7 @@ async fn bridge_status(
         origin_policy_error: desktop_state.origin_policy_error(),
         diagnostics_available: diagnostics.state.is_some(),
         diagnostics_error: diagnostics.startup_error,
+        diagnostics_log_dir: diagnostics.log_dir.clone(),
         diagnostics: diagnostics.state.as_ref().map(DiagnosticsState::stats),
     })
 }
@@ -2974,6 +3114,8 @@ fn system_declaration<R: tauri::Runtime>(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    StartupStage::Bootstrap.enter();
+    install_safe_panic_hook();
     let shortcut_plugin = ShortcutBuilder::<tauri::Wry>::new().build();
 
     let app = tauri::Builder::default()
@@ -2994,25 +3136,31 @@ pub fn run() {
         }))
         .plugin(shortcut_plugin)
         .setup(|app| {
+            StartupStage::RuntimePaths.enter();
             let resource_dir = app.path().resource_dir()?;
             let system_config_dir = app.path().config_dir()?;
             let config_dir = app.path().app_config_dir()?;
             let local_data_dir = app.path().app_local_data_dir()?;
-            let diagnostics = match DiagnosticsState::initialize(&local_data_dir.join("logs")) {
+            let log_dir = local_data_dir.join("logs");
+            let _ = STARTUP_LOG_DIR.set(log_dir.clone());
+            StartupStage::Diagnostics.enter();
+            let diagnostics = match DiagnosticsState::initialize(&log_dir) {
                 Ok(state) => DiagnosticsRuntime {
                     state: Some(state),
                     startup_error: None,
+                    log_dir: log_dir.clone(),
                 },
                 Err(error) => {
                     eprintln!("diagnostics unavailable: {}", error.code());
                     DiagnosticsRuntime {
                         state: None,
                         startup_error: Some(error.code()),
+                        log_dir: log_dir.clone(),
                     }
                 }
             };
             app.manage(diagnostics);
-            install_safe_panic_hook();
+            StartupStage::LocalStorage.enter();
             let config_path = select_runtime_path(
                 config_dir.join("config.json"),
                 development_path_override("SSDEV_CONFIG_PATH"),
@@ -3053,6 +3201,7 @@ pub fn run() {
                     "legacy desktop configuration has unreadable sources"
                 );
             }
+            StartupStage::TrustPolicy.enter();
             let allow_unsigned_plugins = allow_unsigned_plugins();
             let trust_store_path = plugin_trust_store_path(&resource_dir);
             let (trust_store, plugin_trust) = if allow_unsigned_plugins {
@@ -3076,6 +3225,7 @@ pub fn run() {
                 trust_store.as_deref(),
                 allow_unsigned_plugins,
             )?;
+            StartupStage::PluginRuntime.enter();
             let x86_host = host_path(
                 "SSDEV_PLUGIN_HOST_X86",
                 &resource_dir,
@@ -3110,6 +3260,7 @@ pub fn run() {
                 );
             }
             tauri::async_runtime::block_on(controller.replace_manifests(&plugins.manifests))?;
+            StartupStage::CoreServices.enter();
             let initial_config = config.snapshot();
             let (process_policy_entries, managed_process_failures) = launch_managed_processes(
                 &resource_dir,
@@ -3164,6 +3315,7 @@ pub fn run() {
                 managed_process_failures,
                 repository_client,
             });
+            StartupStage::DesktopShell.enter();
             let desktop_state = desktop::DesktopState::new(config, origin_policy);
             if let Err(_error) =
                 desktop_state.ensure_business_ipc_capabilities(app.handle(), &initial_config)
@@ -3175,6 +3327,7 @@ pub fn run() {
                 );
             }
             app.manage(desktop_state);
+            app.manage(FrontendRuntime::default());
             if let Err(_error) =
                 shortcuts::replace(app.handle(), &initial_config.key_bindings, &[])
             {
@@ -3191,6 +3344,7 @@ pub fn run() {
                 );
             }
             desktop::setup_control_window(app)?;
+            start_frontend_watchdog(app.handle());
             if let Err(_error) = desktop::setup_tray(app) {
                 tracing::warn!(
                     event_code = "startup-tray-unavailable",
@@ -3208,6 +3362,7 @@ pub fn run() {
                 origin_policy_enforced = app.state::<desktop::DesktopState>().origin_policy_summary().enforced,
                 "desktop startup completed"
             );
+            StartupStage::SetupComplete.enter();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -3217,6 +3372,7 @@ pub fn run() {
             inspect_project_bundle,
             import_project_bundle,
             frontend_ready,
+            open_diagnostics_directory,
             install_plugin_package,
             install_plugin_from_catalog,
             uninstall_signed_plugin,
@@ -3265,14 +3421,11 @@ pub fn run() {
     let app = match app {
         Ok(app) => app,
         Err(_error) => {
-            tracing::error!(
-                event_code = "desktop-build-failed",
-                error_code = "tauri-build-error",
-                "desktop initialization failed"
-            );
+            report_fatal_startup_failure(StartupStage::current().failure());
             return;
         }
     };
+    STARTUP_COMPLETE.store(true, Ordering::Release);
     app.run(|app, event| {
         if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
             if desktop::intercept_exit_request(app, code.unwrap_or_default()) {
@@ -3478,11 +3631,148 @@ fn install_safe_panic_hook() {
     let _previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         tracing::error!(event_code = "process-panic", "desktop process panicked");
+        if !STARTUP_COMPLETE.load(Ordering::Acquire) {
+            report_fatal_startup_failure(StartupStage::current().failure());
+        }
         #[cfg(debug_assertions)]
         _previous(panic_info);
         #[cfg(not(debug_assertions))]
         let _ = panic_info;
     }));
+}
+
+fn start_frontend_watchdog(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(FRONTEND_READY_TIMEOUT).await;
+        let frontend = app.state::<FrontendRuntime>();
+        if frontend.ready.load(Ordering::Acquire)
+            || frontend
+                .timeout_reported
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        let failure = StartupFailure {
+            code: "frontend-startup-timeout",
+            summary: "控制窗口已经创建，但页面未能连接桌面核心服务。",
+            action: "请修复 Microsoft Edge WebView2 Runtime 或 SSDEV Desktop 安装；随后查看日志并重新启动。",
+        };
+        tracing::error!(
+            event_code = "frontend-startup-timeout",
+            error_code = failure.code,
+            timeout_seconds = FRONTEND_READY_TIMEOUT.as_secs(),
+            "control frontend did not reach native IPC before the startup deadline"
+        );
+        write_startup_failure_document(failure);
+        app.dialog()
+            .message(startup_failure_message(failure))
+            .title("SSDEV Desktop 启动异常")
+            .kind(MessageDialogKind::Error)
+            .show(|_| {});
+    });
+}
+
+fn report_fatal_startup_failure(failure: StartupFailure) {
+    if STARTUP_FAILURE_REPORTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tracing::error!(
+        event_code = "desktop-startup-failed",
+        error_code = failure.code,
+        "desktop initialization failed"
+    );
+    write_startup_failure_document(failure);
+    show_native_startup_error(&startup_failure_message(failure));
+}
+
+fn write_startup_failure_document(failure: StartupFailure) {
+    let Some(log_dir) = STARTUP_LOG_DIR.get() else {
+        return;
+    };
+    let document = StartupFailureDocument {
+        schema_version: 1,
+        generated_at_unix_ms: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        event_code: "desktop-startup-failed",
+        error_code: failure.code,
+        summary: failure.summary,
+        action: failure.action,
+    };
+    let Ok(bytes) = serde_json::to_vec(&document) else {
+        return;
+    };
+    if bytes.len() > 4 * 1024 {
+        return;
+    }
+    let _ = persist_startup_failure_document(log_dir, &bytes);
+}
+
+fn persist_startup_failure_document(
+    log_dir: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    fs::create_dir_all(log_dir)?;
+    let directory_metadata = fs::symlink_metadata(log_dir)?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err(std::io::Error::other(
+            "startup diagnostics directory is unsafe",
+        ));
+    }
+    let destination = log_dir.join(STARTUP_FAILURE_FILE_NAME);
+    if let Ok(metadata) = fs::symlink_metadata(&destination) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(std::io::Error::other("startup failure marker is unsafe"));
+        }
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(log_dir)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file_mut().sync_all()?;
+    temporary
+        .persist(destination)
+        .map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn startup_failure_message(failure: StartupFailure) -> String {
+    let log_location = STARTUP_LOG_DIR
+        .get()
+        .map(|directory| directory.display().to_string())
+        .unwrap_or_else(|| "尚未建立（用户应用数据目录不可用）".to_owned());
+    format!(
+        "{}\n\n处理建议：{}\n\n错误码：{}\n日志目录：{}",
+        failure.summary, failure.action, failure.code, log_location
+    )
+}
+
+#[cfg(windows)]
+fn show_native_startup_error(message: &str) {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let title = "SSDEV Desktop 启动失败\0"
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    let message = message
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(message.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_native_startup_error(message: &str) {
+    eprintln!("SSDEV Desktop startup failed: {message}");
 }
 
 fn plugin_trust_store_path(resource_dir: &std::path::Path) -> PathBuf {
@@ -3661,10 +3951,11 @@ mod tests {
         ensure_plugin_update_plan_matches, ensure_project_export_active_manifests_match,
         ensure_project_export_runtime_matches, ensure_signed_plugin_compatible,
         ensure_upgrade_allowed, is_lowercase_sha256, is_plugin_update_available,
-        legacy_config_candidates, open_project_bundle_for_mode,
+        legacy_config_candidates, open_project_bundle_for_mode, persist_startup_failure_document,
         plugin_update_installed_state_digest, plugin_update_plan_id, project_bundle,
         project_import_plan_id, project_import_state_digest, select_runtime_path,
-        service_inventory_item, CatalogWithdrawalReason,
+        service_inventory_item, startup_failure_message, CatalogWithdrawalReason, FrontendRuntime,
+        StartupFailureDocument, StartupStage, FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -3680,6 +3971,108 @@ mod tests {
     use webplus_plugin_trust::{
         encode_signature_document, prepare_signing_material, TrustStore, SIGNATURE_FILENAME,
     };
+
+    #[test]
+    fn startup_stages_have_stable_actionable_failure_codes() {
+        for (stage, expected_code) in [
+            (StartupStage::Bootstrap, "startup-framework"),
+            (StartupStage::RuntimePaths, "startup-runtime-paths"),
+            (StartupStage::Diagnostics, "startup-diagnostics"),
+            (StartupStage::LocalStorage, "startup-local-storage"),
+            (StartupStage::TrustPolicy, "startup-trust-policy"),
+            (StartupStage::PluginRuntime, "startup-plugin-runtime"),
+            (StartupStage::CoreServices, "startup-core-services"),
+            (StartupStage::DesktopShell, "startup-desktop-shell"),
+            (StartupStage::SetupComplete, "startup-framework"),
+        ] {
+            let failure = stage.failure();
+            assert_eq!(failure.code, expected_code);
+            assert!(!failure.summary.is_empty());
+            assert!(!failure.action.is_empty());
+            let message = startup_failure_message(failure);
+            assert!(message.contains(expected_code));
+            assert!(message.contains("处理建议"));
+            assert!(message.contains("日志目录"));
+        }
+    }
+
+    #[test]
+    fn startup_failure_document_is_bounded_and_contains_no_raw_error() {
+        let failure = StartupStage::DesktopShell.failure();
+        let document = StartupFailureDocument {
+            schema_version: 1,
+            generated_at_unix_ms: 1,
+            event_code: "desktop-startup-failed",
+            error_code: failure.code,
+            summary: failure.summary,
+            action: failure.action,
+        };
+        let encoded = serde_json::to_vec(&document).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+
+        assert!(encoded.len() < 4 * 1024);
+        assert_eq!(value["errorCode"], "startup-desktop-shell");
+        assert!(value.get("error").is_none());
+        assert!(value.get("path").is_none());
+        assert!(value.get("url").is_none());
+    }
+
+    #[test]
+    fn frontend_readiness_timeout_is_bounded_and_reported_once() {
+        let frontend = FrontendRuntime::default();
+
+        assert!(FRONTEND_READY_TIMEOUT >= Duration::from_secs(5));
+        assert!(FRONTEND_READY_TIMEOUT <= Duration::from_secs(60));
+        assert!(!frontend.ready.load(std::sync::atomic::Ordering::Acquire));
+        assert!(frontend
+            .timeout_reported
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok());
+        assert!(frontend
+            .timeout_reported
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn startup_failure_marker_replaces_only_its_fixed_regular_file() {
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("logs");
+
+        persist_startup_failure_document(&log_dir, br#"{"errorCode":"first"}"#).unwrap();
+        persist_startup_failure_document(&log_dir, br#"{"errorCode":"second"}"#).unwrap();
+
+        assert_eq!(
+            fs::read(log_dir.join(super::STARTUP_FAILURE_FILE_NAME)).unwrap(),
+            br#"{"errorCode":"second"}"#
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_failure_marker_refuses_a_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("logs");
+        fs::create_dir(&log_dir).unwrap();
+        let private = root.path().join("private.txt");
+        fs::write(&private, b"keep").unwrap();
+        symlink(&private, log_dir.join(super::STARTUP_FAILURE_FILE_NAME)).unwrap();
+
+        assert!(persist_startup_failure_document(&log_dir, b"replacement").is_err());
+        assert_eq!(fs::read(private).unwrap(), b"keep");
+    }
 
     #[test]
     fn plugin_install_rejects_downgrade_but_allows_repair() {

@@ -66,6 +66,7 @@ type BridgeStatus = {
   originPolicyError?: string
   diagnosticsAvailable: boolean
   diagnosticsError?: string
+  diagnosticsLogDir: string
   diagnostics?: {
     logFiles: number
     logBytes: number
@@ -707,6 +708,13 @@ async function exportDiagnostics() {
   }
 }
 
+async function openDiagnosticsDirectory() {
+  await run(
+    () => invoke('open_diagnostics_directory'),
+    '已使用系统文件管理器打开诊断日志目录。',
+  )
+}
+
 async function runDeploymentCheck() {
   let result: DeploymentCheckReport | undefined
   await run(async () => {
@@ -914,7 +922,7 @@ async function runDeploymentCheck() {
       </section>
 
       <section v-show="activeSection === 'security'" class="page" aria-labelledby="security-title">
-        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>先执行部署自检，再按需查看详细指标和导出诊断。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy" @click="runDeploymentCheck">重新自检</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
+        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>先执行部署自检，再按需查看详细指标和导出诊断。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy" @click="runDeploymentCheck">重新自检</button><button type="button" :disabled="busy" @click="openDiagnosticsDirectory">打开日志目录</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
         <section v-if="deploymentCheck" :class="['deployment-check', { ready: deploymentCheck.ready }]" aria-label="部署自检结果">
           <header>
             <div><p class="eyebrow">DEPLOYMENT CHECK</p><h2>{{ deploymentCheck.ready ? '当前机器可以交付' : '部署条件尚未满足' }}</h2><p>{{ deploymentCheck.passed }} 项正常 · {{ deploymentCheck.warnings }} 项提醒 · {{ deploymentCheck.failures }} 项阻塞</p></div>
@@ -938,7 +946,7 @@ async function runDeploymentCheck() {
           <article><span>开机启动</span><strong>{{ status?.autoStartEnabled == null ? '状态未知' : status.autoStartEnabled ? '已启用' : '未启用' }}</strong><small :title="status?.autoStartError">{{ status?.autoStartError ?? '由本机系统机制管理' }}</small></article>
           <article><span>SSO 传输</span><strong>{{ ssoActive ? '登录处理中' : ssoError ? '最近失败' : 'HTTPS-only' }}</strong><small>禁止重定向 · 请求与响应均有上限</small></article>
           <article><span>业务来源策略</span><strong>{{ status?.originPolicy.allowConfiguredBusinessOrigins ? '项目地址兼容' : status?.originPolicy.enforced ? '发布方签名' : '开发模式' }}</strong><small :title="status?.originPolicyError">{{ status?.originPolicyError ?? `${status?.originPolicy.businessOrigins ?? '—'} 个来源 · HTTP ${status?.originPolicy.allowInsecureHttp ? '允许' : '禁止'}` }}</small></article>
-          <article><span>隐私诊断日志</span><strong>{{ status?.diagnosticsAvailable ? '可用' : '不可用' }}</strong><small :title="status?.diagnosticsError">{{ status?.diagnosticsError ?? `${status?.diagnostics?.logFiles ?? '—'} 个文件 · ${((status?.diagnostics?.logBytes ?? 0) / 1024).toFixed(1)} KiB` }}</small></article>
+          <article><span>隐私诊断日志</span><strong>{{ status?.diagnosticsAvailable ? '可用' : '不可用' }}</strong><small :title="status?.diagnosticsLogDir">{{ status?.diagnosticsError ?? `${status?.diagnostics?.logFiles ?? '—'} 个文件 · ${((status?.diagnostics?.logBytes ?? 0) / 1024).toFixed(1)} KiB` }}</small></article>
           <article><span>协议与兼容网关</span><strong>v{{ status?.protocolVersion ?? '—' }}</strong><small>宿主 v{{ status?.pluginHostProtocolVersion ?? '—' }} · HTTP 网关{{ status?.httpGatewayEnabled ? '已启用' : '关闭' }}</small></article>
         </section>
         <section class="maintenance-panel"><div><p class="eyebrow">CLIENT MAINTENANCE</p><h2>客户端维护</h2><p>{{ status?.appUpdateError ?? (status?.appUpdateConfigured ? '应用更新包必须通过签名验证，并与当前插件兼容。' : '当前构建未配置生产更新端点。') }}</p></div><div class="maintenance-actions"><button type="button" :disabled="busy || !status?.appUpdateConfigured" @click="checkAppUpdate">检查应用更新</button><button class="primary" type="button" :disabled="busy || !appUpdate?.available || !appUpdate.compatible || !appUpdate.installPlanId" @click="installAppUpdate">安装签名更新</button></div><details v-if="appUpdate?.available" class="update-details" open><summary>版本 {{ appUpdate.version }}{{ appUpdate.date ? ` · ${appUpdate.date}` : '' }}</summary><p v-if="!appUpdate.compatible">{{ appUpdate.pluginBlockers }} 个插件阻止升级；请先从签名仓库安装兼容版本。</p><p>{{ appUpdate.notes || '此版本未提供发布说明。' }}</p><small v-if="updateProgress">{{ updateProgress }}</small></details></section>
