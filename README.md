@@ -191,6 +191,8 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
 
 仓库不会包含生产 DLL、OCX 或患者数据。`ssdev-plugin-tool prepare` 会按插件清单生成覆盖全部 service/method 的矩阵草稿；也可以从 [docs/plugin-matrix.example.json](docs/plugin-matrix.example.json) 手工建立。替换全部占位符并把 `draft` 改为 `false` 后，在 Windows x64 验证机执行：
 
+在占用 Windows 实机前，可先在任意开发平台运行 `ssdev-plugin-tool matrix-check --plugin-dir <prepare暂存目录> --matrix <定稿矩阵>`；多插件联合矩阵使用 `--plugin-root <插件根目录>`。它与正式运行器共享 schema、路由、精确输入、占位符、复核标记和全方法覆盖规则，但不会加载组件或替代签名及硬件验证。
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/test-plugin-matrix.ps1 `
   -PluginRoot C:\secure-test-inputs\plugins `

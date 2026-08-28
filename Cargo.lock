@@ -6056,9 +6056,9 @@ dependencies = [
 name = "webplus-controller"
 version = "0.1.0"
 dependencies = [
- "serde",
  "serde_json",
  "ssdev-cutover-evidence",
+ "ssdev-plugin-tool",
  "ssdev-release-manifest",
  "tempfile",
  "thiserror 2.0.20",

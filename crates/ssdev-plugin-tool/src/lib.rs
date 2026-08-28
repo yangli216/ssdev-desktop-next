@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tempfile::Builder as TempBuilder;
 use thiserror::Error;
-use webplus_plugin_config::{PluginManifest, PluginMetadata};
+use webplus_plugin_config::{discover_plugins, PluginManifest, PluginMetadata};
 use webplus_plugin_package::{create_deterministic_package, PreparedPlugin};
 use webplus_plugin_repository::{encode_catalog_document, CatalogEntry};
 use webplus_plugin_trust::{
@@ -133,22 +133,33 @@ struct SigningRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MatrixDocument {
-    schema_version: u8,
-    draft: bool,
-    cases: Vec<MatrixCase>,
+pub struct PluginMatrix {
+    pub schema_version: u8,
+    pub draft: bool,
+    pub cases: Vec<PluginMatrixCase>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MatrixCase {
-    name: String,
+pub struct PluginMatrixCase {
+    pub name: String,
     #[serde(default = "enabled_by_default")]
-    enabled: bool,
+    pub enabled: bool,
     #[serde(default, skip_serializing_if = "is_false")]
-    review_required: bool,
-    request: InvokeRequest,
-    expected: InvokeResponse,
+    pub review_required: bool,
+    pub request: InvokeRequest,
+    pub expected: InvokeResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MatrixCheckReport {
+    pub schema_version: u8,
+    pub plugin_count: usize,
+    pub service_count: usize,
+    pub method_count: usize,
+    pub case_count: usize,
+    pub enabled_case_count: usize,
 }
 
 fn enabled_by_default() -> bool {
@@ -737,7 +748,7 @@ fn detect_pe_architecture(path: &Path) -> Result<Option<PluginArchitecture>, Too
     })
 }
 
-fn draft_matrix(manifest: &PluginManifest) -> MatrixDocument {
+fn draft_matrix(manifest: &PluginManifest) -> PluginMatrix {
     let cases = manifest
         .services
         .iter()
@@ -754,7 +765,7 @@ fn draft_matrix(manifest: &PluginManifest) -> MatrixDocument {
                         Value::String(DRAFT_INPUT_PLACEHOLDER.into()),
                     );
                 }
-                MatrixCase {
+                PluginMatrixCase {
                     name: format!("{}.{}", service.service_id, method.name),
                     enabled: true,
                     review_required: true,
@@ -768,14 +779,14 @@ fn draft_matrix(manifest: &PluginManifest) -> MatrixDocument {
             })
         })
         .collect::<Vec<_>>();
-    MatrixDocument {
+    PluginMatrix {
         schema_version: 1,
         draft: true,
         cases,
     }
 }
 
-fn matrix_case_has_draft_placeholder(case: &MatrixCase) -> bool {
+fn matrix_case_has_draft_placeholder(case: &PluginMatrixCase) -> bool {
     case.request
         .parameters
         .values()
@@ -783,8 +794,8 @@ fn matrix_case_has_draft_placeholder(case: &MatrixCase) -> bool {
         || contains_draft_placeholder(&case.expected.res_data)
 }
 
-fn load_matrix_seed(path: &Path, manifest: &PluginManifest) -> Result<MatrixDocument, ToolError> {
-    let matrix: MatrixDocument = read_bounded_json(path, MAX_MATRIX_BYTES)?;
+fn load_matrix_seed(path: &Path, manifest: &PluginManifest) -> Result<PluginMatrix, ToolError> {
+    let matrix: PluginMatrix = read_bounded_json(path, MAX_MATRIX_BYTES)?;
     if matrix.schema_version != 1 || !matrix.draft {
         return Err(ToolError::Invalid(
             "matrix seed must use schema 1 and remain draft=true".into(),
@@ -877,11 +888,192 @@ fn load_matrix_seed(path: &Path, manifest: &PluginManifest) -> Result<MatrixDocu
     Ok(matrix)
 }
 
+pub fn check_executable_matrix_root(
+    plugin_root: &Path,
+    matrix_path: &Path,
+) -> Result<MatrixCheckReport, ToolError> {
+    let plugin_root = canonical_real_directory(plugin_root)?;
+    let discovery = discover_plugins(&plugin_root)?;
+    if !discovery.failures.is_empty() {
+        let first = &discovery.failures[0];
+        return Err(ToolError::Invalid(format!(
+            "plugin root contains {} invalid plugin director{}; first failure [{}]: {}",
+            discovery.failures.len(),
+            if discovery.failures.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+            first.plugin_id,
+            first.error
+        )));
+    }
+    let (_, report) = validate_executable_matrix(matrix_path, &discovery.manifests)?;
+    Ok(report)
+}
+
+pub fn check_executable_matrix_plugin(
+    plugin_dir: &Path,
+    matrix_path: &Path,
+) -> Result<MatrixCheckReport, ToolError> {
+    let plugin_dir = canonical_real_directory(plugin_dir)?;
+    let metadata = PluginMetadata::load_optional(&plugin_dir)?.ok_or_else(|| {
+        ToolError::Invalid("plugin directory must contain normalized plugin.json".into())
+    })?;
+    let manifest = PluginManifest::load(metadata.plugin_id, &plugin_dir)?;
+    let (_, report) = validate_executable_matrix(matrix_path, &[manifest])?;
+    Ok(report)
+}
+
+pub fn validate_executable_matrix(
+    matrix_path: &Path,
+    manifests: &[PluginManifest],
+) -> Result<(PluginMatrix, MatrixCheckReport), ToolError> {
+    let matrix: PluginMatrix = read_bounded_json(matrix_path, MAX_MATRIX_BYTES)?;
+    if matrix.schema_version != 1
+        || matrix.cases.is_empty()
+        || matrix.cases.len() > MAX_MATRIX_CASES
+    {
+        return Err(ToolError::Invalid(format!(
+            "executable matrix must use schema 1 and contain 1 to {MAX_MATRIX_CASES} cases"
+        )));
+    }
+    if matrix.draft {
+        return Err(ToolError::Invalid(
+            "executable matrix is still marked as draft".into(),
+        ));
+    }
+
+    let mut services = BTreeMap::new();
+    let mut required = BTreeSet::new();
+    let mut plugin_ids = BTreeSet::new();
+    for manifest in manifests {
+        if !plugin_ids.insert(manifest.plugin_id.to_ascii_lowercase()) {
+            return Err(ToolError::Invalid(format!(
+                "verified plugin manifests contain duplicate portable plugin ID [{}]",
+                manifest.plugin_id
+            )));
+        }
+        for service in &manifest.services {
+            if services
+                .insert(service.service_id.as_str(), service)
+                .is_some()
+            {
+                return Err(ToolError::Invalid(format!(
+                    "verified plugin manifests declare duplicate serviceId [{}]",
+                    service.service_id
+                )));
+            }
+            for method in &service.methods {
+                required.insert((service.service_id.as_str(), method.name.as_str()));
+            }
+        }
+    }
+    if required.is_empty() {
+        return Err(ToolError::Invalid(
+            "verified plugin manifests do not declare callable methods".into(),
+        ));
+    }
+
+    let mut names = BTreeSet::new();
+    let mut covered = BTreeSet::new();
+    let mut enabled_case_count = 0_usize;
+    for case in &matrix.cases {
+        if case.name.trim() != case.name
+            || case.name.is_empty()
+            || case.name.chars().count() > 256
+            || case.name.chars().any(char::is_control)
+            || !names.insert(case.name.as_str())
+        {
+            return Err(ToolError::Invalid(
+                "matrix case names must be unique, trimmed, and at most 256 safe characters".into(),
+            ));
+        }
+        case.request.validate().map_err(|error| {
+            ToolError::Invalid(format!(
+                "matrix case [{}] contains an invalid invoke request: {error}",
+                case.name
+            ))
+        })?;
+        let service = services
+            .get(case.request.service_id.as_str())
+            .copied()
+            .ok_or_else(|| {
+                ToolError::Invalid(format!(
+                    "matrix case [{}] targets an unknown service",
+                    case.name
+                ))
+            })?;
+        let method = service.method(&case.request.method).ok_or_else(|| {
+            ToolError::Invalid(format!(
+                "matrix case [{}] targets an unknown method",
+                case.name
+            ))
+        })?;
+        let declared_inputs = method
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name())
+            .filter(|name| !name.starts_with('$'))
+            .collect::<BTreeSet<_>>();
+        let provided_inputs = case
+            .request
+            .parameters
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if provided_inputs != declared_inputs {
+            return Err(ToolError::Invalid(format!(
+                "matrix case [{}] inputs do not exactly match the declared method inputs",
+                case.name
+            )));
+        }
+        if !case.enabled {
+            continue;
+        }
+        enabled_case_count = enabled_case_count.saturating_add(1);
+        if case.review_required {
+            return Err(ToolError::Invalid(format!(
+                "matrix case [{}] still requires exact response review",
+                case.name
+            )));
+        }
+        if matrix_case_has_draft_placeholder(case) {
+            return Err(ToolError::Invalid(format!(
+                "matrix case [{}] still contains a generated draft placeholder",
+                case.name
+            )));
+        }
+        covered.insert((service.service_id.as_str(), method.name.as_str()));
+    }
+    if enabled_case_count == 0 {
+        return Err(ToolError::Invalid(
+            "executable matrix must contain at least one enabled case".into(),
+        ));
+    }
+    if covered != required {
+        return Err(ToolError::Invalid(format!(
+            "enabled matrix cases do not cover {} declared method(s)",
+            required.difference(&covered).count()
+        )));
+    }
+
+    let report = MatrixCheckReport {
+        schema_version: 1,
+        plugin_count: manifests.len(),
+        service_count: services.len(),
+        method_count: required.len(),
+        case_count: matrix.cases.len(),
+        enabled_case_count,
+    };
+    Ok((matrix, report))
+}
+
 fn write_external_outputs(
     request_path: &Path,
     request: &SigningRequest,
     matrix_path: &Path,
-    matrix: &MatrixDocument,
+    matrix: &PluginMatrix,
 ) -> Result<(), ToolError> {
     write_new_json(request_path, request)?;
     if let Err(error) = write_new_json(matrix_path, matrix) {
@@ -1140,6 +1332,179 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    fn matrix_file(root: &Path, name: &str, value: Value) -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        path
+    }
+
+    fn executable_matrix(case: Value) -> Value {
+        json!({
+            "schemaVersion": 1,
+            "draft": false,
+            "cases": [case]
+        })
+    }
+
+    fn executable_case() -> Value {
+        json!({
+            "name": "reader.read verified",
+            "reviewRequired": false,
+            "request": {
+                "serviceId": "reader",
+                "method": "read",
+                "parameters": { "timeout": 5 }
+            },
+            "expected": {
+                "ResCode": 0,
+                "ResData": { "ReturnValue": 0 }
+            }
+        })
+    }
+
+    #[test]
+    fn executable_matrix_check_is_cross_platform_and_reports_exact_coverage() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_dir = source(root.path());
+        let matrix = matrix_file(
+            root.path(),
+            "executable-matrix.json",
+            executable_matrix(executable_case()),
+        );
+        let manifest = PluginManifest::load("reader", plugin_dir).unwrap();
+
+        let (parsed, report) = validate_executable_matrix(&matrix, &[manifest]).unwrap();
+
+        assert_eq!(parsed.cases.len(), 1);
+        assert_eq!(report.plugin_count, 1);
+        assert_eq!(report.service_count, 1);
+        assert_eq!(report.method_count, 1);
+        assert_eq!(report.case_count, 1);
+        assert_eq!(report.enabled_case_count, 1);
+        assert_eq!(
+            check_executable_matrix_root(root.path(), &matrix).unwrap(),
+            report
+        );
+
+        let staging = root.path().join("arbitrary-release-staging-name");
+        fs::create_dir(&staging).unwrap();
+        fs::copy(
+            root.path().join("legacy/api.json"),
+            staging.join("api.json"),
+        )
+        .unwrap();
+        fs::copy(
+            root.path().join("legacy/reader.dll"),
+            staging.join("reader.dll"),
+        )
+        .unwrap();
+        fs::write(
+            staging.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "pluginId": "reader",
+                "version": "1.0.0",
+                "displayName": "Reader"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            check_executable_matrix_plugin(&staging, &matrix).unwrap(),
+            report
+        );
+    }
+
+    #[test]
+    fn executable_matrix_check_rejects_every_unfinished_hardware_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_dir = source(root.path());
+        let manifest = PluginManifest::load("reader", plugin_dir).unwrap();
+
+        let mut draft = executable_matrix(executable_case());
+        draft["draft"] = Value::Bool(true);
+        let error = validate_executable_matrix(
+            &matrix_file(root.path(), "draft.json", draft),
+            std::slice::from_ref(&manifest),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("marked as draft"));
+
+        let mut review = executable_case();
+        review["reviewRequired"] = Value::Bool(true);
+        let error = validate_executable_matrix(
+            &matrix_file(root.path(), "review.json", executable_matrix(review)),
+            std::slice::from_ref(&manifest),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires exact response review"));
+
+        let mut placeholder = executable_case();
+        placeholder["expected"]["ResData"] = Value::String(DRAFT_RESPONSE_PLACEHOLDER.into());
+        let error = validate_executable_matrix(
+            &matrix_file(
+                root.path(),
+                "placeholder.json",
+                executable_matrix(placeholder),
+            ),
+            std::slice::from_ref(&manifest),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("draft placeholder"));
+
+        let mut incomplete = executable_case();
+        incomplete["request"]["parameters"] = json!({});
+        let error = validate_executable_matrix(
+            &matrix_file(
+                root.path(),
+                "incomplete.json",
+                executable_matrix(incomplete),
+            ),
+            &[manifest],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exactly match"));
+    }
+
+    #[test]
+    fn executable_matrix_check_rejects_route_and_coverage_drift() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_dir = source(root.path());
+        let mut manifest = PluginManifest::load("reader", plugin_dir).unwrap();
+
+        let mut unknown = executable_case();
+        unknown["request"]["method"] = Value::String("missing".into());
+        let error = validate_executable_matrix(
+            &matrix_file(root.path(), "unknown.json", executable_matrix(unknown)),
+            std::slice::from_ref(&manifest),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown method"));
+
+        let mut reset = manifest.services[0].methods[0].clone();
+        reset.name = "reset".into();
+        reset.alias = None;
+        reset.parameters.clear();
+        manifest.services[0].methods.push(reset);
+        let matrix = matrix_file(
+            root.path(),
+            "incomplete-coverage.json",
+            executable_matrix(executable_case()),
+        );
+        let error =
+            validate_executable_matrix(&matrix, std::slice::from_ref(&manifest)).unwrap_err();
+        assert!(error.to_string().contains("do not cover 1"));
+
+        let error =
+            validate_executable_matrix(&matrix, &[manifest.clone(), manifest.clone()]).unwrap_err();
+        assert!(error.to_string().contains("duplicate portable plugin ID"));
+
+        let mut duplicate = manifest.clone();
+        duplicate.plugin_id = "duplicate-reader".into();
+        let error = validate_executable_matrix(&matrix, &[manifest, duplicate]).unwrap_err();
+        assert!(error.to_string().contains("duplicate serviceId"));
     }
 
     #[test]

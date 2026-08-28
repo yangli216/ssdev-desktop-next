@@ -50,6 +50,20 @@ COM/OCX 的 ProgID 和真实注册状态无法在离线准备阶段验证，必�
 
 黄金矩阵默认带有 `"draft": true`。自动生成或由工作台现场子集用例转换的条目还带有 `"reviewRequired": true`。运行器会在启动 controller 或接触硬件之前拒绝草稿；即使误把草稿改为 `false`，任何启用用例仍要求复核或存在生成器保留的输入/响应占位符也会失败关闭。只有补齐全部声明输入、把子集断言核对为完整精确响应、删除占位符、将每个已复核用例改为 `"reviewRequired": false`，并显式解除全局草稿后才会执行。暂不验证的用例可设置 `"enabled": false`，但正式切换时仍须由其他启用用例覆盖对应生产能力。
 
+### 跨平台离线检查
+
+矩阵定稿后先在任意开发平台运行语义检查，不需要启动 DLL、COM、插件宿主或真实硬件：
+
+```powershell
+cargo run --locked -p ssdev-plugin-tool -- matrix-check `
+  --plugin-dir C:\secure-release\reader-2.3.1-stage `
+  --matrix C:\secure-release\reader-2.3.1-matrix.json
+```
+
+`--plugin-dir` 用于检查一个包含规范化 `plugin.json` 的 `prepare` 暂存目录；多插件联合矩阵则改用 `--plugin-root C:\secure-test-inputs\plugins`，其直接子目录必须是各插件 ID。命令检查严格 schema、草稿/复核/占位符状态、全部用例路由、输入字段精确一致性、忽略 ASCII 大小写后的插件 ID 冲突、跨插件 `serviceId` 冲突和启用用例全方法覆盖，并输出插件、服务、方法和用例计数。
+
+这只是无需 Windows 的快速失败门禁，不验证插件签名、厂商 ABI 或设备响应。正式 Windows 运行器会在验签插件后再次调用同一份共享校验逻辑，再启动 x86/x64 宿主，避免离线工具与实机规则漂移。
+
 ## 2. 外部签名
 
 签名系统 Base64 解码 `payloadBase64`，对得到的原始字节执行 Ed25519 签名，并把 64 字节签名的 Base64 文本写入一个只含单行值的文件。例如文件形式为：
