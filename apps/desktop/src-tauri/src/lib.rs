@@ -7,6 +7,7 @@ mod capture;
 #[allow(dead_code)]
 // The shared build/runtime ACL declaration intentionally has target-specific subsets.
 mod command_permissions;
+mod deployment_check;
 mod desktop;
 mod invocations;
 mod local_mappings;
@@ -64,6 +65,8 @@ struct BridgeState {
     preflighted_plugin_hosts: AtomicUsize,
     plugin_preflight_failures: AtomicUsize,
     plugin_trust_mode: &'static str,
+    x86_host: PathBuf,
+    x64_host: PathBuf,
     plugin_root: PathBuf,
     local_mapping_root: PathBuf,
     trust_store: Option<Arc<TrustStore>>,
@@ -225,6 +228,60 @@ async fn bridge_status(
         diagnostics_error: diagnostics.startup_error,
         diagnostics: diagnostics.state.as_ref().map(DiagnosticsState::stats),
     })
+}
+
+#[tauri::command]
+async fn run_deployment_check(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    desktop_state: State<'_, desktop::DesktopState>,
+    update_state: State<'_, app_update::AppUpdateState>,
+    diagnostics: State<'_, DiagnosticsRuntime>,
+) -> Result<deployment_check::DeploymentCheckReport, String> {
+    desktop::require_control(&caller)?;
+    let config = desktop_state.config.snapshot();
+    let config_error = config.validate().err().map(|error| error.to_string());
+    let business_origin_count = config.business_origins().map_or(0, |origins| origins.len());
+    let origin = desktop_state.origin_policy_summary();
+    let trust_keys = state
+        .trust_store
+        .as_deref()
+        .map(TrustStore::stats)
+        .unwrap_or_default();
+    let tracked = match &state.invocation_coordinator {
+        Some(coordinator) => Some(coordinator.stats().await),
+        None => None,
+    };
+    let report = deployment_check::evaluate(&deployment_check::DeploymentCheckFacts {
+        is_windows: cfg!(windows),
+        config_error,
+        business_origin_count,
+        origin_policy_error: desktop_state.origin_policy_error(),
+        allow_insecure_http: origin.allow_insecure_http,
+        plugin_trust_mode: state.plugin_trust_mode,
+        active_trust_keys: trust_keys.active,
+        plugin_count: state.plugin_count.load(Ordering::Acquire),
+        service_count: state.controller.service_count().await,
+        plugin_load_failures: state.plugin_load_failures.load(Ordering::Acquire),
+        plugin_preflight_failures: state.plugin_preflight_failures.load(Ordering::Acquire),
+        x86_host_available: state.x86_host.is_file(),
+        x64_host_available: state.x64_host.is_file(),
+        tracked_invocations_available: tracked.is_some(),
+        tracked_invocations_accepting: tracked.is_some_and(|stats| stats.accepting),
+        tracked_persistence_failures: tracked.map_or(0, |stats| stats.persistence_failures),
+        diagnostics_available: diagnostics.state.is_some(),
+        managed_process_failures: state.managed_process_failures,
+        app_update_configured: update_state.status().configured,
+    });
+    tracing::info!(
+        event_code = "deployment-check-completed",
+        ready = report.ready,
+        passed = report.passed,
+        warnings = report.warnings,
+        failures = report.failures,
+        "deployment self-check completed"
+    );
+    Ok(report)
 }
 
 #[derive(Serialize)]
@@ -1401,17 +1458,19 @@ pub fn run() {
                 trust_store.as_deref(),
                 allow_unsigned_plugins,
             )?;
+            let x86_host = host_path(
+                "SSDEV_PLUGIN_HOST_X86",
+                &resource_dir,
+                "windows/webplus-plugin-host-x86.exe",
+            );
+            let x64_host = host_path(
+                "SSDEV_PLUGIN_HOST_X64",
+                &resource_dir,
+                "windows/webplus-plugin-host-x64.exe",
+            );
             let controller = PluginController::new(SupervisorConfig {
-                x86_host: host_path(
-                    "SSDEV_PLUGIN_HOST_X86",
-                    &resource_dir,
-                    "windows/webplus-plugin-host-x86.exe",
-                ),
-                x64_host: host_path(
-                    "SSDEV_PLUGIN_HOST_X64",
-                    &resource_dir,
-                    "windows/webplus-plugin-host-x64.exe",
-                ),
+                x86_host: x86_host.clone(),
+                x64_host: x64_host.clone(),
                 request_timeout: Duration::from_secs(30),
                 max_in_flight_invocations: DEFAULT_MAX_IN_FLIGHT_INVOCATIONS,
                 plugin_trust,
@@ -1474,6 +1533,8 @@ pub fn run() {
                 } else {
                     "ed25519-strict"
                 },
+                x86_host,
+                x64_host,
                 plugin_root,
                 local_mapping_root,
                 trust_store,
@@ -1530,6 +1591,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             bridge_status,
+            run_deployment_check,
             frontend_ready,
             install_plugin_package,
             install_plugin_from_catalog,

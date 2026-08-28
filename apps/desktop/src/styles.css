@@ -145,6 +145,26 @@ button:disabled { cursor: wait !important; opacity: .5; }
 .quarantined li { display: list-item; padding: 8px 0; border: 0; overflow-wrap: anywhere; }
 
 .diagnostic-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 32px; }
+.deployment-check { margin-top: 32px; overflow: hidden; border: 1px solid #dfb7ae; border-radius: 16px; background: rgba(255,250,248,.9); box-shadow: 0 18px 45px rgba(72,42,35,.05); }
+.deployment-check.ready { border-color: #b9d5c2; background: rgba(248,253,249,.92); }
+.deployment-check > header { display: flex; justify-content: space-between; gap: 24px; align-items: flex-start; padding: 26px 30px; border-bottom: 1px solid #e7d8d4; }
+.deployment-check.ready > header { border-color: #d4e4d9; }
+.deployment-check h2 { margin: 0; color: #63382f; font: 500 28px Georgia, "Songti SC", serif; }
+.deployment-check.ready h2 { color: #245338; }
+.deployment-check header p:last-child { margin: 8px 0 0; color: #7a6a66; font-size: 12px; }
+.deployment-check > header > span { padding: 8px 11px; border-radius: 999px; background: #8c3d31; color: #fff; font-size: 10px; font-weight: 800; letter-spacing: .08em; white-space: nowrap; }
+.deployment-check.ready > header > span { background: #2f654b; }
+.check-list { display: grid; grid-template-columns: 1fr 1fr; }
+.check-list article { display: grid; grid-template-columns: 28px 1fr; gap: 12px; min-height: 112px; padding: 19px 22px; border-right: 1px solid #e2e6e1; border-bottom: 1px solid #e2e6e1; background: rgba(255,255,255,.5); }
+.check-list article:nth-child(even) { border-right: 0; }
+.check-list article > i { display: grid; width: 24px; height: 24px; place-items: center; border-radius: 50%; background: #e8eeea; color: #577064; font-size: 12px; font-style: normal; font-weight: 800; }
+.check-list article.check-pass > i { background: #dceee2; color: #27613e; }
+.check-list article.check-warning > i { background: #fff0ce; color: #7c5b18; }
+.check-list article.check-fail > i { background: #f6dfda; color: #91372b; }
+.check-list article > div { min-width: 0; }
+.check-list strong { color: #34483d; font-size: 13px; }
+.check-list p { margin: 6px 0 0; color: #6f7b73; font-size: 11px; line-height: 1.55; }
+.check-list small { display: block; margin-top: 6px; color: #795e45; font-size: 10px; line-height: 1.5; }
 .diagnostic-grid article { min-height: 142px; padding: 20px; border: 1px solid #ced6cf; border-radius: 12px; background: rgba(255,255,252,.84); }
 .diagnostic-grid strong { display: block; margin: 20px 0 8px; color: #183d2c; font: 20px Georgia, "Songti SC", serif; }
 .diagnostic-grid small { line-height: 1.55; }
@@ -195,6 +215,8 @@ button:disabled { cursor: wait !important; opacity: .5; }
   .environment-row { grid-template-columns: auto 1fr auto auto; }
   .environment-row input[type="url"] { grid-column: 2 / -1; }
   .maintenance-panel { grid-template-columns: 1fr; }
+  .check-list { grid-template-columns: 1fr; }
+  .check-list article { border-right: 0; }
   .maintenance-panel .update-details { grid-column: 1; }
   .plugin-update-results > div, .service-mapping summary { align-items: flex-start; flex-direction: column; }
   .method-mapping { grid-template-columns: 1fr 16px 1fr; }

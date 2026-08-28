@@ -1,5 +1,6 @@
 pub const APP_COMMANDS: &[&str] = &[
     "bridge_status",
+    "run_deployment_check",
     "frontend_ready",
     "install_plugin_package",
     "install_plugin_from_catalog",
@@ -40,6 +41,7 @@ pub const APP_COMMANDS: &[&str] = &[
 
 pub const CONTROL_PERMISSIONS: &[&str] = &[
     "allow-bridge-status",
+    "allow-run-deployment-check",
     "allow-frontend-ready",
     "allow-install-plugin-package",
     "allow-install-plugin-from-catalog",
@@ -119,6 +121,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         for forbidden in [
             "allow-desktop-config",
+            "allow-run-deployment-check",
             "allow-save-desktop-config",
             "allow-install-plugin-package",
             "allow-install-plugin-from-catalog",

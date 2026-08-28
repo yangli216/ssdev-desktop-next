@@ -74,6 +74,20 @@ type BridgeStatus = {
   }
 }
 
+type DeploymentCheckReport = {
+  ready: boolean
+  passed: number
+  warnings: number
+  failures: number
+  items: Array<{
+    id: string
+    label: string
+    status: 'pass' | 'warning' | 'fail' | 'info'
+    summary: string
+    action?: string
+  }>
+}
+
 type EnvironmentConfig = {
   name: string
   url: string
@@ -176,6 +190,7 @@ type SsoStatusEvent = {
 }
 
 const status = ref<BridgeStatus | null>(null)
+const deploymentCheck = ref<DeploymentCheckReport | null>(null)
 const snapshot = ref<ConfigSnapshot | null>(null)
 const inventory = ref<PluginInventory | null>(null)
 const catalogPluginId = ref('')
@@ -219,14 +234,20 @@ onMounted(async () => {
       ssoStatusEventSeen = true
       applySsoStatus(event.payload.code, event.payload.active)
     })
-    const [bridge, config, plugins] = await Promise.all([
+    const deploymentPromise = invoke<DeploymentCheckReport>('run_deployment_check').catch((reason) => {
+      error.value = `部署自检不可用：${reason instanceof Error ? reason.message : String(reason)}`
+      return null
+    })
+    const [bridge, config, plugins, deployment] = await Promise.all([
       invoke<BridgeStatus>('bridge_status'),
       invoke<ConfigSnapshot>('desktop_config'),
       invoke<PluginInventory>('plugin_inventory'),
+      deploymentPromise,
     ])
     status.value = bridge
     snapshot.value = config
     inventory.value = plugins
+    deploymentCheck.value = deployment
     if (!ssoStatusEventSeen) applySsoStatus(bridge.ssoError, bridge.ssoActive)
   } catch (reason) {
     error.value = reason instanceof Error ? reason.message : String(reason)
@@ -252,7 +273,10 @@ async function run(action: () => Promise<unknown>, success: string) {
 async function saveConfig() {
   if (!snapshot.value) return
   await run(
-    () => invoke('save_desktop_config', { config: snapshot.value?.config }),
+    async () => {
+      await invoke('save_desktop_config', { config: snapshot.value?.config })
+      deploymentCheck.value = await invoke<DeploymentCheckReport>('run_deployment_check')
+    },
     '配置已安全保存；已有业务窗口已关闭，请重新进入。',
   )
 }
@@ -266,6 +290,7 @@ async function importConfig() {
   if (typeof source !== 'string') return
   await run(async () => {
     snapshot.value = await invoke<ConfigSnapshot>('import_desktop_config', { source })
+    deploymentCheck.value = await invoke<DeploymentCheckReport>('run_deployment_check')
   }, '配置已校验并导入；已有业务窗口已关闭。')
 }
 
@@ -333,9 +358,10 @@ async function installPlugin() {
   let result: PluginInstallResult | undefined
   await run(async () => {
     result = await invoke<PluginInstallResult>('install_plugin_package', { packagePath: selected })
-    ;[status.value, inventory.value] = await Promise.all([
+    ;[status.value, inventory.value, deploymentCheck.value] = await Promise.all([
       invoke<BridgeStatus>('bridge_status'),
       invoke<PluginInventory>('plugin_inventory'),
+      invoke<DeploymentCheckReport>('run_deployment_check'),
     ])
   }, '')
 
@@ -348,18 +374,20 @@ async function installPlugin() {
 async function reloadPlugins() {
   await run(async () => {
     await invoke('reload_plugins')
-    ;[status.value, inventory.value] = await Promise.all([
+    ;[status.value, inventory.value, deploymentCheck.value] = await Promise.all([
       invoke<BridgeStatus>('bridge_status'),
       invoke<PluginInventory>('plugin_inventory'),
+      invoke<DeploymentCheckReport>('run_deployment_check'),
     ])
   }, '插件目录已重新校验并热加载。')
 }
 
 async function refreshPluginsAfterMapping() {
   try {
-    ;[status.value, inventory.value] = await Promise.all([
+    ;[status.value, inventory.value, deploymentCheck.value] = await Promise.all([
       invoke<BridgeStatus>('bridge_status'),
       invoke<PluginInventory>('plugin_inventory'),
+      invoke<DeploymentCheckReport>('run_deployment_check'),
     ])
   } catch (reason) {
     error.value = reason instanceof Error ? reason.message : String(reason)
@@ -401,10 +429,11 @@ async function installFromCatalog(pluginId: string, version?: string) {
       pluginId,
       version,
     })
-    ;[status.value, inventory.value, pluginUpdates.value] = await Promise.all([
+    ;[status.value, inventory.value, pluginUpdates.value, deploymentCheck.value] = await Promise.all([
       invoke<BridgeStatus>('bridge_status'),
       invoke<PluginInventory>('plugin_inventory'),
       invoke<PluginUpdateCheck>('check_plugin_updates', { pluginId }),
+      invoke<DeploymentCheckReport>('run_deployment_check'),
     ])
   }, '')
   if (result) {
@@ -467,6 +496,19 @@ async function exportDiagnostics() {
     notice.value = `诊断包已导出（${(result.bytes / 1024).toFixed(1)} KiB）；不包含业务参数、响应、SSO 参数或业务地址。`
   }
 }
+
+async function runDeploymentCheck() {
+  let result: DeploymentCheckReport | undefined
+  await run(async () => {
+    result = await invoke<DeploymentCheckReport>('run_deployment_check')
+    deploymentCheck.value = result
+  }, '')
+  if (result) {
+    notice.value = result.ready
+      ? `部署自检通过：${result.passed} 项正常，${result.warnings} 项提醒。`
+      : `部署自检发现 ${result.failures} 项阻塞问题，请按建议处理后重新检查。`
+  }
+}
 </script>
 
 <template>
@@ -517,7 +559,7 @@ async function exportDiagnostics() {
           <article><span>桌面通信</span><strong>{{ status?.transport ?? '连接中' }}</strong><small>不开放 localhost 端口</small></article>
           <article><span>原生服务</span><strong>{{ status?.serviceCount ?? '—' }}</strong><small>{{ status?.pluginCount ?? '—' }} 个插件 · x86 / x64 隔离</small></article>
           <article><span>当前调用</span><strong>{{ status ? `${status.inFlightInvocations} / ${status.maxInFlightInvocations}` : '—' }}</strong><small>{{ status?.acceptingPluginInvocations ? '正在接受新调用' : '暂不接受新调用' }}</small></article>
-          <article><span>安全状态</span><strong>{{ status?.pluginLoadFailures || inventory?.quarantined.length ? '需要检查' : '正常' }}</strong><small>{{ inventory?.quarantined.length ?? 0 }} 个隔离项 · {{ status?.pluginLoadFailures ?? 0 }} 次加载失败</small></article>
+          <article><span>部署状态</span><strong>{{ deploymentCheck ? deploymentCheck.ready ? '可以交付' : '需要处理' : '检查中' }}</strong><small>{{ deploymentCheck ? `${deploymentCheck.failures} 项阻塞 · ${deploymentCheck.warnings} 项提醒` : '正在执行环境自检' }}</small></article>
         </section>
 
         <div class="overview-layout">
@@ -550,9 +592,10 @@ async function exportDiagnostics() {
           </section>
         </div>
 
-        <section v-if="status?.pluginLoadFailures || status?.pluginPreflightFailures || inventory?.quarantined.length || ssoError" class="attention-panel">
+        <section v-if="deploymentCheck?.failures || status?.pluginPreflightFailures || inventory?.quarantined.length || ssoError" class="attention-panel">
           <div><p class="eyebrow">ATTENTION</p><h2>待处理事项</h2></div>
           <ul>
+            <li v-if="deploymentCheck?.failures"><strong>部署自检存在 {{ deploymentCheck.failures }} 项阻塞问题</strong><button type="button" @click="activeSection = 'security'">查看自检</button></li>
             <li v-if="inventory?.quarantined.length"><strong>{{ inventory.quarantined.length }} 个插件已隔离</strong><button type="button" @click="activeSection = 'plugins'">查看插件</button></li>
             <li v-if="status?.pluginPreflightFailures"><strong>{{ status.pluginPreflightFailures }} 次宿主预检失败</strong><button type="button" @click="activeSection = 'security'">查看诊断</button></li>
             <li v-if="ssoError"><strong>最近一次 SSO 登录失败</strong><button type="button" @click="activeSection = 'security'">查看详情</button></li>
@@ -625,7 +668,19 @@ async function exportDiagnostics() {
       </section>
 
       <section v-show="activeSection === 'security'" class="page" aria-labelledby="security-title">
-        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>查看详细运行指标、来源策略和客户端维护状态。</p></div><div class="header-actions"><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
+        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>先执行部署自检，再按需查看详细指标和导出诊断。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy" @click="runDeploymentCheck">重新自检</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
+        <section v-if="deploymentCheck" :class="['deployment-check', { ready: deploymentCheck.ready }]" aria-label="部署自检结果">
+          <header>
+            <div><p class="eyebrow">DEPLOYMENT CHECK</p><h2>{{ deploymentCheck.ready ? '当前机器可以交付' : '部署条件尚未满足' }}</h2><p>{{ deploymentCheck.passed }} 项正常 · {{ deploymentCheck.warnings }} 项提醒 · {{ deploymentCheck.failures }} 项阻塞</p></div>
+            <span>{{ deploymentCheck.ready ? 'READY' : 'ACTION REQUIRED' }}</span>
+          </header>
+          <div class="check-list">
+            <article v-for="item in deploymentCheck.items" :key="item.id" :class="`check-${item.status}`">
+              <i>{{ item.status === 'pass' ? '✓' : item.status === 'fail' ? '!' : item.status === 'warning' ? '△' : 'i' }}</i>
+              <div><strong>{{ item.label }}</strong><p>{{ item.summary }}</p><small v-if="item.action">建议：{{ item.action }}</small></div>
+            </article>
+          </div>
+        </section>
         <section class="diagnostic-grid" aria-label="详细运行状态">
           <article><span>插件调用背压</span><strong v-if="status?.globalPluginMaintenanceActive">全局维护中</strong><strong v-else>{{ status ? `${status.inFlightInvocations} / ${status.maxInFlightInvocations}` : '—' }}</strong><small>容量拒绝 {{ status?.rejectedInvocations ?? '—' }} · 槽超时 {{ status?.executionLaneTimeouts ?? '—' }} · 维护拒绝 {{ status?.maintenanceRejectedInvocations ?? '—' }}</small></article>
           <article><span>隔离宿主监督</span><strong>{{ status?.activePluginHosts ?? '—' }} 个活动宿主</strong><small>累计启动 {{ status?.pluginHostStarts ?? '—' }} · 失败 {{ status?.pluginHostStartFailures ?? '—' }}</small></article>

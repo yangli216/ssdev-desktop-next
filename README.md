@@ -20,7 +20,7 @@ business webview -> narrow Tauri command -> Rust controller
 - controller 最多接受 8 个在途插件调用；容量饱和时在进入原生宿主前快速拒绝，不建立无界等待队列。
 - localhost HTTP 仅作为可关闭的旧浏览器兼容网关，不是新架构内部依赖。
 
-每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归，并分别为 x64 与 x86 桌面构建 `0.0.1` 合成旧版本和当前候选版本，对离线 NSIS 执行原位升级、配置保留、布局/架构检查、真实启动和卸载；随后额外构建在线轻量 NSIS 并执行安装、启动和卸载冒烟。工作流还构建 Linux DEB/AppImage 和 macOS DMG 开发预览包。CI 使用临时更新密钥且明确跳过平台代码签名，只验证工程链路，产物不能分发。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
+每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归，并分别为 x64 与 x86 桌面构建 `0.0.1` 合成旧版本和当前候选版本，对离线 NSIS 执行原位升级、配置保留、布局/架构检查、真实启动和卸载；随后额外构建在线轻量 NSIS 并执行安装、启动和卸载冒烟。Linux DEB/AppImage 和 macOS DMG 仅在手动选择 `all` 平台时构建。CI 使用临时更新密钥且明确跳过平台代码签名，只验证工程链路，产物不能分发。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
 
 架构决策和迁移门槛见 [docs/adr/0001-target-architecture.md](docs/adr/0001-target-architecture.md)。
 业务页面从 localhost HTTP 切换到窄桥接接口的方式见 [docs/web-bridge-migration.md](docs/web-bridge-migration.md)。
@@ -44,6 +44,7 @@ Go WebPlus 的逐项替代决策见 [docs/webplus-parity.md](docs/webplus-parity
 应用本体签名更新的发布与密钥要求见 [docs/app-updates.md](docs/app-updates.md)。
 Windows 安装包与源码提交、锁文件和工具链的签名绑定见 [docs/release-provenance.md](docs/release-provenance.md)。
 有界结构化日志、隐私契约和本地诊断包导出见 [docs/diagnostics.md](docs/diagnostics.md)。
+项目交付前的一键环境检查、阻塞条件和处理建议见 [docs/deployment-check.md](docs/deployment-check.md)。
 锁文件、官方 npm 源、固定 GitHub Action 提交和定期漏洞审计要求见 [docs/supply-chain-security.md](docs/supply-chain-security.md)。
 
 仓库内的 `plugin-trust.json` 默认没有任何公钥，因此生产接入真实插件前必须由发布流水线注入组织公钥。每把公钥除用途外还具有 `active`、`retired` 或 `revoked` 生命周期；新发布只接受 active，retired 用于计划轮换并停止官方新签发，revoked 用于泄露后让运行时立即拒绝。旧版把 RSA 私钥放进客户端的 `license.dat` 校验方式不会沿用。

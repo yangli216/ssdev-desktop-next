@@ -27,7 +27,7 @@ GitHub Actions 将离线版命名为 `ssdev-windows-<arch>-offline-unsigned`，�
 - Linux 上执行 Rust 格式、Clippy、测试、桌面安全边界和前端/SDK 测试；
 - Windows 上分别验证 x86/x64 DLL、COM 和插件宿主；
 - 对 x64 与 x86 桌面各构建一套合成旧版本和当前版本，执行 NSIS 原位升级、启动、布局、架构与卸载验证；
-- 构建 Linux DEB/AppImage 和 macOS DMG 开发预览包；
+- 默认只构建 Windows 安装包；手动触发并选择 `all` 时才额外构建 Linux DEB/AppImage 和 macOS DMG 开发预览包；
 - 将通过门禁的未签名产物保存 14 天。
 
 每周依赖审计由 `.github/workflows/supply-chain.yml` 执行。

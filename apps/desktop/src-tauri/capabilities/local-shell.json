@@ -8,6 +8,7 @@
     "dialog:allow-open",
     "dialog:allow-save",
     "allow-bridge-status",
+    "allow-run-deployment-check",
     "allow-frontend-ready",
     "allow-install-plugin-package",
     "allow-install-plugin-from-catalog",
