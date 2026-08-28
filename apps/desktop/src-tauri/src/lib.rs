@@ -1455,6 +1455,23 @@ async fn export_local_mapping_typescript(
 }
 
 #[tauri::command]
+async fn export_local_mapping_release_source(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    plugin_id: String,
+    destination_parent: PathBuf,
+) -> Result<local_mappings::ReleaseSourceExportResult, String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    let root = state.local_mapping_root.clone();
+    tokio::task::spawn_blocking(move || {
+        local_mappings::export_release_source(&root, &plugin_id, &destination_parent)
+    })
+    .await
+    .map_err(|_| "发布源导出任务异常终止".to_owned())?
+}
+
+#[tauri::command]
 async fn import_local_mapping(
     caller: WebviewWindow,
     state: State<'_, BridgeState>,
@@ -2153,6 +2170,7 @@ pub fn run() {
             save_local_mapping,
             export_local_mapping,
             export_local_mapping_typescript,
+            export_local_mapping_release_source,
             import_local_mapping,
             delete_local_mapping,
             debug_plugin_invoke,

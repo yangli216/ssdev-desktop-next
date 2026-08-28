@@ -453,6 +453,22 @@ async function exportTypescript(pluginId: string) {
   })
 }
 
+async function exportReleaseSource(pluginId: string) {
+  const destinationParent = await open({
+    multiple: false,
+    directory: true,
+    title: '选择发布源父目录',
+  })
+  if (typeof destinationParent !== 'string') return
+  await run(async () => {
+    const result = await invoke<{ destination: string; fileCount: number; bytes: number }>('export_local_mapping_release_source', {
+      pluginId,
+      destinationParent,
+    })
+    notice.value = `最小发布源已导出：${result.destination}（${result.fileCount} 个文件，${(result.bytes / 1024 / 1024).toFixed(1)} MiB）。下一步由 ssdev-plugin-tool prepare 生成签名请求。`
+  })
+}
+
 async function importMapping() {
   const source = await open({
     multiple: false,
@@ -643,7 +659,7 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
             <strong>{{ mapping.displayName || mapping.pluginId }}</strong>
             <small>{{ mapping.pluginId }} · {{ mapping.services.length }} 个服务</small>
           </button>
-          <span><button type="button" :disabled="busy || disabled" @click="exportTypescript(mapping.pluginId)">TS</button><button type="button" :disabled="busy || disabled" @click="exportMapping(mapping.pluginId)">导出</button><button class="danger-link" type="button" :disabled="busy || disabled" @click="deleteMapping(mapping.pluginId)">删除</button></span>
+          <span><button type="button" :disabled="busy || disabled" @click="exportTypescript(mapping.pluginId)">TS</button><button type="button" :disabled="busy || disabled" @click="exportReleaseSource(mapping.pluginId)">发布源</button><button type="button" :disabled="busy || disabled" @click="exportMapping(mapping.pluginId)">迁移包</button><button class="danger-link" type="button" :disabled="busy || disabled" @click="deleteMapping(mapping.pluginId)">删除</button></span>
         </article>
         <p v-if="inventory.mappings.length === 0" class="empty">尚未创建本地映射。</p>
       </div>

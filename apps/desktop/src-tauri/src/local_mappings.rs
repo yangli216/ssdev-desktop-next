@@ -64,6 +64,14 @@ pub(crate) struct NativeComponentInspection {
     pub warnings: Vec<&'static str>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReleaseSourceExportResult {
+    pub destination: PathBuf,
+    pub file_count: usize,
+    pub bytes: u64,
+}
+
 pub(crate) struct PreparedLocalMapping {
     staging: TempDir,
     definition: LocalMappingDefinition,
@@ -453,6 +461,85 @@ pub(crate) fn export_typescript(
     Ok(())
 }
 
+pub(crate) fn export_release_source(
+    root: &Path,
+    plugin_id: &str,
+    destination_parent: &Path,
+) -> Result<ReleaseSourceExportResult, String> {
+    let plugin_dir = installed_mapping_dir(root, plugin_id)?;
+    let definition = load_validated_stored_definition(&plugin_dir, plugin_id)?;
+    let parent_metadata = fs::symlink_metadata(destination_parent)
+        .map_err(|error| format!("无法读取发布源目标目录: {error}"))?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err("发布源目标必须是已存在的真实目录".into());
+    }
+    let destination_parent = destination_parent
+        .canonicalize()
+        .map_err(|error| format!("无法解析发布源目标目录: {error}"))?;
+    let managed_root = root
+        .canonicalize()
+        .map_err(|error| format!("无法解析本地映射根目录: {error}"))?;
+    if destination_parent.starts_with(&managed_root) {
+        return Err("发布源不能写入客户端管理的本地映射目录".into());
+    }
+    let destination = destination_parent.join(format!("{plugin_id}-release-source"));
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => {
+            return Err(format!(
+                "发布源目标已存在，不会覆盖: {}",
+                destination.display()
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("无法检查发布源目标: {error}")),
+    }
+    fs::create_dir(&destination).map_err(|error| format!("无法创建发布源目录: {error}"))?;
+    let exported = (|| {
+        write_json(destination.join(API_FILENAME), &definition.services)?;
+        let mut copied = HashSet::new();
+        let mut file_count = 1_usize;
+        let mut bytes = fs::metadata(destination.join(API_FILENAME))
+            .map_err(|error| format!("无法检查发布源 API: {error}"))?
+            .len();
+        for service in &definition.services {
+            let main_type = service.resolved_main_type().to_ascii_lowercase();
+            if matches!(main_type.as_str(), "dll" | "exe" | "bat") {
+                copy_release_file(
+                    &plugin_dir,
+                    &destination,
+                    Path::new(&service.main_class),
+                    &mut copied,
+                    &mut file_count,
+                    &mut bytes,
+                )?;
+            }
+            for dependency in &service.deps {
+                copy_release_file(
+                    &plugin_dir,
+                    &destination,
+                    Path::new(dependency),
+                    &mut copied,
+                    &mut file_count,
+                    &mut bytes,
+                )?;
+            }
+        }
+        Ok::<_, String>((file_count, bytes))
+    })();
+    let (file_count, bytes) = match exported {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&destination);
+            return Err(error);
+        }
+    };
+    Ok(ReleaseSourceExportResult {
+        destination,
+        file_count,
+        bytes,
+    })
+}
+
 pub(crate) fn validate_installed_manifest(manifest: &PluginManifest) -> Result<(), String> {
     let definition = load_stored_definition(&manifest.plugin_dir)?;
     validate_definition_header(&definition)?;
@@ -678,6 +765,47 @@ fn installed_mapping_dir(root: &Path, plugin_id: &str) -> Result<PathBuf, String
         return Err(format!("本地映射 [{plugin_id}] 不存在或目录不安全"));
     }
     Ok(plugin_dir)
+}
+
+fn copy_release_file(
+    plugin_dir: &Path,
+    destination: &Path,
+    relative: &Path,
+    copied: &mut HashSet<String>,
+    file_count: &mut usize,
+    bytes: &mut u64,
+) -> Result<(), String> {
+    validate_plugin_file(plugin_dir, relative)?;
+    let portable = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value.to_str().ok_or("发布源文件名不是有效文本"),
+            Component::CurDir => Ok("."),
+            _ => Err("发布源文件路径不安全"),
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join("/");
+    if !copied.insert(portable.to_ascii_lowercase()) {
+        return Ok(());
+    }
+    let source = plugin_dir.join(relative);
+    let length = fs::metadata(&source)
+        .map_err(|error| format!("无法检查发布源组件: {error}"))?
+        .len();
+    *bytes = bytes.saturating_add(length);
+    *file_count = file_count.saturating_add(1);
+    if *bytes > MAX_BUNDLE_BYTES || *file_count > MAX_BUNDLE_ENTRIES {
+        return Err("发布源超过 1 GiB 或 512 个文件上限".into());
+    }
+    let target = destination.join(relative);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建发布源子目录: {error}"))?;
+    }
+    fs::copy(&source, &target).map_err(|error| format!("无法复制发布源组件: {error}"))?;
+    File::open(&target)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("无法持久化发布源组件: {error}"))?;
+    Ok(())
 }
 
 fn load_validated_stored_definition(
@@ -1371,5 +1499,81 @@ mod tests {
             expected_res_data: serde_json::json!({ "secret": "must not persist" }),
         });
         assert!(validate_definition_header(&definition).is_err());
+    }
+
+    #[test]
+    fn release_source_contains_only_api_and_referenced_native_files() {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine;
+        use ed25519_dalek::SigningKey;
+        use ssdev_plugin_tool::{prepare as prepare_release, PrepareOptions};
+
+        let source = tempfile::tempdir().unwrap();
+        let component = source.path().join("reader.bat");
+        fs::write(&component, b"@echo off\r\necho ready\r\n").unwrap();
+        let active_root = tempfile::tempdir().unwrap();
+        prepare(active_root.path(), fixture_definition(&component))
+            .unwrap()
+            .activate(active_root.path())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let plugin_dir = active_root.path().join("reader.local");
+        fs::write(plugin_dir.join("unreferenced.txt"), b"must not ship").unwrap();
+
+        let output = tempfile::tempdir().unwrap();
+        let result =
+            export_release_source(active_root.path(), "reader.local", output.path()).unwrap();
+        assert_eq!(
+            result.destination,
+            output
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("reader.local-release-source")
+        );
+        assert_eq!(result.file_count, 2);
+        assert!(result.destination.join(API_FILENAME).is_file());
+        assert!(result.destination.join("components/0-reader.bat").is_file());
+        assert!(!result.destination.join(LOCAL_MAPPING_FILENAME).exists());
+        assert!(!result.destination.join(PLUGIN_METADATA_FILENAME).exists());
+        assert!(!result.destination.join("unreferenced.txt").exists());
+
+        let signing_key = SigningKey::from_bytes(&[41; 32]);
+        let trust_store = output.path().join("trust.json");
+        fs::write(
+            &trust_store,
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "keys": [{
+                    "keyId": "release-key",
+                    "algorithm": "ed25519",
+                    "publicKey": BASE64.encode(signing_key.verifying_key().to_bytes()),
+                    "purposes": ["plugin"],
+                    "status": "active"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let prepared = prepare_release(&PrepareOptions {
+            source: &result.destination,
+            staging: &output.path().join("signed-stage"),
+            request: &output.path().join("signing-request.json"),
+            matrix_template: &output.path().join("matrix.json"),
+            plugin_id: "reader.local",
+            version: "1.0.0",
+            display_name: "Reader release",
+            key_id: "release-key",
+            trust_store: &trust_store,
+        })
+        .unwrap();
+        assert_eq!(prepared.plugin_id, "reader.local");
+        assert_eq!(prepared.method_count, 1);
+
+        assert!(export_release_source(active_root.path(), "reader.local", output.path()).is_err());
+        assert!(
+            export_release_source(active_root.path(), "reader.local", active_root.path()).is_err()
+        );
     }
 }

@@ -2,6 +2,8 @@
 
 `ssdev-plugin-tool` 把旧插件目录转换为可审计、可重复的发布输入。它不会加载 DLL、注册 OCX、执行 EXE/BAT 或持有生产私钥。迁移先运行只读审计；处理完 `api.json`、`installRun` 和架构问题后，再进入这里的发布流程。
 
+控制台本地映射已经完成现场验证时，可在“原生映射”卡片点击“发布源”，选择一个受控父目录。桌面端会创建新的 `<pluginId>-release-source`，仅包含规范化 `api.json` 以及清单实际引用的组件和依赖。它不会导出 `local-mapping.json`、合成调试用例、本地 `plugin.json`、旧签名或未引用文件；后续把该目录直接作为下方 `prepare --source` 输入。正式版本号、发布名称和签名 keyId 仍由发布流程明确提供，不能从现场配置静默继承。
+
 ## 两阶段信任边界
 
 发布被刻意拆成两个阶段：
@@ -27,6 +29,8 @@ cargo run --locked -p ssdev-plugin-tool -- prepare `
   --key-id production-2026-01 `
   --trust-store C:\secure-build-inputs\plugin-trust.json
 ```
+
+若来源是工作台导出的本地映射，上述 `--source` 改为例如 `C:\secure-release-inputs\reader.local-release-source`。发布工具仍会重新校验入口、依赖和架构并生成全方法黄金矩阵草稿；本地子集回归不能替代正式插件的完整 `ResData` 精确矩阵。
 
 准备阶段先确认指定 `keyId` 在信任库中具有 `plugin` 用途且状态为 `active`，避免 KMS/HSM 为已退役或吊销的键产生无效签名；随后会硬拒绝以下情况：
 
