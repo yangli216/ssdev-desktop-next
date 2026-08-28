@@ -28,6 +28,7 @@ try {
       -p webplus-plugin-package `
       -p webplus-plugin-trust `
       -p ssdev-plugin-tool `
+      -p ssdev-windows-system-example `
       -p webplus-protocol `
       --all-targets `
       --target $target `
@@ -35,10 +36,18 @@ try {
     cargo check --locked -p ssdev-process-policy --target $target
     cargo build --locked -p webplus-plugin-host --target $target
     cargo build --locked -p webplus-native-fixture --target $target
+    cargo build --locked -p ssdev-windows-system-example --target $target
 
     $fixture = Join-Path $workspace "target/$target/debug/webplus_native_fixture.dll"
     cargo run --locked -p webplus-native --example dll_roundtrip --target $target -- $fixture
     cargo run --locked -p webplus-native --example com_roundtrip --target $target
+    $systemExample = Join-Path $workspace "target/$target/debug/ssdev_windows_system_example.dll"
+    $systemApi = if ($target -eq "i686-pc-windows-msvc") {
+      Join-Path $workspace "examples/windows-system-plugin/api.x86.json"
+    } else {
+      Join-Path $workspace "examples/windows-system-plugin/api.x64.json"
+    }
+    cargo run --locked -p webplus-native --example windows_system_roundtrip --target $target -- $systemExample $systemApi
 
     $pluginHostPath = Join-Path $workspace "target/$target/debug/webplus-plugin-host.exe"
     cargo run --locked -p webplus-controller --example host_roundtrip --target $target -- $pluginHostPath

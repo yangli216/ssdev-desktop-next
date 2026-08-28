@@ -1,0 +1,13 @@
+[package]
+name = "ssdev-windows-system-example"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dev-dependencies]
+serde_json.workspace = true

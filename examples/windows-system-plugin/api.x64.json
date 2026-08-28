@@ -1,0 +1,21 @@
+[
+  {
+    "serviceId": "windows.system",
+    "mainClass": "bin/ssdev_windows_system_example.dll",
+    "mainType": "dll",
+    "architecture": "x64",
+    "charset": "utf8",
+    "callingConvention": "cdecl",
+    "cacheable": true,
+    "timeout": 30000,
+    "deps": [],
+    "methods": [
+      { "name": "SsdevGetTickCountMs", "alias": "getTickCountMs", "returnType": "uint", "parameters": [] },
+      { "name": "SsdevGetCurrentProcessId", "alias": "getCurrentProcessId", "returnType": "uint", "parameters": [] },
+      { "name": "SsdevGetSystemInfo", "alias": "getSystemInfo", "returnType": "int", "parameters": [{ "name": "$value", "type": "string", "len": 512 }] },
+      { "name": "SsdevGetMemoryStatus", "alias": "getMemoryStatus", "returnType": "int", "parameters": [{ "name": "$value", "type": "string", "len": 512 }] },
+      { "name": "SsdevGetDiskSpace", "alias": "getDiskSpace", "returnType": "int", "parameters": [{ "name": "path", "type": "string" }, { "name": "$value", "type": "string", "len": 512 }] },
+      { "name": "SsdevShowMessage", "alias": "showMessage", "returnType": "int", "parameters": [{ "name": "title", "type": "string" }, { "name": "message", "type": "string" }] }
+    ]
+  }
+]
