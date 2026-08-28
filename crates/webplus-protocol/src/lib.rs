@@ -8,8 +8,26 @@ pub const HOST_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_INVOKE_PARAMETERS_BYTES: usize = 8 * 1024 * 1024;
 pub const DRAFT_INPUT_PLACEHOLDER: &str = "<replace-with-redacted-input>";
 pub const DRAFT_RESPONSE_PLACEHOLDER: &str = "<replace-with-redacted-golden-response>";
+/// Rejected before routing because the bounded controller admission capacity is full.
+pub const INVOKE_CAPACITY_BUSY_CODE: i32 = -32001;
+/// Rejected before native execution because the desktop is draining for exit or restart.
+pub const INVOKE_CONTROLLER_STOPPING_CODE: i32 = -32002;
+/// Rejected before native execution because the per-plugin execution lane deadline elapsed.
+pub const INVOKE_EXECUTION_LANE_TIMEOUT_CODE: i32 = -32003;
+/// Rejected before native execution because the selected plugin is in a maintenance generation.
+pub const INVOKE_PLUGIN_RELOADING_CODE: i32 = -32010;
 const MAX_ROUTING_FIELD_CHARS: usize = 256;
 const MAX_PARAMETER_COUNT: usize = 256;
+
+pub fn is_reserved_controller_invoke_code(code: i32) -> bool {
+    matches!(
+        code,
+        INVOKE_CAPACITY_BUSY_CODE
+            | INVOKE_CONTROLLER_STOPPING_CODE
+            | INVOKE_EXECUTION_LANE_TIMEOUT_CODE
+            | INVOKE_PLUGIN_RELOADING_CODE
+    )
+}
 
 pub fn contains_draft_placeholder(value: &Value) -> bool {
     match value {

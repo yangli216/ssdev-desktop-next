@@ -12,6 +12,96 @@ export interface InvokeResponse<T = JsonValue> {
   ResData: T
 }
 
+export const PLUGIN_INVOCATION_CONTROL_CODES = Object.freeze({
+  capacityBusy: -32001,
+  controllerStopping: -32002,
+  executionLaneTimeout: -32003,
+  pluginReloading: -32010,
+} as const)
+
+export type PluginInvocationDisposition = Readonly<
+  | {
+      kind: 'capacity-busy' | 'execution-lane-timeout' | 'plugin-reloading'
+      execution: 'not-executed'
+      retry: 'bounded-backoff'
+    }
+  | {
+      kind: 'controller-stopping'
+      execution: 'not-executed'
+      retry: 'after-restart'
+    }
+  | {
+      kind: 'other'
+      execution: 'not-classified'
+      retry: 'never-automatically'
+    }
+>
+
+const PLUGIN_INVOCATION_DISPOSITIONS = Object.freeze({
+  capacityBusy: Object.freeze({
+    kind: 'capacity-busy',
+    execution: 'not-executed',
+    retry: 'bounded-backoff',
+  }),
+  controllerStopping: Object.freeze({
+    kind: 'controller-stopping',
+    execution: 'not-executed',
+    retry: 'after-restart',
+  }),
+  executionLaneTimeout: Object.freeze({
+    kind: 'execution-lane-timeout',
+    execution: 'not-executed',
+    retry: 'bounded-backoff',
+  }),
+  pluginReloading: Object.freeze({
+    kind: 'plugin-reloading',
+    execution: 'not-executed',
+    retry: 'bounded-backoff',
+  }),
+  other: Object.freeze({
+    kind: 'other',
+    execution: 'not-classified',
+    retry: 'never-automatically',
+  }),
+} as const satisfies Record<string, PluginInvocationDisposition>)
+
+export function classifyPluginInvocationResponse(
+  response: Pick<InvokeResponse, 'ResCode'>,
+): PluginInvocationDisposition {
+  switch (response.ResCode) {
+    case PLUGIN_INVOCATION_CONTROL_CODES.capacityBusy:
+      return PLUGIN_INVOCATION_DISPOSITIONS.capacityBusy
+    case PLUGIN_INVOCATION_CONTROL_CODES.controllerStopping:
+      return PLUGIN_INVOCATION_DISPOSITIONS.controllerStopping
+    case PLUGIN_INVOCATION_CONTROL_CODES.executionLaneTimeout:
+      return PLUGIN_INVOCATION_DISPOSITIONS.executionLaneTimeout
+    case PLUGIN_INVOCATION_CONTROL_CODES.pluginReloading:
+      return PLUGIN_INVOCATION_DISPOSITIONS.pluginReloading
+    default:
+      return PLUGIN_INVOCATION_DISPOSITIONS.other
+  }
+}
+
+export function wasPluginInvocationGuaranteedNotExecuted(
+  response: Pick<InvokeResponse, 'ResCode'>,
+): boolean {
+  return classifyPluginInvocationResponse(response).execution === 'not-executed'
+}
+
+export function canRetryPluginInvocationWithBackoff(
+  response: Pick<InvokeResponse, 'ResCode'>,
+): boolean {
+  return classifyPluginInvocationResponse(response).retry === 'bounded-backoff'
+}
+
+export interface PluginInvoker {
+  invokePlugin<T = JsonValue>(
+    serviceId: string,
+    method: string,
+    parameters?: JsonObject,
+  ): Promise<InvokeResponse<T>>
+}
+
 export type TrackedInvocationStatus<T = JsonValue> =
   | { state: 'unknown' }
   | { state: 'pending' }
@@ -75,12 +165,7 @@ export interface FloatingWindowRequest {
   context?: JsonObject
 }
 
-export interface SsdevDesktopBridge {
-  invokePlugin<T = JsonValue>(
-    serviceId: string,
-    method: string,
-    parameters?: JsonObject,
-  ): Promise<InvokeResponse<T>>
+export interface SsdevDesktopBridge extends PluginInvoker {
   invokePluginTracked?<T = JsonValue>(
     operationId: string,
     serviceId: string,

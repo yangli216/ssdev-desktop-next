@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "protocolVersion": 1,
   "methods": [
     "invokePlugin",
@@ -32,6 +32,12 @@
       "completedRetentionSeconds",
       "indeterminateRetentionSeconds"
     ]
+  },
+  "pluginInvocationControlCodes": {
+    "capacityBusy": -32001,
+    "controllerStopping": -32002,
+    "executionLaneTimeout": -32003,
+    "pluginReloading": -32010
   },
   "events": [
     "ssdev-capture",

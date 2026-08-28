@@ -17,17 +17,17 @@ use tracing::{info, warn};
 use webplus_ipc::{read_frame_async, write_frame_async, FrameError};
 use webplus_plugin_config::PluginManifest;
 use webplus_protocol::{
-    HostCommand, HostPayload, HostRequest, HostResponse, HostResult, InvokeRequest, InvokeResponse,
-    PluginArchitecture, HOST_PROTOCOL_VERSION,
+    is_reserved_controller_invoke_code, HostCommand, HostPayload, HostRequest, HostResponse,
+    HostResult, InvokeRequest, InvokeResponse, PluginArchitecture, HOST_PROTOCOL_VERSION,
+    INVOKE_CAPACITY_BUSY_CODE as SERVER_BUSY,
+    INVOKE_CONTROLLER_STOPPING_CODE as CONTROLLER_STOPPING,
+    INVOKE_EXECUTION_LANE_TIMEOUT_CODE as EXECUTION_LANE_TIMEOUT,
+    INVOKE_PLUGIN_RELOADING_CODE as CONTROLLER_MAINTENANCE,
 };
 
 const INVALID_REQUEST: i32 = -32602;
 const SERVICE_NOT_FOUND: i32 = -32601;
 const HOST_FAILURE: i32 = -32000;
-const SERVER_BUSY: i32 = -32001;
-const CONTROLLER_STOPPING: i32 = -32002;
-const EXECUTION_LANE_TIMEOUT: i32 = -32003;
-const CONTROLLER_MAINTENANCE: i32 = -32010;
 pub const DEFAULT_MAX_IN_FLIGHT_INVOCATIONS: usize = 8;
 const MAX_IN_FLIGHT_INVOCATIONS_LIMIT: usize = 1024;
 const HOST_START_TIMEOUT: Duration = Duration::from_secs(120);
@@ -460,7 +460,7 @@ impl PluginController {
             .invoke(&route.descriptor, request, request_timeout)
             .await
         {
-            Ok(response) => response,
+            Ok(response) => sanitize_host_invoke_response(response),
             Err(error) => {
                 warn!(
                     event_code = "plugin-host-request-failed",
@@ -567,6 +567,22 @@ impl PluginController {
     pub async fn resume_after_shutdown(&self) {
         let _lifecycle = self.lifecycle.write().await;
         self.accepting_invocations.store(true, Ordering::Release);
+    }
+}
+
+fn sanitize_host_invoke_response(response: InvokeResponse) -> InvokeResponse {
+    if is_reserved_controller_invoke_code(response.res_code) {
+        warn!(
+            event_code = "plugin-response-code-collision",
+            error_code = "reserved-controller-response-code",
+            "plugin response used a controller-reserved code"
+        );
+        InvokeResponse::error(
+            HOST_FAILURE,
+            "native plugin returned a reserved controller response code; execution state is unknown",
+        )
+    } else {
+        response
     }
 }
 
@@ -1963,6 +1979,28 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, ControllerError::RequestId { .. }));
+    }
+
+    #[test]
+    fn plugin_responses_cannot_forge_controller_not_executed_codes() {
+        for code in [
+            SERVER_BUSY,
+            CONTROLLER_STOPPING,
+            EXECUTION_LANE_TIMEOUT,
+            CONTROLLER_MAINTENANCE,
+        ] {
+            let response = sanitize_host_invoke_response(InvokeResponse::error(code, "vendor"));
+            assert_eq!(response.res_code, HOST_FAILURE);
+            assert_eq!(
+                response.res_data.as_str(),
+                Some(
+                    "native plugin returned a reserved controller response code; execution state is unknown"
+                )
+            );
+        }
+
+        let response = InvokeResponse::error(17, "vendor status");
+        assert_eq!(sanitize_host_invoke_response(response.clone()), response);
     }
 
     #[test]

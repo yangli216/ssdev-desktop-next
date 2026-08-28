@@ -15,7 +15,24 @@ const result = await bridge.invokePlugin('card.reader', 'readCard', {
 
 SDK 显式导出 `CURRENT_BRIDGE_PROTOCOL_VERSION`；旧名称 `CURRENT_PROTOCOL_VERSION` 仅作为源码兼容别名保留。该版本只治理注入业务页面的公开桥接，不与 controller/plugin-host 的内部命名管道协议绑定。
 
-插件调用容量饱和时返回 `{ ResCode: -32001, ResData: "native plugin invocation capacity is busy; retry later" }`。该请求保证未进入插件宿主；业务代码可以只对这个精确响应做有上限的退避重试，不能把其他超时或插件错误自动重试为潜在的重复硬件操作。
+不要在业务代码中散落 `-32001` 等魔法数字。SDK 的 `classifyPluginInvocationResponse()` 会把四种由 controller 在原生执行前产生的拒绝分类为 `execution: 'not-executed'`；这些代码由 controller 独占，宿主或厂商组件返回同码会被改写成执行状态未知的一般宿主失败。`canRetryPluginInvocationWithBackoff()` 只对容量饱和、执行槽截止和插件维护返回 `true`，退出排空返回 `retry: 'after-restart'`。其他成功、厂商错误、宿主错误和一般超时都返回 `retry: 'never-automatically'`。这些函数只分类，不会自动循环重试。
+
+```ts
+import {
+  canRetryPluginInvocationWithBackoff,
+  classifyPluginInvocationResponse,
+} from '@bsoft/ssdev-web-bridge'
+
+const response = await bridge.invokePlugin('card.reader', 'readCard', {})
+const disposition = classifyPluginInvocationResponse(response)
+if (canRetryPluginInvocationWithBackoff(response)) {
+  // 由业务设置很小的次数和总时限；这里不会自动重试。
+} else if (disposition.retry === 'after-restart') {
+  // 结束当前流程，等待客户端重新启动。
+}
+```
+
+插件调用容量饱和时返回 `{ ResCode: -32001, ResData: "native plugin invocation capacity is busy; retry later" }`。该请求保证未进入插件宿主；业务代码可以按上面的 SDK 分类结果做有上限的退避重试，不能把未被分类的超时或插件错误自动重试为潜在的重复硬件操作。
 
 页面导航、组件卸载或业务代码丢弃 Promise 只会让页面停止等待结果，不会撤销已经被桌面端接纳的原生调用。桌面端会让该调用独立执行到正常响应或受控超时，以保持命名管道请求/响应顺序；调用方不得把“没有继续等待”视为“设备没有执行”，也不得因此自动重试。当前契约没有提供硬件操作取消能力。
 

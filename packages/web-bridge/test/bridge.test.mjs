@@ -9,9 +9,12 @@ import {
   CURRENT_BRIDGE_PROTOCOL_VERSION,
   CURRENT_PROTOCOL_VERSION,
   DesktopBridgeUnavailableError,
+  PLUGIN_INVOCATION_CONTROL_CODES,
   UnsupportedDesktopProtocolError,
   TRACKED_INVOCATION_METHODS,
   TrackedInvocationsUnavailableError,
+  canRetryPluginInvocationWithBackoff,
+  classifyPluginInvocationResponse,
   connectDesktop,
   createPluginOperationId,
   getTrackedInvocationCapabilities,
@@ -19,6 +22,7 @@ import {
   requireDesktopBridge,
   requireTrackedPluginInvocations,
   supportsTrackedPluginInvocations,
+  wasPluginInvocationGuaranteedNotExecuted,
 } from '../dist/index.js'
 
 const contract = JSON.parse(
@@ -34,13 +38,44 @@ function clearBridge() {
 test.afterEach(clearBridge)
 
 test('matches the shared desktop bridge contract', () => {
-  assert.equal(contract.schemaVersion, 3)
+  assert.equal(contract.schemaVersion, 4)
   assert.equal(CURRENT_BRIDGE_PROTOCOL_VERSION, contract.protocolVersion)
   assert.equal(CURRENT_PROTOCOL_VERSION, contract.protocolVersion)
   assert.equal(CURRENT_DESKTOP_CAPABILITIES_SCHEMA_VERSION, contract.capabilities.schemaVersion)
   assert.deepEqual(BRIDGE_METHODS, contract.methods)
   assert.deepEqual(TRACKED_INVOCATION_METHODS, contract.optionalMethods)
   assert.deepEqual(BRIDGE_EVENTS, contract.events)
+  assert.deepEqual(PLUGIN_INVOCATION_CONTROL_CODES, contract.pluginInvocationControlCodes)
+})
+
+test('classifies only controller rejections that prove native execution never started', () => {
+  const expected = [
+    [-32001, 'capacity-busy', 'bounded-backoff'],
+    [-32002, 'controller-stopping', 'after-restart'],
+    [-32003, 'execution-lane-timeout', 'bounded-backoff'],
+    [-32010, 'plugin-reloading', 'bounded-backoff'],
+  ]
+  for (const [ResCode, kind, retry] of expected) {
+    const response = { ResCode }
+    assert.deepEqual(classifyPluginInvocationResponse(response), {
+      kind,
+      execution: 'not-executed',
+      retry,
+    })
+    assert.equal(wasPluginInvocationGuaranteedNotExecuted(response), true)
+    assert.equal(canRetryPluginInvocationWithBackoff(response), retry === 'bounded-backoff')
+  }
+
+  for (const ResCode of [0, 1, -32000, -32601]) {
+    const response = { ResCode }
+    assert.deepEqual(classifyPluginInvocationResponse(response), {
+      kind: 'other',
+      execution: 'not-classified',
+      retry: 'never-automatically',
+    })
+    assert.equal(wasPluginInvocationGuaranteedNotExecuted(response), false)
+    assert.equal(canRetryPluginInvocationWithBackoff(response), false)
+  }
 })
 
 test('distinguishes tracked API support from current runtime availability', () => {

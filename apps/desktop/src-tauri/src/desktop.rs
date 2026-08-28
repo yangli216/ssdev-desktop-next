@@ -1753,8 +1753,24 @@ mod tests {
             "../../../../packages/web-bridge/bridge-contract.json"
         ))
         .expect("bridge contract must be valid JSON");
-        assert_eq!(contract["schemaVersion"], 3);
+        assert_eq!(contract["schemaVersion"], 4);
         assert_eq!(contract["protocolVersion"], crate::BRIDGE_PROTOCOL_VERSION);
+        assert_eq!(
+            contract["pluginInvocationControlCodes"]["capacityBusy"],
+            webplus_protocol::INVOKE_CAPACITY_BUSY_CODE
+        );
+        assert_eq!(
+            contract["pluginInvocationControlCodes"]["controllerStopping"],
+            webplus_protocol::INVOKE_CONTROLLER_STOPPING_CODE
+        );
+        assert_eq!(
+            contract["pluginInvocationControlCodes"]["executionLaneTimeout"],
+            webplus_protocol::INVOKE_EXECUTION_LANE_TIMEOUT_CODE
+        );
+        assert_eq!(
+            contract["pluginInvocationControlCodes"]["pluginReloading"],
+            webplus_protocol::INVOKE_PLUGIN_RELOADING_CODE
+        );
 
         let origins = BTreeSet::from(["https://example.test".into()]);
         let script = bridge_initialization_script(&origins, None).unwrap();
