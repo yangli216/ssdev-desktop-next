@@ -887,6 +887,9 @@ struct DebugCaseRunResult {
     method: String,
     expected_res_code: i32,
     actual_res_code: i32,
+    data_asserted: bool,
+    data_passed: bool,
+    data_mismatch_path: Option<String>,
     elapsed_ms: u128,
     passed: bool,
 }
@@ -1675,14 +1678,26 @@ async fn run_local_mapping_debug_cases(
                 parameters: debug_case.parameters,
             })
             .await;
+        let data_mismatch_path = if debug_case.assert_res_data {
+            local_mappings::res_data_mismatch_path(
+                &debug_case.expected_res_data,
+                &response.res_data,
+            )
+        } else {
+            None
+        };
+        let data_passed = data_mismatch_path.is_none();
         results.push(DebugCaseRunResult {
             name: debug_case.name,
             service_id: debug_case.service_id,
             method: debug_case.method,
             expected_res_code: debug_case.expected_res_code,
             actual_res_code: response.res_code,
+            data_asserted: debug_case.assert_res_data,
+            data_passed,
+            data_mismatch_path,
             elapsed_ms: started.elapsed().as_millis(),
-            passed: response.res_code == debug_case.expected_res_code,
+            passed: response.res_code == debug_case.expected_res_code && data_passed,
         });
     }
     let passed = results.iter().filter(|result| result.passed).count();

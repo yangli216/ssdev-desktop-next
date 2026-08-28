@@ -22,6 +22,9 @@ const MAX_PE_INSPECTION_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BUNDLE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_BUNDLE_ENTRIES: usize = 512;
 const MAX_DEBUG_CASES: usize = 32;
+const MAX_EXPECTED_RES_DATA_BYTES: usize = 64 * 1024;
+const MAX_EXPECTED_RES_DATA_DEPTH: usize = 16;
+const MAX_EXPECTED_RES_DATA_NODES: usize = 512;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -44,6 +47,10 @@ pub(crate) struct DebugCaseDefinition {
     #[serde(default)]
     pub parameters: serde_json::Map<String, serde_json::Value>,
     pub expected_res_code: i32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub assert_res_data: bool,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub expected_res_data: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -540,8 +547,127 @@ fn validate_debug_cases(definition: &LocalMappingDefinition) -> Result<(), Strin
         }
         .validate()
         .map_err(|error| format!("调试用例 [{}] 无效: {error}", debug_case.name))?;
+        validate_expected_res_data(debug_case)?;
     }
     Ok(())
+}
+
+fn validate_expected_res_data(debug_case: &DebugCaseDefinition) -> Result<(), String> {
+    if !debug_case.assert_res_data {
+        if !debug_case.expected_res_data.is_null() {
+            return Err(format!(
+                "调试用例 [{}] 未启用 ResData 断言，不应保存期望数据",
+                debug_case.name
+            ));
+        }
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec(&debug_case.expected_res_data).map_err(|error| {
+        format!(
+            "调试用例 [{}] 的 ResData 断言无效: {error}",
+            debug_case.name
+        )
+    })?;
+    if bytes.len() > MAX_EXPECTED_RES_DATA_BYTES {
+        return Err(format!(
+            "调试用例 [{}] 的 ResData 断言超过 64 KiB",
+            debug_case.name
+        ));
+    }
+    let mut nodes = 0_usize;
+    validate_expected_value(&debug_case.expected_res_data, 0, &mut nodes).map_err(|error| {
+        format!(
+            "调试用例 [{}] 的 ResData 断言无效: {error}",
+            debug_case.name
+        )
+    })
+}
+
+fn validate_expected_value(
+    value: &serde_json::Value,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<(), String> {
+    if depth > MAX_EXPECTED_RES_DATA_DEPTH {
+        return Err(format!("嵌套深度超过 {MAX_EXPECTED_RES_DATA_DEPTH} 层"));
+    }
+    *nodes = nodes.saturating_add(1);
+    if *nodes > MAX_EXPECTED_RES_DATA_NODES {
+        return Err(format!("节点数超过 {MAX_EXPECTED_RES_DATA_NODES} 项"));
+    }
+    match value {
+        serde_json::Value::Object(entries) => {
+            for (key, value) in entries {
+                if key.is_empty() || key.chars().count() > 256 || key.chars().any(char::is_control)
+                {
+                    return Err("对象字段名为空、过长或包含控制字符".into());
+                }
+                validate_expected_value(value, depth + 1, nodes)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for value in items {
+                validate_expected_value(value, depth + 1, nodes)?;
+            }
+        }
+        serde_json::Value::String(value) if value.len() > 16 * 1024 => {
+            return Err("单个期望字符串超过 16 KiB".into());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn res_data_mismatch_path(
+    expected: &serde_json::Value,
+    actual: &serde_json::Value,
+) -> Option<String> {
+    find_res_data_mismatch(expected, actual, "$".to_owned())
+}
+
+fn find_res_data_mismatch(
+    expected: &serde_json::Value,
+    actual: &serde_json::Value,
+    path: String,
+) -> Option<String> {
+    match (expected, actual) {
+        (serde_json::Value::Object(expected), serde_json::Value::Object(actual)) => {
+            for (key, expected_value) in expected {
+                let child_path = format!("{path}/{}", json_pointer_segment(key));
+                let Some(actual_value) = actual.get(key) else {
+                    return Some(child_path);
+                };
+                if let Some(mismatch) =
+                    find_res_data_mismatch(expected_value, actual_value, child_path)
+                {
+                    return Some(mismatch);
+                }
+            }
+            None
+        }
+        (serde_json::Value::Array(expected), serde_json::Value::Array(actual)) => {
+            if expected.len() != actual.len() {
+                return Some(path);
+            }
+            expected
+                .iter()
+                .zip(actual)
+                .enumerate()
+                .find_map(|(index, (expected, actual))| {
+                    find_res_data_mismatch(expected, actual, format!("{path}/{index}"))
+                })
+        }
+        _ if expected == actual => None,
+        _ => Some(path),
+    }
+}
+
+fn json_pointer_segment(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn installed_mapping_dir(root: &Path, plugin_id: &str) -> Result<PathBuf, String> {
@@ -1149,6 +1275,8 @@ mod tests {
             method: "read".into(),
             parameters: serde_json::from_value(serde_json::json!({ "port": "TEST" })).unwrap(),
             expected_res_code: 0,
+            assert_res_data: true,
+            expected_res_data: serde_json::json!({ "ReturnValue": 0 }),
         };
         assert_eq!(
             upsert_debug_case(active_root.path(), "reader.local", debug_case.clone()).unwrap(),
@@ -1164,6 +1292,8 @@ mod tests {
                 parameters: serde_json::from_value(serde_json::json!({ "secret": "value" }))
                     .unwrap(),
                 expected_res_code: 0,
+                assert_res_data: false,
+                expected_res_data: serde_json::Value::Null,
             }
         )
         .is_err());
@@ -1196,5 +1326,50 @@ mod tests {
             "invokePlugin<ReaderService1Read1Data>(\"ReaderService\", \"read\", parameters)"
         ));
         assert!(!source.contains("$message"));
+    }
+
+    #[test]
+    fn res_data_assertions_match_object_subsets_without_disclosing_values() {
+        let actual = serde_json::json!({
+            "ReturnValue": 0,
+            "device": { "state": "ready", "serial": "sensitive" },
+            "ignored": true
+        });
+        assert_eq!(
+            res_data_mismatch_path(
+                &serde_json::json!({ "ReturnValue": 0, "device": { "state": "ready" } }),
+                &actual
+            ),
+            None
+        );
+        assert_eq!(
+            res_data_mismatch_path(&serde_json::json!({ "ReturnValue": 1 }), &actual),
+            Some("$/ReturnValue".into())
+        );
+        assert_eq!(
+            res_data_mismatch_path(
+                &serde_json::json!({ "device": { "missing/key": true } }),
+                &actual
+            ),
+            Some("$/device/missing~1key".into())
+        );
+    }
+
+    #[test]
+    fn disabled_res_data_assertions_cannot_hide_persisted_values() {
+        let source = tempfile::tempdir().unwrap();
+        let component = source.path().join("reader.bat");
+        fs::write(&component, b"@echo off\r\n").unwrap();
+        let mut definition = fixture_definition(&component);
+        definition.debug_cases.push(DebugCaseDefinition {
+            name: "hidden value".into(),
+            service_id: "ReaderService".into(),
+            method: "read".into(),
+            parameters: serde_json::from_value(serde_json::json!({ "port": "TEST" })).unwrap(),
+            expected_res_code: 0,
+            assert_res_data: false,
+            expected_res_data: serde_json::json!({ "secret": "must not persist" }),
+        });
+        assert!(validate_definition_header(&definition).is_err());
     }
 }

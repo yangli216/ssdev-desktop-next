@@ -50,6 +50,8 @@ type DebugCaseDefinition = {
   method: string
   parameters: Record<string, unknown>
   expectedResCode: number
+  assertResData: boolean
+  expectedResData: unknown
 }
 
 type MappingInventory = {
@@ -81,6 +83,9 @@ type DebugCaseRunResult = {
   method: string
   expectedResCode: number
   actualResCode: number
+  dataAsserted: boolean
+  dataPassed: boolean
+  dataMismatchPath: string | null
   elapsedMs: number
   passed: boolean
 }
@@ -97,6 +102,9 @@ const debugValues = ref<Record<string, string | boolean | number>>({})
 const debugResult = ref<DebugResult | null>(null)
 const debugCaseName = ref('')
 const expectedResCode = ref(0)
+const assertResData = ref(false)
+const expectedResDataText = ref('')
+const suggestedExpectedDataText = ref('')
 const regressionResults = ref<DebugCaseRunResult[]>([])
 const busy = ref(false)
 const error = ref('')
@@ -106,6 +114,7 @@ const service = computed(() => draft.value.services[serviceIndex.value])
 const method = computed(() => service.value?.methods[methodIndex.value])
 const callableParameters = computed(() => (method.value?.parameters ?? []).filter((item): item is ParameterDefinition => typeof item !== 'string' && !item.name.startsWith('$')))
 const mappingIsInstalled = computed(() => inventory.value.mappings.some((item) => item.pluginId === draft.value.pluginId))
+const editingStoredCase = computed(() => draft.value.debugCases.some((item) => item.name === debugCaseName.value.trim()))
 
 function newMethod(name = ''): MethodDefinition {
   return { name, alias: '', timeout: 0, returnType: 'string', parameters: [], props: [] }
@@ -134,9 +143,17 @@ function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T
 }
 
+function normalizeDebugCases(cases: DebugCaseDefinition[]): DebugCaseDefinition[] {
+  return cases.map((item) => ({
+    ...item,
+    assertResData: item.assertResData ?? false,
+    expectedResData: item.expectedResData ?? null,
+  }))
+}
+
 function normalizeMapping(mapping: LocalMappingDefinition): LocalMappingDefinition {
   const normalized = clone(mapping)
-  normalized.debugCases ||= []
+  normalized.debugCases = normalizeDebugCases(normalized.debugCases ?? [])
   for (const item of normalized.services) {
     item.mainType = (item.mainType || 'dll').toLowerCase() as MainType
     item.charset ||= 'utf8'
@@ -205,6 +222,9 @@ function resetEditor() {
   debugValues.value = {}
   debugCaseName.value = ''
   expectedResCode.value = 0
+  assertResData.value = false
+  expectedResDataText.value = ''
+  suggestedExpectedDataText.value = ''
   regressionResults.value = []
   error.value = ''
   notice.value = ''
@@ -219,6 +239,9 @@ function editMapping(mapping: LocalMappingDefinition) {
   debugValues.value = {}
   debugCaseName.value = ''
   expectedResCode.value = 0
+  assertResData.value = false
+  expectedResDataText.value = ''
+  suggestedExpectedDataText.value = ''
   regressionResults.value = []
   error.value = ''
   notice.value = `正在编辑 ${mapping.displayName || mapping.pluginId}`
@@ -232,6 +255,9 @@ function selectService(index: number) {
   debugValues.value = {}
   debugCaseName.value = ''
   expectedResCode.value = 0
+  assertResData.value = false
+  expectedResDataText.value = ''
+  suggestedExpectedDataText.value = ''
   regressionResults.value = []
 }
 
@@ -409,6 +435,30 @@ function currentDebugParameters(): Record<string, unknown> {
   return Object.fromEntries(callableParameters.value.map((item) => [item.name, convertedValue(item)]))
 }
 
+function returnValueAssertionSuggestion(data: unknown): string {
+  if (!data || typeof data !== 'object' || Array.isArray(data) || !('ReturnValue' in data)) return ''
+  const value = (data as Record<string, unknown>).ReturnValue
+  if (value !== null && typeof value !== 'number' && typeof value !== 'boolean') return ''
+  return JSON.stringify({ ReturnValue: value }, null, 2)
+}
+
+function useSuggestedExpectedData() {
+  if (!suggestedExpectedDataText.value) return
+  assertResData.value = true
+  expectedResDataText.value = suggestedExpectedDataText.value
+}
+
+function parsedExpectedResData(): unknown {
+  if (!assertResData.value) return null
+  const text = expectedResDataText.value.trim()
+  if (!text) throw new Error('启用 ResData 断言后必须填写有效 JSON。')
+  try {
+    return JSON.parse(text) as unknown
+  } catch (reason) {
+    throw new Error(`期望 ResData 不是有效 JSON：${reasonText(reason)}`)
+  }
+}
+
 async function invokeDebug() {
   if (!service.value || !method.value) return
   const serviceId = service.value.serviceId.trim()
@@ -421,8 +471,13 @@ async function invokeDebug() {
     debugResult.value = await invoke<DebugResult>('debug_plugin_invoke', {
       request: { serviceId, method: methodName, parameters: currentDebugParameters() },
     })
-    expectedResCode.value = debugResult.value.response.ResCode
-    notice.value = `调用完成，用时 ${debugResult.value.elapsedMs} ms。`
+    if (!editingStoredCase.value) expectedResCode.value = debugResult.value.response.ResCode
+    suggestedExpectedDataText.value = debugResult.value.response.ResCode === 0
+      ? returnValueAssertionSuggestion(debugResult.value.response.ResData)
+      : ''
+    notice.value = suggestedExpectedDataText.value
+      ? `调用完成，用时 ${debugResult.value.elapsedMs} ms；可采用本次 ReturnValue 作为断言。`
+      : `调用完成，用时 ${debugResult.value.elapsedMs} ms。`
   })
 }
 
@@ -437,6 +492,13 @@ async function saveDebugCase() {
     return
   }
   const methodName = (method.value.alias || method.value.name).trim()
+  let expectedResData: unknown
+  try {
+    expectedResData = parsedExpectedResData()
+  } catch (reason) {
+    error.value = reasonText(reason)
+    return
+  }
   await run(async () => {
     const debugCases = await invoke<DebugCaseDefinition[]>('save_local_mapping_debug_case', {
       pluginId: draft.value.pluginId,
@@ -446,11 +508,13 @@ async function saveDebugCase() {
         method: methodName,
         parameters: currentDebugParameters(),
         expectedResCode: Number(expectedResCode.value),
+        assertResData: assertResData.value,
+        expectedResData,
       },
     })
-    draft.value.debugCases = debugCases
+    draft.value.debugCases = normalizeDebugCases(debugCases)
     const stored = inventory.value.mappings.find((item) => item.pluginId === draft.value.pluginId)
-    if (stored) stored.debugCases = clone(debugCases)
+    if (stored) stored.debugCases = clone(draft.value.debugCases)
     regressionResults.value = []
     notice.value = `已保存合成调试用例「${name}」。`
   })
@@ -470,6 +534,9 @@ function loadDebugCase(debugCase: DebugCaseDefinition) {
   }))
   debugCaseName.value = debugCase.name
   expectedResCode.value = debugCase.expectedResCode
+  assertResData.value = debugCase.assertResData
+  expectedResDataText.value = debugCase.assertResData ? JSON.stringify(debugCase.expectedResData, null, 2) : ''
+  suggestedExpectedDataText.value = ''
   debugResult.value = null
   notice.value = `已载入调试用例「${debugCase.name}」。`
 }
@@ -480,9 +547,9 @@ async function deleteDebugCase(caseName: string) {
       pluginId: draft.value.pluginId,
       caseName,
     })
-    draft.value.debugCases = debugCases
+    draft.value.debugCases = normalizeDebugCases(debugCases)
     const stored = inventory.value.mappings.find((item) => item.pluginId === draft.value.pluginId)
-    if (stored) stored.debugCases = clone(debugCases)
+    if (stored) stored.debugCases = clone(draft.value.debugCases)
     regressionResults.value = []
     notice.value = `已删除调试用例「${caseName}」。`
   })
@@ -497,6 +564,12 @@ async function runDebugCases() {
     const passed = regressionResults.value.filter((item) => item.passed).length
     notice.value = `回归执行完成：${passed}/${regressionResults.value.length} 通过。`
   })
+}
+
+function regressionDataSummary(item: DebugCaseRunResult): string {
+  if (!item.dataAsserted) return 'ResData 未断言'
+  if (item.dataPassed) return 'ResData 匹配'
+  return `ResData 不匹配：${item.dataMismatchPath || '$'}`
 }
 </script>
 
@@ -620,6 +693,13 @@ async function runDebugCases() {
             <label><span>期望 ResCode</span><input v-model.number="expectedResCode" type="number" /></label>
             <button type="button" :disabled="busy || disabled || !mappingIsInstalled" @click="saveDebugCase">保存为回归用例</button>
           </div>
+          <div class="data-assertion-editor">
+            <div>
+              <label class="check"><input v-model="assertResData" type="checkbox" /><span>断言期望 ResData 子集</span></label>
+              <button v-if="suggestedExpectedDataText" type="button" :disabled="busy || disabled" @click="useSuggestedExpectedData">采用本次 ReturnValue</button>
+            </div>
+            <label><span>期望 JSON；对象只比较填写的字段，数组和基础值精确比较</span><textarea v-model="expectedResDataText" :disabled="!assertResData" rows="5" placeholder="{ &quot;ReturnValue&quot;: 0 }"></textarea></label>
+          </div>
           <div class="debug-case-list">
             <div class="debug-case-heading">
               <strong>已保存回归用例（{{ draft.debugCases.length }}/32）</strong>
@@ -627,7 +707,7 @@ async function runDebugCases() {
             </div>
             <article v-for="item in draft.debugCases" :key="item.name">
               <button type="button" :disabled="busy || disabled" @click="loadDebugCase(item)">
-                <strong>{{ item.name }}</strong><small>{{ item.serviceId }} / {{ item.method }} · 期望 {{ item.expectedResCode }}</small>
+                <strong>{{ item.name }}</strong><small>{{ item.serviceId }} / {{ item.method }} · ResCode {{ item.expectedResCode }}{{ item.assertResData ? ' · 含 ResData 断言' : '' }}</small>
               </button>
               <button class="danger-link" type="button" :disabled="busy || disabled" @click="deleteDebugCase(item.name)">删除</button>
             </article>
@@ -636,7 +716,7 @@ async function runDebugCases() {
           <div v-if="regressionResults.length" class="regression-results">
             <div v-for="item in regressionResults" :key="item.name" :class="{ failed: !item.passed }">
               <strong>{{ item.passed ? '通过' : '失败' }} · {{ item.name }}</strong>
-              <small>{{ item.serviceId }} / {{ item.method }} · {{ item.actualResCode }} / {{ item.expectedResCode }} · {{ item.elapsedMs }} ms</small>
+              <small>{{ item.serviceId }} / {{ item.method }} · ResCode {{ item.actualResCode }} / {{ item.expectedResCode }} · {{ regressionDataSummary(item) }} · {{ item.elapsedMs }} ms</small>
             </div>
           </div>
         </fieldset>
@@ -710,6 +790,11 @@ legend { padding: 0 7px; color: #355746; font-size: 13px; font-weight: 800; }
 .debug-result.failed { background: #f8e1dc; color: #8b2e22; }
 .debug-result pre { grid-column: 1 / -1; max-height: 230px; margin: 0; padding: 10px; overflow: auto; border-radius: 7px; background: rgba(255,255,255,.7); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
 .debug-case-editor { display: grid; grid-template-columns: 1fr 150px auto; gap: 9px; align-items: end; margin-top: 14px; padding-top: 14px; border-top: 1px solid #d1d9d2; }
+.data-assertion-editor { display: grid; grid-template-columns: 210px 1fr; gap: 10px; align-items: start; margin-top: 10px; }
+.data-assertion-editor > div { display: grid; gap: 8px; }
+.data-assertion-editor .check { padding-top: 8px; }
+.data-assertion-editor textarea { min-width: 0; width: 100%; resize: vertical; padding: 9px 10px; border: 1px solid #bfc9c1; border-radius: 8px; background: #fff; color: #13231c; font: 12px ui-monospace, monospace; }
+.data-assertion-editor textarea:disabled { background: #edf0ed; color: #7a857e; }
 .debug-case-list { display: grid; gap: 7px; margin-top: 16px; }
 .debug-case-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #355746; font-size: 12px; }
 .debug-case-list article { display: grid; grid-template-columns: 1fr auto; gap: 7px; }
@@ -729,5 +814,6 @@ legend { padding: 0 7px; color: #355746; font-size: 13px; font-weight: 800; }
   .field-grid.four { grid-template-columns: repeat(2, 1fr); }
   .debug-case-editor { grid-template-columns: 1fr 150px; }
   .debug-case-editor button { grid-column: 1 / -1; }
+  .data-assertion-editor { grid-template-columns: 1fr; }
 }
 </style>
