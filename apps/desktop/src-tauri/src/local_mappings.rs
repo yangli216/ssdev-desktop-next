@@ -11,7 +11,10 @@ use webplus_plugin_config::{
     ParameterDefinition, PluginManifest, PluginMetadata, ServiceDefinition, API_FILENAME,
     PLUGIN_METADATA_FILENAME,
 };
-use webplus_protocol::{InvokeRequest, InvokeResponse};
+use webplus_protocol::{
+    contains_draft_placeholder, InvokeRequest, InvokeResponse, DRAFT_INPUT_PLACEHOLDER,
+    DRAFT_RESPONSE_PLACEHOLDER,
+};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
@@ -74,6 +77,7 @@ pub(crate) struct ReleaseSourceExportResult {
     pub bytes: u64,
     pub seeded_case_count: usize,
     pub placeholder_case_count: usize,
+    pub review_required_case_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,9 +89,11 @@ struct ReleaseMatrixSeed {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ReleaseMatrixCase {
     name: String,
     enabled: bool,
+    review_required: bool,
     request: InvokeRequest,
     expected: InvokeResponse,
 }
@@ -506,7 +512,8 @@ pub(crate) fn export_release_source(
     let matrix_seed = destination_parent.join(format!("{plugin_id}-matrix-seed.json"));
     ensure_release_target_is_new(&destination, "发布源目标")?;
     ensure_release_target_is_new(&matrix_seed, "黄金矩阵种子")?;
-    let (matrix, seeded_case_count, placeholder_case_count) = release_matrix_seed(&definition)?;
+    let (matrix, seeded_case_count, placeholder_case_count, review_required_case_count) =
+        release_matrix_seed(&definition)?;
     fs::create_dir(&destination).map_err(|error| format!("无法创建发布源目录: {error}"))?;
     let exported = (|| {
         write_json(destination.join(API_FILENAME), &definition.services)?;
@@ -555,6 +562,7 @@ pub(crate) fn export_release_source(
         bytes,
         seeded_case_count,
         placeholder_case_count,
+        review_required_case_count,
     })
 }
 
@@ -568,7 +576,7 @@ fn ensure_release_target_is_new(path: &Path, role: &str) -> Result<(), String> {
 
 fn release_matrix_seed(
     definition: &LocalMappingDefinition,
-) -> Result<(ReleaseMatrixSeed, usize, usize), String> {
+) -> Result<(ReleaseMatrixSeed, usize, usize, usize), String> {
     let mut cases = Vec::new();
     let mut names = HashSet::new();
     let mut covered = HashSet::new();
@@ -583,20 +591,31 @@ fn release_matrix_seed(
             .ok_or_else(|| format!("调试用例 [{}] 的方法不存在", debug_case.name))?;
         names.insert(debug_case.name.clone());
         covered.insert((service.service_id.clone(), method.name.clone()));
+        let mut parameters = debug_case.parameters.clone();
+        for parameter in method
+            .parameters
+            .iter()
+            .filter(|parameter| !parameter.name().starts_with('$'))
+        {
+            parameters
+                .entry(parameter.name().to_owned())
+                .or_insert_with(|| release_parameter_placeholder(parameter));
+        }
         cases.push(ReleaseMatrixCase {
             name: debug_case.name.clone(),
             enabled: true,
+            review_required: true,
             request: InvokeRequest {
                 service_id: debug_case.service_id.clone(),
                 method: debug_case.method.clone(),
-                parameters: debug_case.parameters.clone(),
+                parameters,
             },
             expected: InvokeResponse {
                 res_code: debug_case.expected_res_code,
                 res_data: if debug_case.assert_res_data {
                     debug_case.expected_res_data.clone()
                 } else {
-                    serde_json::Value::String("<replace-with-redacted-golden-response>".into())
+                    serde_json::Value::String(DRAFT_RESPONSE_PLACEHOLDER.into())
                 },
             },
         });
@@ -625,12 +644,13 @@ fn release_matrix_seed(
             cases.push(ReleaseMatrixCase {
                 name,
                 enabled: true,
+                review_required: true,
                 request: InvokeRequest {
                     service_id: service.service_id.clone(),
                     method: method.alias.clone().unwrap_or_else(|| method.name.clone()),
                     parameters,
                 },
-                expected: InvokeResponse::success("<replace-with-redacted-golden-response>"),
+                expected: InvokeResponse::success(DRAFT_RESPONSE_PLACEHOLDER),
             });
         }
     }
@@ -639,7 +659,11 @@ fn release_matrix_seed(
             "黄金矩阵种子必须包含 1 到 {MAX_RELEASE_MATRIX_CASES} 个用例"
         ));
     }
-    let placeholder_case_count = cases.len().saturating_sub(seeded_case_count);
+    let placeholder_case_count = cases
+        .iter()
+        .filter(|case| release_case_has_draft_placeholder(case))
+        .count();
+    let review_required_case_count = cases.iter().filter(|case| case.review_required).count();
     Ok((
         ReleaseMatrixSeed {
             schema_version: 1,
@@ -648,7 +672,16 @@ fn release_matrix_seed(
         },
         seeded_case_count,
         placeholder_case_count,
+        review_required_case_count,
     ))
+}
+
+fn release_case_has_draft_placeholder(case: &ReleaseMatrixCase) -> bool {
+    case.request
+        .parameters
+        .values()
+        .any(contains_draft_placeholder)
+        || contains_draft_placeholder(&case.expected.res_data)
 }
 
 fn unique_matrix_case_name(preferred: &str, names: &mut HashSet<String>) -> String {
@@ -664,18 +697,8 @@ fn unique_matrix_case_name(preferred: &str, names: &mut HashSet<String>) -> Stri
     unreachable!("matrix case count is bounded well below u16::MAX")
 }
 
-fn release_parameter_placeholder(parameter: &ParameterDefinition) -> serde_json::Value {
-    let parameter_type = match parameter {
-        ParameterDefinition::Name(_) => "",
-        ParameterDefinition::Detailed(detail) => detail.parameter_type.as_str(),
-    };
-    match parameter_type.trim().to_ascii_lowercase().as_str() {
-        "bool" | "boolean" => serde_json::Value::Bool(false),
-        "int" | "int32" | "long" | "uint" | "uint32" | "dword" | "float" | "double" => {
-            serde_json::Value::from(0)
-        }
-        _ => serde_json::Value::String("<replace-with-redacted-input>".into()),
-    }
+fn release_parameter_placeholder(_: &ParameterDefinition) -> serde_json::Value {
+    serde_json::Value::String(DRAFT_INPUT_PLACEHOLDER.into())
 }
 
 fn write_json_noclobber(path: &Path, value: &impl Serialize) -> Result<(), String> {
@@ -1660,6 +1683,36 @@ mod tests {
     }
 
     #[test]
+    fn release_matrix_counts_seeded_cases_that_still_need_an_exact_response() {
+        let source = tempfile::tempdir().unwrap();
+        let component = source.path().join("reader.bat");
+        fs::write(&component, b"@echo off\r\n").unwrap();
+        let mut definition = fixture_definition(&component);
+        definition.debug_cases.push(DebugCaseDefinition {
+            name: "status-only field test".into(),
+            service_id: "ReaderService".into(),
+            method: "read".into(),
+            parameters: serde_json::Map::new(),
+            expected_res_code: 0,
+            assert_res_data: false,
+            expected_res_data: serde_json::Value::Null,
+        });
+
+        let (matrix, seeded, placeholders, reviews) = release_matrix_seed(&definition).unwrap();
+
+        assert_eq!(matrix.cases.len(), 1);
+        assert_eq!(seeded, 1);
+        assert_eq!(placeholders, 1);
+        assert_eq!(reviews, 1);
+        assert!(matrix.cases[0].review_required);
+        assert!(release_case_has_draft_placeholder(&matrix.cases[0]));
+        assert_eq!(
+            matrix.cases[0].request.parameters["port"],
+            DRAFT_INPUT_PLACEHOLDER
+        );
+    }
+
+    #[test]
     fn release_source_contains_only_api_and_referenced_native_files() {
         use base64::engine::general_purpose::STANDARD as BASE64;
         use base64::Engine;
@@ -1703,6 +1756,7 @@ mod tests {
         assert_eq!(result.file_count, 2);
         assert_eq!(result.seeded_case_count, 1);
         assert_eq!(result.placeholder_case_count, 0);
+        assert_eq!(result.review_required_case_count, 1);
         assert_eq!(
             result.matrix_seed,
             output
@@ -1759,6 +1813,8 @@ mod tests {
         assert_eq!(prepared.method_count, 1);
         assert!(prepared.matrix_seeded);
         assert_eq!(prepared.matrix_case_count, 1);
+        assert_eq!(prepared.matrix_placeholder_case_count, 0);
+        assert_eq!(prepared.matrix_review_required_case_count, 1);
 
         assert!(export_release_source(active_root.path(), "reader.local", output.path()).is_err());
         assert!(

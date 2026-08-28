@@ -461,11 +461,11 @@ async function exportReleaseSource(pluginId: string) {
   })
   if (typeof destinationParent !== 'string') return
   await run(async () => {
-    const result = await invoke<{ destination: string; matrixSeed: string; fileCount: number; bytes: number; seededCaseCount: number; placeholderCaseCount: number }>('export_local_mapping_release_source', {
+    const result = await invoke<{ destination: string; matrixSeed: string; fileCount: number; bytes: number; seededCaseCount: number; placeholderCaseCount: number; reviewRequiredCaseCount: number }>('export_local_mapping_release_source', {
       pluginId,
       destinationParent,
     })
-    notice.value = `最小发布源已导出：${result.destination}（${result.fileCount} 个文件，${(result.bytes / 1024 / 1024).toFixed(1)} MiB）；矩阵种子：${result.matrixSeed}（现场用例 ${result.seededCaseCount} 个，待补 ${result.placeholderCaseCount} 个）。下一步由 ssdev-plugin-tool prepare --matrix-seed 生成签名请求。`
+    notice.value = `最小发布源已导出：${result.destination}（${result.fileCount} 个文件，${(result.bytes / 1024 / 1024).toFixed(1)} MiB）；矩阵种子：${result.matrixSeed}（现场用例 ${result.seededCaseCount} 个，占位待补 ${result.placeholderCaseCount} 个，正式复核 ${result.reviewRequiredCaseCount} 个）。下一步由 ssdev-plugin-tool prepare --matrix-seed 生成签名请求。`
   })
 }
 

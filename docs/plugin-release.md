@@ -46,9 +46,9 @@ COM/OCX 的 ProgID 和真实注册状态无法在离线准备阶段验证，必�
 
 - 暂存插件目录：包含规范化 `plugin.json`，但没有签名封套；
 - 签名请求：显式记录 `pluginId`、`version` 和 `keyId`；`payloadBase64` 是 KMS/HSM 要签名的原始字节，`payloadSha256` 用于发布审批和审计；
-- 黄金矩阵草稿：采用通过校验的外部种子，或从每个 service/method 自动生成参数占位符；准备报告会给出 `matrixSeeded` 和 `matrixCaseCount`。
+- 黄金矩阵草稿：采用通过校验的外部种子，或从每个 service/method 自动生成参数占位符；准备报告会给出 `matrixSeeded`、`matrixCaseCount`、仍含保留占位符的 `matrixPlaceholderCaseCount` 和必须人工确认精确响应的 `matrixReviewRequiredCaseCount`。
 
-黄金矩阵默认带有 `"draft": true`。运行器会在启动 controller 或接触硬件之前拒绝草稿；只有替换所有脱敏输入/预期响应并显式改为 `false` 后才会执行。暂不验证的用例可设置 `"enabled": false`，但正式切换时仍须覆盖全部生产能力。
+黄金矩阵默认带有 `"draft": true`。自动生成或由工作台现场子集用例转换的条目还带有 `"reviewRequired": true`。运行器会在启动 controller 或接触硬件之前拒绝草稿；即使误把草稿改为 `false`，任何启用用例仍要求复核或存在生成器保留的输入/响应占位符也会失败关闭。只有补齐全部声明输入、把子集断言核对为完整精确响应、删除占位符、将每个已复核用例改为 `"reviewRequired": false`，并显式解除全局草稿后才会执行。暂不验证的用例可设置 `"enabled": false`，但正式切换时仍须由其他启用用例覆盖对应生产能力。
 
 ## 2. 外部签名
 
@@ -98,6 +98,6 @@ powershell -ExecutionPolicy Bypass -File scripts/test-plugin-matrix.ps1 `
   -EvidenceEnvironment hospital-a-reader-lab
 ```
 
-矩阵必须由启用用例覆盖插件集合声明的每个方法；alias 会归一到对应真实方法。工具只在全部用例通过后生成 schema 1 证据，并绑定源码提交、插件签名载荷集合、信任库、矩阵、x86/x64 宿主摘要及目标环境标签。任一输入在运行期间变化都会失败，已有证据文件不会被覆盖。
+矩阵必须由启用用例覆盖插件集合声明的每个方法；alias 会归一到对应真实方法。每个启用用例的输入字段必须与该方法声明的非 `$` 输入完全一致，未知字段、缺失字段和生成器保留占位符都会在宿主启动前失败。工具只在全部用例通过后生成 schema 1 证据，并绑定源码提交、插件签名载荷集合、信任库、矩阵、x86/x64 宿主摘要及目标环境标签。任一输入在运行期间变化都会失败，已有证据文件不会被覆盖。
 
 每个正式版本应归档签名请求、签名审批记录、`.ssdev-plugin` SHA-256、非草稿黄金矩阵、生成的机器证据和目标 Windows/硬件环境审批；生产 DLL、患者数据和私钥不进入本仓库。

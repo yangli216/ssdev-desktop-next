@@ -6,8 +6,22 @@ use thiserror::Error;
 /// This is intentionally independent from the public business Web Bridge.
 pub const HOST_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_INVOKE_PARAMETERS_BYTES: usize = 8 * 1024 * 1024;
+pub const DRAFT_INPUT_PLACEHOLDER: &str = "<replace-with-redacted-input>";
+pub const DRAFT_RESPONSE_PLACEHOLDER: &str = "<replace-with-redacted-golden-response>";
 const MAX_ROUTING_FIELD_CHARS: usize = 256;
 const MAX_PARAMETER_COUNT: usize = 256;
+
+pub fn contains_draft_placeholder(value: &Value) -> bool {
+    match value {
+        Value::String(value) => matches!(
+            value.as_str(),
+            DRAFT_INPUT_PLACEHOLDER | DRAFT_RESPONSE_PLACEHOLDER
+        ),
+        Value::Array(values) => values.iter().any(contains_draft_placeholder),
+        Value::Object(values) => values.values().any(contains_draft_placeholder),
+        _ => false,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InvokeRequest {
@@ -255,5 +269,17 @@ mod tests {
             request.validate(),
             Err(ValidationError::ParametersTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn detects_reserved_draft_placeholders_at_any_json_depth() {
+        assert!(contains_draft_placeholder(&json!({
+            "device": [{ "response": DRAFT_RESPONSE_PLACEHOLDER }]
+        })));
+        assert!(contains_draft_placeholder(&json!(DRAFT_INPUT_PLACEHOLDER)));
+        assert!(!contains_draft_placeholder(&json!({
+            "device": "replace with a real value",
+            "response": { "ReturnValue": 0 }
+        })));
     }
 }

@@ -14,7 +14,7 @@ use ssdev_release_manifest::{capture_source_identity, SourceIdentity};
 use webplus_controller::{PluginController, PluginTrust, SupervisorConfig};
 use webplus_plugin_config::{discover_plugins, PluginManifest};
 use webplus_plugin_trust::{prepare_signing_material, read_identity, TrustStore};
-use webplus_protocol::{InvokeRequest, InvokeResponse};
+use webplus_protocol::{contains_draft_placeholder, InvokeRequest, InvokeResponse};
 
 const MAX_MATRIX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CASES: usize = 1024;
@@ -29,11 +29,13 @@ struct Matrix {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Case {
     name: String,
     #[serde(default = "enabled_by_default")]
     enabled: bool,
+    #[serde(default)]
+    review_required: bool,
     request: InvokeRequest,
     expected: InvokeResponse,
 }
@@ -64,6 +66,22 @@ impl Matrix {
             }
             if !names.insert(case.name.as_str()) {
                 return Err("matrix case names must be unique");
+            }
+            case.request
+                .validate()
+                .map_err(|_| "matrix contains an invalid invoke request")?;
+            if case.enabled && case.review_required {
+                return Err("enabled matrix cases must be explicitly approved after exact review");
+            }
+            if case.enabled
+                && (case
+                    .request
+                    .parameters
+                    .values()
+                    .any(contains_draft_placeholder)
+                    || contains_draft_placeholder(&case.expected.res_data))
+            {
+                return Err("enabled matrix cases must not contain generated draft placeholders");
             }
         }
         Ok(())
@@ -104,6 +122,24 @@ impl Matrix {
                     case.name
                 )
             })?;
+            let declared_inputs = method
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name())
+                .filter(|name| !name.starts_with('$'))
+                .collect::<BTreeSet<_>>();
+            let provided_inputs = case
+                .request
+                .parameters
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            if provided_inputs != declared_inputs {
+                return Err(format!(
+                    "enabled matrix case [{}] inputs do not exactly match the declared method inputs",
+                    case.name
+                ));
+            }
             covered.insert((service.service_id.as_str(), method.name.as_str()));
         }
         if covered != required {
@@ -338,13 +374,16 @@ mod tests {
     use super::*;
     use serde_json::Map;
     use std::collections::HashMap;
-    use webplus_plugin_config::{MethodDefinition, ServiceDefinition};
-    use webplus_protocol::PluginArchitecture;
+    use webplus_plugin_config::{MethodDefinition, ParameterDefinition, ServiceDefinition};
+    use webplus_protocol::{
+        PluginArchitecture, DRAFT_INPUT_PLACEHOLDER, DRAFT_RESPONSE_PLACEHOLDER,
+    };
 
     fn case(enabled: bool) -> Case {
         Case {
             name: "reader.read".into(),
             enabled,
+            review_required: false,
             request: InvokeRequest {
                 service_id: "reader".into(),
                 method: "read".into(),
@@ -398,6 +437,59 @@ mod tests {
         assert!(!matrix.draft);
     }
 
+    #[test]
+    fn finalized_matrices_cannot_retain_generated_placeholders() {
+        let mut review_required = case(true);
+        review_required.review_required = true;
+        assert!(Matrix {
+            schema_version: 1,
+            draft: false,
+            cases: vec![review_required],
+        }
+        .validate()
+        .unwrap_err()
+        .contains("exact review"));
+
+        let mut input_placeholder = case(true);
+        input_placeholder.request.parameters.insert(
+            "port".into(),
+            serde_json::Value::String(DRAFT_INPUT_PLACEHOLDER.into()),
+        );
+        assert!(Matrix {
+            schema_version: 1,
+            draft: false,
+            cases: vec![input_placeholder],
+        }
+        .validate()
+        .unwrap_err()
+        .contains("placeholders"));
+
+        let mut response_placeholder = case(true);
+        response_placeholder.expected = InvokeResponse::success(serde_json::json!({
+            "nested": [DRAFT_RESPONSE_PLACEHOLDER]
+        }));
+        assert!(Matrix {
+            schema_version: 1,
+            draft: false,
+            cases: vec![response_placeholder],
+        }
+        .validate()
+        .unwrap_err()
+        .contains("placeholders"));
+
+        let mut disabled_placeholder = case(false);
+        disabled_placeholder.expected = InvokeResponse::success(DRAFT_RESPONSE_PLACEHOLDER);
+        let mut enabled = case(true);
+        enabled.name = "reader.read verified".into();
+        Matrix {
+            schema_version: 1,
+            draft: false,
+            cases: vec![disabled_placeholder, enabled],
+        }
+        .validate()
+        .unwrap();
+    }
+
     fn manifest() -> PluginManifest {
         let method = |name: &str, alias: Option<&str>| MethodDefinition {
             name: name.into(),
@@ -437,6 +529,7 @@ mod tests {
                 Case {
                     name: "reader.read".into(),
                     enabled: true,
+                    review_required: false,
                     request: InvokeRequest {
                         service_id: "reader".into(),
                         method: "readCard".into(),
@@ -447,6 +540,7 @@ mod tests {
                 Case {
                     name: "reader.reset".into(),
                     enabled: true,
+                    review_required: false,
                     request: InvokeRequest {
                         service_id: "reader".into(),
                         method: "reset".into(),
@@ -496,5 +590,45 @@ mod tests {
             cases: vec![case(true), case(true)],
         };
         assert!(duplicate.validate().unwrap_err().contains("unique"));
+    }
+
+    #[test]
+    fn coverage_requires_the_exact_declared_input_set() {
+        let mut manifest = manifest();
+        manifest.services[0].methods[0].parameters = vec![ParameterDefinition::Name("port".into())];
+        let mut read = case(true);
+        read.request.method = "readCard".into();
+        read.request
+            .parameters
+            .insert("port".into(), serde_json::json!("COM1"));
+        let mut reset = case(true);
+        reset.name = "reader.reset".into();
+        reset.request.method = "reset".into();
+        let exact = Matrix {
+            schema_version: 1,
+            draft: false,
+            cases: vec![read, reset],
+        };
+        exact.validate_coverage(&[manifest.clone()]).unwrap();
+
+        let mut missing = exact;
+        missing.cases[0].request.parameters.clear();
+        assert!(missing
+            .validate_coverage(&[manifest.clone()])
+            .unwrap_err()
+            .contains("exactly match"));
+
+        missing.cases[0]
+            .request
+            .parameters
+            .insert("port".into(), serde_json::json!("COM1"));
+        missing.cases[0]
+            .request
+            .parameters
+            .insert("undeclared".into(), serde_json::json!(true));
+        assert!(missing
+            .validate_coverage(&[manifest])
+            .unwrap_err()
+            .contains("exactly match"));
     }
 }

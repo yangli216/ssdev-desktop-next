@@ -19,7 +19,10 @@ use webplus_plugin_trust::{
     encode_signature_document, portable_plugin_path, prepare_signing_material, TrustPurpose,
     TrustStore, SIGNATURE_FILENAME,
 };
-use webplus_protocol::{InvokeRequest, InvokeResponse, PluginArchitecture};
+use webplus_protocol::{
+    contains_draft_placeholder, InvokeRequest, InvokeResponse, PluginArchitecture,
+    DRAFT_INPUT_PLACEHOLDER, DRAFT_RESPONSE_PLACEHOLDER,
+};
 
 const MAX_PLUGIN_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PLUGIN_FILES: usize = 4096;
@@ -77,6 +80,8 @@ pub struct PrepareReport {
     pub legacy_license_excluded: bool,
     pub matrix_seeded: bool,
     pub matrix_case_count: usize,
+    pub matrix_placeholder_case_count: usize,
+    pub matrix_review_required_case_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -135,17 +140,23 @@ struct MatrixDocument {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MatrixCase {
     name: String,
     #[serde(default = "enabled_by_default")]
     enabled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    review_required: bool,
     request: InvokeRequest,
     expected: InvokeResponse,
 }
 
 fn enabled_by_default() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,6 +288,16 @@ pub fn prepare(options: &PrepareOptions<'_>) -> Result<PrepareReport, ToolError>
         legacy_license_excluded: copy.legacy_license_excluded,
         matrix_seeded: matrix_seed.is_some(),
         matrix_case_count: matrix.cases.len(),
+        matrix_placeholder_case_count: matrix
+            .cases
+            .iter()
+            .filter(|case| matrix_case_has_draft_placeholder(case))
+            .count(),
+        matrix_review_required_case_count: matrix
+            .cases
+            .iter()
+            .filter(|case| case.review_required)
+            .count(),
     })
 }
 
@@ -730,18 +751,19 @@ fn draft_matrix(manifest: &PluginManifest) -> MatrixDocument {
                 {
                     parameters.insert(
                         parameter.name().trim_start_matches('$').to_owned(),
-                        Value::String("<replace-with-redacted-input>".into()),
+                        Value::String(DRAFT_INPUT_PLACEHOLDER.into()),
                     );
                 }
                 MatrixCase {
                     name: format!("{}.{}", service.service_id, method.name),
                     enabled: true,
+                    review_required: true,
                     request: InvokeRequest {
                         service_id: service.service_id.clone(),
                         method: method.name.clone(),
                         parameters,
                     },
-                    expected: InvokeResponse::success("<replace-with-redacted-golden-response>"),
+                    expected: InvokeResponse::success(DRAFT_RESPONSE_PLACEHOLDER),
                 }
             })
         })
@@ -751,6 +773,14 @@ fn draft_matrix(manifest: &PluginManifest) -> MatrixDocument {
         draft: true,
         cases,
     }
+}
+
+fn matrix_case_has_draft_placeholder(case: &MatrixCase) -> bool {
+    case.request
+        .parameters
+        .values()
+        .any(contains_draft_placeholder)
+        || contains_draft_placeholder(&case.expected.res_data)
 }
 
 fn load_matrix_seed(path: &Path, manifest: &PluginManifest) -> Result<MatrixDocument, ToolError> {
@@ -822,6 +852,15 @@ fn load_matrix_seed(path: &Path, manifest: &PluginManifest) -> Result<MatrixDocu
         {
             return Err(ToolError::Invalid(format!(
                 "matrix seed case [{}] contains undeclared input parameter [{unexpected}]",
+                case.name
+            )));
+        }
+        if let Some(missing) = allowed_parameters
+            .iter()
+            .find(|name| !case.request.parameters.contains_key(**name))
+        {
+            return Err(ToolError::Invalid(format!(
+                "matrix seed case [{}] is missing declared input parameter [{missing}]",
                 case.name
             )));
         }
@@ -1128,6 +1167,8 @@ mod tests {
         assert!(report.legacy_license_excluded);
         assert!(!report.matrix_seeded);
         assert_eq!(report.matrix_case_count, 1);
+        assert_eq!(report.matrix_placeholder_case_count, 1);
+        assert_eq!(report.matrix_review_required_case_count, 1);
         assert!(!staging.join("license.dat").exists());
         assert!(
             serde_json::from_slice::<Value>(&fs::read(&matrix).unwrap()).unwrap()["draft"]
@@ -1243,6 +1284,8 @@ mod tests {
 
         assert!(report.matrix_seeded);
         assert_eq!(report.matrix_case_count, 1);
+        assert_eq!(report.matrix_placeholder_case_count, 0);
+        assert_eq!(report.matrix_review_required_case_count, 0);
         let generated: Value = serde_json::from_slice(&fs::read(matrix).unwrap()).unwrap();
         assert_eq!(generated["cases"][0]["name"], "known reader response");
         assert_eq!(
@@ -1317,6 +1360,51 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("undeclared input parameter"));
+        assert!(!root.path().join("stage").exists());
+    }
+
+    #[test]
+    fn prepare_rejects_missing_matrix_seed_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let source = source(root.path());
+        let seed = root.path().join("missing-input-matrix-seed.json");
+        fs::write(
+            &seed,
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "draft": true,
+                "cases": [{
+                    "name": "missing timeout",
+                    "request": {
+                        "serviceId": "reader",
+                        "method": "read",
+                        "parameters": {}
+                    },
+                    "expected": { "ResCode": 0, "ResData": null }
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let trust = trust_store(root.path(), &SigningKey::from_bytes(&[45; 32]), None);
+
+        let error = prepare(&PrepareOptions {
+            source: &source,
+            staging: &root.path().join("stage"),
+            request: &root.path().join("request.json"),
+            matrix_template: &root.path().join("matrix.json"),
+            plugin_id: "reader-plugin",
+            version: "1.0.0",
+            display_name: "Reader",
+            key_id: "test-key",
+            trust_store: &trust,
+            matrix_seed: Some(&seed),
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("missing declared input parameter"));
         assert!(!root.path().join("stage").exists());
     }
 
