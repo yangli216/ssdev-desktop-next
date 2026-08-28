@@ -12,6 +12,7 @@ pub(crate) struct DeploymentCheckFacts {
     pub(crate) plugin_count: usize,
     pub(crate) service_count: usize,
     pub(crate) active_service_count: usize,
+    pub(crate) active_manifests_match: bool,
     pub(crate) plugin_route_count: usize,
     pub(crate) evaluated_policy_grants: usize,
     pub(crate) authorized_policy_grants: usize,
@@ -204,6 +205,14 @@ pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
                 facts.service_count, facts.active_service_count
             ),
             Some("进入“插件管理”重新加载插件；若仍不一致，请导出诊断包后重启客户端。"),
+        ));
+    } else if !facts.active_manifests_match {
+        items.push(item(
+            "plugin-inventory",
+            "插件与服务",
+            DeploymentCheckStatus::Fail,
+            "磁盘插件清单与控制器当前活动清单不一致。",
+            Some("进入“插件管理”执行安全重新扫描；若仍不一致，请导出诊断包后重启客户端。"),
         ));
     } else if facts.service_count == 0 {
         items.push(item(
@@ -425,6 +434,7 @@ mod tests {
             plugin_count: 2,
             service_count: 4,
             active_service_count: 4,
+            active_manifests_match: true,
             plugin_route_count: 6,
             evaluated_policy_grants: 12,
             authorized_policy_grants: 6,
@@ -507,6 +517,16 @@ mod tests {
         assert!(!report.ready);
         assert!(report.items.iter().any(|item| {
             item.id == "plugin-inventory" && item.status == DeploymentCheckStatus::Fail
+        }));
+
+        let mut same_count_drift = healthy_facts();
+        same_count_drift.active_manifests_match = false;
+        let report = evaluate(&same_count_drift);
+        assert!(!report.ready);
+        assert!(report.items.iter().any(|item| {
+            item.id == "plugin-inventory"
+                && item.status == DeploymentCheckStatus::Fail
+                && item.summary.contains("活动清单不一致")
         }));
 
         let mut policy_gap = healthy_facts();

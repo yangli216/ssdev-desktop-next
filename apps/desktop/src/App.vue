@@ -504,7 +504,7 @@ async function reloadPlugins() {
       invoke<PluginInventory>('plugin_inventory'),
       invoke<DeploymentCheckReport>('run_deployment_check'),
     ])
-  }, '插件目录已重新校验并热加载。')
+  }, '插件目录已重新验签，候选宿主预检通过并热加载。')
 }
 
 async function refreshPluginsAfterMapping() {

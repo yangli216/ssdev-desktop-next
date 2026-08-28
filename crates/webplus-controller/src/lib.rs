@@ -120,9 +120,10 @@ pub struct PluginHostStats {
     pub failed_starts: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct ServiceRoute {
     descriptor: PluginDescriptor,
+    manifest: Option<Arc<PluginManifest>>,
     default_timeout: Option<Duration>,
     method_timeouts: HashMap<String, Duration>,
 }
@@ -196,6 +197,7 @@ impl PluginController {
             service_id,
             ServiceRoute {
                 descriptor,
+                manifest: None,
                 default_timeout: None,
                 method_timeouts: HashMap::new(),
             },
@@ -207,6 +209,7 @@ impl PluginController {
         &self,
         manifest: &PluginManifest,
     ) -> Result<(), ControllerError> {
+        let snapshot = Arc::new(manifest.clone());
         for service in &manifest.services {
             self.register_service(
                 service.service_id.clone(),
@@ -219,7 +222,9 @@ impl PluginController {
             .await?;
             let mut routes = self.routes.write().await;
             if let Some(route) = routes.get_mut(&service.service_id) {
+                route.manifest = Some(Arc::clone(&snapshot));
                 route.default_timeout = configured_timeout(service.timeout);
+                route.method_timeouts.clear();
                 for method in &service.methods {
                     if let Some(timeout) = configured_timeout(method.timeout) {
                         route.method_timeouts.insert(method.name.clone(), timeout);
@@ -235,6 +240,14 @@ impl PluginController {
 
     pub async fn service_count(&self) -> usize {
         self.routes.read().await.len()
+    }
+
+    pub async fn manifests_match_active_routes(
+        &self,
+        manifests: &[PluginManifest],
+    ) -> Result<bool, ControllerError> {
+        let expected = routes_from_manifests(manifests)?;
+        Ok(*self.routes.read().await == expected)
     }
 
     pub fn invocation_admission_stats(&self) -> InvocationAdmissionStats {
@@ -750,6 +763,7 @@ fn routes_from_manifests(
 ) -> Result<HashMap<String, ServiceRoute>, ControllerError> {
     let mut routes = HashMap::new();
     for manifest in manifests {
+        let snapshot = Arc::new(manifest.clone());
         for service in &manifest.services {
             let service_id = service.service_id.clone();
             let descriptor = PluginDescriptor {
@@ -771,6 +785,7 @@ fn routes_from_manifests(
                     service_id.clone(),
                     ServiceRoute {
                         descriptor,
+                        manifest: Some(Arc::clone(&snapshot)),
                         default_timeout: configured_timeout(service.timeout),
                         method_timeouts,
                     },
@@ -1879,6 +1894,59 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, ControllerError::DuplicateService(_)));
+    }
+
+    #[tokio::test]
+    async fn active_manifest_comparison_detects_same_count_contract_and_version_drift() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("api.json"),
+            r#"{
+              "serviceId":"reader",
+              "mainClass":"reader.dll",
+              "timeout":15,
+              "methods":[{"name":"read","parameters":[{"name":"port","type":"int"}]}]
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("plugin.json"),
+            r#"{"schemaVersion":1,"pluginId":"reader-plugin","version":"1.0.0","desktopVersionRequirement":">=0.1.0, <0.2.0"}"#,
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("reader-plugin", root.path()).unwrap();
+        let controller = PluginController::new(config()).unwrap();
+        controller
+            .replace_manifests(std::slice::from_ref(&manifest))
+            .await
+            .unwrap();
+
+        assert!(controller
+            .manifests_match_active_routes(std::slice::from_ref(&manifest))
+            .await
+            .unwrap());
+        assert_eq!(controller.service_count().await, 1);
+
+        let mut contract_drift = manifest.clone();
+        contract_drift.services[0].methods[0].alias = Some("readCard".into());
+        assert!(!controller
+            .manifests_match_active_routes(std::slice::from_ref(&contract_drift))
+            .await
+            .unwrap());
+        assert_eq!(contract_drift.services.len(), manifest.services.len());
+        controller.register_manifest(&contract_drift).await.unwrap();
+        assert!(controller
+            .manifests_match_active_routes(std::slice::from_ref(&contract_drift))
+            .await
+            .unwrap());
+
+        let mut version_drift = contract_drift.clone();
+        version_drift.metadata.as_mut().unwrap().version = "1.0.1".parse().unwrap();
+        assert!(!controller
+            .manifests_match_active_routes(std::slice::from_ref(&version_drift))
+            .await
+            .unwrap());
+        assert_eq!(controller.service_count().await, 1);
     }
 
     #[test]

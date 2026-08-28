@@ -309,6 +309,11 @@ async fn run_deployment_check(
         plugin_count,
         service_count,
         active_service_count: state.controller.service_count().await,
+        active_manifests_match: state
+            .controller
+            .manifests_match_active_routes(&manifests)
+            .await
+            .is_ok_and(|matches| matches),
         plugin_route_count,
         evaluated_policy_grants,
         authorized_policy_grants,
@@ -611,6 +616,13 @@ async fn export_project_bundle(
         .map(|manifest| manifest.services.len())
         .sum::<usize>();
     ensure_project_export_runtime_matches(service_count, state.controller.service_count().await)?;
+    ensure_project_export_active_manifests_match(
+        state
+            .controller
+            .manifests_match_active_routes(&inspected.manifests)
+            .await
+            .map_err(|error| error.to_string())?,
+    )?;
     let trust_store = state.trust_store.clone();
     let local_mapping_root = state.local_mapping_root.clone();
     let staged_trust_store = trust_store.clone();
@@ -651,7 +663,7 @@ async fn export_project_bundle(
         .map(|manifest| manifest.services.len())
         .sum::<usize>();
     ensure_project_export_runtime_matches(service_count, state.controller.service_count().await)?;
-    let preflighted_hosts = preflight_project_manifests(&state, &candidates).await?;
+    let preflighted_hosts = preflight_manifests(&state, &candidates, "项目组件").await?;
     drop(prepared);
 
     let version = app.package_info().version.to_string();
@@ -1109,7 +1121,7 @@ async fn prepare_project_bundle(
         .iter()
         .map(|component| component.manifest().clone())
         .collect::<Vec<_>>();
-    let preflighted_hosts = preflight_project_manifests(state, &project_manifests).await?;
+    let preflighted_hosts = preflight_manifests(state, &project_manifests, "项目组件").await?;
     let signed_plugins = previews
         .iter()
         .filter(|component| component.source == "signed-package")
@@ -1293,9 +1305,20 @@ fn ensure_project_export_runtime_matches(
     Ok(())
 }
 
-async fn preflight_project_manifests(
+fn ensure_project_export_active_manifests_match(matches: bool) -> Result<(), String> {
+    if !matches {
+        return Err(
+            "当前项目运行状态不一致：磁盘插件完整清单与控制器活动清单存在漂移；请先执行安全重新扫描或重启客户端"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+async fn preflight_manifests(
     state: &BridgeState,
     manifests: &[PluginManifest],
+    subject: &str,
 ) -> Result<usize, String> {
     let mut preflighted_hosts = 0_usize;
     for manifest in manifests {
@@ -1308,7 +1331,7 @@ async fn preflight_project_manifests(
                     .plugin_preflight_failures
                     .fetch_add(1, Ordering::AcqRel);
                 format!(
-                    "项目组件 [{}] 宿主预检失败 ({})：{error}",
+                    "{subject} [{}] 宿主预检失败 ({})：{error}",
                     manifest.plugin_id,
                     error.diagnostic_code()
                 )
@@ -1477,6 +1500,7 @@ struct PluginInstallResult {
 struct PluginReloadResult {
     service_count: usize,
     quarantined_plugins: usize,
+    preflighted_hosts: usize,
 }
 
 #[derive(Serialize)]
@@ -2089,6 +2113,8 @@ async fn reload_plugins(
         &state.desktop_version,
     )?;
     PluginController::validate_manifests(&plugins.manifests).map_err(|error| error.to_string())?;
+    let preflighted_hosts =
+        preflight_manifests(&state, &plugins.manifests, "待重载插件或映射").await?;
     state
         .controller
         .replace_manifests(&plugins.manifests)
@@ -2104,6 +2130,7 @@ async fn reload_plugins(
         event_code = "plugins-reloaded",
         plugin_count = plugins.manifests.len(),
         quarantined_count = plugins.failures.len(),
+        preflighted_hosts,
         "plugin routes reloaded"
     );
     Ok(PluginReloadResult {
@@ -2113,6 +2140,7 @@ async fn reload_plugins(
             .map(|item| item.services.len())
             .sum(),
         quarantined_plugins: plugins.failures.len(),
+        preflighted_hosts,
     })
 }
 
@@ -3485,10 +3513,10 @@ fn select_runtime_path(
 mod tests {
     use super::{
         classify_project_component_action, collect_plugin_updates,
-        ensure_project_export_runtime_matches, ensure_signed_plugin_compatible,
-        ensure_upgrade_allowed, is_lowercase_sha256, is_plugin_update_available,
-        legacy_config_candidates, open_project_bundle_for_mode, project_bundle,
-        project_import_plan_id, project_import_state_digest, select_runtime_path,
+        ensure_project_export_active_manifests_match, ensure_project_export_runtime_matches,
+        ensure_signed_plugin_compatible, ensure_upgrade_allowed, is_lowercase_sha256,
+        is_plugin_update_available, legacy_config_candidates, open_project_bundle_for_mode,
+        project_bundle, project_import_plan_id, project_import_state_digest, select_runtime_path,
         service_inventory_item,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
@@ -3559,6 +3587,10 @@ mod tests {
         let error = ensure_project_export_runtime_matches(4, 3).unwrap_err();
         assert!(error.contains("磁盘插件声明 4 个服务"));
         assert!(error.contains("3 个活动服务"));
+        assert!(ensure_project_export_active_manifests_match(true).is_ok());
+        assert!(ensure_project_export_active_manifests_match(false)
+            .unwrap_err()
+            .contains("完整清单"));
     }
 
     #[test]

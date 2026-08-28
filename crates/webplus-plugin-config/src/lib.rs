@@ -15,7 +15,7 @@ const MAX_METHODS_PER_SERVICE: usize = 1024;
 const MAX_PARAMETERS_PER_METHOD: usize = 256;
 const MAX_DEPENDENCIES_PER_SERVICE: usize = 256;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PluginManifest {
     pub plugin_id: String,
     pub plugin_dir: PathBuf,
@@ -210,7 +210,7 @@ impl ApiDocument {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServiceDefinition {
     #[serde(rename = "serviceId")]
     pub service_id: String,
@@ -254,7 +254,7 @@ impl ServiceDefinition {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MethodDefinition {
     pub name: String,
     #[serde(default)]
@@ -271,7 +271,7 @@ pub struct MethodDefinition {
     pub extensions: HashMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ParameterDefinition {
     Name(String),
@@ -287,7 +287,7 @@ impl ParameterDefinition {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParameterDetail {
     pub name: String,
     #[serde(rename = "type", default = "default_parameter_type")]
