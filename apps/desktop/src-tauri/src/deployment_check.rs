@@ -10,6 +10,9 @@ const MAX_EXPORT_BYTES: usize = 128 * 1024;
 #[derive(Debug, Clone)]
 pub(crate) struct DeploymentCheckFacts {
     pub(crate) is_windows: bool,
+    pub(crate) deep_preflight: bool,
+    pub(crate) deep_preflighted_hosts: usize,
+    pub(crate) deep_preflight_failed: bool,
     pub(crate) config_error: Option<String>,
     pub(crate) business_origin_count: usize,
     pub(crate) origin_policy_error: Option<String>,
@@ -42,6 +45,7 @@ pub(crate) struct DeploymentCheckFacts {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DeploymentCheckReport {
+    pub(crate) deep: bool,
     pub(crate) ready: bool,
     pub(crate) passed: usize,
     pub(crate) warnings: usize,
@@ -387,10 +391,33 @@ pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
         ));
     }
 
-    if facts.plugin_preflight_failures > 0 {
+    if facts.deep_preflight && facts.deep_preflight_failed {
         items.push(item(
             "plugin-preflight",
-            "插件安装预检",
+            "当前插件宿主深度预检",
+            DeploymentCheckStatus::Fail,
+            "当前插件未能通过隔离宿主 Health 预检。",
+            Some("进入“插件管理”核对目标插件架构、依赖和入口定义；修复后重新执行深度自检。"),
+        ));
+    } else if facts.deep_preflight {
+        items.push(item(
+            "plugin-preflight",
+            "当前插件宿主深度预检",
+            DeploymentCheckStatus::Pass,
+            if facts.deep_preflighted_hosts == 0 {
+                "已完成深度检查，当前没有需要启动的插件宿主。".to_owned()
+            } else {
+                format!(
+                    "当前插件已在 {} 个架构宿主中完成 Health 预检。",
+                    facts.deep_preflighted_hosts
+                )
+            },
+            None,
+        ));
+    } else if facts.plugin_preflight_failures > 0 {
+        items.push(item(
+            "plugin-preflight",
+            "插件宿主历史预检",
             DeploymentCheckStatus::Warning,
             format!(
                 "本次运行累计 {} 次宿主预检失败。",
@@ -401,10 +428,10 @@ pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
     } else {
         items.push(item(
             "plugin-preflight",
-            "插件安装预检",
-            DeploymentCheckStatus::Pass,
-            "本次运行没有宿主预检失败。",
-            None,
+            "当前插件宿主深度预检",
+            DeploymentCheckStatus::Info,
+            "快速检查不会主动启动插件宿主。",
+            Some("正式交付或导出现场记录前执行一次深度自检。"),
         ));
     }
 
@@ -472,6 +499,7 @@ pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
         .filter(|check| check.status == DeploymentCheckStatus::Fail)
         .count();
     DeploymentCheckReport {
+        deep: facts.deep_preflight,
         ready: failures == 0,
         passed,
         warnings,
@@ -503,6 +531,9 @@ mod tests {
     fn healthy_facts() -> DeploymentCheckFacts {
         DeploymentCheckFacts {
             is_windows: true,
+            deep_preflight: true,
+            deep_preflighted_hosts: 3,
+            deep_preflight_failed: false,
             config_error: None,
             business_origin_count: 2,
             origin_policy_error: None,
@@ -536,6 +567,7 @@ mod tests {
     #[test]
     fn healthy_offline_windows_deployment_is_ready() {
         let report = evaluate(&healthy_facts());
+        assert!(report.deep);
         assert!(report.ready);
         assert_eq!(report.failures, 0);
         assert!(report.passed >= 8);
@@ -560,6 +592,8 @@ mod tests {
     #[test]
     fn optional_operational_gaps_are_warnings_not_false_failures() {
         let mut facts = healthy_facts();
+        facts.deep_preflight = false;
+        facts.deep_preflighted_hosts = 0;
         facts.service_count = 0;
         facts.active_service_count = 0;
         facts.plugin_route_count = 0;
@@ -584,6 +618,38 @@ mod tests {
         assert!(report.ready);
         assert!(report.items.iter().any(|item| {
             item.id == "plugin-hosts" && item.status == DeploymentCheckStatus::Info
+        }));
+    }
+
+    #[test]
+    fn quick_check_does_not_claim_current_hosts_were_preflighted() {
+        let mut facts = healthy_facts();
+        facts.deep_preflight = false;
+        facts.deep_preflighted_hosts = 0;
+
+        let report = evaluate(&facts);
+
+        assert!(!report.deep);
+        assert!(report.ready);
+        assert!(report.items.iter().any(|item| {
+            item.id == "plugin-preflight"
+                && item.status == DeploymentCheckStatus::Info
+                && item.summary.contains("快速检查")
+        }));
+    }
+
+    #[test]
+    fn failed_deep_host_preflight_blocks_delivery() {
+        let mut facts = healthy_facts();
+        facts.deep_preflight_failed = true;
+        facts.deep_preflighted_hosts = 0;
+
+        let report = evaluate(&facts);
+
+        assert!(report.deep);
+        assert!(!report.ready);
+        assert!(report.items.iter().any(|item| {
+            item.id == "plugin-preflight" && item.status == DeploymentCheckStatus::Fail
         }));
     }
 

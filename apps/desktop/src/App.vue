@@ -76,6 +76,7 @@ type BridgeStatus = {
 }
 
 type DeploymentCheckReport = {
+  deep: boolean
   ready: boolean
   passed: number
   warnings: number
@@ -332,7 +333,7 @@ onMounted(async () => {
       ssoStatusEventSeen = true
       applySsoStatus(event.payload.code, event.payload.active)
     })
-    const deploymentPromise = invoke<DeploymentCheckReport>('run_deployment_check').catch((reason) => {
+    const deploymentPromise = invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }).catch((reason) => {
       error.value = `部署自检不可用：${reason instanceof Error ? reason.message : String(reason)}`
       return null
     })
@@ -373,7 +374,7 @@ async function saveConfig() {
   await run(
     async () => {
       await invoke('save_desktop_config', { config: snapshot.value?.config })
-      deploymentCheck.value = await invoke<DeploymentCheckReport>('run_deployment_check')
+      deploymentCheck.value = await invoke<DeploymentCheckReport>('run_deployment_check', { deep: false })
       configImportPreview.value = null
       selectedConfigImport.value = ''
     },
@@ -409,7 +410,7 @@ async function confirmConfigImport() {
       source,
       expectedPlanId,
     })
-    deploymentCheck.value = await invoke<DeploymentCheckReport>('run_deployment_check')
+    deploymentCheck.value = await invoke<DeploymentCheckReport>('run_deployment_check', { deep: false })
     configImportPreview.value = null
     selectedConfigImport.value = ''
   }, changed ? '配置已按确认计划导入；已有业务窗口已关闭。' : '导入配置与当前配置一致，未执行替换。')
@@ -480,7 +481,7 @@ async function importSelectedProjectBundle() {
       invoke<BridgeStatus>('bridge_status'),
       invoke<ConfigSnapshot>('desktop_config'),
       invoke<PluginInventory>('plugin_inventory'),
-      invoke<DeploymentCheckReport>('run_deployment_check'),
+      invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }),
     ])
     selectedProjectBundle.value = ''
     projectBundlePreview.value = null
@@ -549,7 +550,7 @@ async function installPlugin() {
     ;[status.value, inventory.value, deploymentCheck.value] = await Promise.all([
       invoke<BridgeStatus>('bridge_status'),
       invoke<PluginInventory>('plugin_inventory'),
-      invoke<DeploymentCheckReport>('run_deployment_check'),
+      invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }),
     ])
   }, '')
 
@@ -567,7 +568,7 @@ async function uninstallSignedPlugin(pluginId: string, displayName: string) {
     ;[status.value, inventory.value, deploymentCheck.value] = await Promise.all([
       invoke<BridgeStatus>('bridge_status'),
       invoke<PluginInventory>('plugin_inventory'),
-      invoke<DeploymentCheckReport>('run_deployment_check'),
+      invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }),
     ])
   }, `签名插件 ${pluginId} 已卸载并从路由移除。`)
 }
@@ -578,7 +579,7 @@ async function reloadPlugins() {
     ;[status.value, inventory.value, deploymentCheck.value] = await Promise.all([
       invoke<BridgeStatus>('bridge_status'),
       invoke<PluginInventory>('plugin_inventory'),
-      invoke<DeploymentCheckReport>('run_deployment_check'),
+      invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }),
     ])
   }, '插件目录已重新验签，候选宿主预检通过并热加载。')
 }
@@ -588,7 +589,7 @@ async function refreshPluginsAfterMapping() {
     ;[status.value, inventory.value, deploymentCheck.value] = await Promise.all([
       invoke<BridgeStatus>('bridge_status'),
       invoke<PluginInventory>('plugin_inventory'),
-      invoke<DeploymentCheckReport>('run_deployment_check'),
+      invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }),
     ])
   } catch (reason) {
     error.value = reason instanceof Error ? reason.message : String(reason)
@@ -638,7 +639,7 @@ async function installFromCatalog(pluginId: string, version?: string, installPla
       invoke<BridgeStatus>('bridge_status'),
       invoke<PluginInventory>('plugin_inventory'),
       invoke<PluginUpdateCheck>('check_plugin_updates', { pluginId }),
-      invoke<DeploymentCheckReport>('run_deployment_check'),
+      invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }),
     ])
   }, '')
   if (result) {
@@ -721,13 +722,14 @@ async function openDiagnosticsDirectory() {
 async function runDeploymentCheck() {
   let result: DeploymentCheckReport | undefined
   await run(async () => {
-    result = await invoke<DeploymentCheckReport>('run_deployment_check')
+    result = await invoke<DeploymentCheckReport>('run_deployment_check', { deep: true })
     deploymentCheck.value = result
+    status.value = await invoke<BridgeStatus>('bridge_status')
   }, '')
   if (result) {
     notice.value = result.ready
-      ? `部署自检通过：${result.passed} 项正常，${result.warnings} 项提醒。`
-      : `部署自检发现 ${result.failures} 项阻塞问题，请按建议处理后重新检查。`
+      ? `${result.deep ? '深度' : '快速'}自检通过：${result.passed} 项正常，${result.warnings} 项提醒。`
+      : `${result.deep ? '深度' : '快速'}自检发现 ${result.failures} 项阻塞问题，请按建议处理后重新检查。`
   }
 }
 
@@ -741,9 +743,10 @@ async function exportDeploymentCheck() {
   await run(async () => {
     result = await invoke<{ bytes: number; report: DeploymentCheckReport }>('export_deployment_check', { destination })
     deploymentCheck.value = result.report
+    status.value = await invoke<BridgeStatus>('bridge_status')
   }, '')
   if (result) {
-    notice.value = `部署自检已重新执行并导出（${(result.bytes / 1024).toFixed(1)} KiB）；这是脱敏的未签名现场记录，不替代生产切换证据。`
+    notice.value = `${result.report.deep ? '深度' : '快速'}部署自检已重新执行并导出（${(result.bytes / 1024).toFixed(1)} KiB）；这是脱敏的未签名现场记录，不替代生产切换证据。`
   }
 }
 </script>
@@ -960,11 +963,11 @@ async function exportDeploymentCheck() {
       </section>
 
       <section v-show="activeSection === 'security'" class="page" aria-labelledby="security-title">
-        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>先执行部署自检，再按需留存现场记录或导出诊断。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy" @click="runDeploymentCheck">重新自检</button><button type="button" :disabled="busy" @click="exportDeploymentCheck">导出自检记录</button><button type="button" :disabled="busy" @click="openDiagnosticsDirectory">打开日志目录</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
+        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>快速检查用于日常状态刷新；正式交付前执行深度自检，实际启动当前插件宿主完成 Health 验证。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy" @click="runDeploymentCheck">深度自检</button><button type="button" :disabled="busy" @click="exportDeploymentCheck">导出深度自检记录</button><button type="button" :disabled="busy" @click="openDiagnosticsDirectory">打开日志目录</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
         <section v-if="deploymentCheck" :class="['deployment-check', { ready: deploymentCheck.ready }]" aria-label="部署自检结果">
           <header>
-            <div><p class="eyebrow">DEPLOYMENT CHECK</p><h2>{{ deploymentCheck.ready ? '当前机器可以交付' : '部署条件尚未满足' }}</h2><p>{{ deploymentCheck.passed }} 项正常 · {{ deploymentCheck.warnings }} 项提醒 · {{ deploymentCheck.failures }} 项阻塞</p></div>
-            <span>{{ deploymentCheck.ready ? 'READY' : 'ACTION REQUIRED' }}</span>
+            <div><p class="eyebrow">{{ deploymentCheck.deep ? 'DEEP DEPLOYMENT CHECK' : 'QUICK DEPLOYMENT CHECK' }}</p><h2>{{ deploymentCheck.ready ? (deploymentCheck.deep ? '当前机器通过深度交付检查' : '快速检查未发现阻塞') : '部署条件尚未满足' }}</h2><p>{{ deploymentCheck.passed }} 项正常 · {{ deploymentCheck.warnings }} 项提醒 · {{ deploymentCheck.failures }} 项阻塞</p></div>
+            <span>{{ deploymentCheck.ready ? (deploymentCheck.deep ? 'READY' : 'QUICK PASS') : 'ACTION REQUIRED' }}</span>
           </header>
           <div class="check-list">
             <article v-for="item in deploymentCheck.items" :key="item.id" :class="`check-${item.status}`">

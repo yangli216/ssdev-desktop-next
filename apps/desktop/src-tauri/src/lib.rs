@@ -383,12 +383,14 @@ async fn bridge_status(
 #[tauri::command]
 async fn run_deployment_check(
     caller: WebviewWindow,
+    deep: bool,
     state: State<'_, BridgeState>,
     desktop_state: State<'_, desktop::DesktopState>,
     update_state: State<'_, app_update::AppUpdateState>,
     diagnostics: State<'_, DiagnosticsRuntime>,
 ) -> Result<deployment_check::DeploymentCheckReport, String> {
     desktop::require_control(&caller)?;
+    let deep = deep && cfg!(windows);
     let _install = state.install_lock.lock().await;
     recover_plugin_store(&state)?;
     let config = desktop_state.config.snapshot();
@@ -402,15 +404,53 @@ async fn run_deployment_check(
         state.trust_store.as_deref(),
         &state.desktop_version,
     );
-    let (manifests, plugin_load_failures, plugin_inventory_error) = match inspected {
-        Ok(inspected) => (inspected.manifests, inspected.failures.len(), None),
-        Err(error) => (Vec::new(), 0, Some(error)),
+    let (manifests, plugin_failures, plugin_inventory_error) = match inspected {
+        Ok(inspected) => (inspected.manifests, inspected.failures, None),
+        Err(error) => (Vec::new(), Vec::new(), Some(error)),
     };
+    let plugin_load_failures = plugin_failures.len();
     let plugin_count = manifests.len();
     let service_count = manifests
         .iter()
         .map(|manifest| manifest.services.len())
         .sum();
+    let (deep_preflighted_hosts, deep_preflight_failed) = if !deep {
+        (0, false)
+    } else if plugin_inventory_error.is_some() {
+        (0, true)
+    } else {
+        match preflight_manifests(&state, &manifests, "部署深度自检插件").await {
+            Ok(hosts) => match inspect_all_plugins(
+                &state.plugin_root,
+                &state.local_mapping_root,
+                state.trust_store.as_deref(),
+                &state.desktop_version,
+            ) {
+                Ok(after)
+                    if after.manifests == manifests
+                        && same_plugin_failures(&plugin_failures, &after.failures) =>
+                {
+                    (hosts, false)
+                }
+                Ok(_) | Err(_) => {
+                    tracing::warn!(
+                        event_code = "deployment-check-plugin-state-drifted",
+                        error_code = "plugin-state-drifted-during-preflight",
+                        "plugin state changed while the deep deployment check was running"
+                    );
+                    (hosts, true)
+                }
+            },
+            Err(_error) => {
+                tracing::warn!(
+                    event_code = "deployment-check-host-preflight-failed",
+                    error_code = "plugin-host-preflight-failed",
+                    "deep deployment check could not preflight the current plugin hosts"
+                );
+                (0, true)
+            }
+        }
+    };
     let route_coverage = desktop_state.plugin_route_policy_coverage(&config, &manifests);
     let (
         plugin_route_count,
@@ -441,6 +481,9 @@ async fn run_deployment_check(
     };
     let report = deployment_check::evaluate(&deployment_check::DeploymentCheckFacts {
         is_windows: cfg!(windows),
+        deep_preflight: deep,
+        deep_preflighted_hosts,
+        deep_preflight_failed,
         config_error,
         business_origin_count,
         origin_policy_error,
@@ -475,6 +518,7 @@ async fn run_deployment_check(
     });
     tracing::info!(
         event_code = "deployment-check-completed",
+        deep,
         ready = report.ready,
         passed = report.passed,
         warnings = report.warnings,
@@ -502,8 +546,15 @@ async fn export_deployment_check(
     diagnostics: State<'_, DiagnosticsRuntime>,
 ) -> Result<DeploymentCheckExportResult, String> {
     desktop::require_control(&caller)?;
-    let report =
-        run_deployment_check(caller, state, desktop_state, update_state, diagnostics).await?;
+    let report = run_deployment_check(
+        caller,
+        true,
+        state,
+        desktop_state,
+        update_state,
+        diagnostics,
+    )
+    .await?;
     let generated_at_unix_ms = u64::try_from(
         SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
