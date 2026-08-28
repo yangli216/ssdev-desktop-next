@@ -1599,6 +1599,7 @@ struct PluginUpdateItem {
     installed_version: Option<String>,
     available_version: Option<String>,
     latest_catalog_version: Option<String>,
+    install_plan_id: Option<String>,
     catalog_available: bool,
     compatibility_limited: bool,
     update_available: bool,
@@ -1624,7 +1625,7 @@ async fn install_plugin_package(
         Arc::clone(&trust_store),
     )
     .await?;
-    activate_prepared_plugin(&state, &trust_store, prepared).await
+    activate_prepared_plugin(&state, &trust_store, prepared, None).await
 }
 
 #[tauri::command]
@@ -1633,9 +1634,13 @@ async fn install_plugin_from_catalog(
     bridge_state: State<'_, BridgeState>,
     desktop_state: State<'_, desktop::DesktopState>,
     plugin_id: String,
-    version: Option<String>,
+    version: String,
+    expected_plan_id: String,
 ) -> Result<PluginInstallResult, String> {
     desktop::require_control(&caller)?;
+    if !is_lowercase_sha256(&expected_plan_id) {
+        return Err("插件更新确认标识无效，请重新检查更新".to_owned());
+    }
     let _install = bridge_state.install_lock.lock().await;
     recover_plugin_store(&bridge_state)?;
     let trust_store = bridge_state
@@ -1649,10 +1654,7 @@ async fn install_plugin_from_catalog(
         .plugin_catalog_urls()
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "尚未配置签名插件仓库".to_owned())?;
-    let requested_version = version
-        .as_deref()
-        .map(semver::Version::parse)
-        .transpose()
+    let requested_version = semver::Version::parse(&version)
         .map_err(|error| format!("请求的插件版本不是合法 SemVer: {error}"))?;
     let catalog = fetch_catalog(
         &bridge_state.repository_client,
@@ -1664,9 +1666,12 @@ async fn install_plugin_from_catalog(
     .await
     .map_err(|error| error.to_string())?;
     let entry = catalog
-        .select(&plugin_id, requested_version.as_ref())
+        .select(&plugin_id, Some(&requested_version))
         .cloned()
         .ok_or_else(|| format!("签名仓库中没有插件 [{plugin_id}] 的匹配版本"))?;
+    let catalog_signing_key_id = catalog
+        .signing_key_id()
+        .ok_or_else(|| "签名插件仓库没有已验证的目录签名身份".to_owned())?;
     let desktop_requirement = entry.desktop_version_requirement.as_ref().ok_or_else(|| {
         format!(
             "插件 [{} {}] 未声明支持的 SSDEV Desktop 版本",
@@ -1679,6 +1684,27 @@ async fn install_plugin_from_catalog(
             entry.plugin_id, entry.version, bridge_state.desktop_version, desktop_requirement
         ));
     }
+    let installed = inspect_plugins(
+        &bridge_state.plugin_root,
+        Some(&trust_store),
+        &bridge_state.desktop_version,
+    )?;
+    let installed_manifest = installed
+        .manifests
+        .iter()
+        .find(|manifest| manifest.plugin_id == plugin_id);
+    let current_state_sha256 = plugin_update_installed_state_digest(
+        &bridge_state.plugin_root,
+        &plugin_id,
+        installed_manifest,
+    )?;
+    let actual_plan_id = plugin_update_plan_id(
+        &entry,
+        catalog_signing_key_id,
+        &current_state_sha256,
+        &bridge_state.desktop_version,
+    )?;
+    ensure_plugin_update_plan_matches(&expected_plan_id, &actual_plan_id)?;
     let temporary_directory = bridge_state.plugin_root.join(".downloads");
     let downloaded = download_package(
         &bridge_state.repository_client,
@@ -1694,7 +1720,13 @@ async fn install_plugin_from_catalog(
     )
     .await?;
     verify_catalog_identity(&entry, &prepared)?;
-    activate_prepared_plugin(&bridge_state, &trust_store, prepared).await
+    activate_prepared_plugin(
+        &bridge_state,
+        &trust_store,
+        prepared,
+        Some(&current_state_sha256),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1740,12 +1772,17 @@ async fn check_plugin_updates(
         Some(&trust_store),
         &bridge_state.desktop_version,
     )?;
+    let catalog_signing_key_id = catalog
+        .signing_key_id()
+        .ok_or_else(|| "签名插件仓库没有已验证的目录签名身份".to_owned())?;
     let updates = collect_plugin_updates(
         &installed.manifests,
+        &bridge_state.plugin_root,
         &catalog,
+        catalog_signing_key_id,
         requested_plugin_id,
         &bridge_state.desktop_version,
-    );
+    )?;
     Ok(PluginUpdateCheckResult {
         catalog_issued_at: catalog.issued_at(),
         catalog_expires_at: catalog.expires_at(),
@@ -1755,10 +1792,12 @@ async fn check_plugin_updates(
 
 fn collect_plugin_updates(
     installed: &[PluginManifest],
+    plugin_root: &std::path::Path,
     catalog: &PluginCatalog,
+    catalog_signing_key_id: &str,
     requested_plugin_id: Option<&str>,
     desktop_version: &semver::Version,
-) -> Vec<PluginUpdateItem> {
+) -> Result<Vec<PluginUpdateItem>, String> {
     let mut plugin_ids = if let Some(plugin_id) = requested_plugin_id {
         vec![plugin_id.to_owned()]
     } else {
@@ -1772,25 +1811,43 @@ fn collect_plugin_updates(
     plugin_ids
         .into_iter()
         .map(|plugin_id| {
-            let installed_version = installed
+            let installed_manifest = installed
                 .iter()
-                .find(|manifest| manifest.plugin_id == plugin_id)
+                .find(|manifest| manifest.plugin_id == plugin_id);
+            let installed_version = installed_manifest
                 .and_then(|manifest| manifest.metadata.as_ref())
                 .map(|metadata| &metadata.version);
             let latest_catalog_version =
                 catalog.select(&plugin_id, None).map(|entry| &entry.version);
-            let available_version = catalog
-                .select_compatible(&plugin_id, None, desktop_version)
-                .map(|entry| &entry.version);
-            PluginUpdateItem {
+            let available_entry = catalog.select_compatible(&plugin_id, None, desktop_version);
+            let available_version = available_entry.map(|entry| &entry.version);
+            let update_available = is_plugin_update_available(installed_version, available_version);
+            let install_plan_id = if update_available {
+                let entry = available_entry.expect("an available version must have an entry");
+                let current_state_sha256 = plugin_update_installed_state_digest(
+                    plugin_root,
+                    &plugin_id,
+                    installed_manifest,
+                )?;
+                Some(plugin_update_plan_id(
+                    entry,
+                    catalog_signing_key_id,
+                    &current_state_sha256,
+                    desktop_version,
+                )?)
+            } else {
+                None
+            };
+            Ok(PluginUpdateItem {
                 plugin_id,
                 installed_version: installed_version.map(ToString::to_string),
                 available_version: available_version.map(ToString::to_string),
                 latest_catalog_version: latest_catalog_version.map(ToString::to_string),
+                install_plan_id,
                 catalog_available: latest_catalog_version.is_some(),
                 compatibility_limited: latest_catalog_version != available_version,
-                update_available: is_plugin_update_available(installed_version, available_version),
-            }
+                update_available,
+            })
         })
         .collect()
 }
@@ -1804,6 +1861,77 @@ fn is_plugin_update_available(
         (None, Some(_)) => true,
         (_, None) => false,
     }
+}
+
+fn plugin_update_installed_state_digest(
+    plugin_root: &std::path::Path,
+    plugin_id: &str,
+    installed: Option<&PluginManifest>,
+) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-PLUGIN-UPDATE-STATE\0");
+    hash_plan_field(&mut hasher, plugin_id.as_bytes());
+    match installed {
+        Some(manifest) => {
+            if manifest.plugin_id != plugin_id || !manifest.plugin_dir.starts_with(plugin_root) {
+                return Err("插件更新基线不属于目标签名插件目录".to_owned());
+            }
+            let identity =
+                read_identity(&manifest.plugin_dir).map_err(|error| error.to_string())?;
+            if identity.plugin_id != plugin_id {
+                return Err("插件更新基线签名身份与目标插件不一致".to_owned());
+            }
+            let material =
+                prepare_signing_material(&manifest.plugin_dir, plugin_id, &identity.key_id)
+                    .map_err(|error| error.to_string())?;
+            hash_plan_field(&mut hasher, b"installed");
+            hash_plan_field(&mut hasher, identity.key_id.as_bytes());
+            hash_plan_field(&mut hasher, &material.payload);
+        }
+        None => {
+            let target = plugin_root.join(plugin_id);
+            match fs::symlink_metadata(&target) {
+                Ok(_) => {
+                    return Err(format!(
+                        "插件 [{plugin_id}] 的本机目录存在但未通过签名或兼容性检查；请先处理隔离项再检查更新"
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    hash_plan_field(&mut hasher, b"not-installed");
+                }
+                Err(error) => {
+                    return Err(format!("无法读取插件 [{plugin_id}] 的更新基线: {error}"));
+                }
+            }
+        }
+    }
+    Ok(lowercase_hex(&hasher.finalize()))
+}
+
+fn plugin_update_plan_id(
+    entry: &CatalogEntry,
+    catalog_signing_key_id: &str,
+    current_state_sha256: &str,
+    desktop_version: &semver::Version,
+) -> Result<String, String> {
+    let entry =
+        serde_json::to_vec(entry).map_err(|error| format!("无法生成插件更新确认标识: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-PLUGIN-UPDATE-PLAN\0");
+    hash_plan_field(&mut hasher, &entry);
+    hash_plan_field(&mut hasher, catalog_signing_key_id.as_bytes());
+    hash_plan_field(&mut hasher, current_state_sha256.as_bytes());
+    hash_plan_field(&mut hasher, desktop_version.to_string().as_bytes());
+    Ok(lowercase_hex(&hasher.finalize()))
+}
+
+fn ensure_plugin_update_plan_matches(expected: &str, actual: &str) -> Result<(), String> {
+    if expected != actual {
+        return Err(
+            "签名仓库条目或当前插件状态在确认后发生变化，请重新检查更新并确认目标版本".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 async fn prepare_local_package(
@@ -1850,6 +1978,7 @@ async fn activate_prepared_plugin(
     state: &BridgeState,
     trust_store: &TrustStore,
     prepared: PreparedPlugin,
+    expected_current_state_sha256: Option<&str>,
 ) -> Result<PluginInstallResult, String> {
     let plugin_root = state.plugin_root.clone();
 
@@ -1871,6 +2000,14 @@ async fn activate_prepared_plugin(
                 && !is_local_manifest(manifest, &state.local_mapping_root)
         })
         .cloned();
+    if let Some(expected) = expected_current_state_sha256 {
+        let actual = plugin_update_installed_state_digest(
+            &plugin_root,
+            &plugin_id,
+            previous_manifest.as_ref(),
+        )?;
+        ensure_plugin_update_plan_matches(expected, &actual)?;
+    }
     if before.manifests.iter().any(|manifest| {
         manifest.plugin_id == plugin_id && is_local_manifest(manifest, &state.local_mapping_root)
     }) {
@@ -3513,10 +3650,12 @@ fn select_runtime_path(
 mod tests {
     use super::{
         classify_project_component_action, collect_plugin_updates,
-        ensure_project_export_active_manifests_match, ensure_project_export_runtime_matches,
-        ensure_signed_plugin_compatible, ensure_upgrade_allowed, is_lowercase_sha256,
-        is_plugin_update_available, legacy_config_candidates, open_project_bundle_for_mode,
-        project_bundle, project_import_plan_id, project_import_state_digest, select_runtime_path,
+        ensure_plugin_update_plan_matches, ensure_project_export_active_manifests_match,
+        ensure_project_export_runtime_matches, ensure_signed_plugin_compatible,
+        ensure_upgrade_allowed, is_lowercase_sha256, is_plugin_update_available,
+        legacy_config_candidates, open_project_bundle_for_mode,
+        plugin_update_installed_state_digest, plugin_update_plan_id, project_bundle,
+        project_import_plan_id, project_import_state_digest, select_runtime_path,
         service_inventory_item,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
@@ -3707,17 +3846,27 @@ mod tests {
     #[test]
     fn plugin_update_check_exposes_newer_incompatible_catalog_versions() {
         let root = tempfile::tempdir().unwrap();
+        let plugin = root.path().join("reader");
+        fs::create_dir(&plugin).unwrap();
         fs::write(
-            root.path().join(API_FILENAME),
+            plugin.join(API_FILENAME),
             r#"{"serviceId":"reader","mainClass":"reader.dll"}"#,
         )
         .unwrap();
         fs::write(
-            root.path().join("plugin.json"),
+            plugin.join("plugin.json"),
             r#"{"schemaVersion":1,"pluginId":"reader","version":"1.0.0","desktopVersionRequirement":">=0.1.0, <0.2.0"}"#,
         )
         .unwrap();
-        let installed = PluginManifest::load("reader", root.path()).unwrap();
+        let signing_key = SigningKey::from_bytes(&[91_u8; 32]);
+        let material = prepare_signing_material(&plugin, "reader", "test-key").unwrap();
+        let signature = BASE64.encode(signing_key.sign(&material.payload).to_bytes());
+        fs::write(
+            plugin.join(SIGNATURE_FILENAME),
+            encode_signature_document(&material, &signature).unwrap(),
+        )
+        .unwrap();
+        let installed = PluginManifest::load("reader", &plugin).unwrap();
         let now = UNIX_EPOCH + Duration::from_secs(1_700_000_100);
         let catalog = PluginCatalog::from_unsigned_bytes(
             &serde_json::to_vec(&serde_json::json!({
@@ -3745,12 +3894,109 @@ mod tests {
         )
         .unwrap();
 
-        let updates = collect_plugin_updates(&[installed], &catalog, None, &Version::new(0, 1, 5));
+        let updates = collect_plugin_updates(
+            &[installed],
+            root.path(),
+            &catalog,
+            "catalog-key",
+            None,
+            &Version::new(0, 1, 5),
+        )
+        .unwrap();
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].available_version.as_deref(), Some("1.1.0"));
         assert_eq!(updates[0].latest_catalog_version.as_deref(), Some("2.0.0"));
+        assert!(updates[0]
+            .install_plan_id
+            .as_deref()
+            .is_some_and(is_lowercase_sha256));
         assert!(updates[0].compatibility_limited);
         assert!(updates[0].update_available);
+    }
+
+    #[test]
+    fn plugin_update_plan_binds_entry_key_state_and_desktop_version() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+        let catalog = PluginCatalog::from_unsigned_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "issuedAt": 1_700_000_000_u64,
+                "expiresAt": 1_700_003_600_u64,
+                "entries": [{
+                    "pluginId": "reader",
+                    "version": "1.1.0",
+                    "desktopVersionRequirement": ">=0.1.0, <0.2.0",
+                    "url": "https://plugins.example.test/reader-1.1.0.ssdev-plugin",
+                    "sha256": "11".repeat(32),
+                    "size": 10
+                }]
+            }))
+            .unwrap(),
+            now,
+        )
+        .unwrap();
+        let entry = catalog.select("reader", None).unwrap();
+        let desktop = Version::new(0, 1, 5);
+        let state = "22".repeat(32);
+        let base = plugin_update_plan_id(entry, "catalog-key", &state, &desktop).unwrap();
+        assert!(is_lowercase_sha256(&base));
+
+        let mut changed_entry = entry.clone();
+        changed_entry.sha256 = "33".repeat(32);
+        assert_ne!(
+            base,
+            plugin_update_plan_id(&changed_entry, "catalog-key", &state, &desktop).unwrap()
+        );
+        assert_ne!(
+            base,
+            plugin_update_plan_id(entry, "rotated-key", &state, &desktop).unwrap()
+        );
+        assert_ne!(
+            base,
+            plugin_update_plan_id(entry, "catalog-key", &"44".repeat(32), &desktop).unwrap()
+        );
+        assert_ne!(
+            base,
+            plugin_update_plan_id(entry, "catalog-key", &state, &Version::new(0, 2, 0)).unwrap()
+        );
+        assert!(ensure_plugin_update_plan_matches(&base, &base).is_ok());
+        assert!(ensure_plugin_update_plan_matches(&base, &"55".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn plugin_update_state_digest_binds_installed_content_and_absence() {
+        let root = tempfile::tempdir().unwrap();
+        let absent = plugin_update_installed_state_digest(root.path(), "reader", None).unwrap();
+        let plugin = root.path().join("reader");
+        fs::create_dir(&plugin).unwrap();
+        fs::write(
+            plugin.join(API_FILENAME),
+            r#"{"serviceId":"reader","mainClass":"reader.dll"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin.join("plugin.json"),
+            r#"{"schemaVersion":1,"pluginId":"reader","version":"1.0.0","desktopVersionRequirement":">=0.1.0, <0.2.0"}"#,
+        )
+        .unwrap();
+        fs::write(plugin.join("reader.dll"), b"first payload").unwrap();
+        let signing_key = SigningKey::from_bytes(&[92_u8; 32]);
+        let material = prepare_signing_material(&plugin, "reader", "test-key").unwrap();
+        let signature = BASE64.encode(signing_key.sign(&material.payload).to_bytes());
+        fs::write(
+            plugin.join(SIGNATURE_FILENAME),
+            encode_signature_document(&material, &signature).unwrap(),
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("reader", &plugin).unwrap();
+        let before =
+            plugin_update_installed_state_digest(root.path(), "reader", Some(&manifest)).unwrap();
+        fs::write(plugin.join("reader.dll"), b"second payload").unwrap();
+        let after =
+            plugin_update_installed_state_digest(root.path(), "reader", Some(&manifest)).unwrap();
+        assert_ne!(absent, before);
+        assert_ne!(before, after);
+        assert!(plugin_update_installed_state_digest(root.path(), "reader", None).is_err());
     }
 
     #[test]

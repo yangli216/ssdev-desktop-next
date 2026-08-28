@@ -34,6 +34,7 @@ pub struct CatalogEntry {
 pub struct PluginCatalog {
     issued_at: u64,
     expires_at: u64,
+    signing_key_id: Option<String>,
     entries: Vec<CatalogEntry>,
 }
 
@@ -57,7 +58,9 @@ impl PluginCatalog {
             &signing_payload(catalog_bytes),
             &signature.signature,
         )?;
-        Self::from_unsigned_bytes(catalog_bytes, now)
+        let mut catalog = Self::from_unsigned_bytes(catalog_bytes, now)?;
+        catalog.signing_key_id = Some(signature.key_id);
+        Ok(catalog)
     }
 
     /// Validates an unsigned catalog before it is sent to an external signer.
@@ -109,6 +112,7 @@ impl PluginCatalog {
         Ok(Self {
             issued_at: document.issued_at,
             expires_at: document.expires_at,
+            signing_key_id: None,
             entries: document.entries,
         })
     }
@@ -170,6 +174,12 @@ impl PluginCatalog {
 
     pub fn expires_at(&self) -> u64 {
         self.expires_at
+    }
+
+    /// Identifies the trusted key that authenticated a fetched catalog.
+    /// Unsigned catalogs parsed by release tooling intentionally return None.
+    pub fn signing_key_id(&self) -> Option<&str> {
+        self.signing_key_id.as_deref()
     }
 }
 
@@ -493,6 +503,7 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(1_700_000_100);
         let (trust, catalog, signature) = signed_catalog(1_700_086_400);
         let catalog = PluginCatalog::from_signed_bytes(&catalog, &signature, &trust, now).unwrap();
+        assert_eq!(catalog.signing_key_id(), Some("catalog-key"));
         assert_eq!(
             catalog.select("reader-plugin", None).unwrap().version,
             Version::new(2, 2, 0)

@@ -207,6 +207,7 @@ type PluginUpdateCheck = {
     installedVersion?: string
     availableVersion?: string
     latestCatalogVersion?: string
+    installPlanId?: string
     catalogAvailable: boolean
     compatibilityLimited: boolean
     updateAvailable: boolean
@@ -543,8 +544,8 @@ async function checkPluginUpdates(requestedPluginId?: string) {
   }
 }
 
-async function installFromCatalog(pluginId: string, version?: string) {
-  if (!pluginId.trim() || !version) {
+async function installFromCatalog(pluginId: string, version?: string, installPlanId?: string) {
+  if (!pluginId.trim() || !version || !installPlanId) {
     error.value = '请先检查仓库并选择明确的插件版本。'
     return
   }
@@ -553,6 +554,7 @@ async function installFromCatalog(pluginId: string, version?: string) {
     result = await invoke<PluginInstallResult>('install_plugin_from_catalog', {
       pluginId,
       version,
+      expectedPlanId: installPlanId,
     })
     ;[status.value, inventory.value, pluginUpdates.value, deploymentCheck.value] = await Promise.all([
       invoke<BridgeStatus>('bridge_status'),
@@ -796,7 +798,7 @@ async function runDeploymentCheck() {
           <div class="plugin-list">
             <form class="catalog-install" @submit.prevent="checkPluginUpdates(catalogPluginId)"><input v-model.trim="catalogPluginId" type="text" placeholder="输入签名仓库中的插件 ID" /><button type="submit" :disabled="busy">查询版本</button><button type="button" :disabled="busy" @click="checkPluginUpdates()">检查全部更新</button></form>
             <div v-if="pluginUpdates" class="plugin-update-results" aria-live="polite">
-              <div v-for="update in pluginUpdates.updates" :key="update.pluginId"><span><strong>{{ update.pluginId }}</strong><small>已安装 {{ update.installedVersion ?? '无' }} · 当前客户端可用 {{ update.availableVersion ?? '无' }}<template v-if="update.compatibilityLimited"> · 仓库最新 {{ update.latestCatalogVersion }} 需要其他 Desktop 版本</template></small></span><button v-if="update.updateAvailable && update.availableVersion" type="button" :disabled="busy" @click="installFromCatalog(update.pluginId, update.availableVersion)">{{ update.installedVersion ? `安装更新 ${update.availableVersion}` : `安装 ${update.availableVersion}` }}</button><em v-else>{{ update.catalogAvailable ? (update.compatibilityLimited ? '新版本与当前客户端不兼容' : '已是最新版本') : '仓库未收录' }}</em></div>
+              <div v-for="update in pluginUpdates.updates" :key="update.pluginId"><span><strong>{{ update.pluginId }}</strong><small>已安装 {{ update.installedVersion ?? '无' }} · 当前客户端可用 {{ update.availableVersion ?? '无' }}<template v-if="update.compatibilityLimited"> · 仓库最新 {{ update.latestCatalogVersion }} 需要其他 Desktop 版本</template></small></span><button v-if="update.updateAvailable && update.availableVersion && update.installPlanId" type="button" :disabled="busy" @click="installFromCatalog(update.pluginId, update.availableVersion, update.installPlanId)">{{ update.installedVersion ? `安装更新 ${update.availableVersion}` : `安装 ${update.availableVersion}` }}</button><em v-else>{{ update.catalogAvailable ? (update.compatibilityLimited ? '新版本与当前客户端不兼容' : '已是最新版本') : '仓库未收录' }}</em></div>
             </div>
             <article v-for="plugin in inventory?.plugins ?? []" :key="plugin.pluginId">
               <header><span><strong>{{ plugin.displayName }}</strong><small>{{ plugin.pluginId }} · {{ plugin.source === 'local-mapping' ? '本机动态映射' : `${plugin.version ?? '未知版本'} · Desktop ${plugin.desktopVersionRequirement ?? '未声明'}` }}</small></span><div v-if="plugin.source === 'signed-package'" class="plugin-actions"><button type="button" :disabled="busy" @click="checkPluginUpdates(plugin.pluginId)">检查更新</button><button class="danger-link" type="button" :disabled="busy" @click="uninstallSignedPlugin(plugin.pluginId, plugin.displayName)">卸载</button></div></header>
