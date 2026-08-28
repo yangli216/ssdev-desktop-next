@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::env;
+use std::path::{Component, Path};
 use std::process::ExitCode;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
@@ -38,6 +39,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if !cfg!(debug_assertions) {
             return Err("release plugin hosts refuse --allow-unsigned".into());
         }
+    } else if let Some(local_mapping_root) = arguments.local_mapping_root.as_deref() {
+        require_local_mapping_path(
+            Path::new(&arguments.plugin_dir),
+            Path::new(local_mapping_root),
+        )?;
     } else {
         let trust_store_path = arguments
             .trust_store
@@ -137,6 +143,7 @@ struct HostArguments {
     plugin_dir: String,
     trust_store: Option<String>,
     allow_unsigned: bool,
+    local_mapping_root: Option<String>,
     #[cfg(windows)]
     ipc_pipe: String,
     #[cfg(windows)]
@@ -150,6 +157,8 @@ impl HostArguments {
         let mut plugin_dir = None;
         let mut trust_store = None;
         let mut allow_unsigned = false;
+        let mut allow_local_mapping = false;
+        let mut local_mapping_root = None;
         #[cfg(windows)]
         let mut ipc_pipe = None;
         #[cfg(windows)]
@@ -174,6 +183,15 @@ impl HostArguments {
                 )?,
                 "--allow-unsigned" if !allow_unsigned => allow_unsigned = true,
                 "--allow-unsigned" => return Err("duplicate argument --allow-unsigned".into()),
+                "--allow-local-mapping" if !allow_local_mapping => allow_local_mapping = true,
+                "--allow-local-mapping" => {
+                    return Err("duplicate argument --allow-local-mapping".into())
+                }
+                "--local-mapping-root" => set_once(
+                    &mut local_mapping_root,
+                    "--local-mapping-root",
+                    take_value(&mut arguments, "--local-mapping-root")?,
+                )?,
                 #[cfg(windows)]
                 "--ipc-pipe" => set_once(
                     &mut ipc_pipe,
@@ -195,17 +213,49 @@ impl HostArguments {
             .ok_or("missing required argument --controller-pid")?
             .parse::<u32>()
             .map_err(|_| "--controller-pid must be an unsigned integer")?;
+        if allow_unsigned && allow_local_mapping {
+            return Err("unsigned and local mapping modes are mutually exclusive".into());
+        }
+        if allow_local_mapping != local_mapping_root.is_some() {
+            return Err(
+                "--allow-local-mapping and --local-mapping-root must be supplied together".into(),
+            );
+        }
+        if trust_store.is_some() && (allow_unsigned || allow_local_mapping) {
+            return Err("trust modes are mutually exclusive".into());
+        }
         Ok(Self {
             plugin_id: plugin_id.ok_or("missing required argument --plugin-id")?,
             plugin_dir: plugin_dir.ok_or("missing required argument --plugin-dir")?,
             trust_store,
             allow_unsigned,
+            local_mapping_root,
             #[cfg(windows)]
             ipc_pipe: ipc_pipe.ok_or("missing required argument --ipc-pipe")?,
             #[cfg(windows)]
             controller_pid,
         })
     }
+}
+
+fn require_local_mapping_path(plugin_dir: &Path, root: &Path) -> Result<(), String> {
+    let root = root
+        .canonicalize()
+        .map_err(|_| "local mapping root is unavailable")?;
+    let plugin_dir = plugin_dir
+        .canonicalize()
+        .map_err(|_| "local mapping directory is unavailable")?;
+    let relative = plugin_dir
+        .strip_prefix(&root)
+        .map_err(|_| "local mapping directory is outside the configured root")?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err("local mapping directory is not a bounded child path".into());
+    }
+    Ok(())
 }
 
 fn take_value(arguments: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {
@@ -347,5 +397,55 @@ mod tests {
             "anything".into(),
         ];
         assert!(HostArguments::parse(unknown).is_err());
+    }
+
+    #[test]
+    fn local_mapping_mode_requires_a_root_and_excludes_other_trust_modes() {
+        let mut valid = vec![
+            "--plugin-id".into(),
+            "reader.local".into(),
+            "--plugin-dir".into(),
+            "fixture".into(),
+            "--allow-local-mapping".into(),
+            "--local-mapping-root".into(),
+            "mappings".into(),
+        ];
+        valid.extend(required_platform_arguments());
+        let parsed = HostArguments::parse(valid).unwrap();
+        assert_eq!(parsed.local_mapping_root.as_deref(), Some("mappings"));
+
+        let missing_root = vec![
+            "--plugin-id".into(),
+            "reader.local".into(),
+            "--plugin-dir".into(),
+            "fixture".into(),
+            "--allow-local-mapping".into(),
+        ];
+        assert!(HostArguments::parse(missing_root).is_err());
+
+        let conflicting = vec![
+            "--plugin-id".into(),
+            "reader.local".into(),
+            "--plugin-dir".into(),
+            "fixture".into(),
+            "--allow-local-mapping".into(),
+            "--local-mapping-root".into(),
+            "mappings".into(),
+            "--trust-store".into(),
+            "trust.json".into(),
+        ];
+        assert!(HostArguments::parse(conflicting).is_err());
+    }
+
+    #[test]
+    fn local_mapping_path_must_be_beneath_the_configured_root() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("reader.local");
+        std::fs::create_dir(&child).unwrap();
+        assert!(require_local_mapping_path(&child, root.path()).is_ok());
+        assert!(require_local_mapping_path(root.path(), root.path()).is_err());
+
+        let outside = tempfile::tempdir().unwrap();
+        assert!(require_local_mapping_path(outside.path(), root.path()).is_err());
     }
 }

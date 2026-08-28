@@ -55,7 +55,13 @@ pub struct SupervisorConfig {
 
 #[derive(Debug, Clone)]
 pub enum PluginTrust {
-    Strict { trust_store: PathBuf },
+    Strict {
+        trust_store: PathBuf,
+    },
+    StrictWithLocalMappings {
+        trust_store: PathBuf,
+        local_mapping_root: PathBuf,
+    },
     AllowUnsigned,
 }
 
@@ -1068,6 +1074,19 @@ impl PluginWorker {
             PluginTrust::Strict { trust_store } => {
                 command.arg("--trust-store").arg(trust_store);
             }
+            PluginTrust::StrictWithLocalMappings {
+                trust_store,
+                local_mapping_root,
+            } => {
+                if is_within_root(&descriptor.plugin_dir, local_mapping_root) {
+                    command
+                        .arg("--allow-local-mapping")
+                        .arg("--local-mapping-root")
+                        .arg(local_mapping_root);
+                } else {
+                    command.arg("--trust-store").arg(trust_store);
+                }
+            }
             PluginTrust::AllowUnsigned => {
                 command.arg("--allow-unsigned");
             }
@@ -1239,6 +1258,16 @@ impl PluginWorker {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
     }
+}
+
+fn is_within_root(path: &Path, root: &Path) -> bool {
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    path != root && path.starts_with(root)
 }
 
 fn validate_response(
@@ -1498,6 +1527,18 @@ mod tests {
                 Err(ControllerError::InvalidInvocationLimit { actual, .. }) if actual == invalid
             ));
         }
+    }
+
+    #[test]
+    fn local_mapping_trust_is_bounded_to_a_real_child_directory() {
+        let root = tempdir().unwrap();
+        let child = root.path().join("reader.local");
+        fs::create_dir(&child).unwrap();
+        assert!(is_within_root(&child, root.path()));
+        assert!(!is_within_root(root.path(), root.path()));
+
+        let outside = tempdir().unwrap();
+        assert!(!is_within_root(outside.path(), root.path()));
     }
 
     #[tokio::test]

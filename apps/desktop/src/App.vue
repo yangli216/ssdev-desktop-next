@@ -3,6 +3,7 @@ import { Channel, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { onMounted, onUnmounted, ref } from 'vue'
+import LocalMappingStudio from './LocalMappingStudio.vue'
 
 type BridgeStatus = {
   mode: string
@@ -118,6 +119,7 @@ type PluginInventory = {
     pluginId: string
     version?: string
     displayName: string
+    source: 'signed-package' | 'local-mapping'
     services: Array<{
       serviceId: string
       architecture: 'x86' | 'x64'
@@ -344,6 +346,17 @@ async function reloadPlugins() {
   }, '插件目录已重新校验并热加载。')
 }
 
+async function refreshPluginsAfterMapping() {
+  try {
+    ;[status.value, inventory.value] = await Promise.all([
+      invoke<BridgeStatus>('bridge_status'),
+      invoke<PluginInventory>('plugin_inventory'),
+    ])
+  } catch (reason) {
+    error.value = reason instanceof Error ? reason.message : String(reason)
+  }
+}
+
 async function checkPluginUpdates(requestedPluginId?: string) {
   const pluginId = requestedPluginId?.trim()
   if (requestedPluginId !== undefined && !pluginId) {
@@ -542,7 +555,7 @@ async function exportDiagnostics() {
         <span>业务来源策略</span>
         <strong>{{ status?.originPolicy.allowConfiguredBusinessOrigins ? '配置地址兼容' : status?.originPolicy.enforced ? '发布方签名' : '开发模式' }}</strong>
         <small :title="status?.originPolicyError">
-          {{ status?.originPolicyError ?? (status?.originPolicy.allowConfiguredBusinessOrigins ? `仅当前配置的业务地址可调用已签名插件；HTTP ${status?.originPolicy.allowInsecureHttp ? '允许' : '禁止'}` : `${status?.originPolicy.businessOrigins ?? '—'} 个业务来源，${status?.originPolicy.serviceGrants ?? '—'} 个服务授权，${status?.originPolicy.methodGrants ?? '—'} 个方法授权；HTTP ${status?.originPolicy.allowInsecureHttp ? '已例外放行' : '禁止'}`) }}
+          {{ status?.originPolicyError ?? (status?.originPolicy.allowConfiguredBusinessOrigins ? `仅当前配置的业务地址可调用已安装原生路由；HTTP ${status?.originPolicy.allowInsecureHttp ? '允许' : '禁止'}` : `${status?.originPolicy.businessOrigins ?? '—'} 个业务来源，${status?.originPolicy.serviceGrants ?? '—'} 个服务授权，${status?.originPolicy.methodGrants ?? '—'} 个方法授权；HTTP ${status?.originPolicy.allowInsecureHttp ? '已例外放行' : '禁止'}`) }}
         </small>
       </article>
       <article>
@@ -651,11 +664,13 @@ async function exportDiagnostics() {
       </form>
     </section>
 
+    <LocalMappingStudio :disabled="busy" @changed="refreshPluginsAfterMapping" />
+
     <section class="plugin-inventory" aria-label="已安装插件">
       <div>
         <p class="eyebrow">PLUGIN INVENTORY</p>
         <h2>已验证插件</h2>
-        <p>只展示重新发现并通过当前信任库验签的插件；隔离项不会进入服务路由。</p>
+        <p>展示通过签名校验的发布插件，以及由本机管理员创建并隔离运行的动态映射；无效项不会进入服务路由。</p>
       </div>
       <div class="plugin-list">
         <form class="catalog-install" @submit.prevent="checkPluginUpdates(catalogPluginId)">
@@ -682,8 +697,8 @@ async function exportDiagnostics() {
         </div>
         <article v-for="plugin in inventory?.plugins ?? []" :key="plugin.pluginId">
           <header>
-            <span><strong>{{ plugin.displayName }}</strong><small>{{ plugin.pluginId }} · {{ plugin.version ?? '旧版未知版本' }}</small></span>
-            <button type="button" :disabled="busy" @click="checkPluginUpdates(plugin.pluginId)">检查更新</button>
+            <span><strong>{{ plugin.displayName }}</strong><small>{{ plugin.pluginId }} · {{ plugin.source === 'local-mapping' ? '本机动态映射' : (plugin.version ?? '旧版未知版本') }}</small></span>
+            <button v-if="plugin.source === 'signed-package'" type="button" :disabled="busy" @click="checkPluginUpdates(plugin.pluginId)">检查更新</button>
           </header>
           <details v-for="service in plugin.services" :key="service.serviceId" class="service-mapping">
             <summary>

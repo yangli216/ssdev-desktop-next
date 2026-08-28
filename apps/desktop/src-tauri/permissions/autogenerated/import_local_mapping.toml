@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-import-local-mapping"
+description = "Enables the import_local_mapping command without any pre-configured scope."
+commands.allow = ["import_local_mapping"]
+
+[[permission]]
+identifier = "deny-import-local-mapping"
+description = "Denies the import_local_mapping command without any pre-configured scope."
+commands.deny = ["import_local_mapping"]

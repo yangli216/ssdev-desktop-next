@@ -27,6 +27,7 @@ business webview -> narrow Tauri command -> Rust controller
 业务前端应通过 [packages/web-bridge](packages/web-bridge/README.md) 的类型化协议适配层接入，不直接依赖 Tauri 内部 API。
 打印、写卡等非幂等调用的持久操作 ID、防重放和崩溃后对账语义见 [docs/tracked-invocations.md](docs/tracked-invocations.md)。
 插件完整性与公钥信任链见 [docs/plugin-signing.md](docs/plugin-signing.md)。
+无需重新编译客户端的 DLL/COM 可视化配置、热加载、现场调试和本地映射包迁移见 [docs/local-mapping-studio.md](docs/local-mapping-studio.md)。
 旧插件从安全暂存、外部签名、确定性封包到黄金矩阵草稿的发布流程见 [docs/plugin-release.md](docs/plugin-release.md)。
 业务来源策略、受控进程策略和插件目录共用的外部 Ed25519 发布签名流程见 [docs/release-signing.md](docs/release-signing.md)。
 签名插件仓库协议见 [docs/plugin-repository.md](docs/plugin-repository.md)。

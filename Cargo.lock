@@ -4440,6 +4440,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
  "webplus-controller",
  "webplus-plugin-config",
  "webplus-plugin-package",
@@ -4447,6 +4448,7 @@ dependencies = [
  "webplus-plugin-trust",
  "webplus-protocol",
  "xcap",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -6104,6 +6106,7 @@ name = "webplus-plugin-host"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "tempfile",
  "tokio",
  "webplus-ipc",
  "webplus-native",

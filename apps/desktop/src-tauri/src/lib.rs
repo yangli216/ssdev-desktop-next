@@ -9,6 +9,7 @@ mod capture;
 mod command_permissions;
 mod desktop;
 mod invocations;
+mod local_mappings;
 mod shortcuts;
 mod sso;
 
@@ -64,6 +65,7 @@ struct BridgeState {
     plugin_preflight_failures: AtomicUsize,
     plugin_trust_mode: &'static str,
     plugin_root: PathBuf,
+    local_mapping_root: PathBuf,
     trust_store: Option<Arc<TrustStore>>,
     install_lock: tokio::sync::Mutex<()>,
     process_policy_entries: usize,
@@ -360,6 +362,7 @@ struct PluginInventoryItem {
     plugin_id: String,
     version: Option<String>,
     display_name: String,
+    source: &'static str,
     services: Vec<ServiceInventoryItem>,
 }
 
@@ -387,6 +390,28 @@ struct MethodInventoryItem {
     return_type: String,
     parameter_count: usize,
     timeout_ms: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalMappingInventoryResult {
+    mappings: Vec<local_mappings::LocalMappingDefinition>,
+    failures: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalMappingSaveResult {
+    plugin_id: String,
+    service_count: usize,
+    preflighted_hosts: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginDebugResult {
+    elapsed_ms: u128,
+    response: InvokeResponse,
 }
 
 #[derive(Serialize)]
@@ -618,12 +643,22 @@ async fn activate_prepared_plugin(
 
     let plugin_id = prepared.identity().plugin_id.clone();
     let plugin_version = prepared.metadata().version.clone();
-    let before = inspect_plugins(&plugin_root, Some(trust_store))?;
+    let before = inspect_all_plugins(&plugin_root, &state.local_mapping_root, Some(trust_store))?;
     let previous_manifest = before
         .manifests
         .iter()
-        .find(|manifest| manifest.plugin_id == plugin_id)
+        .find(|manifest| {
+            manifest.plugin_id == plugin_id
+                && !is_local_manifest(manifest, &state.local_mapping_root)
+        })
         .cloned();
+    if before.manifests.iter().any(|manifest| {
+        manifest.plugin_id == plugin_id && is_local_manifest(manifest, &state.local_mapping_root)
+    }) {
+        return Err(format!(
+            "签名插件 ID [{plugin_id}] 与现有本地映射冲突，请先删除或重命名本地映射"
+        ));
+    }
     let current_version = previous_manifest
         .as_ref()
         .and_then(|manifest| manifest.metadata.as_ref())
@@ -663,23 +698,27 @@ async fn activate_prepared_plugin(
             )
         })?;
     let activation = prepared.activate().map_err(|error| error.to_string())?;
-    let installed = match inspect_plugins(&plugin_root, Some(trust_store)) {
-        Ok(installed) => installed,
-        Err(error) => {
-            activation
-                .rollback()
-                .map_err(|rollback| format!("{error}; 插件回滚同时失败: {rollback}"))?;
-            maintenance
-                .replace_manifest(previous_manifest.as_ref())
-                .await
-                .map_err(|reload| format!("{error}; 恢复旧路由失败: {reload}"))?;
-            return Err(error);
-        }
-    };
+    let installed =
+        match inspect_all_plugins(&plugin_root, &state.local_mapping_root, Some(trust_store)) {
+            Ok(installed) => installed,
+            Err(error) => {
+                activation
+                    .rollback()
+                    .map_err(|rollback| format!("{error}; 插件回滚同时失败: {rollback}"))?;
+                maintenance
+                    .replace_manifest(previous_manifest.as_ref())
+                    .await
+                    .map_err(|reload| format!("{error}; 恢复旧路由失败: {reload}"))?;
+                return Err(error);
+            }
+        };
     let Some(installed_manifest) = installed
         .manifests
         .iter()
-        .find(|manifest| manifest.plugin_id == plugin_id)
+        .find(|manifest| {
+            manifest.plugin_id == plugin_id
+                && !is_local_manifest(manifest, &state.local_mapping_root)
+        })
         .cloned()
     else {
         activation
@@ -750,7 +789,11 @@ async fn reload_plugins(
     desktop::require_control(&caller)?;
     let _install = state.install_lock.lock().await;
     recover_plugin_store(&state)?;
-    let plugins = inspect_plugins(&state.plugin_root, state.trust_store.as_deref())?;
+    let plugins = inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+    )?;
     PluginController::validate_manifests(&plugins.manifests).map_err(|error| error.to_string())?;
     state
         .controller
@@ -787,11 +830,20 @@ async fn plugin_inventory(
     desktop::require_control(&caller)?;
     let _install = state.install_lock.lock().await;
     recover_plugin_store(&state)?;
-    let inspected = inspect_plugins(&state.plugin_root, state.trust_store.as_deref())?;
+    let inspected = inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+    )?;
     let plugins = inspected
         .manifests
         .into_iter()
         .map(|manifest| {
+            let source = if is_local_manifest(&manifest, &state.local_mapping_root) {
+                "local-mapping"
+            } else {
+                "signed-package"
+            };
             let version = manifest
                 .metadata
                 .as_ref()
@@ -812,6 +864,7 @@ async fn plugin_inventory(
                 plugin_id: manifest.plugin_id,
                 version,
                 display_name,
+                source,
                 services,
             }
         })
@@ -819,6 +872,252 @@ async fn plugin_inventory(
     Ok(PluginInventoryResult {
         plugins,
         quarantined: inspected.failures,
+    })
+}
+
+#[tauri::command]
+fn inspect_native_component(
+    caller: WebviewWindow,
+    path: PathBuf,
+) -> Result<local_mappings::NativeComponentInspection, String> {
+    desktop::require_control(&caller)?;
+    local_mappings::inspect_component(&path)
+}
+
+#[tauri::command]
+async fn local_mapping_inventory(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+) -> Result<LocalMappingInventoryResult, String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    let inspected = inspect_plugins(&state.local_mapping_root, None)?;
+    let mut mappings = Vec::new();
+    let mut failures = inspected.failures;
+    for manifest in inspected.manifests {
+        match local_mappings::validate_installed_manifest(&manifest)
+            .and_then(|()| local_mappings::load_definition(&manifest.plugin_dir))
+        {
+            Ok(definition) => mappings.push(definition),
+            Err(error) => failures.push(format!("[{}] {error}", manifest.plugin_id)),
+        }
+    }
+    mappings.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    Ok(LocalMappingInventoryResult { mappings, failures })
+}
+
+#[tauri::command]
+async fn save_local_mapping(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    definition: local_mappings::LocalMappingDefinition,
+) -> Result<LocalMappingSaveResult, String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    let plugin_id = definition.plugin_id.clone();
+    if state.plugin_root.join(&plugin_id).exists() {
+        return Err(format!(
+            "映射 ID [{plugin_id}] 与签名插件冲突，请使用其他 ID"
+        ));
+    }
+    let root = state.local_mapping_root.clone();
+    let prepared = tokio::task::spawn_blocking(move || local_mappings::prepare(&root, definition))
+        .await
+        .map_err(|_| "本地映射准备任务异常终止".to_owned())??;
+    activate_prepared_local_mapping(&state, prepared).await
+}
+
+#[tauri::command]
+async fn export_local_mapping(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    plugin_id: String,
+    destination: PathBuf,
+) -> Result<(), String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    let root = state.local_mapping_root.clone();
+    tokio::task::spawn_blocking(move || {
+        local_mappings::export_bundle(&root, &plugin_id, &destination)
+    })
+    .await
+    .map_err(|_| "映射导出任务异常终止".to_owned())?
+}
+
+#[tauri::command]
+async fn import_local_mapping(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    source: PathBuf,
+) -> Result<LocalMappingSaveResult, String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    let root = state.local_mapping_root.clone();
+    let prepared =
+        tokio::task::spawn_blocking(move || local_mappings::prepare_import(&root, &source))
+            .await
+            .map_err(|_| "映射导入任务异常终止".to_owned())??;
+    if state.plugin_root.join(prepared.plugin_id()).exists() {
+        return Err(format!(
+            "映射 ID [{}] 与签名插件冲突，请先调整映射包",
+            prepared.plugin_id()
+        ));
+    }
+    activate_prepared_local_mapping(&state, prepared).await
+}
+
+async fn activate_prepared_local_mapping(
+    state: &BridgeState,
+    prepared: local_mappings::PreparedLocalMapping,
+) -> Result<LocalMappingSaveResult, String> {
+    let plugin_id = prepared.plugin_id().to_owned();
+    let current = inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+    )?;
+    let mut candidates = current.manifests.clone();
+    candidates.retain(|manifest| manifest.plugin_id != plugin_id);
+    candidates.push(prepared.manifest().clone());
+    PluginController::validate_manifests(&candidates).map_err(|error| error.to_string())?;
+    let preflight = state
+        .controller
+        .preflight_candidate_manifest(prepared.manifest())
+        .await
+        .map_err(|error| {
+            state
+                .plugin_preflight_failures
+                .fetch_add(1, Ordering::AcqRel);
+            format!(
+                "本地映射宿主预检失败 ({})，未修改当前映射: {error}",
+                error.diagnostic_code(),
+            )
+        })?;
+    let maintenance = state.controller.begin_maintenance().await;
+    let root = state.local_mapping_root.clone();
+    let activated = tokio::task::spawn_blocking(move || prepared.activate(&root))
+        .await
+        .map_err(|_| "本地映射启用任务异常终止".to_owned())??;
+    let installed = match inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+    ) {
+        Ok(installed) => installed,
+        Err(error) => {
+            activated
+                .rollback()
+                .map_err(|rollback| format!("映射加载失败: {error}; 回滚同时失败: {rollback}"))?;
+            maintenance
+                .replace_manifests(&current.manifests)
+                .await
+                .map_err(|reload| format!("映射加载失败: {error}; 恢复旧路由失败: {reload}"))?;
+            return Err(format!("映射加载失败，已恢复旧映射: {error}"));
+        }
+    };
+    if let Err(error) = maintenance.replace_manifests(&installed.manifests).await {
+        activated
+            .rollback()
+            .map_err(|rollback| format!("新映射路由无效: {error}; 回滚同时失败: {rollback}"))?;
+        maintenance
+            .replace_manifests(&current.manifests)
+            .await
+            .map_err(|reload| format!("新映射路由无效: {error}; 恢复旧路由失败: {reload}"))?;
+        return Err(format!("新映射路由无效，已恢复旧映射: {error}"));
+    }
+    let activated = match activated.commit() {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            maintenance
+                .replace_manifests(&current.manifests)
+                .await
+                .map_err(|reload| format!("映射事务提交失败: {error}; 恢复旧路由失败: {reload}"))?;
+            return Err(format!("映射事务提交失败: {error}"));
+        }
+    };
+    state
+        .plugin_load_failures
+        .store(installed.failures.len(), Ordering::Release);
+    state
+        .plugin_count
+        .store(installed.manifests.len(), Ordering::Release);
+    state
+        .preflighted_plugin_hosts
+        .fetch_add(preflight.hosts_started, Ordering::AcqRel);
+    tracing::info!(
+        event_code = "local-mapping-saved",
+        plugin_id,
+        service_count = activated.services.len(),
+        preflighted_hosts = preflight.hosts_started,
+        "local native mapping saved and hot loaded"
+    );
+    Ok(LocalMappingSaveResult {
+        plugin_id,
+        service_count: activated.services.len(),
+        preflighted_hosts: preflight.hosts_started,
+    })
+}
+
+#[tauri::command]
+async fn delete_local_mapping(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    plugin_id: String,
+) -> Result<(), String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    let target = local_mappings::bounded_plugin_target(&state.local_mapping_root, &plugin_id)?;
+    if !target.is_dir() {
+        return Err(format!("本地映射 [{plugin_id}] 不存在"));
+    }
+    let maintenance = state.controller.begin_maintenance().await;
+    let backup = state
+        .local_mapping_root
+        .join(format!(".mapping-delete-{}", uuid::Uuid::new_v4()));
+    std::fs::rename(&target, &backup).map_err(|error| format!("无法暂存待删除映射: {error}"))?;
+    let installed = match inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+    ) {
+        Ok(installed) => installed,
+        Err(error) => {
+            let _ = std::fs::rename(&backup, &target);
+            return Err(error);
+        }
+    };
+    if let Err(error) = maintenance.replace_manifests(&installed.manifests).await {
+        let _ = std::fs::rename(&backup, &target);
+        return Err(error.to_string());
+    }
+    std::fs::remove_dir_all(&backup).map_err(|error| format!("无法清理已删除映射: {error}"))?;
+    state
+        .plugin_load_failures
+        .store(installed.failures.len(), Ordering::Release);
+    state
+        .plugin_count
+        .store(installed.manifests.len(), Ordering::Release);
+    tracing::info!(
+        event_code = "local-mapping-deleted",
+        plugin_id,
+        "local native mapping deleted"
+    );
+    Ok(())
+}
+
+#[tauri::command]
+async fn debug_plugin_invoke(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    request: InvokeRequest,
+) -> Result<PluginDebugResult, String> {
+    desktop::require_control(&caller)?;
+    request.validate().map_err(|error| error.to_string())?;
+    let started = std::time::Instant::now();
+    let response = state.controller.invoke(request).await;
+    Ok(PluginDebugResult {
+        elapsed_ms: started.elapsed().as_millis(),
+        response,
     })
 }
 
@@ -1077,6 +1376,8 @@ pub fn run() {
                 cfg!(debug_assertions),
             );
             std::fs::create_dir_all(&plugin_root)?;
+            let local_mapping_root = local_data_dir.join("local-mappings");
+            std::fs::create_dir_all(&local_mapping_root)?;
             let allow_unsigned_plugins = allow_unsigned_plugins();
             let trust_store_path = plugin_trust_store_path(&resource_dir);
             let (trust_store, plugin_trust) = if allow_unsigned_plugins {
@@ -1088,8 +1389,9 @@ pub fn run() {
             } else {
                 (
                     Some(Arc::new(TrustStore::load(&trust_store_path)?)),
-                    PluginTrust::Strict {
+                    PluginTrust::StrictWithLocalMappings {
                         trust_store: trust_store_path.clone(),
+                        local_mapping_root: local_mapping_root.clone(),
                     },
                 )
             };
@@ -1117,7 +1419,11 @@ pub fn run() {
             let recovery = recover_incomplete_activations(&plugin_root)
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             log_plugin_recovery(recovery);
-            let plugins = inspect_plugins(&plugin_root, trust_store.as_deref())
+            let plugins = inspect_all_plugins(
+                &plugin_root,
+                &local_mapping_root,
+                trust_store.as_deref(),
+            )
                 .map_err(std::io::Error::other)?;
             if !plugins.failures.is_empty() {
                 tracing::warn!(
@@ -1169,6 +1475,7 @@ pub fn run() {
                     "ed25519-strict"
                 },
                 plugin_root,
+                local_mapping_root,
                 trust_store,
                 install_lock: tokio::sync::Mutex::new(()),
                 process_policy_entries,
@@ -1229,6 +1536,13 @@ pub fn run() {
             check_plugin_updates,
             reload_plugins,
             plugin_inventory,
+            inspect_native_component,
+            local_mapping_inventory,
+            save_local_mapping,
+            export_local_mapping,
+            import_local_mapping,
+            delete_local_mapping,
+            debug_plugin_invoke,
             plugin_invoke,
             plugin_invoke_tracked,
             plugin_invocation_status,
@@ -1347,6 +1661,44 @@ fn inspect_plugins(
         manifests,
         failures,
     })
+}
+
+fn inspect_all_plugins(
+    plugin_root: &std::path::Path,
+    local_mapping_root: &std::path::Path,
+    trust_store: Option<&TrustStore>,
+) -> Result<InspectedPlugins, String> {
+    let mut signed = inspect_plugins(plugin_root, trust_store)?;
+    let local = inspect_plugins(local_mapping_root, None)?;
+    let mut plugin_ids = signed
+        .manifests
+        .iter()
+        .map(|manifest| manifest.plugin_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for manifest in local.manifests {
+        if let Err(error) = local_mappings::validate_installed_manifest(&manifest) {
+            signed.failures.push(format!(
+                "本地映射 [{}] 未通过本机定义校验: {error}",
+                manifest.plugin_id
+            ));
+        } else if plugin_ids.insert(manifest.plugin_id.clone()) {
+            signed.manifests.push(manifest);
+        } else {
+            signed.failures.push(format!(
+                "本地映射 [{}] 与签名插件 ID 冲突",
+                manifest.plugin_id
+            ));
+        }
+    }
+    signed.failures.extend(local.failures);
+    signed
+        .manifests
+        .sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    Ok(signed)
+}
+
+fn is_local_manifest(manifest: &PluginManifest, root: &std::path::Path) -> bool {
+    manifest.plugin_dir.starts_with(root)
 }
 
 fn ensure_upgrade_allowed(

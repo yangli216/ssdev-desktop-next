@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-inspect-native-component"
+description = "Enables the inspect_native_component command without any pre-configured scope."
+commands.allow = ["inspect_native_component"]
+
+[[permission]]
+identifier = "deny-inspect-native-component"
+description = "Denies the inspect_native_component command without any pre-configured scope."
+commands.deny = ["inspect_native_component"]
