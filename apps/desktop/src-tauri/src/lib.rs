@@ -2193,10 +2193,7 @@ async fn install_plugin_from_catalog(
         Some(&trust_store),
         &bridge_state.desktop_version,
     )?;
-    if installed.manifests.iter().any(|manifest| {
-        manifest.plugin_id == plugin_id
-            && is_local_manifest(manifest, &bridge_state.local_mapping_root)
-    }) {
+    if contains_plugin_id(&installed.local_mapping_ids, &plugin_id) {
         return Err(format!(
             "签名插件 ID [{plugin_id}] 与现有本地映射冲突，请重新检查仓库并先调整本地映射"
         ));
@@ -2289,7 +2286,7 @@ async fn check_plugin_updates(
         .signing_key_id()
         .ok_or_else(|| "签名插件仓库没有已验证的目录签名身份".to_owned())?;
     let updates = collect_plugin_updates(
-        &installed.manifests,
+        &installed,
         &bridge_state.plugin_root,
         &bridge_state.local_mapping_root,
         &catalog,
@@ -2305,7 +2302,7 @@ async fn check_plugin_updates(
 }
 
 fn collect_plugin_updates(
-    installed: &[PluginManifest],
+    installed: &InspectedPlugins,
     plugin_root: &std::path::Path,
     local_mapping_root: &std::path::Path,
     catalog: &PluginCatalog,
@@ -2317,6 +2314,7 @@ fn collect_plugin_updates(
         vec![plugin_id.to_owned()]
     } else {
         installed
+            .manifests
             .iter()
             .filter(|manifest| !is_local_manifest(manifest, local_mapping_root))
             .map(|manifest| manifest.plugin_id.clone())
@@ -2333,12 +2331,11 @@ fn collect_plugin_updates(
     plugin_ids
         .into_iter()
         .map(|plugin_id| {
-            let installed_manifest = installed.iter().find(|manifest| {
+            let installed_manifest = installed.manifests.iter().find(|manifest| {
                 manifest.plugin_id == plugin_id && !is_local_manifest(manifest, local_mapping_root)
             });
-            let local_mapping_conflict = installed.iter().any(|manifest| {
-                manifest.plugin_id == plugin_id && is_local_manifest(manifest, local_mapping_root)
-            });
+            let local_mapping_conflict =
+                contains_plugin_id(&installed.local_mapping_ids, &plugin_id);
             let installed_version = installed_manifest
                 .and_then(|manifest| manifest.metadata.as_ref())
                 .map(|metadata| &metadata.version);
@@ -2547,9 +2544,7 @@ async fn local_plugin_install_context(
     if !active_matches {
         return Err("插件目录与当前运行路由不一致，请先重新扫描并处理隔离项后再安装".to_owned());
     }
-    if before.manifests.iter().any(|manifest| {
-        manifest.plugin_id == *plugin_id && is_local_manifest(manifest, &state.local_mapping_root)
-    }) {
+    if contains_plugin_id(&before.local_mapping_ids, plugin_id) {
         return Err(format!(
             "签名插件 ID [{plugin_id}] 与现有本地映射冲突，请先删除或重命名本地映射"
         ));
@@ -2663,9 +2658,7 @@ async fn activate_prepared_plugin(
         )?;
         ensure_plugin_update_plan_matches(expected, &actual)?;
     }
-    if before.manifests.iter().any(|manifest| {
-        manifest.plugin_id == plugin_id && is_local_manifest(manifest, &state.local_mapping_root)
-    }) {
+    if contains_plugin_id(&before.local_mapping_ids, &plugin_id) {
         return Err(format!(
             "签名插件 ID [{plugin_id}] 与现有本地映射冲突，请先删除或重命名本地映射"
         ));
@@ -3952,6 +3945,12 @@ fn app_context<R: tauri::Runtime>() -> tauri::Context<R> {
 struct InspectedPlugins {
     manifests: Vec<webplus_plugin_config::PluginManifest>,
     failures: Vec<String>,
+    /// Normalized identities observed on disk before validation. Keeping this
+    /// separate from `manifests` prevents quarantining an invalid or
+    /// conflicting local mapping from making its target look absent to an
+    /// installer.
+    discovered_plugin_ids: std::collections::HashSet<String>,
+    local_mapping_ids: std::collections::HashSet<String>,
 }
 
 fn same_plugin_failures(baseline: &[String], candidate: &[String]) -> bool {
@@ -4002,6 +4001,17 @@ fn inspect_plugins(
     desktop_version: &semver::Version,
 ) -> Result<InspectedPlugins, String> {
     let report = discover_plugins(plugin_root).map_err(|error| error.to_string())?;
+    let mut discovered_plugin_ids = report
+        .failures
+        .iter()
+        .map(|failure| normalized_plugin_id(&failure.plugin_id))
+        .chain(
+            report
+                .manifests
+                .iter()
+                .map(|manifest| normalized_plugin_id(&manifest.plugin_id)),
+        )
+        .collect::<std::collections::HashSet<_>>();
     let mut failures = report
         .failures
         .into_iter()
@@ -4046,11 +4056,14 @@ fn inspect_plugins(
             }
             _ => {}
         }
+        discovered_plugin_ids.insert(normalized_plugin_id(&manifest.plugin_id));
         manifests.push(manifest);
     }
     Ok(InspectedPlugins {
         manifests,
         failures,
+        discovered_plugin_ids,
+        local_mapping_ids: std::collections::HashSet::new(),
     })
 }
 
@@ -4062,10 +4075,11 @@ fn inspect_all_plugins(
 ) -> Result<InspectedPlugins, String> {
     let mut signed = inspect_plugins(plugin_root, trust_store, desktop_version)?;
     let local = inspect_plugins(local_mapping_root, None, desktop_version)?;
+    signed.local_mapping_ids = local.discovered_plugin_ids.clone();
     let mut plugin_ids = signed
         .manifests
         .iter()
-        .map(|manifest| manifest.plugin_id.clone())
+        .map(|manifest| normalized_plugin_id(&manifest.plugin_id))
         .collect::<std::collections::HashSet<_>>();
     for manifest in local.manifests {
         if let Err(error) = local_mappings::validate_installed_manifest(&manifest) {
@@ -4073,7 +4087,7 @@ fn inspect_all_plugins(
                 "本地映射 [{}] 未通过本机定义校验: {error}",
                 manifest.plugin_id
             ));
-        } else if plugin_ids.insert(manifest.plugin_id.clone()) {
+        } else if plugin_ids.insert(normalized_plugin_id(&manifest.plugin_id)) {
             signed.manifests.push(manifest);
         } else {
             signed.failures.push(format!(
@@ -4087,6 +4101,14 @@ fn inspect_all_plugins(
         .manifests
         .sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
     Ok(signed)
+}
+
+fn normalized_plugin_id(plugin_id: &str) -> String {
+    plugin_id.to_ascii_lowercase()
+}
+
+fn contains_plugin_id(plugin_ids: &std::collections::HashSet<String>, plugin_id: &str) -> bool {
+    plugin_ids.contains(&normalized_plugin_id(plugin_id))
 }
 
 fn is_local_manifest(manifest: &PluginManifest, root: &std::path::Path) -> bool {
@@ -4529,12 +4551,13 @@ mod tests {
         collect_plugin_updates, desktop, ensure_local_plugin_install_plan_matches,
         ensure_plugin_update_plan_matches, ensure_project_export_active_manifests_match,
         ensure_project_export_runtime_matches, ensure_signed_plugin_compatible,
-        ensure_upgrade_allowed, is_lowercase_sha256, is_plugin_update_available,
-        legacy_config_candidates, local_plugin_install_plan_id, open_project_bundle_for_mode,
-        persist_startup_failure_document, plugin_update_installed_state_digest,
-        plugin_update_plan_id, project_bundle, project_import_plan_id, project_import_state_digest,
-        resolve_startup_failure_document, select_runtime_path, service_inventory_item,
-        startup_failure_message, CatalogWithdrawalReason, FrontendRuntime, PluginInstallBlocker,
+        ensure_upgrade_allowed, inspect_all_plugins, is_lowercase_sha256,
+        is_plugin_update_available, legacy_config_candidates, local_plugin_install_plan_id,
+        open_project_bundle_for_mode, persist_startup_failure_document,
+        plugin_update_installed_state_digest, plugin_update_plan_id, project_bundle,
+        project_import_plan_id, project_import_state_digest, resolve_startup_failure_document,
+        select_runtime_path, service_inventory_item, startup_failure_message,
+        CatalogWithdrawalReason, FrontendRuntime, InspectedPlugins, PluginInstallBlocker,
         PluginPackagePreview, PluginPackageServicePreview, ProjectBundlePreview,
         StartupFailureDocument, StartupStage, FRONTEND_READY_TIMEOUT,
     };
@@ -4543,6 +4566,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use semver::Version;
     use std::{
+        collections::HashSet,
         fs,
         path::PathBuf,
         time::{Duration, UNIX_EPOCH},
@@ -4553,6 +4577,22 @@ mod tests {
         encode_signature_document, prepare_signing_material, TrustStore, SIGNATURE_FILENAME,
     };
     use webplus_protocol::PluginArchitecture;
+
+    fn inspected_plugins(
+        manifests: Vec<PluginManifest>,
+        local_mapping_ids: HashSet<String>,
+    ) -> InspectedPlugins {
+        let discovered_plugin_ids = manifests
+            .iter()
+            .map(|manifest| manifest.plugin_id.to_ascii_lowercase())
+            .collect();
+        InspectedPlugins {
+            manifests,
+            failures: Vec::new(),
+            discovered_plugin_ids,
+            local_mapping_ids,
+        }
+    }
 
     #[test]
     fn startup_stages_have_stable_actionable_failure_codes() {
@@ -4964,8 +5004,9 @@ mod tests {
         )
         .unwrap();
 
+        let installed = inspected_plugins(vec![installed], HashSet::new());
         let updates = collect_plugin_updates(
-            &[installed],
+            &installed,
             root.path(),
             &root.path().join("local-mappings"),
             &catalog,
@@ -5023,8 +5064,9 @@ mod tests {
         .unwrap();
         let desktop = Version::new(0, 1, 5);
 
+        let discovered_plugins = inspected_plugins(Vec::new(), HashSet::new());
         let discovered = collect_plugin_updates(
-            &[],
+            &discovered_plugins,
             root.path(),
             &local_root,
             &catalog,
@@ -5051,8 +5093,10 @@ mod tests {
             metadata: None,
             services: Vec::new(),
         };
+        let blocked_plugins =
+            inspected_plugins(vec![local_mapping], HashSet::from(["reader".to_owned()]));
         let blocked = collect_plugin_updates(
-            &[local_mapping],
+            &blocked_plugins,
             root.path(),
             &local_root,
             &catalog,
@@ -5074,8 +5118,9 @@ mod tests {
         assert!(blocked[0].install_plan_id.is_none());
 
         fs::create_dir(root.path().join("reader")).unwrap();
+        let invalid_plugins = inspected_plugins(Vec::new(), HashSet::new());
         let invalid_target = collect_plugin_updates(
-            &[],
+            &invalid_plugins,
             root.path(),
             &local_root,
             &catalog,
@@ -5093,6 +5138,70 @@ mod tests {
         assert!(invalid_target[0].install_plan_id.is_none());
         assert_eq!(invalid_target[1].plugin_id, "scanner");
         assert!(invalid_target[1].compatibility_limited);
+    }
+
+    #[test]
+    fn plugin_catalog_keeps_quarantined_local_mapping_identity_as_a_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_root = root.path().join("plugins");
+        let local_root = root.path().join("local-mappings");
+        let plugin = plugin_root.join("reader");
+        let invalid_local_mapping = local_root.join("Reader");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::create_dir_all(&invalid_local_mapping).unwrap();
+        fs::write(
+            plugin.join(API_FILENAME),
+            r#"{"serviceId":"reader","mainClass":"reader.dll"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin.join("plugin.json"),
+            r#"{"schemaVersion":1,"pluginId":"reader","version":"1.0.0","desktopVersionRequirement":">=0.1.0, <0.2.0"}"#,
+        )
+        .unwrap();
+
+        let desktop = Version::new(0, 1, 5);
+        let inspected = inspect_all_plugins(&plugin_root, &local_root, None, &desktop).unwrap();
+        assert_eq!(inspected.manifests.len(), 1);
+        assert!(inspected.local_mapping_ids.contains("reader"));
+        assert!(!inspected.failures.is_empty());
+
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+        let catalog = PluginCatalog::from_unsigned_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "issuedAt": 1_700_000_000_u64,
+                "expiresAt": 1_700_003_600_u64,
+                "entries": [{
+                    "pluginId": "reader",
+                    "version": "1.1.0",
+                    "desktopVersionRequirement": ">=0.1.0, <0.2.0",
+                    "url": "https://plugins.example.test/reader-1.1.0.ssdev-plugin",
+                    "sha256": "11".repeat(32),
+                    "size": 10
+                }]
+            }))
+            .unwrap(),
+            now,
+        )
+        .unwrap();
+        let updates = collect_plugin_updates(
+            &inspected,
+            &plugin_root,
+            &local_root,
+            &catalog,
+            "catalog-key",
+            Some("reader"),
+            &desktop,
+        )
+        .unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].install_blocker,
+            Some(PluginInstallBlocker::LocalMappingConflict)
+        );
+        assert!(!updates[0].update_available);
+        assert!(updates[0].install_plan_id.is_none());
     }
 
     #[test]
