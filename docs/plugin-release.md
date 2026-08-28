@@ -108,6 +108,17 @@ cargo run --locked -p ssdev-plugin-tool -- release-check `
 
 `release-check` 使用桌面安装路径同源的安全解包和运行时验签，再额外要求签名键仍为 `active`，要求矩阵 `plugins` 中的 `pluginId + version` 与包内元数据精确一致，并直接用包内清单执行完整矩阵语义检查。它在检查前后复核包、信任库和矩阵未变化，成功报告同时给出三份 SHA-256、插件身份、版本、覆盖方法数和用例数。发布审批应归档该报告；结构相同但属于旧版本的矩阵也无法通过。该命令仍不会安装插件、加载原生组件或接触硬件。
 
+一个项目需要多个插件共同覆盖联合矩阵时，创建 [plugin-release-set.example.json](plugin-release-set.example.json) 形式的规范。`packages` 包含 1 到 256 个相对于规范文件的 `.ssdev-plugin` 路径，也可使用绝对路径，然后一次检查整个候选集合：
+
+```powershell
+cargo run --locked -p ssdev-plugin-tool -- release-set-check `
+  --spec C:\secure-release\hospital-a-release-set.json `
+  --trust-store C:\secure-build-inputs\plugin-trust.json `
+  --matrix C:\secure-release\hospital-a-matrix.json
+```
+
+集合门禁逐包安全解压、验签并要求 active 发布键，拒绝重复包、忽略大小写后重复插件 ID、跨插件 `serviceId` 冲突、矩阵目标缺失/多余/错版以及任一方法未覆盖。成功报告按插件 ID 稳定排序，给出每个包的身份、版本、keyId 和摘要，以及域分隔的 `packageSetSha256`、规范/信任库/矩阵摘要和联合覆盖计数；规范、任一包、信任库或矩阵在检查过程中变化都会失败。这样多插件项目不再依赖人工拼接多份单包报告。
+
 多个已签名包进入插件仓库时，不要手工维护版本、大小和摘要。使用 [签名插件仓库协议](plugin-repository.md) 中的 `ssdev-plugin-tool catalog` 从这些包生成确定性目录，再通过统一发布签名工具签目录。
 
 ## 4. 实机门禁
