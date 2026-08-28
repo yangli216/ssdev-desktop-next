@@ -15,6 +15,7 @@
     "allow-frontend-ready",
     "allow-install-plugin-package",
     "allow-install-plugin-from-catalog",
+    "allow-uninstall-signed-plugin",
     "allow-check-plugin-updates",
     "allow-reload-plugins",
     "allow-plugin-inventory",

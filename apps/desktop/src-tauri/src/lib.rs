@@ -47,7 +47,7 @@ use webplus_controller::{
     PluginController, PluginTrust, SupervisorConfig, DEFAULT_MAX_IN_FLIGHT_INVOCATIONS,
 };
 use webplus_plugin_config::{discover_plugins, PluginManifest, ServiceDefinition};
-use webplus_plugin_package::{PluginActivation, PreparedPlugin};
+use webplus_plugin_package::{prepare_plugin_removal, PluginActivation, PreparedPlugin};
 use webplus_plugin_repository::{
     download_package, fetch_catalog, secure_http_client, CatalogEntry, PluginCatalog,
 };
@@ -1509,6 +1509,98 @@ async fn activate_prepared_plugin(
 }
 
 #[tauri::command]
+async fn uninstall_signed_plugin(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    plugin_id: String,
+) -> Result<(), String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    recover_plugin_store(&state)?;
+    let before = inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+    )?;
+    let baseline_failures = before.failures.clone();
+    let previous_manifest = before
+        .manifests
+        .iter()
+        .find(|manifest| {
+            manifest.plugin_id == plugin_id
+                && !is_local_manifest(manifest, &state.local_mapping_root)
+        })
+        .cloned()
+        .ok_or_else(|| format!("签名插件 [{plugin_id}] 不存在"))?;
+    let maintenance = state
+        .controller
+        .begin_plugin_maintenance(&plugin_id)
+        .await
+        .map_err(|error| {
+            format!(
+                "插件维护窗口不可用 ({})，未修改当前插件",
+                error.diagnostic_code()
+            )
+        })?;
+    let root = state.plugin_root.clone();
+    let removal = tokio::task::spawn_blocking({
+        let plugin_id = plugin_id.clone();
+        move || prepare_plugin_removal(&root, &plugin_id)
+    })
+    .await
+    .map_err(|_| "插件卸载任务异常终止".to_owned())?
+    .map_err(|error| error.to_string())?;
+    let installed = match inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+    ) {
+        Ok(installed) if same_plugin_failures(&baseline_failures, &installed.failures) => installed,
+        Ok(_) => {
+            removal.rollback().map_err(|rollback| {
+                format!("卸载后插件隔离清单发生变化；恢复原插件同时失败: {rollback}")
+            })?;
+            return Err("卸载后插件隔离清单发生变化，已恢复原插件".into());
+        }
+        Err(error) => {
+            removal
+                .rollback()
+                .map_err(|rollback| format!("{error}; 恢复原插件同时失败: {rollback}"))?;
+            return Err(format!("无法验证卸载后的插件清单，已恢复原插件: {error}"));
+        }
+    };
+    if let Err(error) = maintenance.replace_manifest(None).await {
+        removal
+            .rollback()
+            .map_err(|rollback| format!("卸载路由失败: {error}; 恢复原插件同时失败: {rollback}"))?;
+        maintenance
+            .replace_manifest(Some(&previous_manifest))
+            .await
+            .map_err(|restore| format!("卸载路由失败: {error}; 恢复原路由失败: {restore}"))?;
+        return Err(format!("卸载路由失败，已恢复原插件: {error}"));
+    }
+    if let Err(error) = removal.commit() {
+        maintenance
+            .replace_manifest(Some(&previous_manifest))
+            .await
+            .map_err(|restore| format!("卸载事务提交失败: {error}; 恢复原路由失败: {restore}"))?;
+        return Err(format!("卸载事务提交失败，已恢复原插件: {error}"));
+    }
+    state
+        .plugin_load_failures
+        .store(installed.failures.len(), Ordering::Release);
+    state
+        .plugin_count
+        .store(installed.manifests.len(), Ordering::Release);
+    tracing::info!(
+        event_code = "plugin-uninstalled",
+        plugin_id,
+        "signed plugin uninstalled"
+    );
+    Ok(())
+}
+
+#[tauri::command]
 async fn reload_plugins(
     caller: WebviewWindow,
     state: State<'_, BridgeState>,
@@ -1839,31 +1931,77 @@ async fn delete_local_mapping(
 ) -> Result<(), String> {
     desktop::require_control(&caller)?;
     let _install = state.install_lock.lock().await;
-    let target = local_mappings::bounded_plugin_target(&state.local_mapping_root, &plugin_id)?;
-    if !target.is_dir() {
-        return Err(format!("本地映射 [{plugin_id}] 不存在"));
-    }
-    let maintenance = state.controller.begin_maintenance().await;
-    let backup = state
-        .local_mapping_root
-        .join(format!(".mapping-delete-{}", uuid::Uuid::new_v4()));
-    std::fs::rename(&target, &backup).map_err(|error| format!("无法暂存待删除映射: {error}"))?;
+    recover_plugin_store(&state)?;
+    let before = inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+    )?;
+    let baseline_failures = before.failures.clone();
+    let previous_manifest = before
+        .manifests
+        .iter()
+        .find(|manifest| {
+            manifest.plugin_id == plugin_id
+                && is_local_manifest(manifest, &state.local_mapping_root)
+        })
+        .cloned()
+        .ok_or_else(|| format!("本地映射 [{plugin_id}] 不存在"))?;
+    let maintenance = state
+        .controller
+        .begin_plugin_maintenance(&plugin_id)
+        .await
+        .map_err(|error| {
+            format!(
+                "映射维护窗口不可用 ({})，未修改当前映射",
+                error.diagnostic_code()
+            )
+        })?;
+    let root = state.local_mapping_root.clone();
+    let removal = tokio::task::spawn_blocking({
+        let plugin_id = plugin_id.clone();
+        move || local_mappings::prepare_removal(&root, &plugin_id)
+    })
+    .await
+    .map_err(|_| "映射删除任务异常终止".to_owned())??;
     let installed = match inspect_all_plugins(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
     ) {
-        Ok(installed) => installed,
+        Ok(installed) if same_plugin_failures(&baseline_failures, &installed.failures) => installed,
+        Ok(_) => {
+            removal.rollback().map_err(|rollback| {
+                format!("删除后插件隔离清单发生变化；恢复原映射同时失败: {rollback}")
+            })?;
+            return Err("删除后插件隔离清单发生变化，已恢复原映射".into());
+        }
         Err(error) => {
-            let _ = std::fs::rename(&backup, &target);
-            return Err(error);
+            removal
+                .rollback()
+                .map_err(|rollback| format!("{error}; 恢复原映射同时失败: {rollback}"))?;
+            return Err(format!("无法验证删除后的插件清单，已恢复原映射: {error}"));
         }
     };
-    if let Err(error) = maintenance.replace_manifests(&installed.manifests).await {
-        let _ = std::fs::rename(&backup, &target);
-        return Err(error.to_string());
+    if let Err(error) = maintenance.replace_manifest(None).await {
+        removal.rollback().map_err(|rollback| {
+            format!("删除映射路由失败: {error}; 恢复映射同时失败: {rollback}")
+        })?;
+        maintenance
+            .replace_manifest(Some(&previous_manifest))
+            .await
+            .map_err(|restore| format!("删除映射路由失败: {error}; 恢复原路由失败: {restore}"))?;
+        return Err(format!("删除映射路由失败，已恢复原映射: {error}"));
     }
-    std::fs::remove_dir_all(&backup).map_err(|error| format!("无法清理已删除映射: {error}"))?;
+    if let Err(error) = removal.commit() {
+        maintenance
+            .replace_manifest(Some(&previous_manifest))
+            .await
+            .map_err(|restore| {
+                format!("映射删除事务提交失败: {error}; 恢复原路由失败: {restore}")
+            })?;
+        return Err(format!("映射删除事务提交失败，已恢复原映射: {error}"));
+    }
     state
         .plugin_load_failures
         .store(installed.failures.len(), Ordering::Release);
@@ -2415,6 +2553,7 @@ pub fn run() {
             frontend_ready,
             install_plugin_package,
             install_plugin_from_catalog,
+            uninstall_signed_plugin,
             check_plugin_updates,
             reload_plugins,
             plugin_inventory,
@@ -2483,6 +2622,14 @@ fn app_context<R: tauri::Runtime>() -> tauri::Context<R> {
 struct InspectedPlugins {
     manifests: Vec<webplus_plugin_config::PluginManifest>,
     failures: Vec<String>,
+}
+
+fn same_plugin_failures(baseline: &[String], candidate: &[String]) -> bool {
+    let mut baseline = baseline.to_vec();
+    let mut candidate = candidate.to_vec();
+    baseline.sort();
+    candidate.sort();
+    baseline == candidate
 }
 
 fn recover_plugin_store(

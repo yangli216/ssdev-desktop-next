@@ -452,6 +452,19 @@ async function installPlugin() {
   }
 }
 
+async function uninstallSignedPlugin(pluginId: string, displayName: string) {
+  if (!window.confirm(`确定卸载签名插件「${displayName}」(${pluginId}) 吗？对应原生服务将立即停止。`)) return
+  await run(async () => {
+    await invoke('uninstall_signed_plugin', { pluginId })
+    pluginUpdates.value = null
+    ;[status.value, inventory.value, deploymentCheck.value] = await Promise.all([
+      invoke<BridgeStatus>('bridge_status'),
+      invoke<PluginInventory>('plugin_inventory'),
+      invoke<DeploymentCheckReport>('run_deployment_check'),
+    ])
+  }, `签名插件 ${pluginId} 已卸载并从路由移除。`)
+}
+
 async function reloadPlugins() {
   await run(async () => {
     await invoke('reload_plugins')
@@ -748,7 +761,7 @@ async function runDeploymentCheck() {
               <div v-for="update in pluginUpdates.updates" :key="update.pluginId"><span><strong>{{ update.pluginId }}</strong><small>已安装 {{ update.installedVersion ?? '无' }} · 仓库 {{ update.availableVersion ?? '无匹配版本' }}</small></span><button v-if="update.updateAvailable && update.availableVersion" type="button" :disabled="busy" @click="installFromCatalog(update.pluginId, update.availableVersion)">{{ update.installedVersion ? `安装更新 ${update.availableVersion}` : `安装 ${update.availableVersion}` }}</button><em v-else>{{ update.catalogAvailable ? '已是最新版本' : '仓库未收录' }}</em></div>
             </div>
             <article v-for="plugin in inventory?.plugins ?? []" :key="plugin.pluginId">
-              <header><span><strong>{{ plugin.displayName }}</strong><small>{{ plugin.pluginId }} · {{ plugin.source === 'local-mapping' ? '本机动态映射' : (plugin.version ?? '旧版未知版本') }}</small></span><button v-if="plugin.source === 'signed-package'" type="button" :disabled="busy" @click="checkPluginUpdates(plugin.pluginId)">检查更新</button></header>
+              <header><span><strong>{{ plugin.displayName }}</strong><small>{{ plugin.pluginId }} · {{ plugin.source === 'local-mapping' ? '本机动态映射' : (plugin.version ?? '旧版未知版本') }}</small></span><div v-if="plugin.source === 'signed-package'" class="plugin-actions"><button type="button" :disabled="busy" @click="checkPluginUpdates(plugin.pluginId)">检查更新</button><button class="danger-link" type="button" :disabled="busy" @click="uninstallSignedPlugin(plugin.pluginId, plugin.displayName)">卸载</button></div></header>
               <details v-for="service in plugin.services" :key="service.serviceId" class="service-mapping"><summary><code>{{ service.serviceId }}</code><span>{{ service.architecture }} / {{ service.mainType }} / {{ service.methodCount }} 个方法</span></summary><dl><div><dt>原生目标</dt><dd><code>{{ service.mainClass }}</code></dd></div><div><dt>调用约定</dt><dd>{{ service.callingConvention || '默认' }} · {{ service.charset || '默认字符集' }}</dd></div><div><dt>服务策略</dt><dd>{{ service.timeoutMs || '默认' }} ms · {{ service.cacheable ? '缓存实例' : '按需实例' }} · {{ service.dependencyCount }} 个依赖</dd></div></dl><div v-for="method in service.methods" :key="`${service.serviceId}:${method.requestName}`" class="method-mapping"><code>{{ method.requestName }}</code><span aria-hidden="true">→</span><code>{{ method.nativeName }}</code><small>{{ method.returnType || '默认返回类型' }} · {{ method.parameterCount }} 参数 · {{ method.timeoutMs || '默认' }} ms</small></div></details>
             </article>
             <p v-if="inventory && inventory.plugins.length === 0" class="empty">尚未安装通过验签的插件。</p>

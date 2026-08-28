@@ -140,6 +140,8 @@ button:disabled { cursor: wait !important; opacity: .5; }
 .plugin-list article header span { display: grid; gap: 4px; }
 .plugin-list article header small { color: #718078; font-size: 11px; }
 .plugin-list button { padding: 8px 11px; border: 1px solid #9eaaa2; border-radius: 8px; background: #fff; color: #274735; cursor: pointer; }
+.plugin-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.plugin-list button.danger-link { border-color: #d2aaa2; color: #8b3c31; }
 .catalog-install { display: flex; flex-wrap: wrap; gap: 9px; }
 .catalog-install input { min-width: 0; flex: 1; padding: 10px 12px; border: 1px solid #bfc9c1; border-radius: 9px; }
 .plugin-update-results { display: grid; gap: 8px; padding: 12px; border: 1px solid #c8d4ca; border-radius: 10px; background: #f3f6f1; }

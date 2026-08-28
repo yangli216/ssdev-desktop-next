@@ -422,6 +422,60 @@ impl PreparedPlugin {
     }
 }
 
+/// Moves an installed plugin into the same durable activation transaction used
+/// by upgrades. Committing removes the backup; dropping or rolling back restores
+/// the exact previous directory. Startup recovery therefore treats an
+/// interrupted removal as an uncommitted change instead of losing the plugin.
+pub fn prepare_plugin_removal(
+    plugin_root: &Path,
+    plugin_id: &str,
+) -> Result<PluginActivation, PackageError> {
+    fs::create_dir_all(plugin_root).map_err(|source| PackageError::Io {
+        path: plugin_root.to_path_buf(),
+        source,
+    })?;
+    let plugin_root = plugin_root
+        .canonicalize()
+        .map_err(|source| PackageError::Io {
+            path: plugin_root.to_path_buf(),
+            source,
+        })?;
+    let target = validated_plugin_target(&plugin_root, plugin_id)?;
+    require_real_directory(&target, "installed plugin target")?;
+    let transaction = TempBuilder::new()
+        .prefix(ACTIVATION_PREFIX)
+        .tempdir_in(&plugin_root)
+        .map_err(|source| PackageError::Io {
+            path: plugin_root.clone(),
+            source,
+        })?
+        .keep();
+    let journal = ActivationJournal {
+        schema_version: 1,
+        plugin_id: plugin_id.to_owned(),
+        had_previous: true,
+    };
+    if let Err(error) = write_activation_journal(&transaction, &journal) {
+        let _ = fs::remove_dir_all(&transaction);
+        return Err(error);
+    }
+    let previous = transaction.join("previous");
+    if let Err(source) = fs::rename(&target, &previous) {
+        let _ = fs::remove_dir_all(&transaction);
+        return Err(PackageError::Io {
+            path: target.clone(),
+            source,
+        });
+    }
+    Ok(PluginActivation {
+        plugin_root,
+        target,
+        transaction,
+        had_previous: true,
+        finalized: false,
+    })
+}
+
 pub struct PluginActivation {
     plugin_root: PathBuf,
     target: PathBuf,
@@ -934,6 +988,39 @@ mod tests {
         let report = recover_incomplete_activations(&plugin_root).unwrap();
         assert_eq!(report.rolled_back_activations, 1);
         assert!(!plugin_root.join("reader-plugin").exists());
+        assert_no_transaction_debris(&plugin_root);
+    }
+
+    #[test]
+    fn plugin_removal_can_rollback_commit_and_recover_after_a_crash() {
+        let root = tempdir().unwrap();
+        let plugin_root = root.path().join("plugins");
+        let target = plugin_root.join("reader-plugin");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("marker.txt"), b"installed plugin").unwrap();
+
+        let removal = prepare_plugin_removal(&plugin_root, "reader-plugin").unwrap();
+        assert!(!target.exists());
+        removal.rollback().unwrap();
+        assert_eq!(
+            fs::read(target.join("marker.txt")).unwrap(),
+            b"installed plugin"
+        );
+
+        let removal = prepare_plugin_removal(&plugin_root, "reader-plugin").unwrap();
+        std::mem::forget(removal);
+        let report = recover_incomplete_activations(&plugin_root).unwrap();
+        assert_eq!(report.rolled_back_activations, 1);
+        assert_eq!(
+            fs::read(target.join("marker.txt")).unwrap(),
+            b"installed plugin"
+        );
+
+        prepare_plugin_removal(&plugin_root, "reader-plugin")
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert!(!target.exists());
         assert_no_transaction_debris(&plugin_root);
     }
 

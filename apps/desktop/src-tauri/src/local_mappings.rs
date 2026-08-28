@@ -352,6 +352,48 @@ fn require_mapping_directory(path: &Path, role: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn prepare_removal(
+    root: &Path,
+    plugin_id: &str,
+) -> Result<ActivatedLocalMapping, String> {
+    fs::create_dir_all(root).map_err(|error| format!("无法创建本地映射目录: {error}"))?;
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("无法解析本地映射目录: {error}"))?;
+    let target = bounded_plugin_target(&root, plugin_id)?;
+    require_mapping_directory(&target, "待删除映射")?;
+    let manifest = PluginManifest::load(plugin_id, &target).map_err(|error| error.to_string())?;
+    let transaction = TempBuilder::new()
+        .prefix(MAPPING_ACTIVATION_PREFIX)
+        .tempdir_in(&root)
+        .map_err(|error| format!("无法创建映射删除事务: {error}"))?
+        .keep();
+    if let Err(error) = write_mapping_activation_journal(
+        &transaction,
+        &MappingActivationJournal {
+            schema_version: 1,
+            plugin_id: plugin_id.to_owned(),
+            had_previous: true,
+        },
+    ) {
+        let _ = fs::remove_dir_all(&transaction);
+        return Err(error);
+    }
+    let previous = transaction.join("previous");
+    if let Err(error) = fs::rename(&target, &previous) {
+        let _ = fs::remove_dir_all(&transaction);
+        return Err(format!("无法暂存待删除映射: {error}"));
+    }
+    Ok(ActivatedLocalMapping {
+        manifest,
+        root,
+        target,
+        transaction,
+        had_previous: true,
+        finalized: false,
+    })
+}
+
 impl PreparedLocalMapping {
     pub(crate) fn manifest(&self) -> &PluginManifest {
         &self.manifest
@@ -1809,6 +1851,39 @@ mod tests {
             .unwrap(),
             b"old mapping"
         );
+    }
+
+    #[test]
+    fn mapping_removal_can_rollback_commit_and_recover_after_a_crash() {
+        let source = tempfile::tempdir().unwrap();
+        let component = source.path().join("reader.bat");
+        fs::write(&component, b"installed mapping").unwrap();
+        let active_root = tempfile::tempdir().unwrap();
+        prepare(active_root.path(), fixture_definition(&component))
+            .unwrap()
+            .activate(active_root.path())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let target = active_root.path().join("reader.local");
+
+        let removal = prepare_removal(active_root.path(), "reader.local").unwrap();
+        assert!(!target.exists());
+        removal.rollback().unwrap();
+        assert!(target.join(LOCAL_MAPPING_FILENAME).is_file());
+
+        let removal = prepare_removal(active_root.path(), "reader.local").unwrap();
+        std::mem::forget(removal);
+        let report =
+            recover_incomplete_mapping_activations(active_root.path(), &HashSet::new()).unwrap();
+        assert_eq!(report.rolled_back_activations, 1);
+        assert!(target.join(LOCAL_MAPPING_FILENAME).is_file());
+
+        prepare_removal(active_root.path(), "reader.local")
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert!(!target.exists());
     }
 
     #[cfg(unix)]
