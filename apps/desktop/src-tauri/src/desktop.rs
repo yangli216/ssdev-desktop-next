@@ -1797,7 +1797,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_policy_scopes_plugin_calls_to_exact_services_and_methods() {
+    fn compatibility_policy_limits_plugin_calls_to_the_configured_business_origin() {
         use webplus_plugin_trust::TrustStore;
 
         let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../fixtures/ci");
@@ -1811,7 +1811,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config_path = directory.path().join("config.json");
         let config = DesktopConfig {
-            website: Some("https://business.invalid/app".into()),
+            website: Some("http://10.17.5.57/app".into()),
             ..DesktopConfig::default()
         };
         fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
@@ -1823,13 +1823,21 @@ mod tests {
         let webview = WebviewWindowBuilder::new(
             &app,
             "business-1",
-            WebviewUrl::External(Url::parse("https://business.invalid/app").unwrap()),
+            WebviewUrl::External(Url::parse("http://10.17.5.57/app").unwrap()),
         )
         .build()
         .unwrap();
 
         require_plugin_invocation(&webview, &state, "ci.health", "probe").unwrap();
-        assert!(require_plugin_invocation(&webview, &state, "ci.health", "reset").is_err());
-        assert!(require_plugin_invocation(&webview, &state, "admin", "probe").is_err());
+        require_plugin_invocation(&webview, &state, "project.reader", "read").unwrap();
+
+        let attacker = WebviewWindowBuilder::new(
+            &app,
+            "business-2",
+            WebviewUrl::External(Url::parse("http://10.17.5.58/app").unwrap()),
+        )
+        .build()
+        .unwrap();
+        assert!(require_plugin_invocation(&attacker, &state, "ci.health", "probe").is_err());
     }
 }

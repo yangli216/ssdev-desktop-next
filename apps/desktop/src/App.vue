@@ -54,6 +54,7 @@ type BridgeStatus = {
   ssoError?: string
   originPolicy: {
     enforced: boolean
+    allowConfiguredBusinessOrigins: boolean
     businessOrigins: number
     serviceGrants: number
     methodGrants: number
@@ -539,9 +540,9 @@ async function exportDiagnostics() {
       </article>
       <article>
         <span>业务来源策略</span>
-        <strong>{{ status?.originPolicy.enforced ? '发布方签名' : '开发模式' }}</strong>
+        <strong>{{ status?.originPolicy.allowConfiguredBusinessOrigins ? '配置地址兼容' : status?.originPolicy.enforced ? '发布方签名' : '开发模式' }}</strong>
         <small :title="status?.originPolicyError">
-          {{ status?.originPolicyError ?? `${status?.originPolicy.businessOrigins ?? '—'} 个业务来源，${status?.originPolicy.serviceGrants ?? '—'} 个服务授权，${status?.originPolicy.methodGrants ?? '—'} 个方法授权；HTTP ${status?.originPolicy.allowInsecureHttp ? '已例外放行' : '禁止'}` }}
+          {{ status?.originPolicyError ?? (status?.originPolicy.allowConfiguredBusinessOrigins ? `仅当前配置的业务地址可调用已签名插件；HTTP ${status?.originPolicy.allowInsecureHttp ? '允许' : '禁止'}` : `${status?.originPolicy.businessOrigins ?? '—'} 个业务来源，${status?.originPolicy.serviceGrants ?? '—'} 个服务授权，${status?.originPolicy.methodGrants ?? '—'} 个方法授权；HTTP ${status?.originPolicy.allowInsecureHttp ? '已例外放行' : '禁止'}`) }}
         </small>
       </article>
       <article>

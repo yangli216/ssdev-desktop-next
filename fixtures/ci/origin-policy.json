@@ -13,11 +13,12 @@
       ]
     }
   ],
+  "allowConfiguredBusinessOrigins": true,
   "navigationOrigins": [
     "https://sso.invalid"
   ],
   "externalOrigins": [
     "https://help.invalid"
   ],
-  "allowInsecureHttp": false
+  "allowInsecureHttp": true
 }

@@ -22,6 +22,8 @@ struct PolicyDocument {
     schema_version: u8,
     business_grants: Vec<BusinessGrantDocument>,
     #[serde(default)]
+    allow_configured_business_origins: bool,
+    #[serde(default)]
     navigation_origins: Vec<String>,
     #[serde(default)]
     external_origins: Vec<String>,
@@ -52,6 +54,7 @@ struct ServiceGrantDocument {
 #[derive(Debug, Clone)]
 pub struct OriginPolicy {
     business_grants: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    allow_configured_business_origins: bool,
     navigation_origins: BTreeSet<String>,
     external_origins: BTreeSet<String>,
     allow_insecure_http: bool,
@@ -62,6 +65,7 @@ pub struct OriginPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct OriginPolicySummary {
     pub enforced: bool,
+    pub allow_configured_business_origins: bool,
     pub business_origins: usize,
     pub service_grants: usize,
     pub method_grants: usize,
@@ -103,6 +107,7 @@ impl OriginPolicy {
     pub fn development_unrestricted() -> Self {
         Self {
             business_grants: BTreeMap::new(),
+            allow_configured_business_origins: true,
             navigation_origins: BTreeSet::new(),
             external_origins: BTreeSet::new(),
             allow_insecure_http: true,
@@ -122,7 +127,11 @@ impl OriginPolicy {
             .business_origins()
             .map_err(|error| OriginPolicyError::Invalid(error.to_string()))?
         {
-            self.require_business_origin(&origin)?;
+            if self.allow_configured_business_origins {
+                self.require_allowed_scheme(&origin)?;
+            } else {
+                self.require_business_origin(&origin)?;
+            }
         }
         for origin in normalized_config_origins(&config.trusted_origins)? {
             if !self.business_grants.contains_key(&origin)
@@ -158,6 +167,10 @@ impl OriginPolicy {
         }
         validate_routing_field(service_id, "serviceId")?;
         validate_routing_field(method, "method")?;
+        if self.allow_configured_business_origins {
+            self.require_allowed_scheme(origin)?;
+            return Ok(());
+        }
         let services =
             self.business_grants
                 .get(origin)
@@ -186,6 +199,7 @@ impl OriginPolicy {
     pub fn summary(&self) -> OriginPolicySummary {
         OriginPolicySummary {
             enforced: self.enforced,
+            allow_configured_business_origins: self.allow_configured_business_origins,
             business_origins: self.business_grants.len(),
             service_grants: self.business_grants.values().map(BTreeMap::len).sum(),
             method_grants: self
@@ -226,6 +240,7 @@ impl OriginPolicy {
         )?;
         Ok(Self {
             business_grants,
+            allow_configured_business_origins: document.allow_configured_business_origins,
             navigation_origins,
             external_origins,
             allow_insecure_http: document.allow_insecure_http,
@@ -265,6 +280,10 @@ impl OriginPolicy {
                 origin: origin.to_owned(),
             });
         }
+        self.require_allowed_scheme(origin)
+    }
+
+    fn require_allowed_scheme(&self, origin: &str) -> Result<(), OriginPolicyError> {
         if origin.starts_with("http://") && !self.allow_insecure_http {
             return Err(OriginPolicyError::Invalid(format!(
                 "insecure origin [{origin}] is disabled by policy"
@@ -588,6 +607,25 @@ mod tests {
                 ..DesktopConfig::default()
             })
             .unwrap();
+    }
+
+    #[test]
+    fn signed_compatibility_mode_accepts_configured_intranet_origins_and_signed_plugins() {
+        let mut compatible = policy_document();
+        compatible["allowConfiguredBusinessOrigins"] = json!(true);
+        compatible["allowInsecureHttp"] = json!(true);
+        let policy = load_signed(compatible).unwrap();
+        let config = DesktopConfig {
+            website: Some("http://10.17.5.57/project".into()),
+            ..DesktopConfig::default()
+        };
+
+        policy.authorize(&config).unwrap();
+        policy
+            .authorize_plugin_invocation("http://10.17.5.57", "project.reader", "read")
+            .unwrap();
+        assert!(policy.summary().allow_configured_business_origins);
+        assert!(policy.summary().allow_insecure_http);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # 签名业务来源策略
 
-业务页面能够间接调用本地 DLL，因此“页面从哪里加载”属于发布安全边界，不能只依赖用户可编辑的 `config.json`。正式构建必须携带 `origin-policy.json` 与对应 Ed25519 签名；签名只能由信任库中显式具备 `origin-policy` 用途的组织公钥验证，插件或目录签名密钥不能越权。
+业务页面能够间接调用本地 DLL，因此“页面从哪里加载”属于发布安全边界。严格模式由签名策略逐个批准来源；多项目兼容模式必须由签名策略显式开启，再由当前 `config.json`、受控 WebView 和已签名插件共同限定边界。正式构建必须携带 `origin-policy.json` 与对应 Ed25519 签名；签名只能由信任库中显式具备 `origin-policy` 用途的组织公钥验证，插件或目录签名密钥不能越权。
 
 ```json
 {
@@ -20,6 +20,7 @@
       ]
     }
   ],
+  "allowConfiguredBusinessOrigins": false,
   "navigationOrigins": ["https://sso.example.internal"],
   "externalOrigins": ["https://help.example.internal"],
   "allowInsecureHttp": false
@@ -27,27 +28,28 @@
 ```
 
 - `businessGrants`：可以获得窄 Web Bridge 的页面来源，以及该来源能够调用的精确 `serviceId` 和 `method`；至少一项来源、每个来源至少一个服务、每个服务至少一个方法。
+- `allowConfiguredBusinessOrigins`：兼容多项目内网部署。为 `true` 时，不再要求逐个预签名业务 IP、域名和端口；只有当前桌面配置明确列出的业务来源可获得桥接，并且只能调用已签名、已安装插件声明的服务和方法。
 - `navigationOrigins`：允许业务窗口在 SSO 流程中导航，但不会获得插件桥接。
 - `externalOrigins`：业务页面可请求系统默认浏览器打开的额外来源。
-- `allowInsecureHttp`：默认必须为 `false`。只有无法立即升级的院内旧站点才能在评审后显式启用，且仍需逐个列出精确来源。
+- `allowInsecureHttp`：默认必须为 `false`。只有无法立即升级的院内旧站点才能显式启用；严格模式仍需逐个列出来源，兼容模式则以当前桌面配置为来源边界。
 
-`allowInsecureHttp` 只兼容旧业务页面来源，不会放宽 SSO POST。SSO 始终要求 HTTPS 且禁止重定向，具体边界见 [SSO 安全边界](sso-security.md)。
+`allowConfiguredBusinessOrigins` 与 `allowInsecureHttp` 同时为 `true` 时，适用于地址随项目变化且无法部署 HTTPS 的院内系统。它们不会放宽 SSO POST；SSO 始终要求 HTTPS 且禁止重定向，具体边界见 [SSO 安全边界](sso-security.md)。
 
-策略项必须是纯 origin，例如 `https://his.example.internal`；禁止凭据、路径、查询参数和片段。每类最多 128 项，每个业务来源最多 256 个服务、每个服务最多 256 个方法。来源、服务和方法都必须唯一；空名称、首尾空白和 `*` 通配符会被拒绝。`serviceId` 和 `method` 区分大小写，并且方法使用业务页面实际传入的名称；若插件定义了 alias，策略应授权页面调用的 alias。用户配置可以选择策略中的来源子集，但不能增加来源或扩大插件权限。
+策略项必须是纯 origin，例如 `https://his.example.internal`；禁止凭据、路径、查询参数和片段。严格模式下，每类最多 128 项，每个业务来源最多 256 个服务、每个服务最多 256 个方法，来源、服务和方法都必须唯一。兼容模式不使用 `businessGrants` 限制具体项目地址或插件路由，而以当前用户配置、受控 WebView 和已签名插件清单作为边界。
 
 schema 1 的 `businessOrigins` 属于无范围授权，正式客户端不再接受。新增插件、服务或方法不会自动授权给既有业务站点；发布方必须明确评审、更新 schema 2 策略并重新签名。
 
 ## Tauri IPC 双层授权
 
-远程页面并不会因为被加载进 WebView 就自动获得 Tauri 命令。客户端启动或保存配置时，会为“签名策略批准且当前配置启用”的每个精确业务 origin 注册运行时 Tauri ACL：
+远程页面并不会因为被加载进 WebView 就自动获得 Tauri 命令。客户端启动或保存配置时，会为当前配置启用且符合所选策略模式的每个精确业务 origin 注册运行时 Tauri ACL：
 
-- `business-*` 窗口只获得插件调用、最小系统声明、业务窗口截图、受控外链、新业务窗口、悬浮窗创建和关闭七类应用命令。每次插件调用还会在 Rust 层用当前页面 origin 对 `serviceId` 和 `method` 做 schema 2 精确授权；Tauri ACL 中存在 `plugin_invoke` 不代表该来源能够调用任意插件。
+- `business-*` 窗口只获得插件调用、最小系统声明、业务窗口截图、受控外链、新业务窗口、悬浮窗创建和关闭七类应用命令。严格模式按 origin 对 `serviceId` 和 `method` 做精确授权；兼容模式则要求 origin 仍在当前配置中，并由已签名插件清单约束可调用路由。
 - `floating-*` 窗口只获得关闭自身和提交结果两类命令。
 - SSO `navigationOrigins` 不注册远程 ACL，因此即使页面直接访问 `window.__TAURI_INTERNALS__` 也无法到达应用命令。
 - 控制台与截图遮罩使用仅限本地内置页面的独立静态 capability；控制台禁止导航到其他页面，每次高权限调用仍会复核窗口标签和内置页面 URL。
 - 内置页面启用 CSP 和原型冻结：生产环境只允许同包脚本与样式、Tauri IPC 和截图所需的 `data:` 图片，禁止对象、表单、frame、worker、媒体和任意外部网络连接。开发环境只额外允许固定 Vite HMR WebSocket。
 
-Tauri ACL 是第一层；Rust 命令处理器仍会再次校验窗口标签、当前页面 origin、当前用户配置、精确服务/方法授权和签名策略。配置移除某个来源后，即使进程内曾为它注册过 ACL，Rust 层也会立即拒绝其后续调用；重启后只重新注册当前配置中的来源。
+Tauri ACL 是第一层；Rust 命令处理器仍会再次校验窗口标签、当前页面 origin、当前用户配置和插件签名。严格模式还复核来源与服务/方法授权。配置移除某个来源后，即使进程内曾为它注册过 ACL，Rust 层也会立即拒绝其后续调用；重启后只重新注册当前配置中的来源。
 
 Release 固定读取安装包内的信任库、来源策略和策略签名，启动环境不能替换它们；相应环境变量只在 Debug 验证中生效。这同时阻止替换信任根和回放历史上签名有效但范围更宽的旧来源策略。
 

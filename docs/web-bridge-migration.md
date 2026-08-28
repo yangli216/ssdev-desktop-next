@@ -125,7 +125,7 @@ controller 对所有入口统一限制最多 8 个在途插件调用，不建立
 
 - 桥接只在 `website` 与 `environments` 的业务来源中启用，且这些来源必须同时拥有发布方签名的 schema 2 `origin-policy.json` 授权；每次插件调用还必须精确匹配该来源的 `serviceId` 和 `method`，不支持通配授权。
 - 用户配置不能扩大发布策略；业务、SSO 导航和系统浏览器外链使用三组独立来源集合。
-- 正式构建默认拒绝 HTTP。确需兼容院内旧 HTTP 站点时，发布方必须在已签名策略中列出精确来源并显式设置 `allowInsecureHttp`，控制台会展示该例外。
+- 正式构建默认拒绝 HTTP。多项目院内环境可在已签名策略中同时启用 `allowConfiguredBusinessOrigins` 与 `allowInsecureHttp`，由当前桌面配置限定可获得桥接的业务来源，无需为每个 IP、域名或端口重新打包；SSO 仍保持 HTTPS-only。
 - HTTP 业务来源例外不适用于 SSO POST；登录标识、租户、角色和科室只发送到由主业务地址派生的 HTTPS 端点，且客户端不跟随重定向。
 - `trustedOrigins` 只允许 SSO 页面完成导航，不会获得插件、截图或窗口能力。
 - 页面导航到未授权来源时会被拦截。

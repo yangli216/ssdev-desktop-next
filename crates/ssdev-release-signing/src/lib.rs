@@ -103,6 +103,7 @@ pub enum ArtifactSummary {
         info_findings: u32,
     },
     OriginPolicy {
+        allow_configured_business_origins: bool,
         business_origins: usize,
         service_grants: usize,
         method_grants: usize,
@@ -356,6 +357,7 @@ fn prepare_material(
             (
                 origin_payload(document),
                 ArtifactSummary::OriginPolicy {
+                    allow_configured_business_origins: summary.allow_configured_business_origins,
                     business_origins: summary.business_origins,
                     service_grants: summary.service_grants,
                     method_grants: summary.method_grants,
