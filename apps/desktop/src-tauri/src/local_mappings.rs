@@ -29,6 +29,12 @@ const MAX_EXPECTED_RES_DATA_BYTES: usize = 64 * 1024;
 const MAX_EXPECTED_RES_DATA_DEPTH: usize = 16;
 const MAX_EXPECTED_RES_DATA_NODES: usize = 512;
 const MAX_RELEASE_MATRIX_CASES: usize = 1024;
+const MAPPING_ACTIVATION_PREFIX: &str = ".mapping-activation-";
+const MAPPING_COMMITTED_PREFIX: &str = ".mapping-committed-";
+const MAPPING_IMPORT_PREFIX: &str = ".mapping-import-";
+const MAPPING_STAGE_PREFIX: &str = ".mapping-stage-";
+const MAPPING_TRANSACTION_JOURNAL: &str = "transaction.json";
+const MAX_MAPPING_TRANSACTION_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -106,50 +112,244 @@ pub(crate) struct PreparedLocalMapping {
 
 pub(crate) struct ActivatedLocalMapping {
     manifest: PluginManifest,
+    root: PathBuf,
     target: PathBuf,
-    backup: Option<PathBuf>,
+    transaction: PathBuf,
+    had_previous: bool,
+    finalized: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LocalMappingRecoveryReport {
+    pub(crate) rolled_back_activations: usize,
+    pub(crate) finalized_activations: usize,
+    pub(crate) removed_committed_transactions: usize,
+    pub(crate) removed_staging_directories: usize,
+}
+
+impl LocalMappingRecoveryReport {
+    pub(crate) fn total(self) -> usize {
+        self.rolled_back_activations
+            .saturating_add(self.finalized_activations)
+            .saturating_add(self.removed_committed_transactions)
+            .saturating_add(self.removed_staging_directories)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MappingActivationJournal {
+    schema_version: u8,
+    plugin_id: String,
+    had_previous: bool,
 }
 
 impl ActivatedLocalMapping {
     pub(crate) fn commit(mut self) -> Result<PluginManifest, String> {
-        if let Some(backup) = self.backup.take() {
-            if let Err(error) = fs::remove_dir_all(&backup) {
-                let failed = self
-                    .target
-                    .parent()
-                    .ok_or("映射目录缺少父目录")?
-                    .join(format!(".mapping-commit-failed-{}", Uuid::new_v4()));
-                fs::rename(&self.target, &failed).map_err(|rollback| {
-                    format!("无法清理旧映射: {error}; 撤销新映射失败: {rollback}")
-                })?;
-                if let Err(rollback) = fs::rename(&backup, &self.target) {
-                    let _ = fs::rename(&failed, &self.target);
-                    return Err(format!(
-                        "无法清理旧映射: {error}; 恢复旧映射失败: {rollback}"
-                    ));
-                }
-                let _ = fs::remove_dir_all(failed);
-                return Err(format!("无法清理旧映射，已恢复旧映射: {error}"));
-            }
-        }
-        Ok(self.manifest)
+        commit_mapping_transaction(&self.root, &self.transaction)?;
+        self.finalized = true;
+        Ok(self.manifest.clone())
+    }
+
+    pub(crate) fn commit_grouped(mut self) -> Result<PluginManifest, String> {
+        self.finalized = true;
+        commit_mapping_transaction(&self.root, &self.transaction)?;
+        Ok(self.manifest.clone())
     }
 
     pub(crate) fn rollback(mut self) -> Result<(), String> {
-        let failed = self
-            .target
-            .parent()
-            .ok_or("映射目录缺少父目录")?
-            .join(format!(".mapping-rollback-{}", Uuid::new_v4()));
-        fs::rename(&self.target, &failed).map_err(|error| format!("无法撤销新映射: {error}"))?;
-        if let Some(backup) = self.backup.take() {
-            if let Err(error) = fs::rename(&backup, &self.target) {
-                let _ = fs::rename(&failed, &self.target);
-                return Err(format!("无法恢复旧映射: {error}"));
-            }
-        }
-        fs::remove_dir_all(failed).map_err(|error| format!("无法清理撤销映射: {error}"))
+        rollback_mapping_transaction(
+            &self.root,
+            &self.transaction,
+            &MappingActivationJournal {
+                schema_version: 1,
+                plugin_id: self
+                    .target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                had_previous: self.had_previous,
+            },
+        )?;
+        self.finalized = true;
+        Ok(())
     }
+}
+
+impl Drop for ActivatedLocalMapping {
+    fn drop(&mut self) {
+        if !self.finalized
+            && rollback_mapping_transaction(
+                &self.root,
+                &self.transaction,
+                &MappingActivationJournal {
+                    schema_version: 1,
+                    plugin_id: self
+                        .target
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    had_previous: self.had_previous,
+                },
+            )
+            .is_err()
+        {
+            tracing::error!(
+                event_code = "local-mapping-rollback-failed",
+                "local mapping activation rollback failed"
+            );
+        }
+    }
+}
+
+pub(crate) fn recover_incomplete_mapping_activations(
+    root: &Path,
+    committed_plugin_ids: &HashSet<String>,
+) -> Result<LocalMappingRecoveryReport, String> {
+    fs::create_dir_all(root).map_err(|error| format!("无法创建本地映射目录: {error}"))?;
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("无法解析本地映射目录: {error}"))?;
+    let mut entries = fs::read_dir(&root)
+        .map_err(|error| format!("无法读取本地映射目录: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法读取本地映射目录项: {error}"))?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+
+    let mut report = LocalMappingRecoveryReport::default();
+    let mut activation_plugins = HashSet::new();
+    let mut activations = Vec::new();
+    for entry in entries {
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("无法检查本地映射事务: {error}"))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(MAPPING_COMMITTED_PREFIX) {
+            fs::remove_dir_all(entry.path())
+                .map_err(|error| format!("无法清理已提交映射事务: {error}"))?;
+            report.removed_committed_transactions += 1;
+        } else if name.starts_with(MAPPING_IMPORT_PREFIX) || name.starts_with(MAPPING_STAGE_PREFIX)
+        {
+            fs::remove_dir_all(entry.path())
+                .map_err(|error| format!("无法清理映射暂存目录: {error}"))?;
+            report.removed_staging_directories += 1;
+        } else if name.starts_with(MAPPING_ACTIVATION_PREFIX) {
+            let journal = read_mapping_activation_journal(&entry.path())?;
+            bounded_plugin_target(&root, &journal.plugin_id)?;
+            if !activation_plugins.insert(journal.plugin_id.clone()) {
+                return Err(format!(
+                    "本地映射 [{}] 存在多个未完成事务",
+                    journal.plugin_id
+                ));
+            }
+            activations.push((entry.path(), journal));
+        }
+    }
+    for (transaction, journal) in activations {
+        if committed_plugin_ids.contains(&journal.plugin_id) {
+            commit_mapping_transaction(&root, &transaction)?;
+            report.finalized_activations += 1;
+        } else {
+            rollback_mapping_transaction(&root, &transaction, &journal)?;
+            report.rolled_back_activations += 1;
+        }
+    }
+    Ok(report)
+}
+
+fn write_mapping_activation_journal(
+    transaction: &Path,
+    journal: &MappingActivationJournal,
+) -> Result<(), String> {
+    let path = transaction.join(MAPPING_TRANSACTION_JOURNAL);
+    let bytes =
+        serde_json::to_vec(journal).map_err(|error| format!("无法编码映射事务: {error}"))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| format!("无法创建映射事务记录: {error}"))?;
+    file.write_all(&bytes)
+        .and_then(|_| file.flush())
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("无法持久化映射事务记录: {error}"))
+}
+
+fn read_mapping_activation_journal(transaction: &Path) -> Result<MappingActivationJournal, String> {
+    let path = transaction.join(MAPPING_TRANSACTION_JOURNAL);
+    let metadata =
+        fs::symlink_metadata(&path).map_err(|error| format!("无法读取映射事务记录: {error}"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_MAPPING_TRANSACTION_BYTES
+    {
+        return Err("映射事务记录不是受支持的普通文件".into());
+    }
+    let bytes = fs::read(&path).map_err(|error| format!("无法读取映射事务记录: {error}"))?;
+    let journal: MappingActivationJournal =
+        serde_json::from_slice(&bytes).map_err(|error| format!("映射事务记录无效: {error}"))?;
+    if journal.schema_version != 1 {
+        return Err(format!("不支持映射事务版本 {}", journal.schema_version));
+    }
+    validate_plugin_id(&journal.plugin_id)?;
+    Ok(journal)
+}
+
+fn commit_mapping_transaction(root: &Path, transaction: &Path) -> Result<(), String> {
+    let name = transaction
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(MAPPING_ACTIVATION_PREFIX))
+        .ok_or("映射事务目录名称无效")?;
+    let committed = root.join(format!("{MAPPING_COMMITTED_PREFIX}{name}"));
+    fs::rename(transaction, &committed).map_err(|error| format!("无法提交映射事务: {error}"))?;
+    if let Err(error) = fs::remove_dir_all(&committed) {
+        tracing::warn!(
+            event_code = "local-mapping-transaction-cleanup-deferred",
+            failure_kind = ?error.kind(),
+            "committed local mapping transaction cleanup deferred"
+        );
+    }
+    Ok(())
+}
+
+fn rollback_mapping_transaction(
+    root: &Path,
+    transaction: &Path,
+    journal: &MappingActivationJournal,
+) -> Result<(), String> {
+    let target = bounded_plugin_target(root, &journal.plugin_id)?;
+    let previous = transaction.join("previous");
+    if journal.had_previous {
+        if previous.exists() {
+            require_mapping_directory(&previous, "旧映射备份")?;
+            if target.exists() {
+                require_mapping_directory(&target, "当前映射")?;
+                fs::remove_dir_all(&target).map_err(|error| format!("无法撤销新映射: {error}"))?;
+            }
+            fs::rename(&previous, &target).map_err(|error| format!("无法恢复旧映射: {error}"))?;
+        } else {
+            require_mapping_directory(&target, "已恢复映射")?;
+        }
+    } else if target.exists() {
+        require_mapping_directory(&target, "未完成的新映射")?;
+        fs::remove_dir_all(&target).map_err(|error| format!("无法撤销新映射: {error}"))?;
+    }
+    fs::remove_dir_all(transaction).map_err(|error| format!("无法清理映射事务: {error}"))
+}
+
+fn require_mapping_directory(path: &Path, role: &str) -> Result<(), String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("无法检查{role}: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("{role}不是安全的真实目录"));
+    }
+    Ok(())
 }
 
 impl PreparedLocalMapping {
@@ -165,15 +365,48 @@ impl PreparedLocalMapping {
         let plugin_id = self.definition.plugin_id.clone();
         let target = bounded_plugin_target(root, &plugin_id)?;
         let staging_path = self.staging.keep();
-        let backup = root.join(format!(".mapping-backup-{}", Uuid::new_v4()));
-        let had_previous = target.exists();
+        let had_previous = match fs::symlink_metadata(&target) {
+            Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => true,
+            Ok(_) => {
+                let _ = fs::remove_dir_all(&staging_path);
+                return Err("现有本地映射目标不是安全的真实目录".into());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging_path);
+                return Err(format!("无法检查现有本地映射: {error}"));
+            }
+        };
+        let transaction = TempBuilder::new()
+            .prefix(MAPPING_ACTIVATION_PREFIX)
+            .tempdir_in(root)
+            .map_err(|error| format!("无法创建映射事务目录: {error}"))?
+            .keep();
+        let previous = transaction.join("previous");
+        if let Err(error) = write_mapping_activation_journal(
+            &transaction,
+            &MappingActivationJournal {
+                schema_version: 1,
+                plugin_id: plugin_id.clone(),
+                had_previous,
+            },
+        ) {
+            let _ = fs::remove_dir_all(&transaction);
+            let _ = fs::remove_dir_all(&staging_path);
+            return Err(error);
+        }
         if had_previous {
-            fs::rename(&target, &backup).map_err(|error| format!("无法暂存旧映射: {error}"))?;
+            if let Err(error) = fs::rename(&target, &previous) {
+                let _ = fs::remove_dir_all(&transaction);
+                let _ = fs::remove_dir_all(&staging_path);
+                return Err(format!("无法暂存旧映射: {error}"));
+            }
         }
         if let Err(error) = fs::rename(&staging_path, &target) {
             if had_previous {
-                let _ = fs::rename(&backup, &target);
+                let _ = fs::rename(&previous, &target);
             }
+            let _ = fs::remove_dir_all(&transaction);
             return Err(format!("无法启用新映射: {error}"));
         }
         let loaded = match PluginManifest::load(&plugin_id, &target) {
@@ -182,16 +415,20 @@ impl PreparedLocalMapping {
                 let failed = root.join(format!(".mapping-failed-{}", Uuid::new_v4()));
                 let _ = fs::rename(&target, &failed);
                 if had_previous {
-                    let _ = fs::rename(&backup, &target);
+                    let _ = fs::rename(&previous, &target);
                 }
                 let _ = fs::remove_dir_all(failed);
+                let _ = fs::remove_dir_all(&transaction);
                 return Err(error.to_string());
             }
         };
         Ok(ActivatedLocalMapping {
             manifest: loaded,
+            root: root.to_path_buf(),
             target,
-            backup: had_previous.then_some(backup),
+            transaction,
+            had_previous,
+            finalized: false,
         })
     }
 }
@@ -1539,6 +1776,94 @@ mod tests {
             .plugin_dir
             .join(&imported.manifest().services[0].main_class)
             .is_file());
+    }
+
+    #[test]
+    fn startup_recovery_rolls_back_an_interrupted_mapping_upgrade() {
+        let source = tempfile::tempdir().unwrap();
+        let component = source.path().join("reader.bat");
+        let active_root = tempfile::tempdir().unwrap();
+        fs::write(&component, b"old mapping").unwrap();
+        prepare(active_root.path(), fixture_definition(&component))
+            .unwrap()
+            .activate(active_root.path())
+            .unwrap()
+            .commit()
+            .unwrap();
+        fs::write(&component, b"new mapping").unwrap();
+        let activation = prepare(active_root.path(), fixture_definition(&component))
+            .unwrap()
+            .activate(active_root.path())
+            .unwrap();
+        std::mem::forget(activation);
+
+        let report =
+            recover_incomplete_mapping_activations(active_root.path(), &HashSet::new()).unwrap();
+        assert_eq!(report.rolled_back_activations, 1);
+        assert_eq!(
+            fs::read(
+                active_root
+                    .path()
+                    .join("reader.local/components/0-reader.bat")
+            )
+            .unwrap(),
+            b"old mapping"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapping_activation_refuses_a_symbolic_link_target() {
+        use std::os::unix::fs::symlink;
+
+        let source = tempfile::tempdir().unwrap();
+        let component = source.path().join("reader.bat");
+        fs::write(&component, b"new mapping").unwrap();
+        let active_root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), active_root.path().join("reader.local")).unwrap();
+
+        assert!(prepare(active_root.path(), fixture_definition(&component))
+            .unwrap()
+            .activate(active_root.path())
+            .is_err());
+        assert!(outside.path().is_dir());
+    }
+
+    #[test]
+    fn committed_set_recovery_keeps_the_new_mapping() {
+        let source = tempfile::tempdir().unwrap();
+        let component = source.path().join("reader.bat");
+        let active_root = tempfile::tempdir().unwrap();
+        fs::write(&component, b"old mapping").unwrap();
+        prepare(active_root.path(), fixture_definition(&component))
+            .unwrap()
+            .activate(active_root.path())
+            .unwrap()
+            .commit()
+            .unwrap();
+        fs::write(&component, b"new mapping").unwrap();
+        let activation = prepare(active_root.path(), fixture_definition(&component))
+            .unwrap()
+            .activate(active_root.path())
+            .unwrap();
+        std::mem::forget(activation);
+
+        let report = recover_incomplete_mapping_activations(
+            active_root.path(),
+            &HashSet::from(["reader.local".to_owned()]),
+        )
+        .unwrap();
+        assert_eq!(report.finalized_activations, 1);
+        assert_eq!(
+            fs::read(
+                active_root
+                    .path()
+                    .join("reader.local/components/0-reader.bat")
+            )
+            .unwrap(),
+            b"new mapping"
+        );
     }
 
     #[test]

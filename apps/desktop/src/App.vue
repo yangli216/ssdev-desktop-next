@@ -358,7 +358,7 @@ async function inspectProjectBundle() {
     selectedProjectBundle.value = ''
     projectBundlePreview.value = await invoke<ProjectBundlePreview>('inspect_project_bundle', { source })
     selectedProjectBundle.value = source
-  }, '项目包完整性、插件签名、路由冲突和宿主架构预检均已通过。')
+  }, '项目包完整性、插件签名、来源授权覆盖、联合路由和宿主架构预检均已通过。')
 }
 
 async function importSelectedProjectBundle() {

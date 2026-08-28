@@ -12,6 +12,7 @@ mod deployment_check;
 mod desktop;
 mod invocations;
 mod local_mappings;
+mod project_activation;
 mod project_bundle;
 mod shortcuts;
 mod sso;
@@ -46,7 +47,7 @@ use webplus_controller::{
     PluginController, PluginTrust, SupervisorConfig, DEFAULT_MAX_IN_FLIGHT_INVOCATIONS,
 };
 use webplus_plugin_config::{discover_plugins, PluginManifest, ServiceDefinition};
-use webplus_plugin_package::{recover_incomplete_activations, PreparedPlugin, RecoveryReport};
+use webplus_plugin_package::{PluginActivation, PreparedPlugin};
 use webplus_plugin_repository::{
     download_package, fetch_catalog, secure_http_client, CatalogEntry, PluginCatalog,
 };
@@ -72,6 +73,8 @@ struct BridgeState {
     x64_host: PathBuf,
     plugin_root: PathBuf,
     local_mapping_root: PathBuf,
+    project_transaction_root: PathBuf,
+    config_path: PathBuf,
     trust_store: Option<Arc<TrustStore>>,
     install_lock: tokio::sync::Mutex<()>,
     process_policy_entries: usize,
@@ -388,6 +391,63 @@ impl PreparedProjectComponent {
             Self::Local(prepared) => prepared.manifest(),
         }
     }
+
+    fn activation_member(&self) -> project_activation::ProjectActivationMember {
+        let (plugin_id, kind) = match self {
+            Self::Signed(prepared) => (
+                prepared.identity().plugin_id.clone(),
+                project_activation::ProjectActivationKind::SignedPlugin,
+            ),
+            Self::Local(prepared) => (
+                prepared.plugin_id().to_owned(),
+                project_activation::ProjectActivationKind::LocalMapping,
+            ),
+        };
+        project_activation::ProjectActivationMember { plugin_id, kind }
+    }
+}
+
+enum ActivatedProjectComponent {
+    Signed(PluginActivation),
+    Local(local_mappings::ActivatedLocalMapping),
+}
+
+impl ActivatedProjectComponent {
+    fn rollback(self) -> Result<(), String> {
+        match self {
+            Self::Signed(activation) => activation.rollback().map_err(|error| error.to_string()),
+            Self::Local(activation) => activation.rollback(),
+        }
+    }
+
+    fn commit_grouped(self) -> Result<(), String> {
+        match self {
+            Self::Signed(activation) => activation
+                .commit_grouped()
+                .map_err(|error| error.to_string()),
+            Self::Local(activation) => activation.commit_grouped().map(|_| ()),
+        }
+    }
+}
+
+fn rollback_project_components(
+    transaction: project_activation::ProjectActivation,
+    mut components: Vec<ActivatedProjectComponent>,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    while let Some(component) = components.pop() {
+        if let Err(error) = component.rollback() {
+            failures.push(error);
+        }
+    }
+    if failures.is_empty() {
+        transaction.abort()
+    } else {
+        Err(format!(
+            "{} 个项目组件回滚失败；已保留恢复事务，请重新启动客户端",
+            failures.len()
+        ))
+    }
 }
 
 struct PreparedProjectBundle {
@@ -621,36 +681,147 @@ async fn import_project_bundle(
     let prepared = prepare_project_bundle(source, &state, &desktop_state).await?;
     let signed_plugins = prepared.preview.signed_plugins;
     let local_mappings = prepared.preview.local_mappings;
-    let mut preflighted_hosts = 0_usize;
+    let preflighted_hosts = prepared.preview.preflighted_hosts;
+    let previous_config = desktop_state.config.snapshot();
+    let previous_plugins = inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+    )?;
+    if !previous_plugins.failures.is_empty() {
+        return Err("当前插件清单在项目预检后发生变化，请处理隔离项后重试".into());
+    }
+    let members = prepared
+        .components
+        .iter()
+        .map(PreparedProjectComponent::activation_member)
+        .collect();
+    let transaction = project_activation::ProjectActivation::begin(
+        &state.project_transaction_root,
+        &previous_config,
+        &prepared.config,
+        members,
+    )?;
+    let maintenance = state.controller.begin_maintenance().await;
+    let mut activated = Vec::with_capacity(prepared.components.len());
     for component in prepared.components {
-        match component {
-            PreparedProjectComponent::Signed(plugin) => {
-                let trust_store = state
-                    .trust_store
-                    .as_ref()
-                    .cloned()
-                    .ok_or_else(|| "正式项目包要求启用插件签名信任".to_owned())?;
-                let result = activate_prepared_plugin(&state, &trust_store, plugin).await?;
-                preflighted_hosts = preflighted_hosts.saturating_add(result.preflighted_hosts);
-            }
-            PreparedProjectComponent::Local(mapping) => {
-                let result = activate_prepared_local_mapping(&state, mapping).await?;
-                preflighted_hosts = preflighted_hosts.saturating_add(result.preflighted_hosts);
+        let activation = match component {
+            PreparedProjectComponent::Signed(plugin) => plugin
+                .activate()
+                .map(ActivatedProjectComponent::Signed)
+                .map_err(|error| error.to_string()),
+            PreparedProjectComponent::Local(mapping) => mapping
+                .activate(&state.local_mapping_root)
+                .map(ActivatedProjectComponent::Local),
+        };
+        match activation {
+            Ok(activation) => activated.push(activation),
+            Err(error) => {
+                let rollback = rollback_project_components(transaction, activated);
+                return Err(match rollback {
+                    Ok(()) => format!("项目组件启用失败，已恢复导入前状态: {error}"),
+                    Err(rollback) => format!("项目组件启用失败: {error}; {rollback}"),
+                });
             }
         }
     }
+
+    let installed = match inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+    ) {
+        Ok(installed) if installed.failures.is_empty() => installed,
+        Ok(installed) => {
+            let error = format!("新项目产生 {} 个无效插件或映射", installed.failures.len());
+            let rollback = rollback_project_components(transaction, activated);
+            return Err(match rollback {
+                Ok(()) => format!("{error}，已恢复导入前状态"),
+                Err(rollback) => format!("{error}; {rollback}"),
+            });
+        }
+        Err(error) => {
+            let rollback = rollback_project_components(transaction, activated);
+            return Err(match rollback {
+                Ok(()) => format!("新项目清单读取失败，已恢复导入前状态: {error}"),
+                Err(rollback) => format!("新项目清单读取失败: {error}; {rollback}"),
+            });
+        }
+    };
+    if let Err(error) = maintenance.replace_manifests(&installed.manifests).await {
+        let rollback = rollback_project_components(transaction, activated);
+        return Err(match rollback {
+            Ok(()) => format!("新项目路由无效，已恢复导入前状态: {error}"),
+            Err(rollback) => format!("新项目路由无效: {error}; {rollback}"),
+        });
+    }
     if let Err(error) = desktop::replace_desktop_config(&app, &desktop_state, prepared.config) {
+        let route_restore = maintenance
+            .replace_manifests(&previous_plugins.manifests)
+            .await;
+        let rollback = rollback_project_components(transaction, activated);
+        return Err(match (route_restore, rollback) {
+            (Ok(()), Ok(())) => {
+                format!("项目配置切换失败，已恢复导入前状态: {error}")
+            }
+            (route_restore, rollback) => format!(
+                "项目配置切换失败: {error}; 恢复旧路由结果: {}; 组件回滚结果: {}",
+                route_restore
+                    .err()
+                    .map_or_else(|| "成功".to_owned(), |failure| failure.to_string()),
+                rollback
+                    .err()
+                    .map_or_else(|| "成功".to_owned(), |failure| failure)
+            ),
+        });
+    }
+    if let Err(error) = transaction.mark_committed() {
+        let config_restore = desktop::replace_desktop_config(&app, &desktop_state, previous_config);
+        let route_restore = maintenance
+            .replace_manifests(&previous_plugins.manifests)
+            .await;
+        let rollback = rollback_project_components(transaction, activated);
         return Err(format!(
-            "项目组件已安全安装，但项目配置切换失败且保持原配置：{error}"
+            "项目提交点写入失败: {error}; 恢复旧配置结果: {}; 恢复旧路由结果: {}; 组件回滚结果: {}",
+            config_restore
+                .err()
+                .map_or_else(|| "成功".to_owned(), |failure| failure),
+            route_restore
+                .err()
+                .map_or_else(|| "成功".to_owned(), |failure| failure.to_string()),
+            rollback
+                .err()
+                .map_or_else(|| "成功".to_owned(), |failure| failure)
         ));
     }
+
+    let mut deferred_cleanup = 0_usize;
+    for component in activated {
+        if component.commit_grouped().is_err() {
+            deferred_cleanup = deferred_cleanup.saturating_add(1);
+        }
+    }
+    if deferred_cleanup == 0 {
+        if transaction.finish().is_err() {
+            deferred_cleanup = 1;
+        }
+    } else {
+        drop(transaction);
+    }
     let service_count = state.controller.service_count().await;
+    state
+        .plugin_load_failures
+        .store(installed.failures.len(), Ordering::Release);
+    state
+        .plugin_count
+        .store(installed.manifests.len(), Ordering::Release);
     tracing::info!(
         event_code = "project-bundle-imported",
         signed_plugins,
         local_mappings,
         service_count,
         preflighted_hosts,
+        deferred_cleanup,
         "project deployment bundle imported"
     );
     Ok(ProjectBundleImportResult {
@@ -795,6 +966,13 @@ async fn prepare_project_bundle(
             .map(|component| component.manifest().clone()),
     );
     PluginController::validate_manifests(&candidates).map_err(|error| error.to_string())?;
+    let coverage = desktop_state.plugin_route_policy_coverage(&opened.config, &candidates)?;
+    if coverage.uncovered_origin_count > 0 || coverage.uncovered_route_count > 0 {
+        return Err(format!(
+            "项目来源与插件能力授权不完整：{} 个来源无法访问任何能力，{} 条调用路由未被当前来源授权",
+            coverage.uncovered_origin_count, coverage.uncovered_route_count
+        ));
+    }
     let mut preflighted_hosts = 0_usize;
     for component in &components {
         let report = state
@@ -2016,8 +2194,25 @@ pub fn run() {
                 development_path_override("SSDEV_CONFIG_PATH"),
                 cfg!(debug_assertions),
             );
+            let plugin_root = select_runtime_path(
+                local_data_dir.join("plugins"),
+                development_path_override("SSDEV_PLUGIN_DIR"),
+                cfg!(debug_assertions),
+            );
+            std::fs::create_dir_all(&plugin_root)?;
+            let local_mapping_root = local_data_dir.join("local-mappings");
+            std::fs::create_dir_all(&local_mapping_root)?;
+            let project_transaction_root = local_data_dir.join("project-activation");
+            let recovery = project_activation::recover(
+                &project_transaction_root,
+                &config_path,
+                &plugin_root,
+                &local_mapping_root,
+            )
+            .map_err(std::io::Error::other)?;
+            log_project_recovery(recovery);
             let config = ConfigStore::open(
-                config_path,
+                config_path.clone(),
                 legacy_config_candidates(&system_config_dir),
             )?;
             if !config.migration_sources().is_empty() {
@@ -2034,14 +2229,6 @@ pub fn run() {
                     "legacy desktop configuration has unreadable sources"
                 );
             }
-            let plugin_root = select_runtime_path(
-                local_data_dir.join("plugins"),
-                development_path_override("SSDEV_PLUGIN_DIR"),
-                cfg!(debug_assertions),
-            );
-            std::fs::create_dir_all(&plugin_root)?;
-            let local_mapping_root = local_data_dir.join("local-mappings");
-            std::fs::create_dir_all(&local_mapping_root)?;
             let allow_unsigned_plugins = allow_unsigned_plugins();
             let trust_store_path = plugin_trust_store_path(&resource_dir);
             let (trust_store, plugin_trust) = if allow_unsigned_plugins {
@@ -2082,9 +2269,6 @@ pub fn run() {
                 max_in_flight_invocations: DEFAULT_MAX_IN_FLIGHT_INVOCATIONS,
                 plugin_trust,
             })?;
-            let recovery = recover_incomplete_activations(&plugin_root)
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-            log_plugin_recovery(recovery);
             let plugins = inspect_all_plugins(
                 &plugin_root,
                 &local_mapping_root,
@@ -2132,7 +2316,7 @@ pub fn run() {
                 invocation_coordinator_error,
                 plugin_load_failures: AtomicUsize::new(plugins.failures.len()),
                 plugin_count: AtomicUsize::new(plugins.manifests.len()),
-                recovered_plugin_transactions: AtomicUsize::new(recovery_total(recovery)),
+                recovered_plugin_transactions: AtomicUsize::new(recovery.total()),
                 preflighted_plugin_hosts: AtomicUsize::new(0),
                 plugin_preflight_failures: AtomicUsize::new(0),
                 plugin_trust_mode: if allow_unsigned_plugins {
@@ -2144,6 +2328,8 @@ pub fn run() {
                 x64_host,
                 plugin_root,
                 local_mapping_root,
+                project_transaction_root,
+                config_path,
                 trust_store,
                 install_lock: tokio::sync::Mutex::new(()),
                 process_policy_entries,
@@ -2275,34 +2461,36 @@ struct InspectedPlugins {
     failures: Vec<String>,
 }
 
-fn recover_plugin_store(state: &BridgeState) -> Result<RecoveryReport, String> {
-    let report = recover_incomplete_activations(&state.plugin_root)
-        .map_err(|error| format!("插件安装事务恢复失败: {error}"))?;
-    let recovered = recovery_total(report);
+fn recover_plugin_store(
+    state: &BridgeState,
+) -> Result<project_activation::ProjectRecoveryReport, String> {
+    let report = project_activation::recover_runtime(
+        &state.project_transaction_root,
+        &state.config_path,
+        &state.plugin_root,
+        &state.local_mapping_root,
+    )?;
+    let recovered = report.total();
     if recovered > 0 {
         state
             .recovered_plugin_transactions
             .fetch_add(recovered, Ordering::AcqRel);
-        log_plugin_recovery(report);
+        log_project_recovery(report);
     }
     Ok(report)
 }
 
-fn recovery_total(report: RecoveryReport) -> usize {
-    report
-        .rolled_back_activations
-        .saturating_add(report.removed_committed_transactions)
-        .saturating_add(report.removed_staging_directories)
-}
-
-fn log_plugin_recovery(report: RecoveryReport) {
-    if report.recovered_anything() {
+fn log_project_recovery(report: project_activation::ProjectRecoveryReport) {
+    if report.total() > 0 {
         tracing::warn!(
             event_code = "plugin-transactions-recovered",
-            rolled_back_activations = report.rolled_back_activations,
-            removed_committed_transactions = report.removed_committed_transactions,
-            removed_staging_directories = report.removed_staging_directories,
-            "incomplete plugin installation transactions recovered"
+            project_transaction = report.recovered_project_transaction,
+            plugin_rollbacks = report.plugin.rolled_back_activations,
+            plugin_finalizations = report.plugin.finalized_activations,
+            mapping_rollbacks = report.local_mapping.rolled_back_activations,
+            mapping_finalizations = report.local_mapping.finalized_activations,
+            recovered_items = report.total(),
+            "incomplete project or plugin transactions recovered"
         );
     }
 }

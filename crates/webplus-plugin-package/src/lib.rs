@@ -180,6 +180,7 @@ fn sync_directory(_path: &Path) -> Result<(), PackageError> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
     pub rolled_back_activations: usize,
+    pub finalized_activations: usize,
     pub removed_committed_transactions: usize,
     pub removed_staging_directories: usize,
 }
@@ -187,6 +188,7 @@ pub struct RecoveryReport {
 impl RecoveryReport {
     pub fn recovered_anything(self) -> bool {
         self.rolled_back_activations > 0
+            || self.finalized_activations > 0
             || self.removed_committed_transactions > 0
             || self.removed_staging_directories > 0
     }
@@ -207,6 +209,15 @@ struct ActivationJournal {
 /// cleanup. Callers must serialize this function with package preparation and
 /// activation so live staging directories cannot be mistaken for crash debris.
 pub fn recover_incomplete_activations(plugin_root: &Path) -> Result<RecoveryReport, PackageError> {
+    recover_incomplete_activations_with_committed(plugin_root, &HashSet::new())
+}
+
+/// Recovers standalone activations and finalizes the members of a durable
+/// higher-level transaction that was already committed as one set.
+pub fn recover_incomplete_activations_with_committed(
+    plugin_root: &Path,
+    committed_plugin_ids: &HashSet<String>,
+) -> Result<RecoveryReport, PackageError> {
     fs::create_dir_all(plugin_root).map_err(|source| PackageError::Io {
         path: plugin_root.to_path_buf(),
         source,
@@ -261,8 +272,13 @@ pub fn recover_incomplete_activations(plugin_root: &Path) -> Result<RecoveryRepo
     }
 
     for (transaction, journal) in activations {
-        rollback_transaction(&plugin_root, &transaction, &journal)?;
-        report.rolled_back_activations += 1;
+        if committed_plugin_ids.contains(&journal.plugin_id) {
+            commit_transaction(&plugin_root, &transaction)?;
+            report.finalized_activations += 1;
+        } else {
+            rollback_transaction(&plugin_root, &transaction, &journal)?;
+            report.rolled_back_activations += 1;
+        }
     }
     Ok(report)
 }
@@ -416,32 +432,17 @@ pub struct PluginActivation {
 
 impl PluginActivation {
     pub fn commit(mut self) -> Result<(), PackageError> {
-        let transaction_name = self
-            .transaction
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                PackageError::Invalid("activation transaction name is invalid".into())
-            })?;
-        let suffix = transaction_name
-            .strip_prefix(ACTIVATION_PREFIX)
-            .ok_or_else(|| {
-                PackageError::Invalid("activation transaction prefix is invalid".into())
-            })?;
-        let committed = self.plugin_root.join(format!("{COMMITTED_PREFIX}{suffix}"));
-        fs::rename(&self.transaction, &committed).map_err(|source| PackageError::Io {
-            path: self.transaction.clone(),
-            source,
-        })?;
+        commit_transaction(&self.plugin_root, &self.transaction)?;
         self.finalized = true;
-        if let Err(cleanup_failure) = fs::remove_dir_all(&committed) {
-            tracing::warn!(
-                event_code = "plugin-transaction-cleanup-deferred",
-                failure_kind = ?cleanup_failure.kind(),
-                "committed plugin transaction cleanup deferred until next startup"
-            );
-        }
         Ok(())
+    }
+
+    /// Finalizes a member after its enclosing set has durably committed. A
+    /// cleanup error leaves the activation journal for set-level recovery and
+    /// must never make Drop roll the already-committed member back.
+    pub fn commit_grouped(mut self) -> Result<(), PackageError> {
+        self.finalized = true;
+        commit_transaction(&self.plugin_root, &self.transaction)
     }
 
     pub fn rollback(mut self) -> Result<(), PackageError> {
@@ -466,6 +467,29 @@ impl PluginActivation {
             },
         )
     }
+}
+
+fn commit_transaction(plugin_root: &Path, transaction: &Path) -> Result<(), PackageError> {
+    let transaction_name = transaction
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| PackageError::Invalid("activation transaction name is invalid".into()))?;
+    let suffix = transaction_name
+        .strip_prefix(ACTIVATION_PREFIX)
+        .ok_or_else(|| PackageError::Invalid("activation transaction prefix is invalid".into()))?;
+    let committed = plugin_root.join(format!("{COMMITTED_PREFIX}{suffix}"));
+    fs::rename(transaction, &committed).map_err(|source| PackageError::Io {
+        path: transaction.to_path_buf(),
+        source,
+    })?;
+    if let Err(cleanup_failure) = fs::remove_dir_all(&committed) {
+        tracing::warn!(
+            event_code = "plugin-transaction-cleanup-deferred",
+            failure_kind = ?cleanup_failure.kind(),
+            "committed plugin transaction cleanup deferred until next startup"
+        );
+    }
+    Ok(())
 }
 
 fn write_activation_journal(
@@ -910,6 +934,36 @@ mod tests {
         let report = recover_incomplete_activations(&plugin_root).unwrap();
         assert_eq!(report.rolled_back_activations, 1);
         assert!(!plugin_root.join("reader-plugin").exists());
+        assert_no_transaction_debris(&plugin_root);
+    }
+
+    #[test]
+    fn committed_set_recovery_keeps_the_new_plugin_and_discards_its_backup() {
+        let root = tempdir().unwrap();
+        let signing_key = SigningKey::from_bytes(&[16; 32]);
+        let trust = trust_store(root.path(), &signing_key);
+        let source = signed_plugin(root.path(), &signing_key);
+        let package = root.path().join("reader.ssdev-plugin");
+        zip_directory(&source, &package);
+        let plugin_root = root.path().join("plugins");
+        let previous = plugin_root.join("reader-plugin");
+        fs::create_dir_all(&previous).unwrap();
+        fs::write(previous.join("old.txt"), b"previous version").unwrap();
+
+        let activation = PreparedPlugin::prepare(&package, &plugin_root, &trust)
+            .unwrap()
+            .activate()
+            .unwrap();
+        std::mem::forget(activation);
+
+        let report = recover_incomplete_activations_with_committed(
+            &plugin_root,
+            &HashSet::from(["reader-plugin".to_owned()]),
+        )
+        .unwrap();
+        assert_eq!(report.finalized_activations, 1);
+        assert!(plugin_root.join("reader-plugin/reader.dll").is_file());
+        assert!(!plugin_root.join("reader-plugin/old.txt").exists());
         assert_no_transaction_debris(&plugin_root);
     }
 

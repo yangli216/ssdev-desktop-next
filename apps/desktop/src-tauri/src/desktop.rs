@@ -246,13 +246,15 @@ fn config_snapshot(state: &DesktopState) -> ConfigSnapshot {
 }
 
 #[tauri::command]
-pub(crate) fn save_desktop_config(
+pub(crate) async fn save_desktop_config(
     caller: WebviewWindow,
     app: AppHandle,
     state: State<'_, DesktopState>,
+    bridge_state: State<'_, crate::BridgeState>,
     config: DesktopConfig,
 ) -> Result<(), String> {
     require_control(&caller)?;
+    let _install = bridge_state.install_lock.lock().await;
     replace_desktop_config(&app, &state, config)
 }
 
@@ -302,13 +304,15 @@ pub(crate) fn replace_desktop_config(
 }
 
 #[tauri::command]
-pub(crate) fn import_desktop_config(
+pub(crate) async fn import_desktop_config(
     caller: WebviewWindow,
     app: AppHandle,
     state: State<'_, DesktopState>,
+    bridge_state: State<'_, crate::BridgeState>,
     source: PathBuf,
 ) -> Result<ConfigSnapshot, String> {
     require_control(&caller)?;
+    let _install = bridge_state.install_lock.lock().await;
     let config = ssdev_config::load_config_file(&source).map_err(|error| error.to_string())?;
     replace_desktop_config(&app, &state, config)?;
     Ok(config_snapshot(&state))
