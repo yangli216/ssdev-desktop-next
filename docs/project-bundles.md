@@ -53,6 +53,7 @@ cargo run --locked -p ssdev-release-signing -- finalize `
 - 验证覆盖整个项目包的 `project-bundle` 组织签名；
 - 核对组件清单、大小和 SHA-256；
 - 验证每个发布插件的身份、版本、完整文件清单和签名密钥状态；
+- 要求每个发布插件显式声明并匹配目标机器当前 SSDEV Desktop SemVer；
 - 拒绝默认插件降级；
 - 验证本地映射定义和组件路径；
 - 拒绝同一 ID 在签名插件和本地映射之间隐式换型；

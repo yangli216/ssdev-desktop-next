@@ -2,6 +2,7 @@ param(
   [ValidateSet("x86", "x64")]
   [string]$Architecture = "x64",
   [Parameter(Mandatory = $true)][string]$Version,
+  [Parameter(Mandatory = $true)][string]$DesktopVersionRequirement,
   [Parameter(Mandatory = $true)][string]$KeyId,
   [Parameter(Mandatory = $true)][string]$TrustStore,
   [Parameter(Mandatory = $true)][string]$OutputRoot
@@ -47,6 +48,7 @@ try {
     --matrix-template $matrix `
     --plugin-id "windows-system-example-$Architecture" `
     --version $Version `
+    --desktop-version-requirement $DesktopVersionRequirement `
     --display-name "Windows System Capability Example ($Architecture)" `
     --key-id $KeyId `
     --trust-store $trust

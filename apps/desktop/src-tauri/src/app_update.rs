@@ -134,6 +134,8 @@ pub(crate) struct AppUpdateCheck {
     configured: bool,
     current_version: String,
     available: bool,
+    compatible: bool,
+    plugin_blockers: usize,
     version: Option<String>,
     date: Option<String>,
     notes: Option<String>,
@@ -157,6 +159,7 @@ pub(crate) enum AppUpdateEvent {
 pub(crate) async fn check_app_update(
     caller: WebviewWindow,
     app: AppHandle,
+    bridge: State<'_, crate::BridgeState>,
     state: State<'_, AppUpdateState>,
 ) -> Result<AppUpdateCheck, String> {
     crate::desktop::require_control(&caller)?;
@@ -168,6 +171,8 @@ pub(crate) async fn check_app_update(
                 configured: false,
                 current_version,
                 available: false,
+                compatible: true,
+                plugin_blockers: 0,
                 version: None,
                 date: None,
                 notes: None,
@@ -197,16 +202,31 @@ pub(crate) async fn check_app_update(
             configured: true,
             current_version,
             available: false,
+            compatible: true,
+            plugin_blockers: 0,
             version: None,
             date: None,
             notes: None,
         });
     };
     require_https_url(&update.download_url, "应用更新包地址")?;
+    let target_version = semver::Version::parse(&update.version)
+        .map_err(|error| format!("更新版本不是合法 SemVer: {error}"))?;
+    let _install = bridge.install_lock.lock().await;
+    crate::recover_plugin_store(&bridge)?;
+    let plugin_blockers = crate::inspect_plugins(
+        &bridge.plugin_root,
+        bridge.trust_store.as_deref(),
+        &target_version,
+    )?
+    .failures
+    .len();
     let metadata = AppUpdateCheck {
         configured: true,
         current_version: update.current_version.clone(),
         available: true,
+        compatible: plugin_blockers == 0,
+        plugin_blockers,
         version: Some(update.version.clone()),
         date: update.date.map(|date| date.to_string()),
         notes: update.body.as_deref().map(truncate_notes),
@@ -233,16 +253,41 @@ pub(crate) async fn install_app_update(
     on_event: Channel<AppUpdateEvent>,
 ) -> Result<(), String> {
     crate::desktop::require_control(&caller)?;
+    let _install = bridge.install_lock.lock().await;
+    crate::recover_plugin_store(&bridge)?;
     let policy = state
         .policy
         .clone()
         .ok_or_else(|| "尚未配置生产应用更新策略".to_owned())?;
+    let target_version = {
+        let pending = state
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let update = pending
+            .as_ref()
+            .ok_or_else(|| "没有待安装更新，请先检查更新".to_owned())?;
+        semver::Version::parse(&update.version)
+            .map_err(|error| format!("更新版本不是合法 SemVer: {error}"))?
+    };
+    let plugin_blockers = crate::inspect_plugins(
+        &bridge.plugin_root,
+        bridge.trust_store.as_deref(),
+        &target_version,
+    )?
+    .failures
+    .len();
+    if plugin_blockers > 0 {
+        return Err(format!(
+            "有 {plugin_blockers} 个签名插件未声明支持 SSDEV Desktop {target_version} 或未通过完整性检查；请先安装兼容插件版本"
+        ));
+    }
     let update = state
         .pending
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take()
-        .ok_or_else(|| "没有待安装更新，请先检查更新".to_owned())?;
+        .ok_or_else(|| "待安装更新状态发生变化，请重新检查更新".to_owned())?;
     let package = download_and_verify(
         &state.client,
         &update,

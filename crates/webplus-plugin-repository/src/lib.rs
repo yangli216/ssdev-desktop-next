@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::{Client, Url};
-use semver::Version;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::{Builder as TempBuilder, NamedTempFile};
@@ -23,6 +23,8 @@ const CATALOG_DOMAIN: &[u8] = b"SSDEV-PLUGIN-CATALOG\0";
 pub struct CatalogEntry {
     pub plugin_id: String,
     pub version: Version,
+    #[serde(default)]
+    pub desktop_version_requirement: Option<VersionReq>,
     pub url: Url,
     pub sha256: String,
     pub size: u64,
@@ -121,8 +123,45 @@ impl PluginCatalog {
             .max_by(|left, right| left.version.cmp(&right.version))
     }
 
+    pub fn select_compatible(
+        &self,
+        plugin_id: &str,
+        version: Option<&Version>,
+        desktop_version: &Version,
+    ) -> Option<&CatalogEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                entry.plugin_id == plugin_id
+                    && version.is_none_or(|version| &entry.version == version)
+                    && entry
+                        .desktop_version_requirement
+                        .as_ref()
+                        .is_some_and(|requirement| requirement.matches(desktop_version))
+            })
+            .max_by(|left, right| left.version.cmp(&right.version))
+    }
+
     pub fn entries(&self) -> &[CatalogEntry] {
         &self.entries
+    }
+
+    /// Rejects legacy catalog entries that do not bind a signed plugin release
+    /// to an explicit Desktop compatibility range. Runtime parsing remains
+    /// tolerant so an old catalog can be diagnosed, but official issuance must
+    /// fail closed instead of publishing an entry no client can safely select.
+    pub fn ensure_desktop_compatibility_declared(&self) -> Result<(), RepositoryError> {
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| entry.desktop_version_requirement.is_none())
+        {
+            return Err(RepositoryError::Invalid(format!(
+                "catalog entry [{} {}] does not declare desktopVersionRequirement",
+                entry.plugin_id, entry.version
+            )));
+        }
+        Ok(())
     }
 
     pub fn issued_at(&self) -> u64 {
@@ -174,7 +213,7 @@ pub fn encode_catalog_document(
     };
     let mut bytes = serde_json::to_vec_pretty(&document)?;
     bytes.push(b'\n');
-    PluginCatalog::from_unsigned_bytes(&bytes, now)?;
+    PluginCatalog::from_unsigned_bytes(&bytes, now)?.ensure_desktop_compatibility_declared()?;
     Ok(bytes)
 }
 
@@ -322,6 +361,15 @@ fn validate_entry(entry: &CatalogEntry) -> Result<(), RepositoryError> {
             entry.plugin_id
         )));
     }
+    if entry
+        .desktop_version_requirement
+        .as_ref()
+        .is_some_and(|requirement| requirement.to_string().len() > 128)
+    {
+        return Err(RepositoryError::Invalid(
+            "catalog desktop version requirement exceeds 128 characters".into(),
+        ));
+    }
     require_https(&entry.url)?;
     if entry.url.username() != ""
         || entry.url.password().is_some()
@@ -415,12 +463,14 @@ mod tests {
             "entries": [{
                 "pluginId": "reader-plugin",
                 "version": "2.1.0",
+                "desktopVersionRequirement": ">=0.1.0, <0.2.0",
                 "url": "https://plugins.example.test/reader-2.1.0.ssdev-plugin",
                 "sha256": "ab".repeat(32),
                 "size": 1024
             }, {
                 "pluginId": "reader-plugin",
                 "version": "2.2.0",
+                "desktopVersionRequirement": ">=0.2.0, <0.3.0",
                 "url": "https://plugins.example.test/reader-2.2.0.ssdev-plugin",
                 "sha256": "cd".repeat(32),
                 "size": 2048
@@ -447,6 +497,23 @@ mod tests {
             catalog.select("reader-plugin", None).unwrap().version,
             Version::new(2, 2, 0)
         );
+        assert_eq!(
+            catalog
+                .select_compatible("reader-plugin", None, &Version::new(0, 1, 5))
+                .unwrap()
+                .version,
+            Version::new(2, 1, 0)
+        );
+        assert_eq!(
+            catalog
+                .select_compatible("reader-plugin", None, &Version::new(0, 2, 1))
+                .unwrap()
+                .version,
+            Version::new(2, 2, 0)
+        );
+        assert!(catalog
+            .select_compatible("reader-plugin", None, &Version::new(1, 0, 0))
+            .is_none());
     }
 
     #[test]
@@ -462,6 +529,7 @@ mod tests {
         let entry = CatalogEntry {
             plugin_id: "reader".into(),
             version: Version::new(1, 0, 0),
+            desktop_version_requirement: Some(VersionReq::STAR),
             url: Url::parse("http://plugins.example.test/reader.zip").unwrap(),
             sha256: "ab".repeat(32),
             size: 10,
@@ -475,6 +543,7 @@ mod tests {
         let first = CatalogEntry {
             plugin_id: "zebra-plugin".into(),
             version: Version::new(1, 0, 0),
+            desktop_version_requirement: Some(VersionReq::STAR),
             url: Url::parse("https://plugins.example.test/zebra.ssdev-plugin").unwrap(),
             sha256: "ab".repeat(32),
             size: 10,
@@ -482,6 +551,7 @@ mod tests {
         let second = CatalogEntry {
             plugin_id: "alpha-plugin".into(),
             version: Version::new(2, 0, 0),
+            desktop_version_requirement: Some(VersionReq::STAR),
             url: Url::parse("https://plugins.example.test/alpha.ssdev-plugin").unwrap(),
             sha256: "cd".repeat(32),
             size: 20,
@@ -508,5 +578,36 @@ mod tests {
             now,
         )
         .is_err());
+    }
+
+    #[test]
+    fn legacy_catalogs_remain_inspectable_but_cannot_be_issued_or_selected() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1,
+            "issuedAt": 1_700_000_000_u64,
+            "expiresAt": 1_700_003_600_u64,
+            "entries": [{
+                "pluginId": "legacy-reader",
+                "version": "1.0.0",
+                "url": "https://plugins.example.test/legacy-reader.ssdev-plugin",
+                "sha256": "ef".repeat(32),
+                "size": 10
+            }]
+        }))
+        .unwrap();
+
+        let catalog = PluginCatalog::from_unsigned_bytes(&bytes, now).unwrap();
+        assert!(catalog.select("legacy-reader", None).is_some());
+        assert!(catalog
+            .select_compatible("legacy-reader", None, &Version::new(0, 1, 0))
+            .is_none());
+        assert!(catalog.ensure_desktop_compatibility_declared().is_err());
+
+        let legacy_entry = catalog.entries()[0].clone();
+        assert!(
+            encode_catalog_document(1_700_000_000, 1_700_003_600, vec![legacy_entry], now,)
+                .is_err()
+        );
     }
 }

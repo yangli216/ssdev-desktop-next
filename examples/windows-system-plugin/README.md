@@ -44,10 +44,13 @@ target/i686-pc-windows-msvc/debug/ssdev_windows_system_example.dll
 ./examples/windows-system-plugin/prepare-plugin.ps1 `
   -Architecture x64 `
   -Version 1.0.0 `
+  -DesktopVersionRequirement ">=0.1.0, <0.2.0" `
   -KeyId production-plugin-2026 `
   -TrustStore C:\secure-inputs\plugin-trust.json `
   -OutputRoot C:\secure-release\windows-system-example-x64-1.0.0
 ```
+
+`DesktopVersionRequirement` 是该插件已经验证过的 SSDEV Desktop SemVer 范围，并进入签名覆盖的 `plugin.json`。示例当前按 `0.1.x` 客户端验证，因此使用 `>=0.1.0, <0.2.0`；生产插件应根据真实兼容矩阵填写，不要为省事使用 `*`。
 
 输出目录中的 `plugin-signing-request.json` 包含 `payloadBase64` 和 `payloadSha256`。由组织 KMS/HSM 对 Base64 解码后的原始字节执行 Ed25519 签名，把 64 字节签名写成单行 Base64 文件。私钥不能交给示例脚本或桌面客户端。
 
@@ -82,6 +85,6 @@ const result = await bridge.invokePlugin('windows.system', 'getMemoryStatus', {}
 
 ## 5. 加入签名更新仓库
 
-正式包与普通 COM/DLL 插件使用同一更新机制：用 `ssdev-plugin-tool catalog` 从已验签包生成短期 HTTPS 目录，再用具有 `plugin-catalog` 用途的独立密钥签目录。客户端检查更新后显示更高 SemVer，用户确认后重新下载、验签、预检并原子替换；失败恢复旧包和旧路由。
+正式包与普通 COM/DLL 插件使用同一更新机制：用 `ssdev-plugin-tool catalog` 从已验签包生成短期 HTTPS 目录，再用具有 `plugin-catalog` 用途的独立密钥签目录。客户端只选择与自身版本匹配的最高插件 SemVer；仓库存在更高但不兼容的版本时会明确提示而不会安装。用户确认兼容版本后才重新下载、验签、预检并原子替换；失败恢复旧包和旧路由。
 
 本示例是能力和发布流程参考，不是建议把所有 Windows API 放进一个万能插件。生产插件应按业务域拆分服务，固定允许的方法、参数和副作用，并使用真实硬件黄金矩阵验收。

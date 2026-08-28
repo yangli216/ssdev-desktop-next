@@ -80,6 +80,8 @@ pub struct PluginMetadata {
     pub plugin_id: String,
     pub version: semver::Version,
     #[serde(default)]
+    pub desktop_version_requirement: Option<semver::VersionReq>,
+    #[serde(default)]
     pub display_name: String,
 }
 
@@ -117,7 +119,22 @@ impl PluginMetadata {
                 "plugin display name must not exceed 128 characters".into(),
             ));
         }
+        if metadata
+            .desktop_version_requirement
+            .as_ref()
+            .is_some_and(|requirement| requirement.to_string().len() > 128)
+        {
+            return Err(ConfigError::Validation(
+                "desktop version requirement must not exceed 128 characters".into(),
+            ));
+        }
         Ok(Some(metadata))
+    }
+
+    pub fn supports_desktop_version(&self, version: &semver::Version) -> bool {
+        self.desktop_version_requirement
+            .as_ref()
+            .is_some_and(|requirement| requirement.matches(version))
     }
 }
 
@@ -607,15 +624,26 @@ mod tests {
         .unwrap();
         fs::write(
             plugin.join(PLUGIN_METADATA_FILENAME),
-            r#"{"schemaVersion":1,"pluginId":"reader-plugin","version":"2.1.0"}"#,
+            r#"{"schemaVersion":1,"pluginId":"reader-plugin","version":"2.1.0","desktopVersionRequirement":">=0.1.0, <0.2.0"}"#,
         )
         .unwrap();
 
         let manifest = PluginManifest::load("reader-plugin", &plugin).unwrap();
-        assert_eq!(
-            manifest.metadata.unwrap().version,
-            semver::Version::new(2, 1, 0)
-        );
+        let metadata = manifest.metadata.unwrap();
+        assert_eq!(metadata.version, semver::Version::new(2, 1, 0));
+        assert!(metadata.supports_desktop_version(&semver::Version::new(0, 1, 9)));
+        assert!(!metadata.supports_desktop_version(&semver::Version::new(0, 2, 0)));
+
+        fs::write(
+            plugin.join(PLUGIN_METADATA_FILENAME),
+            r#"{"schemaVersion":1,"pluginId":"reader-plugin","version":"2.1.0"}"#,
+        )
+        .unwrap();
+        let legacy = PluginManifest::load("reader-plugin", &plugin).unwrap();
+        assert!(!legacy
+            .metadata
+            .unwrap()
+            .supports_desktop_version(&semver::Version::new(0, 1, 0)));
 
         fs::write(
             plugin.join(PLUGIN_METADATA_FILENAME),

@@ -101,6 +101,7 @@ type ProjectBundlePreview = {
   components: Array<{
     pluginId: string
     version?: string
+    desktopVersionRequirement?: string
     source: 'signed-package' | 'local-mapping'
     serviceCount: number
   }>
@@ -157,6 +158,7 @@ type PluginInventory = {
   plugins: Array<{
     pluginId: string
     version?: string
+    desktopVersionRequirement?: string
     displayName: string
     source: 'signed-package' | 'local-mapping'
     services: Array<{
@@ -189,7 +191,9 @@ type PluginUpdateCheck = {
     pluginId: string
     installedVersion?: string
     availableVersion?: string
+    latestCatalogVersion?: string
     catalogAvailable: boolean
+    compatibilityLimited: boolean
     updateAvailable: boolean
   }>
 }
@@ -198,6 +202,8 @@ type AppUpdateCheck = {
   configured: boolean
   currentVersion: string
   available: boolean
+  compatible: boolean
+  pluginBlockers: number
   version?: string
   date?: string
   notes?: string
@@ -545,6 +551,8 @@ async function checkAppUpdate() {
   if (!result) return
   if (!result.configured) {
     notice.value = '当前构建未配置生产更新端点与公钥。'
+  } else if (result.available && !result.compatible) {
+    notice.value = `发现签名更新 ${result.version}，但有 ${result.pluginBlockers} 个插件未声明兼容或未通过完整性检查。`
   } else if (result.available) {
     notice.value = `发现签名更新 ${result.version}，安装前可以查看发布说明。`
   } else {
@@ -553,8 +561,10 @@ async function checkAppUpdate() {
 }
 
 async function installAppUpdate() {
-  if (!appUpdate.value?.available) {
-    error.value = '请先检查并确认存在可用更新。'
+  if (!appUpdate.value?.available || !appUpdate.value.compatible) {
+    error.value = appUpdate.value?.available
+      ? '当前插件集合与目标 Desktop 版本不兼容，请先安装兼容插件版本。'
+      : '请先检查并确认存在可用更新。'
     return
   }
   const onEvent = new Channel<AppUpdateEvent>()
@@ -705,7 +715,7 @@ async function runDeploymentCheck() {
           <div v-if="projectBundlePreview" class="project-bundle-preview">
             <header><div><strong>预检通过，可以导入</strong><small>由客户端 {{ projectBundlePreview.createdByVersion }} 创建 · schema {{ projectBundlePreview.schemaVersion }} · {{ projectBundlePreview.signatureVerified ? `组织签名 ${projectBundlePreview.signatureKeyId}` : '调试态未签名' }}</small></div><button class="primary" type="button" :disabled="busy" @click="importSelectedProjectBundle">确认导入并切换项目</button></header>
             <div class="bundle-summary"><span><strong>{{ projectBundlePreview.businessOrigins }}</strong>业务来源</span><span><strong>{{ projectBundlePreview.signedPlugins }}</strong>签名插件</span><span><strong>{{ projectBundlePreview.localMappings }}</strong>本地映射</span><span><strong>{{ projectBundlePreview.serviceCount }}</strong>原生服务</span><span><strong>{{ projectBundlePreview.preflightedHosts }}</strong>宿主预检</span></div>
-            <ul><li v-for="component in projectBundlePreview.components" :key="component.pluginId"><span><strong>{{ component.pluginId }}</strong><small>{{ component.source === 'signed-package' ? `签名插件 ${component.version ?? ''}` : '本地动态映射' }}</small></span><em>{{ component.serviceCount }} 个服务</em></li></ul>
+            <ul><li v-for="component in projectBundlePreview.components" :key="component.pluginId"><span><strong>{{ component.pluginId }}</strong><small>{{ component.source === 'signed-package' ? `签名插件 ${component.version ?? ''} · Desktop ${component.desktopVersionRequirement ?? '未声明'}` : '本地动态映射' }}</small></span><em>{{ component.serviceCount }} 个服务</em></li></ul>
           </div>
         </section>
         <section class="operations" aria-label="桌面配置">
@@ -758,10 +768,10 @@ async function runDeploymentCheck() {
           <div class="plugin-list">
             <form class="catalog-install" @submit.prevent="checkPluginUpdates(catalogPluginId)"><input v-model.trim="catalogPluginId" type="text" placeholder="输入签名仓库中的插件 ID" /><button type="submit" :disabled="busy">查询版本</button><button type="button" :disabled="busy" @click="checkPluginUpdates()">检查全部更新</button></form>
             <div v-if="pluginUpdates" class="plugin-update-results" aria-live="polite">
-              <div v-for="update in pluginUpdates.updates" :key="update.pluginId"><span><strong>{{ update.pluginId }}</strong><small>已安装 {{ update.installedVersion ?? '无' }} · 仓库 {{ update.availableVersion ?? '无匹配版本' }}</small></span><button v-if="update.updateAvailable && update.availableVersion" type="button" :disabled="busy" @click="installFromCatalog(update.pluginId, update.availableVersion)">{{ update.installedVersion ? `安装更新 ${update.availableVersion}` : `安装 ${update.availableVersion}` }}</button><em v-else>{{ update.catalogAvailable ? '已是最新版本' : '仓库未收录' }}</em></div>
+              <div v-for="update in pluginUpdates.updates" :key="update.pluginId"><span><strong>{{ update.pluginId }}</strong><small>已安装 {{ update.installedVersion ?? '无' }} · 当前客户端可用 {{ update.availableVersion ?? '无' }}<template v-if="update.compatibilityLimited"> · 仓库最新 {{ update.latestCatalogVersion }} 需要其他 Desktop 版本</template></small></span><button v-if="update.updateAvailable && update.availableVersion" type="button" :disabled="busy" @click="installFromCatalog(update.pluginId, update.availableVersion)">{{ update.installedVersion ? `安装更新 ${update.availableVersion}` : `安装 ${update.availableVersion}` }}</button><em v-else>{{ update.catalogAvailable ? (update.compatibilityLimited ? '新版本与当前客户端不兼容' : '已是最新版本') : '仓库未收录' }}</em></div>
             </div>
             <article v-for="plugin in inventory?.plugins ?? []" :key="plugin.pluginId">
-              <header><span><strong>{{ plugin.displayName }}</strong><small>{{ plugin.pluginId }} · {{ plugin.source === 'local-mapping' ? '本机动态映射' : (plugin.version ?? '旧版未知版本') }}</small></span><div v-if="plugin.source === 'signed-package'" class="plugin-actions"><button type="button" :disabled="busy" @click="checkPluginUpdates(plugin.pluginId)">检查更新</button><button class="danger-link" type="button" :disabled="busy" @click="uninstallSignedPlugin(plugin.pluginId, plugin.displayName)">卸载</button></div></header>
+              <header><span><strong>{{ plugin.displayName }}</strong><small>{{ plugin.pluginId }} · {{ plugin.source === 'local-mapping' ? '本机动态映射' : `${plugin.version ?? '未知版本'} · Desktop ${plugin.desktopVersionRequirement ?? '未声明'}` }}</small></span><div v-if="plugin.source === 'signed-package'" class="plugin-actions"><button type="button" :disabled="busy" @click="checkPluginUpdates(plugin.pluginId)">检查更新</button><button class="danger-link" type="button" :disabled="busy" @click="uninstallSignedPlugin(plugin.pluginId, plugin.displayName)">卸载</button></div></header>
               <details v-for="service in plugin.services" :key="service.serviceId" class="service-mapping"><summary><code>{{ service.serviceId }}</code><span>{{ service.architecture }} / {{ service.mainType }} / {{ service.methodCount }} 个方法</span></summary><dl><div><dt>原生目标</dt><dd><code>{{ service.mainClass }}</code></dd></div><div><dt>调用约定</dt><dd>{{ service.callingConvention || '默认' }} · {{ service.charset || '默认字符集' }}</dd></div><div><dt>服务策略</dt><dd>{{ service.timeoutMs || '默认' }} ms · {{ service.cacheable ? '缓存实例' : '按需实例' }} · {{ service.dependencyCount }} 个依赖</dd></div></dl><div v-for="method in service.methods" :key="`${service.serviceId}:${method.requestName}`" class="method-mapping"><code>{{ method.requestName }}</code><span aria-hidden="true">→</span><code>{{ method.nativeName }}</code><small>{{ method.returnType || '默认返回类型' }} · {{ method.parameterCount }} 参数 · {{ method.timeoutMs || '默认' }} ms</small></div></details>
             </article>
             <p v-if="inventory && inventory.plugins.length === 0" class="empty">尚未安装通过验签的插件。</p>
@@ -798,7 +808,7 @@ async function runDeploymentCheck() {
           <article><span>隐私诊断日志</span><strong>{{ status?.diagnosticsAvailable ? '可用' : '不可用' }}</strong><small :title="status?.diagnosticsError">{{ status?.diagnosticsError ?? `${status?.diagnostics?.logFiles ?? '—'} 个文件 · ${((status?.diagnostics?.logBytes ?? 0) / 1024).toFixed(1)} KiB` }}</small></article>
           <article><span>协议与兼容网关</span><strong>v{{ status?.protocolVersion ?? '—' }}</strong><small>宿主 v{{ status?.pluginHostProtocolVersion ?? '—' }} · HTTP 网关{{ status?.httpGatewayEnabled ? '已启用' : '关闭' }}</small></article>
         </section>
-        <section class="maintenance-panel"><div><p class="eyebrow">CLIENT MAINTENANCE</p><h2>客户端维护</h2><p>{{ status?.appUpdateError ?? (status?.appUpdateConfigured ? '应用更新包必须通过签名验证。' : '当前构建未配置生产更新端点。') }}</p></div><div class="maintenance-actions"><button type="button" :disabled="busy || !status?.appUpdateConfigured" @click="checkAppUpdate">检查应用更新</button><button class="primary" type="button" :disabled="busy || !appUpdate?.available" @click="installAppUpdate">安装签名更新</button></div><details v-if="appUpdate?.available" class="update-details" open><summary>版本 {{ appUpdate.version }}{{ appUpdate.date ? ` · ${appUpdate.date}` : '' }}</summary><p>{{ appUpdate.notes || '此版本未提供发布说明。' }}</p><small v-if="updateProgress">{{ updateProgress }}</small></details></section>
+        <section class="maintenance-panel"><div><p class="eyebrow">CLIENT MAINTENANCE</p><h2>客户端维护</h2><p>{{ status?.appUpdateError ?? (status?.appUpdateConfigured ? '应用更新包必须通过签名验证，并与当前插件兼容。' : '当前构建未配置生产更新端点。') }}</p></div><div class="maintenance-actions"><button type="button" :disabled="busy || !status?.appUpdateConfigured" @click="checkAppUpdate">检查应用更新</button><button class="primary" type="button" :disabled="busy || !appUpdate?.available || !appUpdate.compatible" @click="installAppUpdate">安装签名更新</button></div><details v-if="appUpdate?.available" class="update-details" open><summary>版本 {{ appUpdate.version }}{{ appUpdate.date ? ` · ${appUpdate.date}` : '' }}</summary><p v-if="!appUpdate.compatible">{{ appUpdate.pluginBlockers }} 个插件阻止升级；请先从签名仓库安装兼容版本。</p><p>{{ appUpdate.notes || '此版本未提供发布说明。' }}</p><small v-if="updateProgress">{{ updateProgress }}</small></details></section>
         <section class="boundary"><div><p class="eyebrow">TRUST BOUNDARY</p><h2>第三方 DLL 永不进入主进程</h2></div><ol><li><b>业务 WebView</b><span>只调用受限的业务命令</span></li><li><b>Rust Controller</b><span>执行路由、策略、超时和监督</span></li><li><b>Plugin Host</b><span>加载 DLL、COM、OCX、EXE 或 BAT</span></li></ol></section>
       </section>
     </main>

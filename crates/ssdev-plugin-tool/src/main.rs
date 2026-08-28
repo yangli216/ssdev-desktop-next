@@ -35,6 +35,7 @@ fn run(arguments: impl IntoIterator<Item = String>) -> Result<String, String> {
                     "matrix-template",
                     "plugin-id",
                     "version",
+                    "desktop-version-requirement",
                     "display-name",
                     "key-id",
                     "trust-store",
@@ -53,6 +54,7 @@ fn run(arguments: impl IntoIterator<Item = String>) -> Result<String, String> {
                     matrix_template: required_path(&options, "matrix-template")?,
                     plugin_id: required(&options, "plugin-id")?,
                     version: required(&options, "version")?,
+                    desktop_version_requirement: required(&options, "desktop-version-requirement")?,
                     display_name,
                     key_id: required(&options, "key-id")?,
                     trust_store: required_path(&options, "trust-store")?,
@@ -195,7 +197,7 @@ fn required_path<'a>(options: &'a HashMap<String, String>, name: &str) -> Result
 }
 
 fn usage() -> &'static str {
-    "用法:\n  ssdev-plugin-tool prepare --source DIR --staging DIR --request FILE --matrix-template FILE --plugin-id ID --version SEMVER [--display-name NAME] --key-id ID --trust-store FILE [--matrix-seed FILE]\n  ssdev-plugin-tool finalize --staging DIR --request FILE --signature FILE --trust-store FILE --package FILE.ssdev-plugin\n  ssdev-plugin-tool verify --package FILE.ssdev-plugin --trust-store FILE\n  ssdev-plugin-tool release-check --package FILE.ssdev-plugin --trust-store FILE --matrix FILE\n  ssdev-plugin-tool release-set-check --spec FILE --trust-store FILE --matrix FILE\n  ssdev-plugin-tool release-set-materialize --spec FILE --trust-store FILE --matrix FILE --plugin-root NEW_DIR\n  ssdev-plugin-tool catalog --spec FILE --trust-store FILE --catalog FILE\n  ssdev-plugin-tool matrix-check (--plugin-root DIR | --plugin-dir DIR) --matrix FILE"
+    "用法:\n  ssdev-plugin-tool prepare --source DIR --staging DIR --request FILE --matrix-template FILE --plugin-id ID --version SEMVER --desktop-version-requirement SEMVER_REQ [--display-name NAME] --key-id ID --trust-store FILE [--matrix-seed FILE]\n  ssdev-plugin-tool finalize --staging DIR --request FILE --signature FILE --trust-store FILE --package FILE.ssdev-plugin\n  ssdev-plugin-tool verify --package FILE.ssdev-plugin --trust-store FILE\n  ssdev-plugin-tool release-check --package FILE.ssdev-plugin --trust-store FILE --matrix FILE\n  ssdev-plugin-tool release-set-check --spec FILE --trust-store FILE --matrix FILE\n  ssdev-plugin-tool release-set-materialize --spec FILE --trust-store FILE --matrix FILE --plugin-root NEW_DIR\n  ssdev-plugin-tool catalog --spec FILE --trust-store FILE --catalog FILE\n  ssdev-plugin-tool matrix-check (--plugin-root DIR | --plugin-dir DIR) --matrix FILE"
 }
 
 #[cfg(test)]

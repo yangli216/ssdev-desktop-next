@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use semver::Version;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -47,6 +47,7 @@ pub struct PrepareOptions<'a> {
     pub matrix_template: &'a Path,
     pub plugin_id: &'a str,
     pub version: &'a str,
+    pub desktop_version_requirement: &'a str,
     pub display_name: &'a str,
     pub key_id: &'a str,
     pub trust_store: &'a Path,
@@ -84,6 +85,7 @@ pub struct PrepareReport {
     pub schema_version: u8,
     pub plugin_id: String,
     pub version: String,
+    pub desktop_version_requirement: String,
     pub key_id: String,
     pub service_count: usize,
     pub method_count: usize,
@@ -102,6 +104,7 @@ pub struct FinalizeReport {
     pub schema_version: u8,
     pub plugin_id: String,
     pub version: String,
+    pub desktop_version_requirement: String,
     pub key_id: String,
     pub signed_file_count: usize,
     pub payload_sha256: String,
@@ -115,6 +118,7 @@ pub struct VerifyReport {
     pub schema_version: u8,
     pub plugin_id: String,
     pub version: String,
+    pub desktop_version_requirement: Option<String>,
     pub key_id: String,
     pub service_count: usize,
     pub package_sha256: String,
@@ -126,6 +130,7 @@ pub struct ReleaseCheckReport {
     pub schema_version: u8,
     pub plugin_id: String,
     pub version: String,
+    pub desktop_version_requirement: String,
     pub key_id: String,
     pub package_sha256: String,
     pub trust_store_sha256: String,
@@ -143,6 +148,7 @@ pub struct ReleaseCheckReport {
 pub struct ReleasePackageReport {
     pub plugin_id: String,
     pub version: String,
+    pub desktop_version_requirement: String,
     pub key_id: String,
     pub package_sha256: String,
 }
@@ -208,6 +214,7 @@ struct SigningRequest {
     schema_version: u8,
     plugin_id: String,
     version: String,
+    desktop_version_requirement: String,
     key_id: String,
     algorithm: String,
     files: BTreeMap<String, String>,
@@ -335,6 +342,17 @@ pub fn prepare(options: &PrepareOptions<'_>) -> Result<PrepareReport, ToolError>
 
     let version = Version::parse(options.version)
         .map_err(|error| ToolError::Invalid(format!("plugin version is not SemVer: {error}")))?;
+    if options.desktop_version_requirement.len() > 128 {
+        return Err(ToolError::Invalid(
+            "desktop version requirement must not exceed 128 characters".into(),
+        ));
+    }
+    let desktop_version_requirement = VersionReq::parse(options.desktop_version_requirement)
+        .map_err(|error| {
+            ToolError::Invalid(format!(
+                "desktop version requirement is not a SemVer requirement: {error}"
+            ))
+        })?;
     fs::create_dir(&staging).map_err(|source| ToolError::Io {
         path: staging.clone(),
         source,
@@ -345,6 +363,7 @@ pub fn prepare(options: &PrepareOptions<'_>) -> Result<PrepareReport, ToolError>
             schema_version: 1,
             plugin_id: options.plugin_id.to_owned(),
             version: version.clone(),
+            desktop_version_requirement: Some(desktop_version_requirement.clone()),
             display_name: options.display_name.to_owned(),
         };
         write_new_json(staging.join(PLUGIN_METADATA_FILENAME), &metadata)?;
@@ -357,6 +376,7 @@ pub fn prepare(options: &PrepareOptions<'_>) -> Result<PrepareReport, ToolError>
             schema_version: 1,
             plugin_id: material.plugin_id.clone(),
             version: version.to_string(),
+            desktop_version_requirement: desktop_version_requirement.to_string(),
             key_id: material.key_id.clone(),
             algorithm: "ed25519".into(),
             files: material.files.clone(),
@@ -394,6 +414,7 @@ pub fn prepare(options: &PrepareOptions<'_>) -> Result<PrepareReport, ToolError>
         schema_version: 1,
         plugin_id: options.plugin_id.to_owned(),
         version: version.to_string(),
+        desktop_version_requirement: desktop_version_requirement.to_string(),
         key_id: options.key_id.to_owned(),
         service_count: manifest.services.len(),
         method_count: manifest
@@ -433,9 +454,17 @@ pub fn finalize(options: &FinalizeOptions<'_>) -> Result<FinalizeReport, ToolErr
         .metadata
         .as_ref()
         .ok_or_else(|| ToolError::Invalid("staging directory must contain plugin.json".into()))?;
-    if request.version != staged_metadata.version.to_string() {
+    if request.version != staged_metadata.version.to_string()
+        || staged_metadata
+            .desktop_version_requirement
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref()
+            != Some(request.desktop_version_requirement.as_str())
+    {
         return Err(ToolError::Invalid(
-            "signing request version does not match staged plugin metadata".into(),
+            "signing request version or desktop compatibility does not match staged plugin metadata"
+                .into(),
         ));
     }
     let material = prepare_signing_material(&staging, &request.plugin_id, &request.key_id)?;
@@ -497,6 +526,7 @@ pub fn finalize(options: &FinalizeOptions<'_>) -> Result<FinalizeReport, ToolErr
         schema_version: 1,
         plugin_id: verified.identity().plugin_id.clone(),
         version: metadata.version.to_string(),
+        desktop_version_requirement: request.desktop_version_requirement.clone(),
         key_id: verified.identity().key_id.clone(),
         signed_file_count: material.files.len(),
         payload_sha256: request.payload_sha256,
@@ -517,6 +547,11 @@ pub fn verify(package: &Path, trust_store: &Path) -> Result<VerifyReport, ToolEr
         schema_version: 1,
         plugin_id: prepared.identity().plugin_id.clone(),
         version: prepared.metadata().version.to_string(),
+        desktop_version_requirement: prepared
+            .metadata()
+            .desktop_version_requirement
+            .as_ref()
+            .map(ToString::to_string),
         key_id: prepared.identity().key_id.clone(),
         service_count: prepared.manifest().services.len(),
         package_sha256,
@@ -538,6 +573,7 @@ pub fn check_release_candidate(
         schema_version: 1,
         plugin_id: package.plugin_id,
         version: package.version,
+        desktop_version_requirement: package.desktop_version_requirement,
         key_id: package.key_id,
         package_sha256: package.package_sha256,
         trust_store_sha256: checked.trust_store_sha256,
@@ -840,13 +876,27 @@ fn check_release_packages(
     let mut package_reports = prepared
         .iter()
         .zip(&package_inputs)
-        .map(|(candidate, (_, package_sha256))| ReleasePackageReport {
-            plugin_id: candidate.identity().plugin_id.clone(),
-            version: candidate.metadata().version.to_string(),
-            key_id: candidate.identity().key_id.clone(),
-            package_sha256: package_sha256.clone(),
+        .map(|(candidate, (_, package_sha256))| {
+            let desktop_version_requirement = candidate
+                .metadata()
+                .desktop_version_requirement
+                .as_ref()
+                .ok_or_else(|| {
+                    ToolError::Invalid(format!(
+                        "release plugin [{}] does not declare desktop compatibility",
+                        candidate.identity().plugin_id
+                    ))
+                })?
+                .to_string();
+            Ok(ReleasePackageReport {
+                plugin_id: candidate.identity().plugin_id.clone(),
+                version: candidate.metadata().version.to_string(),
+                desktop_version_requirement,
+                key_id: candidate.identity().key_id.clone(),
+                package_sha256: package_sha256.clone(),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, ToolError>>()?;
     package_reports.sort_by(|left, right| {
         left.plugin_id
             .to_ascii_lowercase()
@@ -924,7 +974,18 @@ pub fn create_catalog(options: &CatalogOptions<'_>) -> Result<CatalogReport, Too
         let prepared =
             PreparedPlugin::prepare(&package_path, verification_root.path(), &trust_store)?;
         let identity = prepared.identity().clone();
-        let version = prepared.metadata().version.clone();
+        let metadata = prepared.metadata();
+        let version = metadata.version.clone();
+        let desktop_version_requirement = metadata
+            .desktop_version_requirement
+            .as_ref()
+            .ok_or_else(|| {
+                ToolError::Invalid(format!(
+                    "catalog plugin [{}] does not declare desktop compatibility",
+                    identity.plugin_id
+                ))
+            })?
+            .clone();
         drop(prepared);
         let metadata_after =
             fs::symlink_metadata(&package_path).map_err(|source| ToolError::Io {
@@ -943,6 +1004,7 @@ pub fn create_catalog(options: &CatalogOptions<'_>) -> Result<CatalogReport, Too
         entries.push(CatalogEntry {
             plugin_id: identity.plugin_id,
             version,
+            desktop_version_requirement: Some(desktop_version_requirement),
             url: package_spec.url,
             sha256: digest_before,
             size: size_before,
@@ -1927,6 +1989,7 @@ mod tests {
             matrix_template: &matrix,
             plugin_id,
             version,
+            desktop_version_requirement: ">=0.1.0, <0.2.0",
             display_name: plugin_id,
             key_id: "test-key",
             trust_store,
@@ -2333,6 +2396,7 @@ mod tests {
             matrix_template: &matrix,
             plugin_id: "reader-plugin",
             version: "1.2.3",
+            desktop_version_requirement: ">=0.1.0, <0.2.0",
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust_path,
@@ -2340,11 +2404,17 @@ mod tests {
         })
         .unwrap();
         assert!(report.legacy_license_excluded);
+        assert_eq!(report.desktop_version_requirement, ">=0.1.0, <0.2.0");
         assert!(!report.matrix_seeded);
         assert_eq!(report.matrix_case_count, 1);
         assert_eq!(report.matrix_placeholder_case_count, 1);
         assert_eq!(report.matrix_review_required_case_count, 1);
         assert!(!staging.join("license.dat").exists());
+        let generated_metadata: PluginMetadata =
+            serde_json::from_slice(&fs::read(staging.join(PLUGIN_METADATA_FILENAME)).unwrap())
+                .unwrap();
+        assert!(generated_metadata.supports_desktop_version(&Version::new(0, 1, 7)));
+        assert!(!generated_metadata.supports_desktop_version(&Version::new(0, 2, 0)));
         let generated_matrix: Value = serde_json::from_slice(&fs::read(&matrix).unwrap()).unwrap();
         assert!(generated_matrix["draft"].as_bool().unwrap());
         assert_eq!(
@@ -2462,7 +2532,42 @@ mod tests {
             catalog.entries()[0].version,
             Version::parse("1.2.3").unwrap()
         );
+        assert_eq!(
+            catalog.entries()[0]
+                .desktop_version_requirement
+                .as_ref()
+                .unwrap()
+                .to_string(),
+            ">=0.1.0, <0.2.0"
+        );
         assert_eq!(catalog.entries()[0].sha256, finalized.package_sha256);
+    }
+
+    #[test]
+    fn prepare_rejects_an_invalid_desktop_version_range_before_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let source = source(root.path());
+        let trust = trust_store(root.path(), &SigningKey::from_bytes(&[58; 32]), None);
+        let staging = root.path().join("invalid-compat-stage");
+        let error = prepare(&PrepareOptions {
+            source: &source,
+            staging: &staging,
+            request: &root.path().join("invalid-compat-request.json"),
+            matrix_template: &root.path().join("invalid-compat-matrix.json"),
+            plugin_id: "reader-plugin",
+            version: "1.0.0",
+            desktop_version_requirement: "not a semver range",
+            display_name: "Reader",
+            key_id: "test-key",
+            trust_store: &trust,
+            matrix_seed: None,
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("desktop version requirement is not a SemVer requirement"));
+        assert!(!staging.exists());
     }
 
     #[test]
@@ -2502,6 +2607,7 @@ mod tests {
             matrix_template: &matrix,
             plugin_id: "reader-plugin",
             version: "1.0.0",
+            desktop_version_requirement: ">=0.1.0, <0.2.0",
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust,
@@ -2538,6 +2644,7 @@ mod tests {
             matrix_template: &root.path().join("matrix.json"),
             plugin_id: "reader-plugin",
             version: "1.0.0",
+            desktop_version_requirement: ">=0.1.0, <0.2.0",
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust,
@@ -2581,6 +2688,7 @@ mod tests {
             matrix_template: &root.path().join("matrix.json"),
             plugin_id: "reader-plugin",
             version: "1.0.0",
+            desktop_version_requirement: ">=0.1.0, <0.2.0",
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust,
@@ -2624,6 +2732,7 @@ mod tests {
             matrix_template: &root.path().join("matrix.json"),
             plugin_id: "reader-plugin",
             version: "1.0.0",
+            desktop_version_requirement: ">=0.1.0, <0.2.0",
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust,
@@ -2654,6 +2763,7 @@ mod tests {
             matrix_template: &root.path().join("matrix.json"),
             plugin_id: "reader-plugin",
             version: "1.0.0",
+            desktop_version_requirement: ">=0.1.0, <0.2.0",
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust,
@@ -2683,6 +2793,7 @@ mod tests {
             matrix_template: &root.path().join("matrix.json"),
             plugin_id: "reader-plugin",
             version: "1.0.0",
+            desktop_version_requirement: ">=0.1.0, <0.2.0",
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust,
@@ -2709,6 +2820,7 @@ mod tests {
             matrix_template: &root.path().join("matrix.json"),
             plugin_id: "reader-plugin",
             version: "1.0.0",
+            desktop_version_requirement: ">=0.1.0, <0.2.0",
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust,
@@ -2745,6 +2857,7 @@ mod tests {
             matrix_template: &root.path().join("matrix.json"),
             plugin_id: "reader-plugin",
             version: "1.0.0",
+            desktop_version_requirement: ">=0.1.0, <0.2.0",
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust_path,
@@ -2795,6 +2908,7 @@ mod tests {
             matrix_template: &root.path().join("matrix.json"),
             plugin_id: "reader-plugin",
             version: "1.0.0",
+            desktop_version_requirement: ">=0.1.0, <0.2.0",
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust,

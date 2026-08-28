@@ -413,6 +413,7 @@ fn prepare_material(
         }
         ArtifactKind::PluginCatalog => {
             let catalog = PluginCatalog::from_unsigned_bytes(document, now)?;
+            catalog.ensure_desktop_compatibility_declared()?;
             (
                 catalog_payload(document),
                 ArtifactSummary::PluginCatalog {
@@ -694,6 +695,7 @@ mod tests {
                     "entries": [{
                         "pluginId": "reader-plugin",
                         "version": "1.2.3",
+                        "desktopVersionRequirement": ">=0.1.0, <0.2.0",
                         "url": "https://plugins.example.test/reader.ssdev-plugin",
                         "sha256": "22".repeat(32),
                         "size": 1234
@@ -956,6 +958,43 @@ mod tests {
 
         assert!(prepare(&PrepareOptions {
             kind: ArtifactKind::CutoverDecision,
+            document: &document,
+            key_id: "release-key",
+            trust_store: &trust,
+            request: &request,
+            now: unix_time(NOW).unwrap(),
+        })
+        .is_err());
+        assert!(!request.exists());
+    }
+
+    #[test]
+    fn plugin_catalog_signing_rejects_missing_desktop_compatibility() {
+        let root = tempfile::tempdir().unwrap();
+        let signing_key = SigningKey::from_bytes(&[61_u8; 32]);
+        let trust = trust_store(root.path(), &signing_key);
+        let document = root.path().join("legacy-catalog.json");
+        fs::write(
+            &document,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 1,
+                "issuedAt": NOW - 60,
+                "expiresAt": NOW + 3600,
+                "entries": [{
+                    "pluginId": "legacy-reader",
+                    "version": "1.0.0",
+                    "url": "https://plugins.example.test/legacy-reader.ssdev-plugin",
+                    "sha256": "22".repeat(32),
+                    "size": 1234
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let request = root.path().join("legacy-catalog.request.json");
+
+        assert!(prepare(&PrepareOptions {
+            kind: ArtifactKind::PluginCatalog,
             document: &document,
             key_id: "release-key",
             trust_store: &trust,

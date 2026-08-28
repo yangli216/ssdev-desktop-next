@@ -516,6 +516,7 @@ pub(crate) fn prepare(
         schema_version: 1,
         plugin_id: definition.plugin_id.clone(),
         version: Version::parse("0.0.0-local").map_err(|error| error.to_string())?,
+        desktop_version_requirement: Some(semver::VersionReq::STAR),
         display_name: definition.display_name.clone(),
     };
     write_json(staging.path().join(API_FILENAME), &definition.services)?;
@@ -2203,6 +2204,7 @@ mod tests {
             matrix_template: &output.path().join("matrix.json"),
             plugin_id: "reader.local",
             version: "1.0.0",
+            desktop_version_requirement: ">=0.1.0, <0.2.0",
             display_name: "Reader release",
             key_id: "release-key",
             trust_store: &trust_store,

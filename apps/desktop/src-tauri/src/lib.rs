@@ -61,6 +61,7 @@ use invocations::{
 
 struct BridgeState {
     controller: Arc<PluginController>,
+    desktop_version: semver::Version,
     invocation_coordinator: Option<Arc<InvocationCoordinator>>,
     invocation_coordinator_error: Option<&'static str>,
     plugin_load_failures: AtomicUsize,
@@ -256,6 +257,7 @@ async fn run_deployment_check(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
+        &state.desktop_version,
     );
     let (manifests, plugin_load_failures, plugin_inventory_error) = match inspected {
         Ok(inspected) => (inspected.manifests, inspected.failures.len(), None),
@@ -368,6 +370,7 @@ struct ProjectBundlePreview {
 struct ProjectBundleComponentPreview {
     plugin_id: String,
     version: Option<String>,
+    desktop_version_requirement: Option<String>,
     source: &'static str,
     service_count: usize,
 }
@@ -573,6 +576,7 @@ async fn export_project_bundle(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
+        &state.desktop_version,
     )?;
     if !inspected.failures.is_empty() {
         return Err(format!(
@@ -689,6 +693,7 @@ async fn import_project_bundle(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
+        &state.desktop_version,
     )?;
     if !previous_plugins.failures.is_empty() {
         return Err("当前插件清单在项目预检后发生变化，请处理隔离项后重试".into());
@@ -732,6 +737,7 @@ async fn import_project_bundle(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
+        &state.desktop_version,
     ) {
         Ok(installed) if installed.failures.is_empty() => installed,
         Ok(installed) => {
@@ -869,6 +875,7 @@ async fn prepare_project_bundle(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
+        &state.desktop_version,
     )?;
     if !current.failures.is_empty() {
         return Err(format!(
@@ -902,6 +909,7 @@ async fn prepare_project_bundle(
                 .await
                 .map_err(|_| "签名插件准备任务异常终止".to_owned())??;
                 let metadata = prepared.metadata();
+                ensure_signed_plugin_compatible(prepared.manifest(), &state.desktop_version)?;
                 let actual_version = metadata.version.to_string();
                 if prepared.identity().plugin_id != declared_id
                     || declared_version.as_deref() != Some(actual_version.as_str())
@@ -921,6 +929,10 @@ async fn prepare_project_bundle(
                 previews.push(ProjectBundleComponentPreview {
                     plugin_id: declared_id,
                     version: Some(actual_version),
+                    desktop_version_requirement: metadata
+                        .desktop_version_requirement
+                        .as_ref()
+                        .map(ToString::to_string),
                     source: "signed-package",
                     service_count: prepared.manifest().services.len(),
                 });
@@ -950,6 +962,7 @@ async fn prepare_project_bundle(
                 previews.push(ProjectBundleComponentPreview {
                     plugin_id: declared_id,
                     version: None,
+                    desktop_version_requirement: None,
                     source: "local-mapping",
                     service_count: prepared.manifest().services.len(),
                 });
@@ -1073,6 +1086,7 @@ struct PluginInventoryResult {
 struct PluginInventoryItem {
     plugin_id: String,
     version: Option<String>,
+    desktop_version_requirement: Option<String>,
     display_name: String,
     source: &'static str,
     services: Vec<ServiceInventoryItem>,
@@ -1155,7 +1169,9 @@ struct PluginUpdateItem {
     plugin_id: String,
     installed_version: Option<String>,
     available_version: Option<String>,
+    latest_catalog_version: Option<String>,
     catalog_available: bool,
+    compatibility_limited: bool,
     update_available: bool,
 }
 
@@ -1222,6 +1238,18 @@ async fn install_plugin_from_catalog(
         .select(&plugin_id, requested_version.as_ref())
         .cloned()
         .ok_or_else(|| format!("签名仓库中没有插件 [{plugin_id}] 的匹配版本"))?;
+    let desktop_requirement = entry.desktop_version_requirement.as_ref().ok_or_else(|| {
+        format!(
+            "插件 [{} {}] 未声明支持的 SSDEV Desktop 版本",
+            entry.plugin_id, entry.version
+        )
+    })?;
+    if !desktop_requirement.matches(&bridge_state.desktop_version) {
+        return Err(format!(
+            "插件 [{} {}] 不支持当前 SSDEV Desktop {}；要求 {}",
+            entry.plugin_id, entry.version, bridge_state.desktop_version, desktop_requirement
+        ));
+    }
     let temporary_directory = bridge_state.plugin_root.join(".downloads");
     let downloaded = download_package(
         &bridge_state.repository_client,
@@ -1278,8 +1306,17 @@ async fn check_plugin_updates(
     )
     .await
     .map_err(|error| error.to_string())?;
-    let installed = inspect_plugins(&bridge_state.plugin_root, Some(&trust_store))?;
-    let updates = collect_plugin_updates(&installed.manifests, &catalog, requested_plugin_id);
+    let installed = inspect_plugins(
+        &bridge_state.plugin_root,
+        Some(&trust_store),
+        &bridge_state.desktop_version,
+    )?;
+    let updates = collect_plugin_updates(
+        &installed.manifests,
+        &catalog,
+        requested_plugin_id,
+        &bridge_state.desktop_version,
+    );
     Ok(PluginUpdateCheckResult {
         catalog_issued_at: catalog.issued_at(),
         catalog_expires_at: catalog.expires_at(),
@@ -1291,6 +1328,7 @@ fn collect_plugin_updates(
     installed: &[PluginManifest],
     catalog: &PluginCatalog,
     requested_plugin_id: Option<&str>,
+    desktop_version: &semver::Version,
 ) -> Vec<PluginUpdateItem> {
     let mut plugin_ids = if let Some(plugin_id) = requested_plugin_id {
         vec![plugin_id.to_owned()]
@@ -1310,12 +1348,18 @@ fn collect_plugin_updates(
                 .find(|manifest| manifest.plugin_id == plugin_id)
                 .and_then(|manifest| manifest.metadata.as_ref())
                 .map(|metadata| &metadata.version);
-            let available_version = catalog.select(&plugin_id, None).map(|entry| &entry.version);
+            let latest_catalog_version =
+                catalog.select(&plugin_id, None).map(|entry| &entry.version);
+            let available_version = catalog
+                .select_compatible(&plugin_id, None, desktop_version)
+                .map(|entry| &entry.version);
             PluginUpdateItem {
                 plugin_id,
                 installed_version: installed_version.map(ToString::to_string),
                 available_version: available_version.map(ToString::to_string),
-                catalog_available: available_version.is_some(),
+                latest_catalog_version: latest_catalog_version.map(ToString::to_string),
+                catalog_available: latest_catalog_version.is_some(),
+                compatibility_limited: latest_catalog_version != available_version,
                 update_available: is_plugin_update_available(installed_version, available_version),
             }
         })
@@ -1349,13 +1393,25 @@ async fn prepare_local_package(
 fn verify_catalog_identity(entry: &CatalogEntry, prepared: &PreparedPlugin) -> Result<(), String> {
     if prepared.identity().plugin_id != entry.plugin_id
         || prepared.metadata().version != entry.version
+        || prepared.metadata().desktop_version_requirement != entry.desktop_version_requirement
     {
         return Err(format!(
-            "下载包身份与签名仓库不一致：期望 {} {}，实际 {} {}",
+            "下载包身份或兼容范围与签名仓库不一致：期望 {} {} [{}]，实际 {} {} [{}]",
             entry.plugin_id,
             entry.version,
+            entry
+                .desktop_version_requirement
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "未声明".to_owned()),
             prepared.identity().plugin_id,
-            prepared.metadata().version
+            prepared.metadata().version,
+            prepared
+                .metadata()
+                .desktop_version_requirement
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "未声明".to_owned())
         ));
     }
     Ok(())
@@ -1368,9 +1424,16 @@ async fn activate_prepared_plugin(
 ) -> Result<PluginInstallResult, String> {
     let plugin_root = state.plugin_root.clone();
 
+    ensure_signed_plugin_compatible(prepared.manifest(), &state.desktop_version)?;
+
     let plugin_id = prepared.identity().plugin_id.clone();
     let plugin_version = prepared.metadata().version.clone();
-    let before = inspect_all_plugins(&plugin_root, &state.local_mapping_root, Some(trust_store))?;
+    let before = inspect_all_plugins(
+        &plugin_root,
+        &state.local_mapping_root,
+        Some(trust_store),
+        &state.desktop_version,
+    )?;
     let previous_manifest = before
         .manifests
         .iter()
@@ -1425,20 +1488,24 @@ async fn activate_prepared_plugin(
             )
         })?;
     let activation = prepared.activate().map_err(|error| error.to_string())?;
-    let installed =
-        match inspect_all_plugins(&plugin_root, &state.local_mapping_root, Some(trust_store)) {
-            Ok(installed) => installed,
-            Err(error) => {
-                activation
-                    .rollback()
-                    .map_err(|rollback| format!("{error}; 插件回滚同时失败: {rollback}"))?;
-                maintenance
-                    .replace_manifest(previous_manifest.as_ref())
-                    .await
-                    .map_err(|reload| format!("{error}; 恢复旧路由失败: {reload}"))?;
-                return Err(error);
-            }
-        };
+    let installed = match inspect_all_plugins(
+        &plugin_root,
+        &state.local_mapping_root,
+        Some(trust_store),
+        &state.desktop_version,
+    ) {
+        Ok(installed) => installed,
+        Err(error) => {
+            activation
+                .rollback()
+                .map_err(|rollback| format!("{error}; 插件回滚同时失败: {rollback}"))?;
+            maintenance
+                .replace_manifest(previous_manifest.as_ref())
+                .await
+                .map_err(|reload| format!("{error}; 恢复旧路由失败: {reload}"))?;
+            return Err(error);
+        }
+    };
     let Some(installed_manifest) = installed
         .manifests
         .iter()
@@ -1521,6 +1588,7 @@ async fn uninstall_signed_plugin(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
+        &state.desktop_version,
     )?;
     let baseline_failures = before.failures.clone();
     let previous_manifest = before
@@ -1554,6 +1622,7 @@ async fn uninstall_signed_plugin(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
+        &state.desktop_version,
     ) {
         Ok(installed) if same_plugin_failures(&baseline_failures, &installed.failures) => installed,
         Ok(_) => {
@@ -1612,6 +1681,7 @@ async fn reload_plugins(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
+        &state.desktop_version,
     )?;
     PluginController::validate_manifests(&plugins.manifests).map_err(|error| error.to_string())?;
     state
@@ -1653,6 +1723,7 @@ async fn plugin_inventory(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
+        &state.desktop_version,
     )?;
     let plugins = inspected
         .manifests
@@ -1667,6 +1738,15 @@ async fn plugin_inventory(
                 .metadata
                 .as_ref()
                 .map(|metadata| metadata.version.to_string());
+            let desktop_version_requirement = if source == "signed-package" {
+                manifest
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.desktop_version_requirement.as_ref())
+                    .map(ToString::to_string)
+            } else {
+                None
+            };
             let display_name = manifest
                 .metadata
                 .as_ref()
@@ -1682,6 +1762,7 @@ async fn plugin_inventory(
             PluginInventoryItem {
                 plugin_id: manifest.plugin_id,
                 version,
+                desktop_version_requirement,
                 display_name,
                 source,
                 services,
@@ -1722,7 +1803,7 @@ async fn local_mapping_inventory(
 ) -> Result<LocalMappingInventoryResult, String> {
     desktop::require_control(&caller)?;
     let _install = state.install_lock.lock().await;
-    let inspected = inspect_plugins(&state.local_mapping_root, None)?;
+    let inspected = inspect_plugins(&state.local_mapping_root, None, &state.desktop_version)?;
     let mut mappings = Vec::new();
     let mut failures = inspected.failures;
     for manifest in inspected.manifests {
@@ -1840,6 +1921,7 @@ async fn activate_prepared_local_mapping(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
+        &state.desktop_version,
     )?;
     let mut candidates = current.manifests.clone();
     candidates.retain(|manifest| manifest.plugin_id != plugin_id);
@@ -1867,6 +1949,7 @@ async fn activate_prepared_local_mapping(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
+        &state.desktop_version,
     ) {
         Ok(installed) => installed,
         Err(error) => {
@@ -1936,6 +2019,7 @@ async fn delete_local_mapping(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
+        &state.desktop_version,
     )?;
     let baseline_failures = before.failures.clone();
     let previous_manifest = before
@@ -1968,6 +2052,7 @@ async fn delete_local_mapping(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
+        &state.desktop_version,
     ) {
         Ok(installed) if same_plugin_failures(&baseline_failures, &installed.failures) => installed,
         Ok(_) => {
@@ -2431,10 +2516,13 @@ pub fn run() {
                 max_in_flight_invocations: DEFAULT_MAX_IN_FLIGHT_INVOCATIONS,
                 plugin_trust,
             })?;
+            let desktop_version = semver::Version::parse(&app.package_info().version.to_string())
+                .map_err(std::io::Error::other)?;
             let plugins = inspect_all_plugins(
                 &plugin_root,
                 &local_mapping_root,
                 trust_store.as_deref(),
+                &desktop_version,
             )
                 .map_err(std::io::Error::other)?;
             if !plugins.failures.is_empty() {
@@ -2474,6 +2562,7 @@ pub fn run() {
             app.manage(capture::RegionCaptureState::new());
             app.manage(BridgeState {
                 controller: Arc::new(controller),
+                desktop_version,
                 invocation_coordinator,
                 invocation_coordinator_error,
                 plugin_load_failures: AtomicUsize::new(plugins.failures.len()),
@@ -2669,6 +2758,7 @@ fn log_project_recovery(report: project_activation::ProjectRecoveryReport) {
 fn inspect_plugins(
     plugin_root: &std::path::Path,
     trust_store: Option<&TrustStore>,
+    desktop_version: &semver::Version,
 ) -> Result<InspectedPlugins, String> {
     let report = discover_plugins(plugin_root).map_err(|error| error.to_string())?;
     let mut failures = report
@@ -2692,6 +2782,29 @@ fn inspect_plugins(
                 continue;
             }
         }
+        match manifest.metadata.as_ref() {
+            Some(metadata) if !metadata.supports_desktop_version(desktop_version) => {
+                failures.push(format!(
+                    "[{}] does not support SSDEV Desktop {}; required {}",
+                    manifest.plugin_id,
+                    desktop_version,
+                    metadata
+                        .desktop_version_requirement
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "not declared".to_owned())
+                ));
+                continue;
+            }
+            None if trust_store.is_some() => {
+                failures.push(format!(
+                    "[{}] signed plugin is missing compatibility metadata",
+                    manifest.plugin_id
+                ));
+                continue;
+            }
+            _ => {}
+        }
         manifests.push(manifest);
     }
     Ok(InspectedPlugins {
@@ -2704,9 +2817,10 @@ fn inspect_all_plugins(
     plugin_root: &std::path::Path,
     local_mapping_root: &std::path::Path,
     trust_store: Option<&TrustStore>,
+    desktop_version: &semver::Version,
 ) -> Result<InspectedPlugins, String> {
-    let mut signed = inspect_plugins(plugin_root, trust_store)?;
-    let local = inspect_plugins(local_mapping_root, None)?;
+    let mut signed = inspect_plugins(plugin_root, trust_store, desktop_version)?;
+    let local = inspect_plugins(local_mapping_root, None, desktop_version)?;
     let mut plugin_ids = signed
         .manifests
         .iter()
@@ -2748,6 +2862,30 @@ fn ensure_upgrade_allowed(
                 "默认禁止插件降级：当前版本 {current}，安装包版本 {candidate}"
             ));
         }
+    }
+    Ok(())
+}
+
+fn ensure_signed_plugin_compatible(
+    manifest: &PluginManifest,
+    desktop_version: &semver::Version,
+) -> Result<(), String> {
+    let metadata = manifest
+        .metadata
+        .as_ref()
+        .ok_or_else(|| format!("签名插件 [{}] 缺少版本兼容元数据", manifest.plugin_id))?;
+    if !metadata.supports_desktop_version(desktop_version) {
+        return Err(format!(
+            "签名插件 [{} {}] 不支持 SSDEV Desktop {}；要求 {}",
+            manifest.plugin_id,
+            metadata.version,
+            desktop_version,
+            metadata
+                .desktop_version_requirement
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "未声明".to_owned())
+        ));
     }
     Ok(())
 }
@@ -2941,12 +3079,18 @@ fn select_runtime_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_upgrade_allowed, is_plugin_update_available, legacy_config_candidates,
-        open_project_bundle_for_mode, project_bundle, select_runtime_path, service_inventory_item,
+        collect_plugin_updates, ensure_signed_plugin_compatible, ensure_upgrade_allowed,
+        is_plugin_update_available, legacy_config_candidates, open_project_bundle_for_mode,
+        project_bundle, select_runtime_path, service_inventory_item,
     };
     use semver::Version;
-    use std::{fs, path::PathBuf};
-    use webplus_plugin_config::ServiceDefinition;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{Duration, UNIX_EPOCH},
+    };
+    use webplus_plugin_config::{PluginManifest, ServiceDefinition, API_FILENAME};
+    use webplus_plugin_repository::PluginCatalog;
     use webplus_plugin_trust::TrustStore;
 
     #[test]
@@ -2956,6 +3100,32 @@ mod tests {
         assert!(ensure_upgrade_allowed(Some(&current), &Version::new(2, 4, 0)).is_ok());
         assert!(ensure_upgrade_allowed(Some(&current), &Version::new(3, 0, 0)).is_ok());
         assert!(ensure_upgrade_allowed(None, &Version::new(1, 0, 0)).is_ok());
+    }
+
+    #[test]
+    fn signed_plugin_compatibility_must_be_explicit_and_match_the_desktop() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join(API_FILENAME),
+            r#"{"serviceId":"reader","mainClass":"reader.dll"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("plugin.json"),
+            r#"{"schemaVersion":1,"pluginId":"reader","version":"1.0.0","desktopVersionRequirement":">=0.1.0, <0.2.0"}"#,
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("reader", root.path()).unwrap();
+        assert!(ensure_signed_plugin_compatible(&manifest, &Version::new(0, 1, 5)).is_ok());
+        assert!(ensure_signed_plugin_compatible(&manifest, &Version::new(0, 2, 0)).is_err());
+
+        fs::write(
+            root.path().join("plugin.json"),
+            r#"{"schemaVersion":1,"pluginId":"reader","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let legacy = PluginManifest::load("reader", root.path()).unwrap();
+        assert!(ensure_signed_plugin_compatible(&legacy, &Version::new(0, 1, 5)).is_err());
     }
 
     #[test]
@@ -2970,6 +3140,55 @@ mod tests {
         assert!(is_plugin_update_available(Some(&current), Some(&newer)));
         assert!(is_plugin_update_available(None, Some(&newer)));
         assert!(!is_plugin_update_available(Some(&current), None));
+    }
+
+    #[test]
+    fn plugin_update_check_exposes_newer_incompatible_catalog_versions() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join(API_FILENAME),
+            r#"{"serviceId":"reader","mainClass":"reader.dll"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("plugin.json"),
+            r#"{"schemaVersion":1,"pluginId":"reader","version":"1.0.0","desktopVersionRequirement":">=0.1.0, <0.2.0"}"#,
+        )
+        .unwrap();
+        let installed = PluginManifest::load("reader", root.path()).unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+        let catalog = PluginCatalog::from_unsigned_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "issuedAt": 1_700_000_000_u64,
+                "expiresAt": 1_700_003_600_u64,
+                "entries": [{
+                    "pluginId": "reader",
+                    "version": "1.1.0",
+                    "desktopVersionRequirement": ">=0.1.0, <0.2.0",
+                    "url": "https://plugins.example.test/reader-1.1.0.ssdev-plugin",
+                    "sha256": "11".repeat(32),
+                    "size": 10
+                }, {
+                    "pluginId": "reader",
+                    "version": "2.0.0",
+                    "desktopVersionRequirement": ">=0.2.0, <0.3.0",
+                    "url": "https://plugins.example.test/reader-2.0.0.ssdev-plugin",
+                    "sha256": "22".repeat(32),
+                    "size": 10
+                }]
+            }))
+            .unwrap(),
+            now,
+        )
+        .unwrap();
+
+        let updates = collect_plugin_updates(&[installed], &catalog, None, &Version::new(0, 1, 5));
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].available_version.as_deref(), Some("1.1.0"));
+        assert_eq!(updates[0].latest_catalog_version.as_deref(), Some("2.0.0"));
+        assert!(updates[0].compatibility_limited);
+        assert!(updates[0].update_available);
     }
 
     #[test]

@@ -25,6 +25,7 @@ cargo run --locked -p ssdev-plugin-tool -- prepare `
   --matrix-template C:\secure-release\reader-2.3.1-matrix.json `
   --plugin-id reader-plugin `
   --version 2.3.1 `
+  --desktop-version-requirement ">=0.1.0, <0.2.0" `
   --display-name "读卡器插件" `
   --key-id production-2026-01 `
   --trust-store C:\secure-build-inputs\plugin-trust.json
@@ -32,11 +33,13 @@ cargo run --locked -p ssdev-plugin-tool -- prepare `
 
 若来源是工作台导出，则把 `--source` 改为例如 `C:\secure-release-inputs\reader.local-release-source`，并追加 `--matrix-seed C:\secure-release-inputs\reader.local-matrix-seed.json`。`--matrix-seed` 是可选参数，仅适用于工作台导出的外部种子；其他旧插件可省略，由工具自动生成全方法占位草稿。发布工具会要求种子位于待签名源目录之外、使用 schema 1、保持 `draft: true`、只引用清单声明的输入与路由，并由启用用例覆盖全部方法。本地子集回归不能替代正式插件的完整 `ResData` 精确矩阵。
 
+`--desktop-version-requirement` 是该插件经过真实矩阵验证的 SSDEV Desktop SemVer 范围。当前 `0.1.x` 客户端可使用 `>=0.1.0, <0.2.0`；跨越新的 Desktop 次版本前应重新执行兼容矩阵，不应无依据填写 `*`。
+
 准备阶段先确认指定 `keyId` 在信任库中具有 `plugin` 用途且状态为 `active`，避免 KMS/HSM 为已退役或吊销的键产生无效签名；随后会硬拒绝以下情况：
 
 - 符号链接、Windows 不可移植路径、忽略大小写后的重复路径；
 - 超过 4,096 个文件或 512 MiB；
-- 非 SemVer 版本、无调用方法的服务、缺失入口或显式依赖；
+- 非 SemVer 版本、无效或超过 128 字符的 Desktop SemVer requirement、无调用方法的服务、缺失入口或显式依赖；
 - DLL/EXE 的 PE 位数与 `architecture` 不一致；
 - 仍声明非空 `installRun` 的旧插件。
 
@@ -45,7 +48,7 @@ COM/OCX 的 ProgID 和真实注册状态无法在离线准备阶段验证，必�
 准备成功会生成：
 
 - 暂存插件目录：包含规范化 `plugin.json`，但没有签名封套；
-- 签名请求：显式记录 `pluginId`、`version` 和 `keyId`；`payloadBase64` 是 KMS/HSM 要签名的原始字节，`payloadSha256` 用于发布审批和审计；
+- 签名请求：显式记录 `pluginId`、`version`、`desktopVersionRequirement` 和 `keyId`；`payloadBase64` 是 KMS/HSM 要签名的原始字节，`payloadSha256` 用于发布审批和审计；
 - 黄金矩阵草稿：采用通过校验的外部种子，或从每个 service/method 自动生成参数占位符；准备报告会给出 `matrixSeeded`、`matrixCaseCount`、仍含保留占位符的 `matrixPlaceholderCaseCount` 和必须人工确认精确响应的 `matrixReviewRequiredCaseCount`。
 
 黄金矩阵默认带有 `"draft": true`，并在 `plugins` 中固定本次 `pluginId` 与 SemVer 版本。自动生成或由工作台现场子集用例转换的条目还带有 `"reviewRequired": true`。运行器会在启动 controller 或接触硬件之前拒绝草稿；即使误把草稿改为 `false`，任何启用用例仍要求复核或存在生成器保留的输入/响应占位符也会失败关闭。只有补齐全部声明输入、把子集断言核对为完整精确响应、删除占位符、将每个已复核用例改为 `"reviewRequired": false`，并显式解除全局草稿后才会执行。暂不验证的用例可设置 `"enabled": false`，但正式切换时仍须由其他启用用例覆盖对应生产能力。
@@ -72,7 +75,7 @@ cargo run --locked -p ssdev-plugin-tool -- matrix-check `
 <base64-ed25519-signature>
 ```
 
-不要对 `payloadBase64` 文本本身签名，也不要签名 JSON 文件的文本字节。审批系统应同时记录 `pluginId`、`version`、`keyId` 和 `payloadSha256`。
+不要对 `payloadBase64` 文本本身签名，也不要签名 JSON 文件的文本字节。审批系统应同时记录 `pluginId`、`version`、`desktopVersionRequirement`、`keyId` 和 `payloadSha256`。
 
 ## 3. 导入签名并封包
 
@@ -95,7 +98,7 @@ cargo run --locked -p ssdev-plugin-tool -- verify `
   --trust-store C:\secure-build-inputs\plugin-trust.json
 ```
 
-`finalize` 和 `verify` 的 JSON 结果都会给出 `packageSha256`；`finalize` 还会回显签名审批使用的 `payloadSha256`。制品库应以这两个摘要把签名请求、审批记录和最终安装包关联起来。
+`finalize` 和 `verify` 的 JSON 结果都会给出 `desktopVersionRequirement` 与 `packageSha256`；`finalize` 还会回显签名审批使用的 `payloadSha256`。制品库应以这些字段把签名请求、审批记录、兼容范围和最终安装包关联起来。
 
 正式发布候选还必须把定稿黄金矩阵与实际签名包联合检查，不能只分别验证暂存目录和包：
 
