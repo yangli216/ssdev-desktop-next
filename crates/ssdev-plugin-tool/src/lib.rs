@@ -570,6 +570,86 @@ pub fn check_release_set(
     })
 }
 
+pub fn check_release_root_against_set(
+    plugin_root: &Path,
+    spec: &Path,
+    trust_store: &Path,
+    matrix: &Path,
+) -> Result<ReleaseSetCheckReport, ToolError> {
+    let release_set = check_release_set(spec, trust_store, matrix)?;
+    let manifests = discover_clean_plugin_root(plugin_root)?;
+    let trust = TrustStore::load(trust_store)?;
+    for manifest in &manifests {
+        trust.verify_for_issuance(manifest)?;
+    }
+    let (_, coverage) = validate_executable_matrix(matrix, &manifests)?;
+    if coverage.plugin_count != release_set.plugin_count
+        || coverage.service_count != release_set.service_count
+        || coverage.method_count != release_set.method_count
+        || coverage.enabled_case_count != release_set.enabled_case_count
+    {
+        return Err(ToolError::Invalid(
+            "tested plugin root coverage does not match the release set".into(),
+        ));
+    }
+    verify_release_packages_match_manifests(&release_set, &manifests, &trust)?;
+    Ok(release_set)
+}
+
+fn verify_release_packages_match_manifests(
+    release_set: &ReleaseSetCheckReport,
+    manifests: &[PluginManifest],
+    trust_store: &TrustStore,
+) -> Result<(), ToolError> {
+    if release_set.packages.len() != manifests.len() {
+        return Err(ToolError::Invalid(
+            "release set package count does not match the tested plugin root".into(),
+        ));
+    }
+    let packages = release_set
+        .packages
+        .iter()
+        .map(|package| (package.plugin_id.as_str(), package))
+        .collect::<BTreeMap<_, _>>();
+    if packages.len() != manifests.len() {
+        return Err(ToolError::Invalid(
+            "release set contains duplicate plugin identities".into(),
+        ));
+    }
+    let rebuilt = tempfile::tempdir().map_err(|source| ToolError::Io {
+        path: std::env::temp_dir(),
+        source,
+    })?;
+    for manifest in manifests {
+        let metadata = manifest.metadata.as_ref().ok_or_else(|| {
+            ToolError::Invalid(
+                "tested plugin root contains a plugin without version metadata".into(),
+            )
+        })?;
+        let expected = packages.get(manifest.plugin_id.as_str()).ok_or_else(|| {
+            ToolError::Invalid("tested plugin root is not the approved release set".into())
+        })?;
+        if expected.version != metadata.version.to_string() {
+            return Err(ToolError::Invalid(
+                "tested plugin version is not the approved release set version".into(),
+            ));
+        }
+        let package_path = rebuilt
+            .path()
+            .join(format!("{}.ssdev-plugin", manifest.plugin_id));
+        let identity =
+            create_deterministic_package(&manifest.plugin_dir, &package_path, trust_store)?;
+        if identity.key_id != expected.key_id
+            || sha256_file(&package_path)? != expected.package_sha256
+        {
+            return Err(ToolError::Invalid(
+                "tested plugin bytes do not match the approved release package".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn check_release_packages(
     packages: &[PathBuf],
     trust_store: &Path,
@@ -1144,6 +1224,12 @@ pub fn check_executable_matrix_root(
     plugin_root: &Path,
     matrix_path: &Path,
 ) -> Result<MatrixCheckReport, ToolError> {
+    let manifests = discover_clean_plugin_root(plugin_root)?;
+    let (_, report) = validate_executable_matrix(matrix_path, &manifests)?;
+    Ok(report)
+}
+
+fn discover_clean_plugin_root(plugin_root: &Path) -> Result<Vec<PluginManifest>, ToolError> {
     let plugin_root = canonical_real_directory(plugin_root)?;
     let discovery = discover_plugins(&plugin_root)?;
     if !discovery.failures.is_empty() {
@@ -1160,8 +1246,7 @@ pub fn check_executable_matrix_root(
             first.error
         )));
     }
-    let (_, report) = validate_executable_matrix(matrix_path, &discovery.manifests)?;
-    Ok(report)
+    Ok(discovery.manifests)
 }
 
 pub fn check_executable_matrix_plugin(
@@ -1996,6 +2081,23 @@ mod tests {
         let reversed = check_release_set(&reversed_spec, &trust, &matrix).unwrap();
         assert_eq!(reversed.package_set_sha256, report.package_set_sha256);
         assert_eq!(reversed.packages, report.packages);
+
+        let plugin_root = root.path().join("tested-plugin-root");
+        let trust_store = TrustStore::load(&trust).unwrap();
+        for package in [&reader_package, &printer_package] {
+            PreparedPlugin::prepare(package, &plugin_root, &trust_store)
+                .unwrap()
+                .activate()
+                .unwrap()
+                .commit()
+                .unwrap();
+        }
+        let rooted = check_release_root_against_set(&plugin_root, &spec, &trust, &matrix).unwrap();
+        assert_eq!(rooted.package_set_sha256, report.package_set_sha256);
+        fs::write(plugin_root.join("reader-plugin/reader.dll"), b"tampered").unwrap();
+        let error =
+            check_release_root_against_set(&plugin_root, &spec, &trust, &matrix).unwrap_err();
+        assert!(error.to_string().contains("signature"));
 
         let duplicate_spec = matrix_file(
             root.path(),

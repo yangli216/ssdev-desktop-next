@@ -2,7 +2,7 @@
 
 生产切换不以人工汇总日志中的 `PASS` 为依据。`ssdev-cutover-evidence` 严格读取三份不可覆盖且经 QA 环境签名的机器证据，绑定证据、签名封套、信任库和策略的 SHA-256，并生成一个确定的 `GO` 或 `NO-GO` 决策：
 
-- 真实插件黄金矩阵证据：必须由 Windows x64 运行器产生，覆盖全部已声明 service/method，并绑定插件集合、信任库、矩阵和 x86/x64 宿主。
+- 真实插件黄金矩阵证据：必须由 Windows x64 运行器产生，覆盖全部已声明 service/method；schema 2 同时绑定批准的发布集合规范、确定性包集合、实际插件载荷、信任库、矩阵和 x86/x64 宿主。现场插件根目录必须能逐包重建出发布集合中的相同 SHA-256。
 - 迁移审计证据：必须同时扫描业务前端静态资源和代表性真实 HAR；旧 WebPlus `7711` 与桌面回调 `45121` 均不得有静态或运行时证据，且不能留有 critical 或 warning finding。
 - Windows 包证据：必须验证 Authenticode、NSIS、实际启动事件，以及从更低正式版本升级并保留配置。历史证据中的 MSI 字段仅为格式兼容保留，不参与新发布判定。
 
@@ -42,7 +42,7 @@ cargo run --locked -p ssdev-cutover-evidence -- decide `
   D:\cutover-output\cutover-decision.json
 ```
 
-输入必须是有大小上限的普通文件，决策输出的父目录必须预先存在且目标不能已存在。工具先按策略指定 `keyId` 和 `cutover-evidence` 用途验证三个 active-key 封套，再在读取前后重新计算全部摘要，拒绝执行中变化。`GO` 返回 0；`NO-GO` 仍以不覆盖方式写出排序后的稳定阻塞码，随后返回 3，便于 CI 阻断发布；输入损坏、签名/用途/keyId 不匹配、schema 不匹配或 I/O 失败返回 1。
+输入必须是有大小上限的普通文件，决策输出的父目录必须预先存在且目标不能已存在。工具先按策略指定 `keyId` 和 `cutover-evidence` 用途验证三个 active-key 封套，再在读取前后重新计算全部摘要，拒绝执行中变化。插件矩阵证据只接受当前 schema 2；旧 schema 1 证据必须以批准发布集合重新执行。`GO` 返回 0；`NO-GO` 仍以不覆盖方式写出排序后的稳定阻塞码，随后返回 3，便于 CI 阻断发布；输入损坏、签名/用途/keyId 不匹配、schema 不匹配或 I/O 失败返回 1。
 
 常见阻塞码包括 dirty/source mismatch、证据过期或未来时间、静态资源/HAR 未覆盖、旧 HTTP 仍被观察到、迁移 warning/critical 未清零，以及 Windows 签名、双安装器、启动或升级未验证。
 

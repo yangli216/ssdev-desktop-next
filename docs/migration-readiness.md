@@ -32,7 +32,7 @@
 | 截图 | 完成实现 | `Ctrl+Shift+C` 聚焦业务窗口截图；`Ctrl+Shift+A` 本地显示器冻结遮罩、用户框选、裁剪后回传；原始全屏图不交给业务页 |
 | Windows 构建门禁 | 完成实现 | GitHub Actions 同时执行 Debug 全工作区与 Release 桌面安全回归，并调用 `scripts/test-windows.ps1` 覆盖双架构 DLL/COM/宿主回归 |
 | Windows 安装包 | 完成实现 | CI 对 NSIS 在干净测试账户的真实标准数据目录执行合成旧版本原位升级、配置保留、PE/资源检查、启动诊断和卸载；正式脚本强制 Authenticode、独立更新公钥锚定、签名的全 bundle SHA-256 清单、绑定 Git 提交/锁文件/工具链的 schema 2 溯源元数据及桌面/npm/x86/x64 CycloneDX SBOM，安装包使用离线 WebView2 |
-| 真实插件矩阵 | 完成工具 | `ssdev-plugin-tool matrix-check` 可先在任意开发平台离线检查草稿、复核标记、占位符、路由、精确输入、冲突和全方法覆盖；`scripts/test-plugin-matrix.ps1` 验签后复用同一规则，再用真实 x86/x64 宿主精确比对黄金响应，执行前后复核源码/插件/信任库/矩阵/宿主摘要，成功后以不覆盖方式输出环境标记的机器证据 |
+| 真实插件矩阵 | 完成工具 | `ssdev-plugin-tool matrix-check` 可先在任意开发平台离线检查草稿、复核标记、占位符、路由、精确输入、冲突和全方法覆盖；`scripts/test-plugin-matrix.ps1` 还要求批准的发布集合，逐包重建现场插件并精确比对包 SHA-256，再用真实 x86/x64 宿主比对黄金响应；执行前后复核源码/发布集合/插件/信任库/矩阵/宿主摘要，成功后以不覆盖方式输出 schema 2 环境证据 |
 | 生产诊断 | 完成实现 | 默认脱敏 JSON 事件、64 KiB 单事件、5 MiB × 6 轮转上限、32 MiB 诊断包上限；含调用方脱离等待、执行槽超时、维护/退出期拒绝、持久调用可用性/数量/落盘失败和当前准入/维护状态计数，operationId、业务参数/响应/SSO/URL/路径禁止入日志并有源码门禁 |
 | 依赖供应链 | 完成实现 | Rust/npm 锁文件、npm 官方源与 integrity、默认禁用 npm 生命周期脚本；所有 GitHub Actions 固定完整提交 SHA，RustSec 与 npm 漏洞审计在依赖变更及每周定时执行；Windows 双目标分别执行严格 Clippy，安装包验收要求各 SBOM 不仅格式/目标正确，还必须包含持久账本、controller、原生执行、IPC、Tauri API 与 Vue 等关键组件 |
 

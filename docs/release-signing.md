@@ -43,7 +43,7 @@ cargo run --locked -p ssdev-release-signing -- prepare `
 - 进程策略检查固定绝对路径、参数上限、SHA-256 格式、重复 ID 和条目上限；
 - 插件目录检查 schema、SemVer、HTTPS URL、包大小/摘要、重复版本，以及当前签发/过期时间和最长 31 天有效期。目录本身应先由 `ssdev-plugin-tool catalog` 从已验签包生成，避免人工录入包字段。
 - 切换决策检查严格 schema、源码提交、应用版本、策略/信任库/三份证据/三个封套摘要和阻塞码一致性；只有 `eligible: true` 的 `GO` 决策可以进入签名请求，且请求、封套和独立验证的 keyId 都必须等于策略选定的 `approvalSignerKeyId`。`NO-GO` 决策只能归档，不能获准发布。
-- 三类执行证据分别检查自身严格 schema、来源提交、执行环境、输入摘要、覆盖与结果一致性，并使用不同域分隔 payload；它们共享 `cutover-evidence` 用途，但生产策略可为每类证据指定不同 `keyId` 以隔离 QA 职责。
+- 三类执行证据分别检查自身严格 schema、来源提交、执行环境、输入摘要、覆盖与结果一致性，并使用不同域分隔 payload；插件矩阵 schema 2 的审核摘要额外公开 `packageSetSha256`，把硬件结论绑定到批准的确定性包集合。它们共享 `cutover-evidence` 用途，但生产策略可为每类证据指定不同 `keyId` 以隔离 QA 职责。
 
 请求文件明确记录 `artifactKind`、对应 `trustPurpose`、`keyId`、文档摘要、待签字节及其摘要，并给出不含敏感内容的审核摘要。来源策略摘要包含授权来源/服务/方法数量和 HTTP 例外状态；进程策略包含条目数；插件目录包含签发时间、过期时间和条目数；执行证据包含源码提交与关键覆盖/结果计数；切换决策包含源码提交、应用版本和判定时间。
 

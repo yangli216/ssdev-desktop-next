@@ -196,13 +196,14 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/test-plugin-matrix.ps1 `
   -PluginRoot C:\secure-test-inputs\plugins `
+  -ReleaseSetSpec C:\secure-release\hospital-a-release-set.json `
   -TrustStore C:\secure-test-inputs\plugin-trust.json `
   -Matrix C:\secure-test-inputs\plugin-matrix.json `
   -EvidenceOutput C:\secure-release\reader-lab-evidence.json `
   -EvidenceEnvironment hospital-a-reader-lab
 ```
 
-矩阵运行器会在启动 controller 和接触硬件前拒绝草稿、尚未解除的 `reviewRequired`、生成器保留占位符、无效或不完整输入、重复名称、未知路由，或未覆盖任一已声明 service/method 的矩阵；随后先发现并验签全部插件，再由 x64 控制器分别拉起真实 x86/x64 宿主，逐项对 `ResCode` 和 `ResData` 做精确黄金比对。全部通过且源码、插件、信任库、矩阵和两个宿主在执行前后保持一致时，才以不覆盖方式写出绑定这些 SHA-256、源码提交、环境标签和覆盖计数的机器证据。任何无效插件、签名问题、输入变化、宿主崩溃、超时或结果差异都会使门禁失败。
+矩阵运行器会在启动 controller 和接触硬件前拒绝草稿、尚未解除的 `reviewRequired`、生成器保留占位符、无效或不完整输入、重复名称、未知路由，或未覆盖任一已声明 service/method 的矩阵；还会把插件根目录中的每个已安装插件重新确定性封包，要求插件身份、版本、签名 keyId 和包 SHA-256 与批准的发布集合逐项一致。随后由 x64 控制器分别拉起真实 x86/x64 宿主，逐项对 `ResCode` 和 `ResData` 做精确黄金比对。全部通过且源码、发布集合、插件、信任库、矩阵和两个宿主在执行前后保持一致时，才以不覆盖方式写出绑定这些 SHA-256、源码提交、环境标签和覆盖计数的 schema 2 机器证据。任何无效插件、签名问题、输入变化、宿主崩溃、超时或结果差异都会使门禁失败。
 
 ## 生产切换判定
 

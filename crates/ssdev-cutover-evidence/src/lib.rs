@@ -13,6 +13,7 @@ use webplus_plugin_trust::{
 };
 
 pub const EVIDENCE_SCHEMA_VERSION: u8 = 1;
+pub const PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION: u8 = 2;
 pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 1;
 pub const CUTOVER_DECISION_SCHEMA_VERSION: u8 = 1;
 const MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
@@ -57,6 +58,8 @@ pub struct PluginMatrixEvidence {
     pub environment: String,
     pub runner_os: String,
     pub runner_architecture: String,
+    pub release_set_spec_sha256: String,
+    pub package_set_sha256: String,
     pub plugin_set_sha256: String,
     pub trust_store_sha256: String,
     pub matrix_sha256: String,
@@ -401,7 +404,7 @@ impl MigrationAuditEvidence {
 
 impl PluginMatrixEvidence {
     pub fn validate(&self) -> Result<(), EvidenceError> {
-        if self.schema_version != EVIDENCE_SCHEMA_VERSION
+        if self.schema_version != PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION
             || self.evidence_type != EvidenceType::PluginMatrix
         {
             return Err(EvidenceError::Invalid(
@@ -421,6 +424,8 @@ impl PluginMatrixEvidence {
             ));
         }
         for (name, digest) in [
+            ("releaseSetSpecSha256", &self.release_set_spec_sha256),
+            ("packageSetSha256", &self.package_set_sha256),
             ("pluginSetSha256", &self.plugin_set_sha256),
             ("trustStoreSha256", &self.trust_store_sha256),
             ("matrixSha256", &self.matrix_sha256),
@@ -976,7 +981,7 @@ mod tests {
 
     fn valid() -> PluginMatrixEvidence {
         PluginMatrixEvidence {
-            schema_version: EVIDENCE_SCHEMA_VERSION,
+            schema_version: PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION,
             evidence_type: EvidenceType::PluginMatrix,
             source_revision: "a".repeat(40),
             source_dirty: false,
@@ -984,6 +989,8 @@ mod tests {
             environment: "reader-lab-1".into(),
             runner_os: "windows".into(),
             runner_architecture: "x86_64".into(),
+            release_set_spec_sha256: "0".repeat(64),
+            package_set_sha256: "9".repeat(64),
             plugin_set_sha256: "1".repeat(64),
             trust_store_sha256: "2".repeat(64),
             matrix_sha256: "3".repeat(64),
@@ -1075,6 +1082,14 @@ mod tests {
         let mut malformed = valid();
         malformed.enabled_case_count = 2;
         assert!(malformed.validate().is_err());
+
+        let mut legacy = valid();
+        legacy.schema_version = EVIDENCE_SCHEMA_VERSION;
+        assert!(legacy.validate().is_err());
+
+        let mut unbound = valid();
+        unbound.package_set_sha256 = "not-a-digest".into();
+        assert!(unbound.validate().is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

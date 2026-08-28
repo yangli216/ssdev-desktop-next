@@ -121,6 +121,7 @@ pub enum ArtifactSummary {
     },
     PluginMatrixEvidence {
         source_revision: String,
+        package_set_sha256: String,
         plugin_count: u32,
         service_count: u32,
         method_count: u32,
@@ -397,6 +398,7 @@ fn prepare_material(
                 )?,
                 ArtifactSummary::PluginMatrixEvidence {
                     source_revision: evidence.source_revision,
+                    package_set_sha256: evidence.package_set_sha256,
                     plugin_count: evidence.plugin_count,
                     service_count: evidence.service_count,
                     method_count: evidence.method_count,
@@ -660,7 +662,7 @@ mod tests {
             (
                 ArtifactKind::PluginMatrixEvidence,
                 serde_json::json!({
-                    "schemaVersion": 1,
+                    "schemaVersion": ssdev_cutover_evidence::PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION,
                     "evidenceType": "plugin-matrix",
                     "sourceRevision": "aa".repeat(20),
                     "sourceDirty": false,
@@ -668,6 +670,8 @@ mod tests {
                     "environment": "plugin-reader-lab",
                     "runnerOs": "windows",
                     "runnerArchitecture": "x86_64",
+                    "releaseSetSpecSha256": "00".repeat(32),
+                    "packageSetSha256": "99".repeat(32),
                     "pluginSetSha256": "11".repeat(32),
                     "trustStoreSha256": "22".repeat(32),
                     "matrixSha256": "33".repeat(32),

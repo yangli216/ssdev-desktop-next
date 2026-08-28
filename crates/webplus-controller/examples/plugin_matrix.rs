@@ -5,9 +5,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ssdev_cutover_evidence::{
     digest_named_payloads, prepare_new_output, sha256_file, write_plugin_matrix_evidence,
-    EvidenceType, PluginMatrixEvidence, EVIDENCE_SCHEMA_VERSION,
+    EvidenceType, PluginMatrixEvidence, PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION,
 };
-use ssdev_plugin_tool::validate_executable_matrix;
+use ssdev_plugin_tool::{check_release_root_against_set, validate_executable_matrix};
 use ssdev_release_manifest::{capture_source_identity, SourceIdentity};
 use webplus_controller::{PluginController, PluginTrust, SupervisorConfig};
 use webplus_plugin_config::{discover_plugins, PluginManifest};
@@ -16,11 +16,23 @@ use webplus_plugin_trust::{prepare_signing_material, read_identity, TrustStore};
 #[derive(Debug, PartialEq, Eq)]
 struct EvidenceInputs {
     source: SourceIdentity,
+    release_set_spec_sha256: String,
+    package_set_sha256: String,
     plugin_set_sha256: String,
     trust_store_sha256: String,
     matrix_sha256: String,
     x86_host_sha256: String,
     x64_host_sha256: String,
+}
+
+struct EvidenceFiles<'a> {
+    workspace: &'a std::path::Path,
+    x86_host: &'a std::path::Path,
+    x64_host: &'a std::path::Path,
+    plugin_root: &'a std::path::Path,
+    release_set_spec: &'a std::path::Path,
+    trust_store: &'a std::path::Path,
+    matrix: &'a std::path::Path,
 }
 
 #[tokio::main]
@@ -29,6 +41,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let x86_host = required(&mut arguments, "x86 plugin host")?;
     let x64_host = required(&mut arguments, "x64 plugin host")?;
     let plugin_root = required(&mut arguments, "plugin root")?;
+    let release_set_spec = required(&mut arguments, "release set spec")?;
     let trust_store_path = required(&mut arguments, "trust store")?;
     let matrix_path = required(&mut arguments, "matrix JSON")?;
     let workspace = required(&mut arguments, "source workspace")?;
@@ -66,14 +79,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let (matrix, coverage) = validate_executable_matrix(&matrix_path, &discovery.manifests)?;
-    let evidence_before = capture_evidence_inputs(
-        &workspace,
-        &x86_host,
-        &x64_host,
-        &trust_store_path,
-        &matrix_path,
-        &discovery.manifests,
-    )?;
+    let evidence_files = EvidenceFiles {
+        workspace: &workspace,
+        x86_host: &x86_host,
+        x64_host: &x64_host,
+        plugin_root: &plugin_root,
+        release_set_spec: &release_set_spec,
+        trust_store: &trust_store_path,
+        matrix: &matrix_path,
+    };
+    let evidence_before = capture_evidence_inputs(&evidence_files, &discovery.manifests)?;
 
     let controller = Arc::new(PluginController::new(SupervisorConfig {
         x86_host: x86_host.clone(),
@@ -104,16 +119,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     controller.shutdown().await;
     if failures.is_empty() {
-        let evidence_after = capture_evidence_inputs(
-            &workspace,
-            &x86_host,
-            &x64_host,
-            &trust_store_path,
-            &matrix_path,
-            &discovery.manifests,
-        )?;
+        let evidence_after = capture_evidence_inputs(&evidence_files, &discovery.manifests)?;
         if evidence_before != evidence_after {
-            return Err("source, plugins, trust, matrix, or hosts changed during execution".into());
+            return Err(
+                "source, release set, plugins, trust, matrix, or hosts changed during execution"
+                    .into(),
+            );
         }
         let executed_at_unix_seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -122,7 +133,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         write_plugin_matrix_evidence(
             &evidence_output,
             &PluginMatrixEvidence {
-                schema_version: EVIDENCE_SCHEMA_VERSION,
+                schema_version: PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION,
                 evidence_type: EvidenceType::PluginMatrix,
                 source_revision: evidence_after.source.revision,
                 source_dirty: evidence_after.source.dirty,
@@ -130,6 +141,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 environment,
                 runner_os: std::env::consts::OS.into(),
                 runner_architecture: std::env::consts::ARCH.into(),
+                release_set_spec_sha256: evidence_after.release_set_spec_sha256,
+                package_set_sha256: evidence_after.package_set_sha256,
                 plugin_set_sha256: evidence_after.plugin_set_sha256,
                 trust_store_sha256: evidence_after.trust_store_sha256,
                 matrix_sha256: evidence_after.matrix_sha256,
@@ -159,14 +172,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn capture_evidence_inputs(
-    workspace: &std::path::Path,
-    x86_host: &std::path::Path,
-    x64_host: &std::path::Path,
-    trust_store_path: &std::path::Path,
-    matrix_path: &std::path::Path,
+    files: &EvidenceFiles<'_>,
     manifests: &[PluginManifest],
 ) -> Result<EvidenceInputs, Box<dyn Error>> {
-    let trust_store = TrustStore::load(trust_store_path)?;
+    let trust_store = TrustStore::load(files.trust_store)?;
+    let release_set = check_release_root_against_set(
+        files.plugin_root,
+        files.release_set_spec,
+        files.trust_store,
+        files.matrix,
+    )?;
     let mut plugin_payloads = std::collections::BTreeMap::new();
     for manifest in manifests {
         trust_store.verify(manifest)?;
@@ -180,13 +195,22 @@ fn capture_evidence_inputs(
             return Err("verified plugin IDs must be unique".into());
         }
     }
+    let trust_store_sha256 = sha256_file(files.trust_store)?;
+    let matrix_sha256 = sha256_file(files.matrix)?;
+    if release_set.trust_store_sha256 != trust_store_sha256
+        || release_set.matrix_sha256 != matrix_sha256
+    {
+        return Err("release set report is not bound to the tested trust store and matrix".into());
+    }
     Ok(EvidenceInputs {
-        source: capture_source_identity(workspace)?,
+        source: capture_source_identity(files.workspace)?,
+        release_set_spec_sha256: release_set.spec_sha256,
+        package_set_sha256: release_set.package_set_sha256,
         plugin_set_sha256: digest_named_payloads("plugin-set", &plugin_payloads)?,
-        trust_store_sha256: sha256_file(trust_store_path)?,
-        matrix_sha256: sha256_file(matrix_path)?,
-        x86_host_sha256: sha256_file(x86_host)?,
-        x64_host_sha256: sha256_file(x64_host)?,
+        trust_store_sha256,
+        matrix_sha256,
+        x86_host_sha256: sha256_file(files.x86_host)?,
+        x64_host_sha256: sha256_file(files.x64_host)?,
     })
 }
 
