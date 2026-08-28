@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use ssdev_config::{ConfigStore, DesktopConfig};
 use ssdev_origin_policy::{InvocationPolicyCoverage, OriginPolicy, OriginPolicySummary};
 use tauri::ipc::CapabilityBuilder;
@@ -226,6 +227,43 @@ pub(crate) struct ConfigSnapshot {
     migration_warnings: Vec<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfigImportEnvironmentPreview {
+    name: String,
+    url: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfigImportPreview {
+    plan_id: String,
+    config_changed: bool,
+    default_website_changed: bool,
+    tenant_changed: bool,
+    allow_switch_changed: bool,
+    auto_close_changed: bool,
+    auto_start_changed: bool,
+    plugin_catalog_changed: bool,
+    candidate_default_website: Option<String>,
+    candidate_allow_switch: bool,
+    candidate_auto_close: bool,
+    candidate_auto_start: bool,
+    current_environment_count: usize,
+    candidate_environment_count: usize,
+    candidate_environments: Vec<ConfigImportEnvironmentPreview>,
+    current_business_origin_count: usize,
+    candidate_business_origin_count: usize,
+    current_trusted_origin_count: usize,
+    candidate_trusted_origin_count: usize,
+    current_external_origin_count: usize,
+    candidate_external_origin_count: usize,
+    current_managed_process_count: usize,
+    candidate_managed_process_count: usize,
+    current_enabled_shortcut_count: usize,
+    candidate_enabled_shortcut_count: usize,
+}
+
 #[tauri::command]
 pub(crate) fn desktop_config<R: tauri::Runtime>(
     caller: WebviewWindow<R>,
@@ -256,6 +294,30 @@ pub(crate) async fn save_desktop_config(
     require_control(&caller)?;
     let _install = bridge_state.install_lock.lock().await;
     replace_desktop_config(&app, &state, config)
+}
+
+#[tauri::command]
+pub(crate) async fn inspect_desktop_config_import(
+    caller: WebviewWindow,
+    state: State<'_, DesktopState>,
+    bridge_state: State<'_, crate::BridgeState>,
+    source: PathBuf,
+) -> Result<ConfigImportPreview, String> {
+    require_control(&caller)?;
+    let _install = bridge_state.install_lock.lock().await;
+    let candidate = ssdev_config::load_config_file(&source).map_err(|error| error.to_string())?;
+    state.authorize_config(&candidate)?;
+    let preview = build_config_import_preview(&state.config.snapshot(), &candidate)?;
+    tracing::info!(
+        event_code = "desktop-config-import-inspected",
+        config_changed = preview.config_changed,
+        business_origins = preview.candidate_business_origin_count,
+        environments = preview.candidate_environment_count,
+        managed_processes = preview.candidate_managed_process_count,
+        enabled_shortcuts = preview.candidate_enabled_shortcut_count,
+        "desktop config import inspected"
+    );
+    Ok(preview)
 }
 
 pub(crate) fn replace_desktop_config(
@@ -310,12 +372,108 @@ pub(crate) async fn import_desktop_config(
     state: State<'_, DesktopState>,
     bridge_state: State<'_, crate::BridgeState>,
     source: PathBuf,
+    expected_plan_id: String,
 ) -> Result<ConfigSnapshot, String> {
     require_control(&caller)?;
     let _install = bridge_state.install_lock.lock().await;
-    let config = ssdev_config::load_config_file(&source).map_err(|error| error.to_string())?;
-    replace_desktop_config(&app, &state, config)?;
+    if !crate::is_lowercase_sha256(&expected_plan_id) {
+        return Err("配置导入计划标识无效，请重新预检".into());
+    }
+    let candidate = ssdev_config::load_config_file(&source).map_err(|error| error.to_string())?;
+    state.authorize_config(&candidate)?;
+    let preview = build_config_import_preview(&state.config.snapshot(), &candidate)?;
+    if preview.plan_id != expected_plan_id {
+        return Err("导入文件或当前配置已在预检后变化，请重新预检后确认导入".into());
+    }
+    if !preview.config_changed {
+        tracing::info!(
+            event_code = "desktop-config-import-unchanged",
+            "desktop config import skipped because configuration is unchanged"
+        );
+        return Ok(config_snapshot(&state));
+    }
+    replace_desktop_config(&app, &state, candidate)?;
+    tracing::info!(
+        event_code = "desktop-config-imported",
+        config_changed = preview.config_changed,
+        business_origins = preview.candidate_business_origin_count,
+        environments = preview.candidate_environment_count,
+        managed_processes = preview.candidate_managed_process_count,
+        enabled_shortcuts = preview.candidate_enabled_shortcut_count,
+        "desktop config imported"
+    );
     Ok(config_snapshot(&state))
+}
+
+fn build_config_import_preview(
+    current: &DesktopConfig,
+    candidate: &DesktopConfig,
+) -> Result<ConfigImportPreview, String> {
+    let current_business_origin_count = current
+        .business_origins()
+        .map_err(|error| error.to_string())?
+        .len();
+    let candidate_business_origin_count = candidate
+        .business_origins()
+        .map_err(|error| error.to_string())?
+        .len();
+    let plan_id = config_import_plan_id(current, candidate)?;
+    Ok(ConfigImportPreview {
+        plan_id,
+        config_changed: current != candidate,
+        default_website_changed: current.website != candidate.website,
+        tenant_changed: current.tenant_id != candidate.tenant_id,
+        allow_switch_changed: current.allow_switch != candidate.allow_switch,
+        auto_close_changed: current.auto_close != candidate.auto_close,
+        auto_start_changed: current.auto_start != candidate.auto_start,
+        plugin_catalog_changed: current.plugin_catalog_url != candidate.plugin_catalog_url
+            || current.plugin_catalog_signature_url != candidate.plugin_catalog_signature_url,
+        candidate_default_website: candidate.website.clone(),
+        candidate_allow_switch: candidate.allow_switch,
+        candidate_auto_close: candidate.auto_close,
+        candidate_auto_start: candidate.auto_start,
+        current_environment_count: current.environments.len(),
+        candidate_environment_count: candidate.environments.len(),
+        candidate_environments: candidate
+            .environments
+            .iter()
+            .map(|environment| ConfigImportEnvironmentPreview {
+                name: environment.name.clone(),
+                url: environment.url.clone(),
+            })
+            .collect(),
+        current_business_origin_count,
+        candidate_business_origin_count,
+        current_trusted_origin_count: current.trusted_origins.len(),
+        candidate_trusted_origin_count: candidate.trusted_origins.len(),
+        current_external_origin_count: current.external_origins.len(),
+        candidate_external_origin_count: candidate.external_origins.len(),
+        current_managed_process_count: current.managed_processes.len(),
+        candidate_managed_process_count: candidate.managed_processes.len(),
+        current_enabled_shortcut_count: enabled_shortcut_count(current),
+        candidate_enabled_shortcut_count: enabled_shortcut_count(candidate),
+    })
+}
+
+fn enabled_shortcut_count(config: &DesktopConfig) -> usize {
+    config
+        .key_bindings
+        .iter()
+        .filter(|binding| binding.enabled)
+        .count()
+}
+
+fn config_import_plan_id(
+    current: &DesktopConfig,
+    candidate: &DesktopConfig,
+) -> Result<String, String> {
+    let current = serde_json::to_vec(current).map_err(|error| error.to_string())?;
+    let candidate = serde_json::to_vec(candidate).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-DESKTOP-CONFIG-IMPORT-PLAN\0");
+    crate::hash_plan_field(&mut hasher, &current);
+    crate::hash_plan_field(&mut hasher, &candidate);
+    Ok(crate::lowercase_hex(&hasher.finalize()))
 }
 
 #[tauri::command]
@@ -1453,6 +1611,82 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn config_import_plan_binds_candidate_and_current_configuration() {
+        let current = DesktopConfig {
+            website: Some("https://current.example.test/app".into()),
+            ..DesktopConfig::default()
+        };
+        let candidate = DesktopConfig {
+            website: Some("https://candidate.example.test/app".into()),
+            auto_start: true,
+            ..DesktopConfig::default()
+        };
+        let plan = config_import_plan_id(&current, &candidate).unwrap();
+
+        assert!(crate::is_lowercase_sha256(&plan));
+        assert_eq!(plan, config_import_plan_id(&current, &candidate).unwrap());
+
+        let changed_current = DesktopConfig {
+            tenant_id: "changed-current".into(),
+            ..current.clone()
+        };
+        let changed_candidate = DesktopConfig {
+            tenant_id: "changed-candidate".into(),
+            ..candidate.clone()
+        };
+        assert_ne!(
+            plan,
+            config_import_plan_id(&changed_current, &candidate).unwrap()
+        );
+        assert_ne!(
+            plan,
+            config_import_plan_id(&current, &changed_candidate).unwrap()
+        );
+    }
+
+    #[test]
+    fn config_import_preview_exposes_effects_without_applying_them() {
+        let current = DesktopConfig {
+            website: Some("https://current.example.test/app".into()),
+            managed_processes: vec!["reader-agent".into()],
+            ..DesktopConfig::default()
+        };
+        let candidate = DesktopConfig {
+            website: Some("https://candidate.example.test/app".into()),
+            environments: vec![ssdev_config::EnvironmentConfig {
+                name: "验收环境".into(),
+                url: "https://acceptance.example.test/app".into(),
+                extensions: Default::default(),
+            }],
+            allow_switch: false,
+            auto_close: true,
+            auto_start: true,
+            tenant_id: "tenant-a".into(),
+            trusted_origins: vec!["https://sso.example.test".into()],
+            external_origins: vec!["https://help.example.test".into()],
+            ..DesktopConfig::default()
+        };
+
+        let preview = build_config_import_preview(&current, &candidate).unwrap();
+
+        assert!(preview.config_changed);
+        assert!(preview.default_website_changed);
+        assert!(preview.tenant_changed);
+        assert!(preview.allow_switch_changed);
+        assert!(preview.auto_close_changed);
+        assert!(preview.auto_start_changed);
+        assert_eq!(preview.current_environment_count, 0);
+        assert_eq!(preview.candidate_environment_count, 1);
+        assert_eq!(preview.current_business_origin_count, 1);
+        assert_eq!(preview.candidate_business_origin_count, 2);
+        assert_eq!(preview.current_managed_process_count, 1);
+        assert_eq!(preview.candidate_managed_process_count, 0);
+        assert_eq!(preview.candidate_trusted_origin_count, 1);
+        assert_eq!(preview.candidate_external_origin_count, 1);
+        assert_eq!(preview.candidate_environments[0].name, "验收环境");
+    }
 
     #[test]
     fn exit_lifecycle_starts_one_drain_and_then_allows_the_final_exit() {

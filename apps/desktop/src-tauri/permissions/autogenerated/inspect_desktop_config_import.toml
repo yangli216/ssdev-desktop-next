@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-inspect-desktop-config-import"
+description = "Enables the inspect_desktop_config_import command without any pre-configured scope."
+commands.allow = ["inspect_desktop_config_import"]
+
+[[permission]]
+identifier = "deny-inspect-desktop-config-import"
+description = "Denies the inspect_desktop_config_import command without any pre-configured scope."
+commands.deny = ["inspect_desktop_config_import"]

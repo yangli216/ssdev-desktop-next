@@ -34,6 +34,7 @@
     "allow-run-local-mapping-debug-cases",
     "allow-desktop-config",
     "allow-save-desktop-config",
+    "allow-inspect-desktop-config-import",
     "allow-import-desktop-config",
     "allow-export-desktop-config",
     "allow-open-business-window",

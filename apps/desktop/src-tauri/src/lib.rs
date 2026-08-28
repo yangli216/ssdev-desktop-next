@@ -3242,6 +3242,7 @@ pub fn run() {
             system_declaration,
             desktop::desktop_config,
             desktop::save_desktop_config,
+            desktop::inspect_desktop_config_import,
             desktop::import_desktop_config,
             desktop::export_desktop_config,
             desktop::open_business_window,

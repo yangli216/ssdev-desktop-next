@@ -160,6 +160,34 @@ type ConfigSnapshot = {
   migrationWarnings: string[]
 }
 
+type ConfigImportPreview = {
+  planId: string
+  configChanged: boolean
+  defaultWebsiteChanged: boolean
+  tenantChanged: boolean
+  allowSwitchChanged: boolean
+  autoCloseChanged: boolean
+  autoStartChanged: boolean
+  pluginCatalogChanged: boolean
+  candidateDefaultWebsite?: string
+  candidateAllowSwitch: boolean
+  candidateAutoClose: boolean
+  candidateAutoStart: boolean
+  currentEnvironmentCount: number
+  candidateEnvironmentCount: number
+  candidateEnvironments: EnvironmentConfig[]
+  currentBusinessOriginCount: number
+  candidateBusinessOriginCount: number
+  currentTrustedOriginCount: number
+  candidateTrustedOriginCount: number
+  currentExternalOriginCount: number
+  candidateExternalOriginCount: number
+  currentManagedProcessCount: number
+  candidateManagedProcessCount: number
+  currentEnabledShortcutCount: number
+  candidateEnabledShortcutCount: number
+}
+
 type PluginInstallResult = {
   pluginId: string
   pluginVersion: string
@@ -243,6 +271,8 @@ const status = ref<BridgeStatus | null>(null)
 const deploymentCheck = ref<DeploymentCheckReport | null>(null)
 const projectBundlePreview = ref<ProjectBundlePreview | null>(null)
 const selectedProjectBundle = ref('')
+const configImportPreview = ref<ConfigImportPreview | null>(null)
+const selectedConfigImport = ref('')
 const snapshot = ref<ConfigSnapshot | null>(null)
 const inventory = ref<PluginInventory | null>(null)
 const catalogPluginId = ref('')
@@ -340,6 +370,8 @@ async function saveConfig() {
     async () => {
       await invoke('save_desktop_config', { config: snapshot.value?.config })
       deploymentCheck.value = await invoke<DeploymentCheckReport>('run_deployment_check')
+      configImportPreview.value = null
+      selectedConfigImport.value = ''
     },
     '配置已安全保存；已有业务窗口已关闭，请重新进入。',
   )
@@ -353,9 +385,36 @@ async function importConfig() {
   })
   if (typeof source !== 'string') return
   await run(async () => {
-    snapshot.value = await invoke<ConfigSnapshot>('import_desktop_config', { source })
+    configImportPreview.value = null
+    selectedConfigImport.value = ''
+    configImportPreview.value = await invoke<ConfigImportPreview>('inspect_desktop_config_import', { source })
+    selectedConfigImport.value = source
+  }, '配置预检已完成；计划已绑定导入文件和当前已保存配置，请核对后确认。')
+}
+
+async function confirmConfigImport() {
+  if (!selectedConfigImport.value || !configImportPreview.value) {
+    error.value = '请先选择并预检桌面配置。'
+    return
+  }
+  const source = selectedConfigImport.value
+  const expectedPlanId = configImportPreview.value.planId
+  const changed = configImportPreview.value.configChanged
+  await run(async () => {
+    snapshot.value = await invoke<ConfigSnapshot>('import_desktop_config', {
+      source,
+      expectedPlanId,
+    })
     deploymentCheck.value = await invoke<DeploymentCheckReport>('run_deployment_check')
-  }, '配置已校验并导入；已有业务窗口已关闭。')
+    configImportPreview.value = null
+    selectedConfigImport.value = ''
+  }, changed ? '配置已按确认计划导入；已有业务窗口已关闭。' : '导入配置与当前配置一致，未执行替换。')
+}
+
+function cancelConfigImport() {
+  configImportPreview.value = null
+  selectedConfigImport.value = ''
+  notice.value = '已取消配置导入。'
 }
 
 async function exportConfig() {
@@ -421,6 +480,8 @@ async function importSelectedProjectBundle() {
     ])
     selectedProjectBundle.value = ''
     projectBundlePreview.value = null
+    selectedConfigImport.value = ''
+    configImportPreview.value = null
   }, '')
   if (result) {
     notice.value = `项目已导入：${result.signedPlugins} 个签名插件、${result.localMappings} 个本地映射、${result.serviceCount} 个原生服务；已有业务窗口已关闭。`
@@ -435,6 +496,8 @@ async function openEnvironment(environment: EnvironmentConfig) {
   if (!snapshot.value) return
   await run(async () => {
     await invoke('save_desktop_config', { config: snapshot.value?.config })
+    selectedConfigImport.value = ''
+    configImportPreview.value = null
     await invoke('open_business_window', { environment: environment.name })
   }, `已保存配置并打开环境「${environment.name}」。`)
 }
@@ -752,6 +815,30 @@ async function runDeploymentCheck() {
 
       <section v-show="activeSection === 'configuration'" class="page" aria-labelledby="configuration-title">
         <header class="section-header"><div><p class="eyebrow">PROJECT CONFIGURATION</p><h1 id="configuration-title">项目配置</h1><p>管理业务环境、来源边界和桌面启动行为。</p></div><div class="header-actions"><button type="button" :disabled="busy" @click="importConfig">导入配置</button><button type="button" :disabled="busy" @click="exportConfig">导出配置</button></div></header>
+        <section v-if="configImportPreview" class="config-import-preview" aria-label="配置导入变更预览">
+          <header>
+            <div><p class="eyebrow">CONFIG IMPORT PLAN</p><h2>{{ configImportPreview.configChanged ? '核对配置变更' : '配置内容没有变化' }}</h2><p>确认时会重新读取文件并核对当前已保存配置；任一变化都会要求重新预检。</p></div>
+            <div class="config-import-actions"><button type="button" :disabled="busy" @click="cancelConfigImport">取消</button><button class="primary" type="button" :disabled="busy" @click="confirmConfigImport">{{ configImportPreview.configChanged ? '确认并应用配置' : '确认无须替换' }}</button></div>
+          </header>
+          <div class="config-import-target"><span>目标默认入口</span><strong>{{ configImportPreview.candidateDefaultWebsite || '未配置' }}</strong></div>
+          <div class="config-import-counts">
+            <span><small>业务环境</small><strong>{{ configImportPreview.currentEnvironmentCount }} → {{ configImportPreview.candidateEnvironmentCount }}</strong></span>
+            <span><small>业务来源</small><strong>{{ configImportPreview.currentBusinessOriginCount }} → {{ configImportPreview.candidateBusinessOriginCount }}</strong></span>
+            <span><small>SSO 来源</small><strong>{{ configImportPreview.currentTrustedOriginCount }} → {{ configImportPreview.candidateTrustedOriginCount }}</strong></span>
+            <span><small>外链来源</small><strong>{{ configImportPreview.currentExternalOriginCount }} → {{ configImportPreview.candidateExternalOriginCount }}</strong></span>
+            <span><small>受控进程</small><strong>{{ configImportPreview.currentManagedProcessCount }} → {{ configImportPreview.candidateManagedProcessCount }}</strong></span>
+            <span><small>启用快捷键</small><strong>{{ configImportPreview.currentEnabledShortcutCount }} → {{ configImportPreview.candidateEnabledShortcutCount }}</strong></span>
+          </div>
+          <div class="project-change-summary">
+            <span :class="{ changed: configImportPreview.defaultWebsiteChanged }">默认入口{{ configImportPreview.defaultWebsiteChanged ? '变更' : '不变' }}</span>
+            <span :class="{ changed: configImportPreview.tenantChanged }">租户{{ configImportPreview.tenantChanged ? '变更' : '不变' }}</span>
+            <span :class="{ changed: configImportPreview.allowSwitchChanged }">环境切换：{{ configImportPreview.candidateAllowSwitch ? '启用' : '关闭' }}</span>
+            <span :class="{ changed: configImportPreview.autoCloseChanged }">关闭确认：{{ configImportPreview.candidateAutoClose ? '启用' : '关闭' }}</span>
+            <span :class="{ changed: configImportPreview.autoStartChanged }">开机启动：{{ configImportPreview.candidateAutoStart ? '启用' : '关闭' }}</span>
+            <span :class="{ changed: configImportPreview.pluginCatalogChanged }">插件仓库{{ configImportPreview.pluginCatalogChanged ? '变更' : '不变' }}</span>
+          </div>
+          <details v-if="configImportPreview.candidateEnvironments.length" class="config-import-environments"><summary>查看目标业务环境（{{ configImportPreview.candidateEnvironments.length }}）</summary><ul><li v-for="environment in configImportPreview.candidateEnvironments" :key="`${environment.name}:${environment.url}`"><strong>{{ environment.name }}</strong><code>{{ environment.url }}</code></li></ul></details>
+        </section>
         <section class="project-bundle-panel">
           <div class="project-bundle-copy"><p class="eyebrow">PROJECT DELIVERY</p><h2>项目部署包</h2><p>将当前配置、签名插件和本地映射作为一个交付单元迁移到目标 Windows 机器；正式导入要求同目录组织签名旁签。</p></div>
           <div class="project-bundle-actions"><button type="button" :disabled="busy" @click="exportProjectBundle">导出当前项目</button><button class="primary" type="button" :disabled="busy" @click="inspectProjectBundle">选择项目包并预检</button></div>

@@ -83,6 +83,26 @@ button:disabled { cursor: wait !important; opacity: .5; }
 .attention-panel li button { border: 0; background: transparent; color: #386148; font-size: 12px; font-weight: 750; cursor: pointer; }
 
 .operations, .plugin-inventory { display: grid; grid-template-columns: minmax(230px, .58fr) minmax(440px, 1.42fr); gap: clamp(36px, 5vw, 72px); margin-top: 32px; padding: 36px; border: 1px solid #cad2cb; border-radius: 16px; background: rgba(255,255,252,.86); }
+.config-import-preview { margin-top: 32px; overflow: hidden; border: 1px solid #d9c68e; border-radius: 16px; background: rgba(255,251,239,.94); box-shadow: 0 18px 45px rgba(82,66,26,.05); }
+.config-import-preview > header { display: flex; justify-content: space-between; gap: 28px; align-items: center; padding: 24px 28px; border-bottom: 1px solid #e9ddbd; }
+.config-import-preview h2 { margin: 0; color: #594919; font: 500 27px Georgia, "Songti SC", serif; }
+.config-import-preview header p:last-child { margin: 8px 0 0; color: #786d4e; font-size: 12px; }
+.config-import-actions { display: flex; flex: 0 0 auto; gap: 9px; }
+.config-import-actions button { padding: 10px 14px; border: 1px solid #b6a977; border-radius: 9px; background: rgba(255,255,255,.78); color: #4b492c; cursor: pointer; }
+.config-import-target { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 16px; align-items: center; padding: 15px 28px; border-bottom: 1px solid #eee5cd; }
+.config-import-target span { color: #7a7157; font-size: 11px; }
+.config-import-target strong { overflow: hidden; color: #3f452d; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.config-import-counts { display: grid; grid-template-columns: repeat(6, 1fr); border-bottom: 1px solid #e9ddbd; }
+.config-import-counts span { display: grid; gap: 7px; padding: 15px 18px; border-right: 1px solid #eee5cd; }
+.config-import-counts span:last-child { border-right: 0; }
+.config-import-counts small { color: #82785d; font-size: 10px; }
+.config-import-counts strong { color: #485239; font: 19px Georgia, serif; }
+.config-import-environments { border-top: 1px solid #eee5cd; }
+.config-import-environments summary { padding: 13px 28px; color: #655d46; font-size: 11px; cursor: pointer; }
+.config-import-environments ul { margin: 0; padding: 0 28px 17px; list-style: none; }
+.config-import-environments li { display: grid; grid-template-columns: minmax(120px, .35fr) minmax(0, 1fr); gap: 16px; padding: 8px 0; border-top: 1px solid #eee5cd; }
+.config-import-environments strong { color: #4d513b; font-size: 11px; }
+.config-import-environments code { overflow: hidden; color: #746d57; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .project-bundle-panel { display: grid; grid-template-columns: 1fr auto; gap: 24px; align-items: center; margin-top: 32px; padding: 28px 30px; border: 1px solid #c7d4ca; border-radius: 16px; background: linear-gradient(135deg, rgba(238,246,239,.95), rgba(255,252,241,.9)); box-shadow: 0 18px 45px rgba(36,63,48,.04); }
 .project-bundle-copy h2 { margin: 0; color: #214a35; font: 500 28px Georgia, "Songti SC", serif; }
 .project-bundle-copy p:last-child { max-width: 650px; margin: 8px 0 0; color: #68766e; font-size: 12px; line-height: 1.6; }
@@ -248,6 +268,8 @@ button:disabled { cursor: wait !important; opacity: .5; }
   .module-panel > header > small { text-align: left; }
   .attention-panel, .boundary { grid-template-columns: 1fr; gap: 24px; }
   .form-columns { grid-template-columns: 1fr; }
+  .config-import-preview > header { align-items: flex-start; flex-direction: column; }
+  .config-import-counts { grid-template-columns: repeat(3, 1fr); }
   .bundle-summary { grid-template-columns: repeat(3, 1fr); }
   .environment-row { grid-template-columns: auto 1fr auto auto; }
   .environment-row input[type="url"] { grid-column: 2 / -1; }
