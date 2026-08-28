@@ -11,7 +11,7 @@ use webplus_plugin_config::{
     ParameterDefinition, PluginManifest, PluginMetadata, ServiceDefinition, API_FILENAME,
     PLUGIN_METADATA_FILENAME,
 };
-use webplus_protocol::InvokeRequest;
+use webplus_protocol::{InvokeRequest, InvokeResponse};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
@@ -25,6 +25,7 @@ const MAX_DEBUG_CASES: usize = 32;
 const MAX_EXPECTED_RES_DATA_BYTES: usize = 64 * 1024;
 const MAX_EXPECTED_RES_DATA_DEPTH: usize = 16;
 const MAX_EXPECTED_RES_DATA_NODES: usize = 512;
+const MAX_RELEASE_MATRIX_CASES: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -68,8 +69,27 @@ pub(crate) struct NativeComponentInspection {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ReleaseSourceExportResult {
     pub destination: PathBuf,
+    pub matrix_seed: PathBuf,
     pub file_count: usize,
     pub bytes: u64,
+    pub seeded_case_count: usize,
+    pub placeholder_case_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReleaseMatrixSeed {
+    schema_version: u8,
+    draft: bool,
+    cases: Vec<ReleaseMatrixCase>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReleaseMatrixCase {
+    name: String,
+    enabled: bool,
+    request: InvokeRequest,
+    expected: InvokeResponse,
 }
 
 pub(crate) struct PreparedLocalMapping {
@@ -483,16 +503,10 @@ pub(crate) fn export_release_source(
         return Err("发布源不能写入客户端管理的本地映射目录".into());
     }
     let destination = destination_parent.join(format!("{plugin_id}-release-source"));
-    match fs::symlink_metadata(&destination) {
-        Ok(_) => {
-            return Err(format!(
-                "发布源目标已存在，不会覆盖: {}",
-                destination.display()
-            ))
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("无法检查发布源目标: {error}")),
-    }
+    let matrix_seed = destination_parent.join(format!("{plugin_id}-matrix-seed.json"));
+    ensure_release_target_is_new(&destination, "发布源目标")?;
+    ensure_release_target_is_new(&matrix_seed, "黄金矩阵种子")?;
+    let (matrix, seeded_case_count, placeholder_case_count) = release_matrix_seed(&definition)?;
     fs::create_dir(&destination).map_err(|error| format!("无法创建发布源目录: {error}"))?;
     let exported = (|| {
         write_json(destination.join(API_FILENAME), &definition.services)?;
@@ -524,6 +538,7 @@ pub(crate) fn export_release_source(
                 )?;
             }
         }
+        write_json_noclobber(&matrix_seed, &matrix)?;
         Ok::<_, String>((file_count, bytes))
     })();
     let (file_count, bytes) = match exported {
@@ -535,9 +550,152 @@ pub(crate) fn export_release_source(
     };
     Ok(ReleaseSourceExportResult {
         destination,
+        matrix_seed,
         file_count,
         bytes,
+        seeded_case_count,
+        placeholder_case_count,
     })
+}
+
+fn ensure_release_target_is_new(path: &Path, role: &str) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(format!("{role}已存在，不会覆盖: {}", path.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("无法检查{role}: {error}")),
+    }
+}
+
+fn release_matrix_seed(
+    definition: &LocalMappingDefinition,
+) -> Result<(ReleaseMatrixSeed, usize, usize), String> {
+    let mut cases = Vec::new();
+    let mut names = HashSet::new();
+    let mut covered = HashSet::new();
+    for debug_case in &definition.debug_cases {
+        let service = definition
+            .services
+            .iter()
+            .find(|service| service.service_id == debug_case.service_id)
+            .ok_or_else(|| format!("调试用例 [{}] 的服务不存在", debug_case.name))?;
+        let method = service
+            .method(&debug_case.method)
+            .ok_or_else(|| format!("调试用例 [{}] 的方法不存在", debug_case.name))?;
+        names.insert(debug_case.name.clone());
+        covered.insert((service.service_id.clone(), method.name.clone()));
+        cases.push(ReleaseMatrixCase {
+            name: debug_case.name.clone(),
+            enabled: true,
+            request: InvokeRequest {
+                service_id: debug_case.service_id.clone(),
+                method: debug_case.method.clone(),
+                parameters: debug_case.parameters.clone(),
+            },
+            expected: InvokeResponse {
+                res_code: debug_case.expected_res_code,
+                res_data: if debug_case.assert_res_data {
+                    debug_case.expected_res_data.clone()
+                } else {
+                    serde_json::Value::String("<replace-with-redacted-golden-response>".into())
+                },
+            },
+        });
+    }
+    let seeded_case_count = cases.len();
+    for service in &definition.services {
+        for method in &service.methods {
+            if covered.contains(&(service.service_id.clone(), method.name.clone())) {
+                continue;
+            }
+            let name = unique_matrix_case_name(
+                &format!("{}.{} release draft", service.service_id, method.name),
+                &mut names,
+            );
+            let parameters = method
+                .parameters
+                .iter()
+                .filter(|parameter| !parameter.name().starts_with('$'))
+                .map(|parameter| {
+                    (
+                        parameter.name().to_owned(),
+                        release_parameter_placeholder(parameter),
+                    )
+                })
+                .collect();
+            cases.push(ReleaseMatrixCase {
+                name,
+                enabled: true,
+                request: InvokeRequest {
+                    service_id: service.service_id.clone(),
+                    method: method.alias.clone().unwrap_or_else(|| method.name.clone()),
+                    parameters,
+                },
+                expected: InvokeResponse::success("<replace-with-redacted-golden-response>"),
+            });
+        }
+    }
+    if cases.is_empty() || cases.len() > MAX_RELEASE_MATRIX_CASES {
+        return Err(format!(
+            "黄金矩阵种子必须包含 1 到 {MAX_RELEASE_MATRIX_CASES} 个用例"
+        ));
+    }
+    let placeholder_case_count = cases.len().saturating_sub(seeded_case_count);
+    Ok((
+        ReleaseMatrixSeed {
+            schema_version: 1,
+            draft: true,
+            cases,
+        },
+        seeded_case_count,
+        placeholder_case_count,
+    ))
+}
+
+fn unique_matrix_case_name(preferred: &str, names: &mut HashSet<String>) -> String {
+    if names.insert(preferred.to_owned()) {
+        return preferred.to_owned();
+    }
+    for suffix in 2_u16..=u16::MAX {
+        let candidate = format!("{preferred} ({suffix})");
+        if names.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("matrix case count is bounded well below u16::MAX")
+}
+
+fn release_parameter_placeholder(parameter: &ParameterDefinition) -> serde_json::Value {
+    let parameter_type = match parameter {
+        ParameterDefinition::Name(_) => "",
+        ParameterDefinition::Detailed(detail) => detail.parameter_type.as_str(),
+    };
+    match parameter_type.trim().to_ascii_lowercase().as_str() {
+        "bool" | "boolean" => serde_json::Value::Bool(false),
+        "int" | "int32" | "long" | "uint" | "uint32" | "dword" | "float" | "double" => {
+            serde_json::Value::from(0)
+        }
+        _ => serde_json::Value::String("<replace-with-redacted-input>".into()),
+    }
+}
+
+fn write_json_noclobber(path: &Path, value: &impl Serialize) -> Result<(), String> {
+    let parent = path.parent().ok_or("黄金矩阵种子缺少父目录")?;
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("无法生成黄金矩阵种子: {error}"))?;
+    bytes.push(b'\n');
+    let mut temporary = TempBuilder::new()
+        .prefix(".ssdev-matrix-seed-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|error| format!("无法创建黄金矩阵种子暂存文件: {error}"))?;
+    temporary
+        .write_all(&bytes)
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|error| format!("无法持久化黄金矩阵种子: {error}"))?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| format!("无法保存黄金矩阵种子（不会覆盖已有文件）: {}", error.error))?;
+    Ok(())
 }
 
 pub(crate) fn validate_installed_manifest(manifest: &PluginManifest) -> Result<(), String> {
@@ -1512,7 +1670,17 @@ mod tests {
         let component = source.path().join("reader.bat");
         fs::write(&component, b"@echo off\r\necho ready\r\n").unwrap();
         let active_root = tempfile::tempdir().unwrap();
-        prepare(active_root.path(), fixture_definition(&component))
+        let mut definition = fixture_definition(&component);
+        definition.debug_cases.push(DebugCaseDefinition {
+            name: "reader known response".into(),
+            service_id: "ReaderService".into(),
+            method: "read".into(),
+            parameters: serde_json::from_value(serde_json::json!({ "port": "COM1" })).unwrap(),
+            expected_res_code: 0,
+            assert_res_data: true,
+            expected_res_data: serde_json::json!({ "ReturnValue": "ready" }),
+        });
+        prepare(active_root.path(), definition)
             .unwrap()
             .activate(active_root.path())
             .unwrap()
@@ -1533,6 +1701,24 @@ mod tests {
                 .join("reader.local-release-source")
         );
         assert_eq!(result.file_count, 2);
+        assert_eq!(result.seeded_case_count, 1);
+        assert_eq!(result.placeholder_case_count, 0);
+        assert_eq!(
+            result.matrix_seed,
+            output
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("reader.local-matrix-seed.json")
+        );
+        let matrix_seed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&result.matrix_seed).unwrap()).unwrap();
+        assert_eq!(matrix_seed["draft"], true);
+        assert_eq!(matrix_seed["cases"][0]["name"], "reader known response");
+        assert_eq!(
+            matrix_seed["cases"][0]["expected"]["ResData"]["ReturnValue"],
+            "ready"
+        );
         assert!(result.destination.join(API_FILENAME).is_file());
         assert!(result.destination.join("components/0-reader.bat").is_file());
         assert!(!result.destination.join(LOCAL_MAPPING_FILENAME).exists());
@@ -1566,10 +1752,13 @@ mod tests {
             display_name: "Reader release",
             key_id: "release-key",
             trust_store: &trust_store,
+            matrix_seed: Some(&result.matrix_seed),
         })
         .unwrap();
         assert_eq!(prepared.plugin_id, "reader.local");
         assert_eq!(prepared.method_count, 1);
+        assert!(prepared.matrix_seeded);
+        assert_eq!(prepared.matrix_case_count, 1);
 
         assert!(export_release_source(active_root.path(), "reader.local", output.path()).is_err());
         assert!(

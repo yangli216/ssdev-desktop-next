@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tempfile::Builder as TempBuilder;
 use thiserror::Error;
@@ -19,13 +19,14 @@ use webplus_plugin_trust::{
     encode_signature_document, portable_plugin_path, prepare_signing_material, TrustPurpose,
     TrustStore, SIGNATURE_FILENAME,
 };
-use webplus_protocol::PluginArchitecture;
+use webplus_protocol::{InvokeRequest, InvokeResponse, PluginArchitecture};
 
 const MAX_PLUGIN_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PLUGIN_FILES: usize = 4096;
 const MAX_SIGNING_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 1024;
 const MAX_MATRIX_CASES: usize = 1024;
+const MAX_MATRIX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CATALOG_SPEC_BYTES: u64 = 1024 * 1024;
 const MAX_CATALOG_PACKAGES: usize = 4096;
 const PLUGIN_METADATA_FILENAME: &str = "plugin.json";
@@ -42,6 +43,7 @@ pub struct PrepareOptions<'a> {
     pub display_name: &'a str,
     pub key_id: &'a str,
     pub trust_store: &'a Path,
+    pub matrix_seed: Option<&'a Path>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +75,8 @@ pub struct PrepareReport {
     pub signed_file_count: usize,
     pub payload_sha256: String,
     pub legacy_license_excluded: bool,
+    pub matrix_seeded: bool,
+    pub matrix_case_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -122,6 +126,28 @@ struct SigningRequest {
     payload_sha256: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MatrixDocument {
+    schema_version: u8,
+    draft: bool,
+    cases: Vec<MatrixCase>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MatrixCase {
+    name: String,
+    #[serde(default = "enabled_by_default")]
+    enabled: bool,
+    request: InvokeRequest,
+    expected: InvokeResponse,
+}
+
+fn enabled_by_default() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CatalogSpec {
@@ -145,6 +171,18 @@ pub fn prepare(options: &PrepareOptions<'_>) -> Result<PrepareReport, ToolError>
     let trust_store = TrustStore::load(options.trust_store)?;
     trust_store.ensure_key_can_issue(TrustPurpose::Plugin, options.key_id)?;
     let source = canonical_real_directory(options.source)?;
+    let matrix_seed = options
+        .matrix_seed
+        .map(|path| canonical_real_file(path, MAX_MATRIX_BYTES))
+        .transpose()?;
+    if matrix_seed
+        .as_ref()
+        .is_some_and(|matrix_seed| matrix_seed.starts_with(&source))
+    {
+        return Err(ToolError::Invalid(
+            "matrix seed must stay outside the signed source directory".into(),
+        ));
+    }
     let staging = normalized_new_path(options.staging)?;
     let request = normalized_new_path(options.request)?;
     let matrix_template = normalized_new_path(options.matrix_template)?;
@@ -196,7 +234,10 @@ pub fn prepare(options: &PrepareOptions<'_>) -> Result<PrepareReport, ToolError>
             payload_base64: BASE64.encode(&material.payload),
             payload_sha256: payload_sha256.clone(),
         };
-        let matrix = draft_matrix(&manifest);
+        let matrix = match matrix_seed.as_deref() {
+            Some(path) => load_matrix_seed(path, &manifest)?,
+            None => draft_matrix(&manifest),
+        };
         Ok::<_, ToolError>((
             copy,
             manifest,
@@ -234,6 +275,8 @@ pub fn prepare(options: &PrepareOptions<'_>) -> Result<PrepareReport, ToolError>
         signed_file_count: material.files.len(),
         payload_sha256,
         legacy_license_excluded: copy.legacy_license_excluded,
+        matrix_seeded: matrix_seed.is_some(),
+        matrix_case_count: matrix.cases.len(),
     })
 }
 
@@ -673,47 +716,133 @@ fn detect_pe_architecture(path: &Path) -> Result<Option<PluginArchitecture>, Too
     })
 }
 
-fn draft_matrix(manifest: &PluginManifest) -> Value {
+fn draft_matrix(manifest: &PluginManifest) -> MatrixDocument {
     let cases = manifest
         .services
         .iter()
         .flat_map(|service| {
             service.methods.iter().map(move |method| {
                 let mut parameters = Map::new();
-                for parameter in &method.parameters {
+                for parameter in method
+                    .parameters
+                    .iter()
+                    .filter(|parameter| !parameter.name().starts_with('$'))
+                {
                     parameters.insert(
                         parameter.name().trim_start_matches('$').to_owned(),
                         Value::String("<replace-with-redacted-input>".into()),
                     );
                 }
-                json!({
-                    "name": format!("{}.{}", service.service_id, method.name),
-                    "enabled": true,
-                    "request": {
-                        "serviceId": service.service_id,
-                        "method": method.name,
-                        "parameters": parameters,
+                MatrixCase {
+                    name: format!("{}.{}", service.service_id, method.name),
+                    enabled: true,
+                    request: InvokeRequest {
+                        service_id: service.service_id.clone(),
+                        method: method.name.clone(),
+                        parameters,
                     },
-                    "expected": {
-                        "ResCode": 0,
-                        "ResData": "<replace-with-redacted-golden-response>"
-                    }
-                })
+                    expected: InvokeResponse::success("<replace-with-redacted-golden-response>"),
+                }
             })
         })
         .collect::<Vec<_>>();
-    json!({
-        "schemaVersion": 1,
-        "draft": true,
-        "cases": cases,
-    })
+    MatrixDocument {
+        schema_version: 1,
+        draft: true,
+        cases,
+    }
+}
+
+fn load_matrix_seed(path: &Path, manifest: &PluginManifest) -> Result<MatrixDocument, ToolError> {
+    let matrix: MatrixDocument = read_bounded_json(path, MAX_MATRIX_BYTES)?;
+    if matrix.schema_version != 1 || !matrix.draft {
+        return Err(ToolError::Invalid(
+            "matrix seed must use schema 1 and remain draft=true".into(),
+        ));
+    }
+    if matrix.cases.is_empty() || matrix.cases.len() > MAX_MATRIX_CASES {
+        return Err(ToolError::Invalid(format!(
+            "matrix seed must contain 1 to {MAX_MATRIX_CASES} cases"
+        )));
+    }
+    let required = manifest
+        .services
+        .iter()
+        .flat_map(|service| {
+            service
+                .methods
+                .iter()
+                .map(move |method| (service.service_id.clone(), method.name.clone()))
+        })
+        .collect::<BTreeSet<_>>();
+    let mut covered = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for case in &matrix.cases {
+        if case.name.trim() != case.name
+            || case.name.is_empty()
+            || case.name.chars().count() > 256
+            || case.name.chars().any(char::is_control)
+            || !names.insert(case.name.as_str())
+        {
+            return Err(ToolError::Invalid(
+                "matrix seed case names must be unique, trimmed, and at most 256 safe characters"
+                    .into(),
+            ));
+        }
+        case.request.validate().map_err(|error| {
+            ToolError::Invalid(format!("matrix seed request is invalid: {error}"))
+        })?;
+        let service = manifest
+            .services
+            .iter()
+            .find(|service| service.service_id == case.request.service_id)
+            .ok_or_else(|| {
+                ToolError::Invalid(format!(
+                    "matrix seed case [{}] targets an unknown service",
+                    case.name
+                ))
+            })?;
+        let method = service.method(&case.request.method).ok_or_else(|| {
+            ToolError::Invalid(format!(
+                "matrix seed case [{}] targets an unknown method",
+                case.name
+            ))
+        })?;
+        let allowed_parameters = method
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name())
+            .filter(|name| !name.starts_with('$'))
+            .collect::<HashSet<_>>();
+        if let Some(unexpected) = case
+            .request
+            .parameters
+            .keys()
+            .find(|name| !allowed_parameters.contains(name.as_str()))
+        {
+            return Err(ToolError::Invalid(format!(
+                "matrix seed case [{}] contains undeclared input parameter [{unexpected}]",
+                case.name
+            )));
+        }
+        if case.enabled {
+            covered.insert((service.service_id.clone(), method.name.clone()));
+        }
+    }
+    if covered != required {
+        return Err(ToolError::Invalid(format!(
+            "enabled matrix seed cases do not cover {} declared method(s)",
+            required.difference(&covered).count()
+        )));
+    }
+    Ok(matrix)
 }
 
 fn write_external_outputs(
     request_path: &Path,
     request: &SigningRequest,
     matrix_path: &Path,
-    matrix: &Value,
+    matrix: &MatrixDocument,
 ) -> Result<(), ToolError> {
     write_new_json(request_path, request)?;
     if let Err(error) = write_new_json(matrix_path, matrix) {
@@ -799,6 +928,22 @@ fn canonical_real_directory(path: &Path) -> Result<PathBuf, ToolError> {
     })?;
     if !metadata.file_type().is_dir() {
         return Err(ToolError::Invalid("input must be a real directory".into()));
+    }
+    path.canonicalize().map_err(|source| ToolError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn canonical_real_file(path: &Path, limit: u64) -> Result<PathBuf, ToolError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| ToolError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() > limit {
+        return Err(ToolError::Invalid(format!(
+            "input must be a real file no larger than {limit} bytes"
+        )));
     }
     path.canonicalize().map_err(|source| ToolError::Io {
         path: path.to_path_buf(),
@@ -910,6 +1055,7 @@ pub enum ToolError {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::json;
     use std::time::{Duration, UNIX_EPOCH};
 
     fn pe(machine: u16) -> Vec<u8> {
@@ -976,9 +1122,12 @@ mod tests {
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust_path,
+            matrix_seed: None,
         })
         .unwrap();
         assert!(report.legacy_license_excluded);
+        assert!(!report.matrix_seeded);
+        assert_eq!(report.matrix_case_count, 1);
         assert!(!staging.join("license.dat").exists());
         assert!(
             serde_json::from_slice::<Value>(&fs::read(&matrix).unwrap()).unwrap()["draft"]
@@ -1049,6 +1198,129 @@ mod tests {
     }
 
     #[test]
+    fn prepare_validates_and_adopts_an_external_draft_matrix_seed() {
+        let root = tempfile::tempdir().unwrap();
+        let source = source(root.path());
+        let seed = root.path().join("release-matrix-seed.json");
+        fs::write(
+            &seed,
+            serde_json::to_vec_pretty(&json!({
+                "schemaVersion": 1,
+                "draft": true,
+                "cases": [{
+                    "name": "known reader response",
+                    "enabled": true,
+                    "request": {
+                        "serviceId": "reader",
+                        "method": "read",
+                        "parameters": { "timeout": 5 }
+                    },
+                    "expected": {
+                        "ResCode": 0,
+                        "ResData": { "ReturnValue": 0 }
+                    }
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let matrix = root.path().join("matrix.json");
+        let trust = trust_store(root.path(), &SigningKey::from_bytes(&[42; 32]), None);
+
+        let report = prepare(&PrepareOptions {
+            source: &source,
+            staging: &root.path().join("stage"),
+            request: &root.path().join("request.json"),
+            matrix_template: &matrix,
+            plugin_id: "reader-plugin",
+            version: "1.0.0",
+            display_name: "Reader",
+            key_id: "test-key",
+            trust_store: &trust,
+            matrix_seed: Some(&seed),
+        })
+        .unwrap();
+
+        assert!(report.matrix_seeded);
+        assert_eq!(report.matrix_case_count, 1);
+        let generated: Value = serde_json::from_slice(&fs::read(matrix).unwrap()).unwrap();
+        assert_eq!(generated["cases"][0]["name"], "known reader response");
+        assert_eq!(
+            generated["cases"][0]["expected"]["ResData"]["ReturnValue"],
+            0
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_a_matrix_seed_inside_the_signed_source() {
+        let root = tempfile::tempdir().unwrap();
+        let source = source(root.path());
+        let seed = source.join("matrix-seed.json");
+        fs::write(&seed, b"{}").unwrap();
+        let trust = trust_store(root.path(), &SigningKey::from_bytes(&[43; 32]), None);
+
+        let error = prepare(&PrepareOptions {
+            source: &source,
+            staging: &root.path().join("stage"),
+            request: &root.path().join("request.json"),
+            matrix_template: &root.path().join("matrix.json"),
+            plugin_id: "reader-plugin",
+            version: "1.0.0",
+            display_name: "Reader",
+            key_id: "test-key",
+            trust_store: &trust,
+            matrix_seed: Some(&seed),
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("outside the signed source"));
+        assert!(!root.path().join("stage").exists());
+    }
+
+    #[test]
+    fn prepare_rejects_undeclared_matrix_seed_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let source = source(root.path());
+        let seed = root.path().join("invalid-matrix-seed.json");
+        fs::write(
+            &seed,
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "draft": true,
+                "cases": [{
+                    "name": "undeclared input",
+                    "request": {
+                        "serviceId": "reader",
+                        "method": "read",
+                        "parameters": { "secret": "must-not-pass" }
+                    },
+                    "expected": { "ResCode": 0, "ResData": null }
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let trust = trust_store(root.path(), &SigningKey::from_bytes(&[44; 32]), None);
+
+        let error = prepare(&PrepareOptions {
+            source: &source,
+            staging: &root.path().join("stage"),
+            request: &root.path().join("request.json"),
+            matrix_template: &root.path().join("matrix.json"),
+            plugin_id: "reader-plugin",
+            version: "1.0.0",
+            display_name: "Reader",
+            key_id: "test-key",
+            trust_store: &trust,
+            matrix_seed: Some(&seed),
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("undeclared input parameter"));
+        assert!(!root.path().join("stage").exists());
+    }
+
+    #[test]
     fn prepare_rejects_install_run_and_architecture_mismatch() {
         let root = tempfile::tempdir().unwrap();
         let source = source(root.path());
@@ -1068,6 +1340,7 @@ mod tests {
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust,
+            matrix_seed: None,
         })
         .unwrap_err();
         assert!(error.to_string().contains("installRun"));
@@ -1096,6 +1369,7 @@ mod tests {
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust,
+            matrix_seed: None,
         })
         .unwrap_err();
 
@@ -1121,6 +1395,7 @@ mod tests {
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust,
+            matrix_seed: None,
         })
         .unwrap();
         fs::write(staging.join("reader.dll"), pe(0x8664)).unwrap();
@@ -1156,6 +1431,7 @@ mod tests {
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust_path,
+            matrix_seed: None,
         })
         .unwrap();
         let signing_request: SigningRequest =
@@ -1205,6 +1481,7 @@ mod tests {
             display_name: "Reader",
             key_id: "test-key",
             trust_store: &trust,
+            matrix_seed: None,
         })
         .unwrap_err();
 

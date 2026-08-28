@@ -2,7 +2,7 @@
 
 `ssdev-plugin-tool` 把旧插件目录转换为可审计、可重复的发布输入。它不会加载 DLL、注册 OCX、执行 EXE/BAT 或持有生产私钥。迁移先运行只读审计；处理完 `api.json`、`installRun` 和架构问题后，再进入这里的发布流程。
 
-控制台本地映射已经完成现场验证时，可在“原生映射”卡片点击“发布源”，选择一个受控父目录。桌面端会创建新的 `<pluginId>-release-source`，仅包含规范化 `api.json` 以及清单实际引用的组件和依赖。它不会导出 `local-mapping.json`、合成调试用例、本地 `plugin.json`、旧签名或未引用文件；后续把该目录直接作为下方 `prepare --source` 输入。正式版本号、发布名称和签名 keyId 仍由发布流程明确提供，不能从现场配置静默继承。
+控制台本地映射已经完成现场验证时，可在“原生映射”卡片点击“发布源”，选择一个受控父目录。桌面端会创建新的 `<pluginId>-release-source`，仅包含规范化 `api.json` 以及清单实际引用的组件和依赖；另在目录外生成 `<pluginId>-matrix-seed.json` 草稿，复用已保存的脱敏现场用例并为未覆盖方法补占位用例。待签名目录不会包含 `local-mapping.json`、合成调试用例、本地 `plugin.json`、旧签名或未引用文件。正式版本号、发布名称和签名 keyId 仍由发布流程明确提供，不能从现场配置静默继承。
 
 ## 两阶段信任边界
 
@@ -30,7 +30,7 @@ cargo run --locked -p ssdev-plugin-tool -- prepare `
   --trust-store C:\secure-build-inputs\plugin-trust.json
 ```
 
-若来源是工作台导出的本地映射，上述 `--source` 改为例如 `C:\secure-release-inputs\reader.local-release-source`。发布工具仍会重新校验入口、依赖和架构并生成全方法黄金矩阵草稿；本地子集回归不能替代正式插件的完整 `ResData` 精确矩阵。
+若来源是工作台导出，则把 `--source` 改为例如 `C:\secure-release-inputs\reader.local-release-source`，并追加 `--matrix-seed C:\secure-release-inputs\reader.local-matrix-seed.json`。`--matrix-seed` 是可选参数，仅适用于工作台导出的外部种子；其他旧插件可省略，由工具自动生成全方法占位草稿。发布工具会要求种子位于待签名源目录之外、使用 schema 1、保持 `draft: true`、只引用清单声明的输入与路由，并由启用用例覆盖全部方法。本地子集回归不能替代正式插件的完整 `ResData` 精确矩阵。
 
 准备阶段先确认指定 `keyId` 在信任库中具有 `plugin` 用途且状态为 `active`，避免 KMS/HSM 为已退役或吊销的键产生无效签名；随后会硬拒绝以下情况：
 
@@ -46,7 +46,7 @@ COM/OCX 的 ProgID 和真实注册状态无法在离线准备阶段验证，必�
 
 - 暂存插件目录：包含规范化 `plugin.json`，但没有签名封套；
 - 签名请求：显式记录 `pluginId`、`version` 和 `keyId`；`payloadBase64` 是 KMS/HSM 要签名的原始字节，`payloadSha256` 用于发布审批和审计；
-- 黄金矩阵草稿：从每个 service/method 自动生成参数占位符。
+- 黄金矩阵草稿：采用通过校验的外部种子，或从每个 service/method 自动生成参数占位符；准备报告会给出 `matrixSeeded` 和 `matrixCaseCount`。
 
 黄金矩阵默认带有 `"draft": true`。运行器会在启动 controller 或接触硬件之前拒绝草稿；只有替换所有脱敏输入/预期响应并显式改为 `false` 后才会执行。暂不验证的用例可设置 `"enabled": false`，但正式切换时仍须覆盖全部生产能力。
 

@@ -36,6 +36,7 @@ fn run(arguments: impl IntoIterator<Item = String>) -> Result<String, String> {
                     "display-name",
                     "key-id",
                     "trust-store",
+                    "matrix-seed",
                 ],
             )?;
             let display_name = options
@@ -53,6 +54,7 @@ fn run(arguments: impl IntoIterator<Item = String>) -> Result<String, String> {
                     display_name,
                     key_id: required(&options, "key-id")?,
                     trust_store: required_path(&options, "trust-store")?,
+                    matrix_seed: options.get("matrix-seed").map(Path::new),
                 })
                 .map_err(|error| error.to_string())?,
             )
@@ -143,7 +145,7 @@ fn required_path<'a>(options: &'a HashMap<String, String>, name: &str) -> Result
 }
 
 fn usage() -> &'static str {
-    "用法:\n  ssdev-plugin-tool prepare --source DIR --staging DIR --request FILE --matrix-template FILE --plugin-id ID --version SEMVER [--display-name NAME] --key-id ID --trust-store FILE\n  ssdev-plugin-tool finalize --staging DIR --request FILE --signature FILE --trust-store FILE --package FILE.ssdev-plugin\n  ssdev-plugin-tool verify --package FILE.ssdev-plugin --trust-store FILE\n  ssdev-plugin-tool catalog --spec FILE --trust-store FILE --catalog FILE"
+    "用法:\n  ssdev-plugin-tool prepare --source DIR --staging DIR --request FILE --matrix-template FILE --plugin-id ID --version SEMVER [--display-name NAME] --key-id ID --trust-store FILE [--matrix-seed FILE]\n  ssdev-plugin-tool finalize --staging DIR --request FILE --signature FILE --trust-store FILE --package FILE.ssdev-plugin\n  ssdev-plugin-tool verify --package FILE.ssdev-plugin --trust-store FILE\n  ssdev-plugin-tool catalog --spec FILE --trust-store FILE --catalog FILE"
 }
 
 #[cfg(test)]
