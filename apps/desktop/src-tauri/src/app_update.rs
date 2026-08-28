@@ -8,11 +8,14 @@ use base64::Engine as _;
 use minisign_verify::{PublicKey, Signature};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State, WebviewWindow};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tempfile::{Builder as TempBuilder, NamedTempFile};
 use tokio::io::AsyncWriteExt;
+use webplus_plugin_config::PluginManifest;
+use webplus_plugin_trust::{prepare_signing_material, read_identity};
 
 const POLICY_FILENAME: &str = "app-update.json";
 const MAX_POLICY_BYTES: u64 = 64 * 1024;
@@ -136,9 +139,36 @@ pub(crate) struct AppUpdateCheck {
     available: bool,
     compatible: bool,
     plugin_blockers: usize,
+    install_plan_id: Option<String>,
     version: Option<String>,
     date: Option<String>,
     notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdatePlanMetadata {
+    current_version: String,
+    version: String,
+    date: Option<String>,
+    target: String,
+    download_url: String,
+    signature: String,
+    notes: Option<String>,
+}
+
+impl AppUpdatePlanMetadata {
+    fn from_update(update: &Update) -> Self {
+        Self {
+            current_version: update.current_version.clone(),
+            version: update.version.clone(),
+            date: update.date.map(|date| date.to_string()),
+            target: update.target.clone(),
+            download_url: update.download_url.to_string(),
+            signature: update.signature.clone(),
+            notes: update.body.as_deref().map(truncate_notes),
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -163,6 +193,10 @@ pub(crate) async fn check_app_update(
     state: State<'_, AppUpdateState>,
 ) -> Result<AppUpdateCheck, String> {
     crate::desktop::require_control(&caller)?;
+    *state
+        .pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     let current_version = app.package_info().version.to_string();
     let Some(policy) = state.policy.as_ref() else {
         return match &state.policy_error {
@@ -173,6 +207,7 @@ pub(crate) async fn check_app_update(
                 available: false,
                 compatible: true,
                 plugin_blockers: 0,
+                install_plan_id: None,
                 version: None,
                 date: None,
                 notes: None,
@@ -204,6 +239,7 @@ pub(crate) async fn check_app_update(
             available: false,
             compatible: true,
             plugin_blockers: 0,
+            install_plan_id: None,
             version: None,
             date: None,
             notes: None,
@@ -214,19 +250,28 @@ pub(crate) async fn check_app_update(
         .map_err(|error| format!("更新版本不是合法 SemVer: {error}"))?;
     let _install = bridge.install_lock.lock().await;
     crate::recover_plugin_store(&bridge)?;
-    let plugin_blockers = crate::inspect_plugins(
+    let inspected = crate::inspect_plugins(
         &bridge.plugin_root,
         bridge.trust_store.as_deref(),
         &target_version,
-    )?
-    .failures
-    .len();
+    )?;
+    let plugin_blockers = inspected.failures.len();
+    let install_plan_id = if plugin_blockers == 0 {
+        let plugin_state_sha256 = app_update_plugin_state_digest(&inspected.manifests)?;
+        Some(app_update_plan_id(
+            &AppUpdatePlanMetadata::from_update(&update),
+            &plugin_state_sha256,
+        )?)
+    } else {
+        None
+    };
     let metadata = AppUpdateCheck {
         configured: true,
         current_version: update.current_version.clone(),
         available: true,
         compatible: plugin_blockers == 0,
         plugin_blockers,
+        install_plan_id,
         version: Some(update.version.clone()),
         date: update.date.map(|date| date.to_string()),
         notes: update.body.as_deref().map(truncate_notes),
@@ -250,38 +295,48 @@ pub(crate) async fn install_app_update(
     app: AppHandle,
     bridge: State<'_, crate::BridgeState>,
     state: State<'_, AppUpdateState>,
+    expected_plan_id: String,
     on_event: Channel<AppUpdateEvent>,
 ) -> Result<(), String> {
     crate::desktop::require_control(&caller)?;
+    if !crate::is_lowercase_sha256(&expected_plan_id) {
+        return Err("应用更新确认标识无效，请重新检查更新".to_owned());
+    }
     let _install = bridge.install_lock.lock().await;
     crate::recover_plugin_store(&bridge)?;
     let policy = state
         .policy
         .clone()
         .ok_or_else(|| "尚未配置生产应用更新策略".to_owned())?;
-    let target_version = {
+    let pending_update = {
         let pending = state
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let update = pending
+        pending
             .as_ref()
-            .ok_or_else(|| "没有待安装更新，请先检查更新".to_owned())?;
-        semver::Version::parse(&update.version)
-            .map_err(|error| format!("更新版本不是合法 SemVer: {error}"))?
+            .cloned()
+            .ok_or_else(|| "没有待安装更新，请先检查更新".to_owned())?
     };
-    let plugin_blockers = crate::inspect_plugins(
+    let target_version = semver::Version::parse(&pending_update.version)
+        .map_err(|error| format!("更新版本不是合法 SemVer: {error}"))?;
+    let inspected = crate::inspect_plugins(
         &bridge.plugin_root,
         bridge.trust_store.as_deref(),
         &target_version,
-    )?
-    .failures
-    .len();
+    )?;
+    let plugin_blockers = inspected.failures.len();
     if plugin_blockers > 0 {
         return Err(format!(
             "有 {plugin_blockers} 个签名插件未声明支持 SSDEV Desktop {target_version} 或未通过完整性检查；请先安装兼容插件版本"
         ));
     }
+    let expected_plugin_state_sha256 = app_update_plugin_state_digest(&inspected.manifests)?;
+    let actual_plan_id = app_update_plan_id(
+        &AppUpdatePlanMetadata::from_update(&pending_update),
+        &expected_plugin_state_sha256,
+    )?;
+    ensure_app_update_plan_matches(&expected_plan_id, &actual_plan_id)?;
     let update = state
         .pending
         .lock()
@@ -302,6 +357,18 @@ pub(crate) async fn install_app_update(
     let bytes = read_verified_package(package, policy.max_download_bytes)
         .await
         .map_err(|error| format!("无法读取已验签更新包: {error}"))?;
+    let current_plugins = crate::inspect_plugins(
+        &bridge.plugin_root,
+        bridge.trust_store.as_deref(),
+        &target_version,
+    )?;
+    if !current_plugins.failures.is_empty() {
+        return Err("下载期间插件兼容性或完整性发生变化，请重新检查应用更新".to_owned());
+    }
+    let current_plugin_state_sha256 = app_update_plugin_state_digest(&current_plugins.manifests)?;
+    if current_plugin_state_sha256 != expected_plugin_state_sha256 {
+        return Err("下载期间插件集合发生变化，请重新检查应用更新".to_owned());
+    }
     tracing::info!(
         event_code = "app-update-verified",
         version = %update.version,
@@ -332,6 +399,47 @@ pub(crate) async fn install_app_update(
     }
     crate::desktop::mark_exit_ready(&app);
     app.restart();
+}
+
+fn app_update_plugin_state_digest(manifests: &[PluginManifest]) -> Result<String, String> {
+    let mut manifests = manifests.iter().collect::<Vec<_>>();
+    manifests.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-APP-UPDATE-PLUGIN-STATE\0");
+    for manifest in manifests {
+        let key_id = match read_identity(&manifest.plugin_dir) {
+            Ok(identity) if identity.plugin_id == manifest.plugin_id => identity.key_id,
+            Ok(_) => return Err("应用更新插件基线签名身份不一致".to_owned()),
+            Err(_) if crate::allow_unsigned_plugins() => "debug-unsigned".to_owned(),
+            Err(error) => return Err(error.to_string()),
+        };
+        let material = prepare_signing_material(&manifest.plugin_dir, &manifest.plugin_id, &key_id)
+            .map_err(|error| error.to_string())?;
+        crate::hash_plan_field(&mut hasher, manifest.plugin_id.as_bytes());
+        crate::hash_plan_field(&mut hasher, key_id.as_bytes());
+        crate::hash_plan_field(&mut hasher, &material.payload);
+    }
+    Ok(crate::lowercase_hex(&hasher.finalize()))
+}
+
+fn app_update_plan_id(
+    metadata: &AppUpdatePlanMetadata,
+    plugin_state_sha256: &str,
+) -> Result<String, String> {
+    let metadata = serde_json::to_vec(metadata)
+        .map_err(|error| format!("无法生成应用更新确认标识: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-APP-UPDATE-PLAN\0");
+    crate::hash_plan_field(&mut hasher, &metadata);
+    crate::hash_plan_field(&mut hasher, plugin_state_sha256.as_bytes());
+    Ok(crate::lowercase_hex(&hasher.finalize()))
+}
+
+fn ensure_app_update_plan_matches(expected: &str, actual: &str) -> Result<(), String> {
+    if expected != actual {
+        return Err("待安装应用版本或当前插件集合在确认后发生变化，请重新检查应用更新".to_owned());
+    }
+    Ok(())
 }
 
 async fn read_verified_package(
@@ -537,8 +645,12 @@ fn truncate_notes(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
     use tempfile::tempdir;
+    use webplus_plugin_config::{PluginManifest, API_FILENAME};
+    use webplus_plugin_trust::{encode_signature_document, SIGNATURE_FILENAME};
 
     #[test]
     fn disabled_policy_is_explicit_and_empty() {
@@ -656,5 +768,80 @@ mod tests {
         let bounded = truncate_notes(&notes);
         assert_eq!(bounded.chars().count(), MAX_NOTES_CHARS + 1);
         assert!(bounded.ends_with('…'));
+    }
+
+    #[test]
+    fn app_update_plan_binds_pending_metadata_and_plugin_state() {
+        let metadata = AppUpdatePlanMetadata {
+            current_version: "0.1.0".into(),
+            version: "0.2.0".into(),
+            date: Some("2026-08-29T00:00:00Z".into()),
+            target: "windows-x86_64".into(),
+            download_url: "https://updates.example.test/ssdev-0.2.0.nsis.zip".into(),
+            signature: "signed-release-a".into(),
+            notes: Some("verified release".into()),
+        };
+        let plugin_state = "11".repeat(32);
+        let base = app_update_plan_id(&metadata, &plugin_state).unwrap();
+        assert!(crate::is_lowercase_sha256(&base));
+
+        let mut changed_version = metadata.clone();
+        changed_version.version = "0.2.1".into();
+        assert_ne!(
+            base,
+            app_update_plan_id(&changed_version, &plugin_state).unwrap()
+        );
+        let mut changed_url = metadata.clone();
+        changed_url.download_url = "https://updates.example.test/replaced.nsis.zip".into();
+        assert_ne!(
+            base,
+            app_update_plan_id(&changed_url, &plugin_state).unwrap()
+        );
+        let mut changed_signature = metadata.clone();
+        changed_signature.signature = "signed-release-b".into();
+        assert_ne!(
+            base,
+            app_update_plan_id(&changed_signature, &plugin_state).unwrap()
+        );
+        assert_ne!(
+            base,
+            app_update_plan_id(&metadata, &"22".repeat(32)).unwrap()
+        );
+        assert!(ensure_app_update_plan_matches(&base, &base).is_ok());
+        assert!(ensure_app_update_plan_matches(&base, &"33".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn app_update_plugin_state_digest_binds_signed_plugin_content() {
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("reader");
+        fs::create_dir(&plugin).unwrap();
+        fs::write(
+            plugin.join(API_FILENAME),
+            r#"{"serviceId":"reader","mainClass":"reader.dll"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin.join("plugin.json"),
+            r#"{"schemaVersion":1,"pluginId":"reader","version":"1.0.0","desktopVersionRequirement":">=0.1.0, <0.3.0"}"#,
+        )
+        .unwrap();
+        fs::write(plugin.join("reader.dll"), b"first payload").unwrap();
+        let signing_key = SigningKey::from_bytes(&[93_u8; 32]);
+        let material = prepare_signing_material(&plugin, "reader", "test-key").unwrap();
+        let signature = BASE64.encode(signing_key.sign(&material.payload).to_bytes());
+        fs::write(
+            plugin.join(SIGNATURE_FILENAME),
+            encode_signature_document(&material, &signature).unwrap(),
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("reader", &plugin).unwrap();
+
+        let empty = app_update_plugin_state_digest(&[]).unwrap();
+        let before = app_update_plugin_state_digest(std::slice::from_ref(&manifest)).unwrap();
+        fs::write(plugin.join("reader.dll"), b"second payload").unwrap();
+        let after = app_update_plugin_state_digest(&[manifest]).unwrap();
+        assert_ne!(empty, before);
+        assert_ne!(before, after);
     }
 }

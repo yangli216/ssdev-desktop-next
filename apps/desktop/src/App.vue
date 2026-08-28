@@ -220,6 +220,7 @@ type AppUpdateCheck = {
   available: boolean
   compatible: boolean
   pluginBlockers: number
+  installPlanId?: string
   version?: string
   date?: string
   notes?: string
@@ -571,6 +572,8 @@ async function installFromCatalog(pluginId: string, version?: string, installPla
 
 async function checkAppUpdate() {
   let result: AppUpdateCheck | undefined
+  appUpdate.value = null
+  updateProgress.value = ''
   await run(async () => {
     result = await invoke<AppUpdateCheck>('check_app_update')
     appUpdate.value = result
@@ -588,12 +591,15 @@ async function checkAppUpdate() {
 }
 
 async function installAppUpdate() {
-  if (!appUpdate.value?.available || !appUpdate.value.compatible) {
+  if (!appUpdate.value?.available || !appUpdate.value.compatible || !appUpdate.value.installPlanId) {
     error.value = appUpdate.value?.available
-      ? '当前插件集合与目标 Desktop 版本不兼容，请先安装兼容插件版本。'
+      ? appUpdate.value.compatible
+        ? '应用更新确认状态已失效，请重新检查更新。'
+        : '当前插件集合与目标 Desktop 版本不兼容，请先安装兼容插件版本。'
       : '请先检查并确认存在可用更新。'
     return
   }
+  const expectedPlanId = appUpdate.value.installPlanId
   const onEvent = new Channel<AppUpdateEvent>()
   onEvent.onmessage = (event) => {
     if (event.event === 'started') {
@@ -608,7 +614,7 @@ async function installAppUpdate() {
     }
   }
   await run(
-    () => invoke('install_app_update', { onEvent }),
+    () => invoke('install_app_update', { expectedPlanId, onEvent }),
     '更新已安装，客户端即将重新启动。',
   )
 }
@@ -838,7 +844,7 @@ async function runDeploymentCheck() {
           <article><span>隐私诊断日志</span><strong>{{ status?.diagnosticsAvailable ? '可用' : '不可用' }}</strong><small :title="status?.diagnosticsError">{{ status?.diagnosticsError ?? `${status?.diagnostics?.logFiles ?? '—'} 个文件 · ${((status?.diagnostics?.logBytes ?? 0) / 1024).toFixed(1)} KiB` }}</small></article>
           <article><span>协议与兼容网关</span><strong>v{{ status?.protocolVersion ?? '—' }}</strong><small>宿主 v{{ status?.pluginHostProtocolVersion ?? '—' }} · HTTP 网关{{ status?.httpGatewayEnabled ? '已启用' : '关闭' }}</small></article>
         </section>
-        <section class="maintenance-panel"><div><p class="eyebrow">CLIENT MAINTENANCE</p><h2>客户端维护</h2><p>{{ status?.appUpdateError ?? (status?.appUpdateConfigured ? '应用更新包必须通过签名验证，并与当前插件兼容。' : '当前构建未配置生产更新端点。') }}</p></div><div class="maintenance-actions"><button type="button" :disabled="busy || !status?.appUpdateConfigured" @click="checkAppUpdate">检查应用更新</button><button class="primary" type="button" :disabled="busy || !appUpdate?.available || !appUpdate.compatible" @click="installAppUpdate">安装签名更新</button></div><details v-if="appUpdate?.available" class="update-details" open><summary>版本 {{ appUpdate.version }}{{ appUpdate.date ? ` · ${appUpdate.date}` : '' }}</summary><p v-if="!appUpdate.compatible">{{ appUpdate.pluginBlockers }} 个插件阻止升级；请先从签名仓库安装兼容版本。</p><p>{{ appUpdate.notes || '此版本未提供发布说明。' }}</p><small v-if="updateProgress">{{ updateProgress }}</small></details></section>
+        <section class="maintenance-panel"><div><p class="eyebrow">CLIENT MAINTENANCE</p><h2>客户端维护</h2><p>{{ status?.appUpdateError ?? (status?.appUpdateConfigured ? '应用更新包必须通过签名验证，并与当前插件兼容。' : '当前构建未配置生产更新端点。') }}</p></div><div class="maintenance-actions"><button type="button" :disabled="busy || !status?.appUpdateConfigured" @click="checkAppUpdate">检查应用更新</button><button class="primary" type="button" :disabled="busy || !appUpdate?.available || !appUpdate.compatible || !appUpdate.installPlanId" @click="installAppUpdate">安装签名更新</button></div><details v-if="appUpdate?.available" class="update-details" open><summary>版本 {{ appUpdate.version }}{{ appUpdate.date ? ` · ${appUpdate.date}` : '' }}</summary><p v-if="!appUpdate.compatible">{{ appUpdate.pluginBlockers }} 个插件阻止升级；请先从签名仓库安装兼容版本。</p><p>{{ appUpdate.notes || '此版本未提供发布说明。' }}</p><small v-if="updateProgress">{{ updateProgress }}</small></details></section>
         <section class="boundary"><div><p class="eyebrow">TRUST BOUNDARY</p><h2>第三方 DLL 永不进入主进程</h2></div><ol><li><b>业务 WebView</b><span>只调用受限的业务命令</span></li><li><b>Rust Controller</b><span>执行路由、策略、超时和监督</span></li><li><b>Plugin Host</b><span>加载 DLL、COM、OCX、EXE 或 BAT</span></li></ol></section>
       </section>
     </main>
