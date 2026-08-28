@@ -1,4 +1,11 @@
+use std::fs;
+use std::io::Write;
+use std::path::Path;
+
 use serde::Serialize;
+
+const EXPORT_SCHEMA_VERSION: u16 = 1;
+const MAX_EXPORT_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DeploymentCheckFacts {
@@ -59,6 +66,77 @@ pub(crate) enum DeploymentCheckStatus {
     Warning,
     Fail,
     Info,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeploymentCheckExportDocument<'a> {
+    schema_version: u16,
+    generated_at_unix_ms: u64,
+    desktop_version: &'a str,
+    os: &'a str,
+    architecture: &'a str,
+    evidence_level: &'static str,
+    report: &'a DeploymentCheckReport,
+}
+
+pub(crate) fn encode_export_document(
+    report: &DeploymentCheckReport,
+    generated_at_unix_ms: u64,
+    desktop_version: &str,
+    os: &str,
+    architecture: &str,
+) -> Result<Vec<u8>, String> {
+    if generated_at_unix_ms == 0
+        || desktop_version.is_empty()
+        || desktop_version.len() > 128
+        || os.is_empty()
+        || os.len() > 32
+        || architecture.is_empty()
+        || architecture.len() > 32
+    {
+        return Err("部署自检记录元数据无效".into());
+    }
+    let document = DeploymentCheckExportDocument {
+        schema_version: EXPORT_SCHEMA_VERSION,
+        generated_at_unix_ms,
+        desktop_version,
+        os,
+        architecture,
+        evidence_level: "unsigned-local-record",
+        report,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&document)
+        .map_err(|error| format!("无法生成部署自检记录: {error}"))?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_EXPORT_BYTES {
+        return Err("部署自检记录超过大小限制".into());
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn persist_export_document(destination: &Path, bytes: &[u8]) -> Result<u64, String> {
+    if !destination.is_absolute() || bytes.is_empty() || bytes.len() > MAX_EXPORT_BYTES {
+        return Err("部署自检记录目标或内容无效".into());
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "部署自检记录缺少父目录".to_owned())?;
+    let metadata = fs::symlink_metadata(parent)
+        .map_err(|error| format!("无法检查部署自检记录目录: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("部署自检记录目录必须是已存在的普通目录".into());
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("无法创建部署自检记录暂存文件: {error}"))?;
+    temporary
+        .write_all(bytes)
+        .and_then(|_| temporary.as_file_mut().sync_all())
+        .map_err(|error| format!("无法写入部署自检记录: {error}"))?;
+    temporary
+        .persist_noclobber(destination)
+        .map_err(|error| format!("无法保存部署自检记录（不会覆盖已有文件）: {}", error.error))?;
+    u64::try_from(bytes.len()).map_err(|_| "部署自检记录大小无效".to_owned())
 }
 
 pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
@@ -551,5 +629,58 @@ mod tests {
         assert!(!encoded.contains("private.example"));
         assert!(!encoded.contains("private\\\\plugins"));
         assert!(!encoded.contains("secretMethod"));
+    }
+
+    #[test]
+    fn exported_field_record_is_bounded_and_explicitly_unsigned() {
+        let mut facts = healthy_facts();
+        facts.config_error = Some("invalid http://private.example/app".to_owned());
+        let report = evaluate(&facts);
+        let bytes =
+            encode_export_document(&report, 1_786_000_000_000, "0.1.0", "windows", "x86_64")
+                .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["evidenceLevel"], "unsigned-local-record");
+        assert_eq!(value["desktopVersion"], "0.1.0");
+        assert_eq!(value["report"]["ready"], false);
+        assert!(bytes.len() < MAX_EXPORT_BYTES);
+        assert!(!String::from_utf8(bytes)
+            .unwrap()
+            .contains("private.example"));
+    }
+
+    #[test]
+    fn field_record_export_never_overwrites_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("deployment-check.json");
+        let report = evaluate(&healthy_facts());
+        let bytes = encode_export_document(&report, 1, "0.1.0", "windows", "x86_64").unwrap();
+
+        assert_eq!(
+            persist_export_document(&destination, &bytes).unwrap(),
+            u64::try_from(bytes.len()).unwrap()
+        );
+        assert!(persist_export_document(&destination, &bytes).is_err());
+        assert_eq!(fs::read(destination).unwrap(), bytes);
+        assert!(persist_export_document(Path::new("relative.json"), &bytes).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn field_record_export_refuses_a_symbolic_link_parent() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let actual = directory.path().join("actual");
+        let linked = directory.path().join("linked");
+        fs::create_dir(&actual).unwrap();
+        symlink(&actual, &linked).unwrap();
+        let report = evaluate(&healthy_facts());
+        let bytes = encode_export_document(&report, 1, "0.1.0", "macos", "aarch64").unwrap();
+
+        assert!(persist_export_document(&linked.join("deployment-check.json"), &bytes).is_err());
+        assert!(!actual.join("deployment-check.json").exists());
     }
 }

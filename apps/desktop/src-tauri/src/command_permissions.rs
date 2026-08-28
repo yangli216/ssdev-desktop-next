@@ -1,6 +1,7 @@
 pub const APP_COMMANDS: &[&str] = &[
     "bridge_status",
     "run_deployment_check",
+    "export_deployment_check",
     "export_project_bundle",
     "inspect_project_bundle",
     "import_project_bundle",
@@ -54,6 +55,7 @@ pub const APP_COMMANDS: &[&str] = &[
 pub const CONTROL_PERMISSIONS: &[&str] = &[
     "allow-bridge-status",
     "allow-run-deployment-check",
+    "allow-export-deployment-check",
     "allow-export-project-bundle",
     "allow-inspect-project-bundle",
     "allow-import-project-bundle",
@@ -146,6 +148,7 @@ mod tests {
         for forbidden in [
             "allow-desktop-config",
             "allow-run-deployment-check",
+            "allow-export-deployment-check",
             "allow-export-project-bundle",
             "allow-inspect-project-bundle",
             "allow-import-project-bundle",

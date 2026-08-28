@@ -486,6 +486,60 @@ async fn run_deployment_check(
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct DeploymentCheckExportResult {
+    bytes: u64,
+    report: deployment_check::DeploymentCheckReport,
+}
+
+#[tauri::command]
+async fn export_deployment_check(
+    caller: WebviewWindow,
+    app: AppHandle,
+    destination: PathBuf,
+    state: State<'_, BridgeState>,
+    desktop_state: State<'_, desktop::DesktopState>,
+    update_state: State<'_, app_update::AppUpdateState>,
+    diagnostics: State<'_, DiagnosticsRuntime>,
+) -> Result<DeploymentCheckExportResult, String> {
+    desktop::require_control(&caller)?;
+    let report =
+        run_deployment_check(caller, state, desktop_state, update_state, diagnostics).await?;
+    let generated_at_unix_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|_| "系统时间早于 Unix epoch，无法导出部署自检记录".to_owned())?
+            .as_millis(),
+    )
+    .map_err(|_| "系统时间超出部署自检记录范围".to_owned())?;
+    let bytes = deployment_check::encode_export_document(
+        &report,
+        generated_at_unix_ms,
+        &app.package_info().version.to_string(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )?;
+    let written = tokio::task::spawn_blocking(move || {
+        deployment_check::persist_export_document(&destination, &bytes)
+    })
+    .await
+    .map_err(|error| format!("部署自检记录导出任务失败: {error}"))??;
+    tracing::info!(
+        event_code = "deployment-check-exported",
+        ready = report.ready,
+        passed = report.passed,
+        warnings = report.warnings,
+        failures = report.failures,
+        bytes = written,
+        "unsigned local deployment check record exported"
+    );
+    Ok(DeploymentCheckExportResult {
+        bytes: written,
+        report,
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct DiagnosticsExportResult {
     bytes: u64,
 }
@@ -3368,6 +3422,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             bridge_status,
             run_deployment_check,
+            export_deployment_check,
             export_project_bundle,
             inspect_project_bundle,
             import_project_bundle,

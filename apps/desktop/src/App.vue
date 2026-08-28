@@ -730,6 +730,22 @@ async function runDeploymentCheck() {
       : `部署自检发现 ${result.failures} 项阻塞问题，请按建议处理后重新检查。`
   }
 }
+
+async function exportDeploymentCheck() {
+  const destination = await save({
+    defaultPath: `ssdev-deployment-check-${new Date().toISOString().slice(0, 10)}.json`,
+    filters: [{ name: 'SSDEV 部署自检记录', extensions: ['json'] }],
+  })
+  if (typeof destination !== 'string') return
+  let result: { bytes: number; report: DeploymentCheckReport } | undefined
+  await run(async () => {
+    result = await invoke<{ bytes: number; report: DeploymentCheckReport }>('export_deployment_check', { destination })
+    deploymentCheck.value = result.report
+  }, '')
+  if (result) {
+    notice.value = `部署自检已重新执行并导出（${(result.bytes / 1024).toFixed(1)} KiB）；这是脱敏的未签名现场记录，不替代生产切换证据。`
+  }
+}
 </script>
 
 <template>
@@ -944,7 +960,7 @@ async function runDeploymentCheck() {
       </section>
 
       <section v-show="activeSection === 'security'" class="page" aria-labelledby="security-title">
-        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>先执行部署自检，再按需查看详细指标和导出诊断。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy" @click="runDeploymentCheck">重新自检</button><button type="button" :disabled="busy" @click="openDiagnosticsDirectory">打开日志目录</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
+        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>先执行部署自检，再按需留存现场记录或导出诊断。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy" @click="runDeploymentCheck">重新自检</button><button type="button" :disabled="busy" @click="exportDeploymentCheck">导出自检记录</button><button type="button" :disabled="busy" @click="openDiagnosticsDirectory">打开日志目录</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
         <section v-if="deploymentCheck" :class="['deployment-check', { ready: deploymentCheck.ready }]" aria-label="部署自检结果">
           <header>
             <div><p class="eyebrow">DEPLOYMENT CHECK</p><h2>{{ deploymentCheck.ready ? '当前机器可以交付' : '部署条件尚未满足' }}</h2><p>{{ deploymentCheck.passed }} 项正常 · {{ deploymentCheck.warnings }} 项提醒 · {{ deploymentCheck.failures }} 项阻塞</p></div>

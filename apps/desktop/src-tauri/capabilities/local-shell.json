@@ -9,6 +9,7 @@
     "dialog:allow-save",
     "allow-bridge-status",
     "allow-run-deployment-check",
+    "allow-export-deployment-check",
     "allow-export-project-bundle",
     "allow-inspect-project-bundle",
     "allow-import-project-bundle",
