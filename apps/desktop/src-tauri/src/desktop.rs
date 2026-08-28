@@ -227,41 +227,48 @@ pub(crate) struct ConfigSnapshot {
     migration_warnings: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConfigImportEnvironmentPreview {
     name: String,
     url: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfigChangePreview {
+    pub(crate) config_changed: bool,
+    pub(crate) default_website_changed: bool,
+    pub(crate) tenant_changed: bool,
+    pub(crate) allow_switch_changed: bool,
+    pub(crate) auto_close_changed: bool,
+    pub(crate) auto_start_changed: bool,
+    pub(crate) plugin_catalog_changed: bool,
+    pub(crate) candidate_default_website: Option<String>,
+    pub(crate) candidate_allow_switch: bool,
+    pub(crate) candidate_auto_close: bool,
+    pub(crate) candidate_auto_start: bool,
+    pub(crate) current_environment_count: usize,
+    pub(crate) candidate_environment_count: usize,
+    pub(crate) candidate_environments: Vec<ConfigImportEnvironmentPreview>,
+    pub(crate) current_business_origin_count: usize,
+    pub(crate) candidate_business_origin_count: usize,
+    pub(crate) current_trusted_origin_count: usize,
+    pub(crate) candidate_trusted_origin_count: usize,
+    pub(crate) current_external_origin_count: usize,
+    pub(crate) candidate_external_origin_count: usize,
+    pub(crate) current_managed_process_count: usize,
+    pub(crate) candidate_managed_process_count: usize,
+    pub(crate) current_enabled_shortcut_count: usize,
+    pub(crate) candidate_enabled_shortcut_count: usize,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConfigImportPreview {
     plan_id: String,
-    config_changed: bool,
-    default_website_changed: bool,
-    tenant_changed: bool,
-    allow_switch_changed: bool,
-    auto_close_changed: bool,
-    auto_start_changed: bool,
-    plugin_catalog_changed: bool,
-    candidate_default_website: Option<String>,
-    candidate_allow_switch: bool,
-    candidate_auto_close: bool,
-    candidate_auto_start: bool,
-    current_environment_count: usize,
-    candidate_environment_count: usize,
-    candidate_environments: Vec<ConfigImportEnvironmentPreview>,
-    current_business_origin_count: usize,
-    candidate_business_origin_count: usize,
-    current_trusted_origin_count: usize,
-    candidate_trusted_origin_count: usize,
-    current_external_origin_count: usize,
-    candidate_external_origin_count: usize,
-    current_managed_process_count: usize,
-    candidate_managed_process_count: usize,
-    current_enabled_shortcut_count: usize,
-    candidate_enabled_shortcut_count: usize,
+    #[serde(flatten)]
+    change: ConfigChangePreview,
 }
 
 #[tauri::command]
@@ -310,11 +317,11 @@ pub(crate) async fn inspect_desktop_config_import(
     let preview = build_config_import_preview(&state.config.snapshot(), &candidate)?;
     tracing::info!(
         event_code = "desktop-config-import-inspected",
-        config_changed = preview.config_changed,
-        business_origins = preview.candidate_business_origin_count,
-        environments = preview.candidate_environment_count,
-        managed_processes = preview.candidate_managed_process_count,
-        enabled_shortcuts = preview.candidate_enabled_shortcut_count,
+        config_changed = preview.change.config_changed,
+        business_origins = preview.change.candidate_business_origin_count,
+        environments = preview.change.candidate_environment_count,
+        managed_processes = preview.change.candidate_managed_process_count,
+        enabled_shortcuts = preview.change.candidate_enabled_shortcut_count,
         "desktop config import inspected"
     );
     Ok(preview)
@@ -385,7 +392,7 @@ pub(crate) async fn import_desktop_config(
     if preview.plan_id != expected_plan_id {
         return Err("导入文件或当前配置已在预检后变化，请重新预检后确认导入".into());
     }
-    if !preview.config_changed {
+    if !preview.change.config_changed {
         tracing::info!(
             event_code = "desktop-config-import-unchanged",
             "desktop config import skipped because configuration is unchanged"
@@ -395,11 +402,11 @@ pub(crate) async fn import_desktop_config(
     replace_desktop_config(&app, &state, candidate)?;
     tracing::info!(
         event_code = "desktop-config-imported",
-        config_changed = preview.config_changed,
-        business_origins = preview.candidate_business_origin_count,
-        environments = preview.candidate_environment_count,
-        managed_processes = preview.candidate_managed_process_count,
-        enabled_shortcuts = preview.candidate_enabled_shortcut_count,
+        config_changed = preview.change.config_changed,
+        business_origins = preview.change.candidate_business_origin_count,
+        environments = preview.change.candidate_environment_count,
+        managed_processes = preview.change.candidate_managed_process_count,
+        enabled_shortcuts = preview.change.candidate_enabled_shortcut_count,
         "desktop config imported"
     );
     Ok(config_snapshot(&state))
@@ -409,6 +416,16 @@ fn build_config_import_preview(
     current: &DesktopConfig,
     candidate: &DesktopConfig,
 ) -> Result<ConfigImportPreview, String> {
+    Ok(ConfigImportPreview {
+        plan_id: config_import_plan_id(current, candidate)?,
+        change: build_config_change_preview(current, candidate)?,
+    })
+}
+
+pub(crate) fn build_config_change_preview(
+    current: &DesktopConfig,
+    candidate: &DesktopConfig,
+) -> Result<ConfigChangePreview, String> {
     let current_business_origin_count = current
         .business_origins()
         .map_err(|error| error.to_string())?
@@ -417,9 +434,7 @@ fn build_config_import_preview(
         .business_origins()
         .map_err(|error| error.to_string())?
         .len();
-    let plan_id = config_import_plan_id(current, candidate)?;
-    Ok(ConfigImportPreview {
-        plan_id,
+    Ok(ConfigChangePreview {
         config_changed: current != candidate,
         default_website_changed: current.website != candidate.website,
         tenant_changed: current.tenant_id != candidate.tenant_id,
@@ -1669,7 +1684,7 @@ mod tests {
             ..DesktopConfig::default()
         };
 
-        let preview = build_config_import_preview(&current, &candidate).unwrap();
+        let preview = build_config_change_preview(&current, &candidate).unwrap();
 
         assert!(preview.config_changed);
         assert!(preview.default_website_changed);

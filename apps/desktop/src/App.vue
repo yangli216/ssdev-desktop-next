@@ -100,7 +100,7 @@ type ProjectBundlePreview = {
   localMappings: number
   serviceCount: number
   preflightedHosts: number
-  configChanged: boolean
+  configPreview: ConfigChangePreview
   installCount: number
   upgradeCount: number
   replaceCount: number
@@ -161,8 +161,7 @@ type ConfigSnapshot = {
   migrationWarnings: string[]
 }
 
-type ConfigImportPreview = {
-  planId: string
+type ConfigChangePreview = {
   configChanged: boolean
   defaultWebsiteChanged: boolean
   tenantChanged: boolean
@@ -187,6 +186,10 @@ type ConfigImportPreview = {
   candidateManagedProcessCount: number
   currentEnabledShortcutCount: number
   candidateEnabledShortcutCount: number
+}
+
+type ConfigImportPreview = ConfigChangePreview & {
+  planId: string
 }
 
 type PluginInstallResult = {
@@ -853,7 +856,26 @@ async function runDeploymentCheck() {
           <div v-if="projectBundlePreview" class="project-bundle-preview">
             <header><div><strong>变更计划已验证，可以导入</strong><small>由客户端 {{ projectBundlePreview.createdByVersion }} 创建 · schema {{ projectBundlePreview.schemaVersion }} · {{ projectBundlePreview.signatureVerified ? `组织签名 ${projectBundlePreview.signatureKeyId}` : '调试态未签名' }}</small></div><button class="primary" type="button" :disabled="busy" @click="importSelectedProjectBundle">确认计划并切换项目</button></header>
             <div class="bundle-summary"><span><strong>{{ projectBundlePreview.businessOrigins }}</strong>业务来源</span><span><strong>{{ projectBundlePreview.signedPlugins }}</strong>签名插件</span><span><strong>{{ projectBundlePreview.localMappings }}</strong>本地映射</span><span><strong>{{ projectBundlePreview.serviceCount }}</strong>原生服务</span><span><strong>{{ projectBundlePreview.preflightedHosts }}</strong>宿主预检</span></div>
-            <div class="project-change-summary"><span :class="{ changed: projectBundlePreview.configChanged }">配置{{ projectBundlePreview.configChanged ? '更新' : '不变' }}</span><span>新增 {{ projectBundlePreview.installCount }}</span><span>升级 {{ projectBundlePreview.upgradeCount }}</span><span>修复/替换 {{ projectBundlePreview.replaceCount }}</span><span>保留本机 {{ projectBundlePreview.retainedCount }}</span></div>
+            <div class="project-change-summary"><span :class="{ changed: projectBundlePreview.configPreview.configChanged }">配置{{ projectBundlePreview.configPreview.configChanged ? '更新' : '不变' }}</span><span>新增 {{ projectBundlePreview.installCount }}</span><span>升级 {{ projectBundlePreview.upgradeCount }}</span><span>修复/替换 {{ projectBundlePreview.replaceCount }}</span><span>保留本机 {{ projectBundlePreview.retainedCount }}</span></div>
+            <h3>目标项目配置</h3>
+            <div class="config-import-target"><span>默认业务入口</span><strong>{{ projectBundlePreview.configPreview.candidateDefaultWebsite || '未配置' }}</strong></div>
+            <div class="config-import-counts">
+              <span><small>业务环境</small><strong>{{ projectBundlePreview.configPreview.currentEnvironmentCount }} → {{ projectBundlePreview.configPreview.candidateEnvironmentCount }}</strong></span>
+              <span><small>业务来源</small><strong>{{ projectBundlePreview.configPreview.currentBusinessOriginCount }} → {{ projectBundlePreview.configPreview.candidateBusinessOriginCount }}</strong></span>
+              <span><small>SSO 来源</small><strong>{{ projectBundlePreview.configPreview.currentTrustedOriginCount }} → {{ projectBundlePreview.configPreview.candidateTrustedOriginCount }}</strong></span>
+              <span><small>外链来源</small><strong>{{ projectBundlePreview.configPreview.currentExternalOriginCount }} → {{ projectBundlePreview.configPreview.candidateExternalOriginCount }}</strong></span>
+              <span><small>受控进程</small><strong>{{ projectBundlePreview.configPreview.currentManagedProcessCount }} → {{ projectBundlePreview.configPreview.candidateManagedProcessCount }}</strong></span>
+              <span><small>启用快捷键</small><strong>{{ projectBundlePreview.configPreview.currentEnabledShortcutCount }} → {{ projectBundlePreview.configPreview.candidateEnabledShortcutCount }}</strong></span>
+            </div>
+            <div class="project-change-summary">
+              <span :class="{ changed: projectBundlePreview.configPreview.defaultWebsiteChanged }">默认入口{{ projectBundlePreview.configPreview.defaultWebsiteChanged ? '变更' : '不变' }}</span>
+              <span :class="{ changed: projectBundlePreview.configPreview.tenantChanged }">租户{{ projectBundlePreview.configPreview.tenantChanged ? '变更' : '不变' }}</span>
+              <span :class="{ changed: projectBundlePreview.configPreview.allowSwitchChanged }">环境切换：{{ projectBundlePreview.configPreview.candidateAllowSwitch ? '启用' : '关闭' }}</span>
+              <span :class="{ changed: projectBundlePreview.configPreview.autoCloseChanged }">关闭确认：{{ projectBundlePreview.configPreview.candidateAutoClose ? '启用' : '关闭' }}</span>
+              <span :class="{ changed: projectBundlePreview.configPreview.autoStartChanged }">开机启动：{{ projectBundlePreview.configPreview.candidateAutoStart ? '启用' : '关闭' }}</span>
+              <span :class="{ changed: projectBundlePreview.configPreview.pluginCatalogChanged }">插件仓库{{ projectBundlePreview.configPreview.pluginCatalogChanged ? '变更' : '不变' }}</span>
+            </div>
+            <details v-if="projectBundlePreview.configPreview.candidateEnvironments.length" class="config-import-environments"><summary>查看目标业务环境（{{ projectBundlePreview.configPreview.candidateEnvironments.length }}）</summary><ul><li v-for="environment in projectBundlePreview.configPreview.candidateEnvironments" :key="`${environment.name}:${environment.url}`"><strong>{{ environment.name }}</strong><code>{{ environment.url }}</code></li></ul></details>
             <h3>项目包变更</h3>
             <ul><li v-for="component in projectBundlePreview.components" :key="component.pluginId"><span><strong>{{ component.pluginId }}</strong><small>{{ component.source === 'signed-package' ? `签名插件 ${component.version ?? ''} · Desktop ${component.desktopVersionRequirement ?? '未声明'}` : '本地动态映射' }}</small></span><em><b :class="`plan-action ${component.action}`">{{ projectActionLabels[component.action] }}</b>{{ component.serviceCount }} 个服务</em></li></ul>
             <details v-if="projectBundlePreview.retainedComponents.length" class="retained-components"><summary>不会删除的本机现有能力（{{ projectBundlePreview.retainedCount }}）</summary><ul><li v-for="component in projectBundlePreview.retainedComponents" :key="component.pluginId"><span><strong>{{ component.pluginId }}</strong><small>{{ component.source === 'signed-package' ? `签名插件 ${component.version ?? ''}` : '本地动态映射' }}</small></span><em><b class="plan-action retain">保留</b>{{ component.serviceCount }} 个服务</em></li></ul></details>

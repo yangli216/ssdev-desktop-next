@@ -135,6 +135,10 @@ button:disabled { cursor: wait !important; opacity: .5; }
 .plan-action.retain { background: #f0f1f0; color: #6a746e; }
 .retained-components { border-top: 1px solid #dbe6dd; }
 .retained-components summary { padding: 12px 18px; color: #5e6b63; font-size: 11px; cursor: pointer; }
+.project-bundle-preview .config-import-environments ul { margin: 0; padding: 0 28px 17px; }
+.project-bundle-preview .config-import-environments li { display: grid; grid-template-columns: minmax(120px, .35fr) minmax(0, 1fr); gap: 16px; align-items: initial; padding: 8px 0; border-top: 1px solid #eee5cd; border-bottom: 0; }
+.project-bundle-preview .config-import-environments strong { color: #4d513b; font-size: 11px; }
+.project-bundle-preview .config-import-environments code { overflow: hidden; color: #746d57; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .operation-copy > p:not(.eyebrow), .plugin-inventory > div > p:not(.eyebrow) { color: #66736b; line-height: 1.7; }
 .migration { padding: 12px; overflow-wrap: anywhere; border-radius: 9px; background: #edf1e7; font-size: 12px; }
 .warning { color: #7c4d2b !important; background: #fff2df !important; }

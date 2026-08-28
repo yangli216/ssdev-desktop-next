@@ -521,7 +521,7 @@ struct ProjectBundlePreview {
     local_mappings: usize,
     service_count: usize,
     preflighted_hosts: usize,
-    config_changed: bool,
+    config_preview: desktop::ConfigChangePreview,
     install_count: usize,
     upgrade_count: usize,
     replace_count: usize,
@@ -863,7 +863,7 @@ async fn inspect_project_bundle(
         local_mappings = prepared.preview.local_mappings,
         service_count = prepared.preview.service_count,
         preflighted_hosts = prepared.preview.preflighted_hosts,
-        config_changed = prepared.preview.config_changed,
+        config_changed = prepared.preview.config_preview.config_changed,
         installs = prepared.preview.install_count,
         upgrades = prepared.preview.upgrade_count,
         replacements = prepared.preview.replace_count,
@@ -1092,7 +1092,7 @@ async fn prepare_project_bundle(
         ));
     }
     let current_config = desktop_state.config.snapshot();
-    let config_changed = current_config != opened.config;
+    let config_preview = desktop::build_config_change_preview(&current_config, &opened.config)?;
     let current_state_manifests = current.manifests.clone();
     let current_state_local_root = state.local_mapping_root.clone();
     let current_state_digest = tokio::task::spawn_blocking(move || {
@@ -1299,7 +1299,7 @@ async fn prepare_project_bundle(
             local_mappings,
             service_count,
             preflighted_hosts,
-            config_changed,
+            config_preview,
             install_count,
             upgrade_count,
             replace_count,
@@ -3947,7 +3947,7 @@ fn select_runtime_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_project_component_action, collect_plugin_updates,
+        classify_project_component_action, collect_plugin_updates, desktop,
         ensure_plugin_update_plan_matches, ensure_project_export_active_manifests_match,
         ensure_project_export_runtime_matches, ensure_signed_plugin_compatible,
         ensure_upgrade_allowed, is_lowercase_sha256, is_plugin_update_available,
@@ -3955,7 +3955,7 @@ mod tests {
         plugin_update_installed_state_digest, plugin_update_plan_id, project_bundle,
         project_import_plan_id, project_import_state_digest, select_runtime_path,
         service_inventory_item, startup_failure_message, CatalogWithdrawalReason, FrontendRuntime,
-        StartupFailureDocument, StartupStage, FRONTEND_READY_TIMEOUT,
+        ProjectBundlePreview, StartupFailureDocument, StartupStage, FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -4118,6 +4118,55 @@ mod tests {
             classify_project_component_action(LocalMapping, true, None, None),
             "replace"
         );
+    }
+
+    #[test]
+    fn project_import_preview_contains_the_shared_configuration_change_summary() {
+        let current = ssdev_config::DesktopConfig {
+            website: Some("https://current.example.test/app".into()),
+            managed_processes: vec!["reader-agent".into()],
+            ..ssdev_config::DesktopConfig::default()
+        };
+        let candidate = ssdev_config::DesktopConfig {
+            website: Some("https://candidate.example.test/app".into()),
+            environments: vec![ssdev_config::EnvironmentConfig {
+                name: "生产环境".into(),
+                url: "https://candidate.example.test/app".into(),
+                extensions: Default::default(),
+            }],
+            auto_start: true,
+            ..ssdev_config::DesktopConfig::default()
+        };
+        let preview = ProjectBundlePreview {
+            plan_id: "a".repeat(64),
+            schema_version: 1,
+            created_by_version: "0.1.0".into(),
+            signature_verified: true,
+            signature_key_id: Some("project-key".into()),
+            business_origins: 1,
+            signed_plugins: 0,
+            local_mappings: 0,
+            service_count: 0,
+            preflighted_hosts: 0,
+            config_preview: desktop::build_config_change_preview(&current, &candidate).unwrap(),
+            install_count: 0,
+            upgrade_count: 0,
+            replace_count: 0,
+            retained_count: 0,
+            components: Vec::new(),
+            retained_components: Vec::new(),
+        };
+        let value = serde_json::to_value(preview).unwrap();
+
+        assert!(value.get("configChanged").is_none());
+        assert_eq!(value["configPreview"]["configChanged"], true);
+        assert_eq!(
+            value["configPreview"]["candidateDefaultWebsite"],
+            "https://candidate.example.test/app"
+        );
+        assert_eq!(value["configPreview"]["currentManagedProcessCount"], 1);
+        assert_eq!(value["configPreview"]["candidateManagedProcessCount"], 0);
+        assert!(value["configPreview"].get("planId").is_none());
     }
 
     #[test]
