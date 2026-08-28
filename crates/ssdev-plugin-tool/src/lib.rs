@@ -29,7 +29,9 @@ const MAX_PLUGIN_FILES: usize = 4096;
 const MAX_SIGNING_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 1024;
 const MAX_MATRIX_CASES: usize = 1024;
+const MAX_MATRIX_PLUGINS: usize = 256;
 const MAX_MATRIX_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TRUST_STORE_BYTES: u64 = 256 * 1024;
 const MAX_CATALOG_SPEC_BYTES: u64 = 1024 * 1024;
 const MAX_CATALOG_PACKAGES: usize = 4096;
 const PLUGIN_METADATA_FILENAME: &str = "plugin.json";
@@ -110,6 +112,24 @@ pub struct VerifyReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReleaseCheckReport {
+    pub schema_version: u8,
+    pub plugin_id: String,
+    pub version: String,
+    pub key_id: String,
+    pub package_sha256: String,
+    pub trust_store_sha256: String,
+    pub matrix_sha256: String,
+    pub service_count: usize,
+    pub method_count: usize,
+    pub case_count: usize,
+    pub enabled_case_count: usize,
+    pub package_verified: bool,
+    pub matrix_verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CatalogReport {
     pub schema_version: u8,
     pub issued_at: u64,
@@ -136,7 +156,16 @@ struct SigningRequest {
 pub struct PluginMatrix {
     pub schema_version: u8,
     pub draft: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<PluginMatrixTarget>,
     pub cases: Vec<PluginMatrixCase>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PluginMatrixTarget {
+    pub plugin_id: String,
+    pub version: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -160,6 +189,7 @@ pub struct MatrixCheckReport {
     pub method_count: usize,
     pub case_count: usize,
     pub enabled_case_count: usize,
+    pub identity_bound: bool,
 }
 
 fn enabled_by_default() -> bool {
@@ -258,7 +288,7 @@ pub fn prepare(options: &PrepareOptions<'_>) -> Result<PrepareReport, ToolError>
         };
         let matrix = match matrix_seed.as_deref() {
             Some(path) => load_matrix_seed(path, &manifest)?,
-            None => draft_matrix(&manifest),
+            None => draft_matrix(&manifest)?,
         };
         Ok::<_, ToolError>((
             copy,
@@ -413,6 +443,55 @@ pub fn verify(package: &Path, trust_store: &Path) -> Result<VerifyReport, ToolEr
         key_id: prepared.identity().key_id.clone(),
         service_count: prepared.manifest().services.len(),
         package_sha256,
+    })
+}
+
+pub fn check_release_candidate(
+    package: &Path,
+    trust_store: &Path,
+    matrix: &Path,
+) -> Result<ReleaseCheckReport, ToolError> {
+    let package_sha256 = sha256_file(package)?;
+    let trust_store_sha256 = sha256_file_bounded(trust_store, MAX_TRUST_STORE_BYTES)?;
+    let matrix_sha256 = sha256_file_bounded(matrix, MAX_MATRIX_BYTES)?;
+    let trust = TrustStore::load(trust_store)?;
+    let verification_root = tempfile::tempdir().map_err(|source| ToolError::Io {
+        path: std::env::temp_dir(),
+        source,
+    })?;
+    let prepared = PreparedPlugin::prepare(package, verification_root.path(), &trust)?;
+    trust.verify_for_issuance(prepared.manifest())?;
+    let (_, matrix_report) =
+        validate_executable_matrix(matrix, std::slice::from_ref(prepared.manifest()))?;
+    if !matrix_report.identity_bound {
+        return Err(ToolError::Invalid(
+            "release candidate matrix must bind the exact plugin ID and version".into(),
+        ));
+    }
+
+    if package_sha256 != sha256_file(package)?
+        || trust_store_sha256 != sha256_file_bounded(trust_store, MAX_TRUST_STORE_BYTES)?
+        || matrix_sha256 != sha256_file_bounded(matrix, MAX_MATRIX_BYTES)?
+    {
+        return Err(ToolError::Invalid(
+            "release candidate package, trust store, or matrix changed while it was checked".into(),
+        ));
+    }
+
+    Ok(ReleaseCheckReport {
+        schema_version: 1,
+        plugin_id: prepared.identity().plugin_id.clone(),
+        version: prepared.metadata().version.to_string(),
+        key_id: prepared.identity().key_id.clone(),
+        package_sha256,
+        trust_store_sha256,
+        matrix_sha256,
+        service_count: matrix_report.service_count,
+        method_count: matrix_report.method_count,
+        case_count: matrix_report.case_count,
+        enabled_case_count: matrix_report.enabled_case_count,
+        package_verified: true,
+        matrix_verified: true,
     })
 }
 
@@ -748,7 +827,7 @@ fn detect_pe_architecture(path: &Path) -> Result<Option<PluginArchitecture>, Too
     })
 }
 
-fn draft_matrix(manifest: &PluginManifest) -> PluginMatrix {
+fn draft_matrix(manifest: &PluginManifest) -> Result<PluginMatrix, ToolError> {
     let cases = manifest
         .services
         .iter()
@@ -779,11 +858,12 @@ fn draft_matrix(manifest: &PluginManifest) -> PluginMatrix {
             })
         })
         .collect::<Vec<_>>();
-    PluginMatrix {
+    Ok(PluginMatrix {
         schema_version: 1,
         draft: true,
+        plugins: vec![matrix_target(manifest)?],
         cases,
-    }
+    })
 }
 
 fn matrix_case_has_draft_placeholder(case: &PluginMatrixCase) -> bool {
@@ -795,7 +875,7 @@ fn matrix_case_has_draft_placeholder(case: &PluginMatrixCase) -> bool {
 }
 
 fn load_matrix_seed(path: &Path, manifest: &PluginManifest) -> Result<PluginMatrix, ToolError> {
-    let matrix: PluginMatrix = read_bounded_json(path, MAX_MATRIX_BYTES)?;
+    let mut matrix: PluginMatrix = read_bounded_json(path, MAX_MATRIX_BYTES)?;
     if matrix.schema_version != 1 || !matrix.draft {
         return Err(ToolError::Invalid(
             "matrix seed must use schema 1 and remain draft=true".into(),
@@ -885,6 +965,8 @@ fn load_matrix_seed(path: &Path, manifest: &PluginManifest) -> Result<PluginMatr
             required.difference(&covered).count()
         )));
     }
+    validate_matrix_targets(&matrix.plugins, std::slice::from_ref(manifest))?;
+    matrix.plugins = vec![matrix_target(manifest)?];
     Ok(matrix)
 }
 
@@ -925,6 +1007,74 @@ pub fn check_executable_matrix_plugin(
     Ok(report)
 }
 
+fn matrix_target(manifest: &PluginManifest) -> Result<PluginMatrixTarget, ToolError> {
+    let metadata = manifest.metadata.as_ref().ok_or_else(|| {
+        ToolError::Invalid("matrix identity binding requires normalized plugin.json".into())
+    })?;
+    Ok(PluginMatrixTarget {
+        plugin_id: metadata.plugin_id.clone(),
+        version: metadata.version.to_string(),
+    })
+}
+
+fn validate_matrix_targets(
+    targets: &[PluginMatrixTarget],
+    manifests: &[PluginManifest],
+) -> Result<bool, ToolError> {
+    if targets.is_empty() {
+        return Ok(false);
+    }
+    if targets.len() > MAX_MATRIX_PLUGINS {
+        return Err(ToolError::Invalid(format!(
+            "matrix identity binding contains more than {MAX_MATRIX_PLUGINS} plugins"
+        )));
+    }
+
+    let mut expected = BTreeMap::new();
+    for manifest in manifests {
+        let target = matrix_target(manifest)?;
+        expected.insert(
+            target.plugin_id.to_ascii_lowercase(),
+            (target.plugin_id, target.version),
+        );
+    }
+    let mut actual = BTreeMap::new();
+    for target in targets {
+        let path = Path::new(&target.plugin_id);
+        let version = Version::parse(&target.version).map_err(|error| {
+            ToolError::Invalid(format!(
+                "matrix plugin target version is not SemVer: {error}"
+            ))
+        })?;
+        if target.plugin_id.trim() != target.plugin_id
+            || path.components().count() != 1
+            || portable_plugin_path(path)? != target.plugin_id
+            || version.to_string() != target.version
+        {
+            return Err(ToolError::Invalid(
+                "matrix plugin targets must use canonical portable IDs and SemVer versions".into(),
+            ));
+        }
+        if actual
+            .insert(
+                target.plugin_id.to_ascii_lowercase(),
+                (target.plugin_id.clone(), target.version.clone()),
+            )
+            .is_some()
+        {
+            return Err(ToolError::Invalid(
+                "matrix identity binding contains a duplicate portable plugin ID".into(),
+            ));
+        }
+    }
+    if actual != expected {
+        return Err(ToolError::Invalid(
+            "matrix plugin identities or versions do not exactly match the checked plugins".into(),
+        ));
+    }
+    Ok(true)
+}
+
 pub fn validate_executable_matrix(
     matrix_path: &Path,
     manifests: &[PluginManifest],
@@ -943,6 +1093,7 @@ pub fn validate_executable_matrix(
             "executable matrix is still marked as draft".into(),
         ));
     }
+    let identity_bound = validate_matrix_targets(&matrix.plugins, manifests)?;
 
     let mut services = BTreeMap::new();
     let mut required = BTreeSet::new();
@@ -1065,6 +1216,7 @@ pub fn validate_executable_matrix(
         method_count: required.len(),
         case_count: matrix.cases.len(),
         enabled_case_count,
+        identity_bound,
     };
     Ok((matrix, report))
 }
@@ -1225,6 +1377,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 fn sha256_file(path: &Path) -> Result<String, ToolError> {
+    sha256_file_bounded(path, MAX_PLUGIN_BYTES)
+}
+
+fn sha256_file_bounded(path: &Path, limit: u64) -> Result<String, ToolError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| ToolError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() > limit {
+        return Err(ToolError::Invalid(format!(
+            "digest input must be a regular file no larger than {limit} bytes"
+        )));
+    }
     let mut file = File::open(path).map_err(|source| ToolError::Io {
         path: path.to_path_buf(),
         source,
@@ -1241,9 +1406,9 @@ fn sha256_file(path: &Path) -> Result<String, ToolError> {
             break;
         }
         total = total.saturating_add(count as u64);
-        if total > MAX_PLUGIN_BYTES {
+        if total > limit {
             return Err(ToolError::Invalid(format!(
-                "plugin package exceeds {MAX_PLUGIN_BYTES} bytes while being read"
+                "digest input exceeds {limit} bytes while being read"
             )));
         }
         hasher.update(&buffer[..count]);
@@ -1348,6 +1513,18 @@ mod tests {
         })
     }
 
+    fn bound_executable_matrix(case: Value, plugin_id: &str, version: &str) -> Value {
+        json!({
+            "schemaVersion": 1,
+            "draft": false,
+            "plugins": [{
+                "pluginId": plugin_id,
+                "version": version
+            }],
+            "cases": [case]
+        })
+    }
+
     fn executable_case() -> Value {
         json!({
             "name": "reader.read verified",
@@ -1383,6 +1560,7 @@ mod tests {
         assert_eq!(report.method_count, 1);
         assert_eq!(report.case_count, 1);
         assert_eq!(report.enabled_case_count, 1);
+        assert!(!report.identity_bound);
         assert_eq!(
             check_executable_matrix_root(root.path(), &matrix).unwrap(),
             report
@@ -1535,10 +1713,11 @@ mod tests {
         assert_eq!(report.matrix_placeholder_case_count, 1);
         assert_eq!(report.matrix_review_required_case_count, 1);
         assert!(!staging.join("license.dat").exists());
-        assert!(
-            serde_json::from_slice::<Value>(&fs::read(&matrix).unwrap()).unwrap()["draft"]
-                .as_bool()
-                .unwrap()
+        let generated_matrix: Value = serde_json::from_slice(&fs::read(&matrix).unwrap()).unwrap();
+        assert!(generated_matrix["draft"].as_bool().unwrap());
+        assert_eq!(
+            generated_matrix["plugins"][0],
+            json!({ "pluginId": "reader-plugin", "version": "1.2.3" })
         );
 
         let signing_request: SigningRequest =
@@ -1564,6 +1743,59 @@ mod tests {
         let verified = verify(&package, &trust_path).unwrap();
         assert_eq!(verified.plugin_id, "reader-plugin");
         assert_eq!(verified.package_sha256, finalized.package_sha256);
+
+        let finalized_matrix = matrix_file(
+            root.path(),
+            "finalized-matrix.json",
+            bound_executable_matrix(executable_case(), "reader-plugin", "1.2.3"),
+        );
+        let candidate = check_release_candidate(&package, &trust_path, &finalized_matrix).unwrap();
+        assert_eq!(candidate.plugin_id, "reader-plugin");
+        assert_eq!(candidate.version, "1.2.3");
+        assert_eq!(candidate.package_sha256, finalized.package_sha256);
+        assert_eq!(
+            candidate.matrix_sha256,
+            sha256_file(&finalized_matrix).unwrap()
+        );
+        assert_eq!(candidate.service_count, 1);
+        assert_eq!(candidate.method_count, 1);
+        assert_eq!(candidate.case_count, 1);
+        assert_eq!(candidate.enabled_case_count, 1);
+        assert!(candidate.package_verified);
+        assert!(candidate.matrix_verified);
+
+        let unbound_matrix = matrix_file(
+            root.path(),
+            "unbound-matrix.json",
+            executable_matrix(executable_case()),
+        );
+        let error = check_release_candidate(&package, &trust_path, &unbound_matrix).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("bind the exact plugin ID and version"));
+
+        let stale_matrix = matrix_file(
+            root.path(),
+            "stale-version-matrix.json",
+            bound_executable_matrix(executable_case(), "reader-plugin", "1.2.2"),
+        );
+        let error = check_release_candidate(&package, &trust_path, &stale_matrix).unwrap_err();
+        assert!(error.to_string().contains("do not exactly match"));
+
+        let mut mismatched_case = executable_case();
+        mismatched_case["request"]["method"] = Value::String("other-version-method".into());
+        let mismatched_matrix = matrix_file(
+            root.path(),
+            "mismatched-matrix.json",
+            bound_executable_matrix(mismatched_case, "reader-plugin", "1.2.3"),
+        );
+        let error = check_release_candidate(&package, &trust_path, &mismatched_matrix).unwrap_err();
+        assert!(error.to_string().contains("unknown method"));
+
+        trust_store(root.path(), &signing_key, Some("retired"));
+        let error = check_release_candidate(&package, &trust_path, &finalized_matrix).unwrap_err();
+        assert!(error.to_string().contains("retired"));
+        trust_store(root.path(), &signing_key, None);
 
         let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let spec = root.path().join("catalog-spec.json");
@@ -1653,6 +1885,8 @@ mod tests {
         assert_eq!(report.matrix_review_required_case_count, 0);
         let generated: Value = serde_json::from_slice(&fs::read(matrix).unwrap()).unwrap();
         assert_eq!(generated["cases"][0]["name"], "known reader response");
+        assert_eq!(generated["plugins"][0]["pluginId"], "reader-plugin");
+        assert_eq!(generated["plugins"][0]["version"], "1.0.0");
         assert_eq!(
             generated["cases"][0]["expected"]["ResData"]["ReturnValue"],
             0

@@ -4,8 +4,8 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use ssdev_plugin_tool::{
-    check_executable_matrix_plugin, check_executable_matrix_root, create_catalog, finalize,
-    prepare, verify, CatalogOptions, FinalizeOptions, PrepareOptions,
+    check_executable_matrix_plugin, check_executable_matrix_root, check_release_candidate,
+    create_catalog, finalize, prepare, verify, CatalogOptions, FinalizeOptions, PrepareOptions,
 };
 
 fn main() {
@@ -112,6 +112,17 @@ fn run(arguments: impl IntoIterator<Item = String>) -> Result<String, String> {
             };
             serde_json::to_string_pretty(&report.map_err(|error| error.to_string())?)
         }
+        "release-check" => {
+            reject_unknown(&options, &["package", "trust-store", "matrix"])?;
+            serde_json::to_string_pretty(
+                &check_release_candidate(
+                    required_path(&options, "package")?,
+                    required_path(&options, "trust-store")?,
+                    required_path(&options, "matrix")?,
+                )
+                .map_err(|error| error.to_string())?,
+            )
+        }
         _ => return Err(format!("未知子命令 [{command}]")),
     }
     .map_err(|error| error.to_string())?;
@@ -160,7 +171,7 @@ fn required_path<'a>(options: &'a HashMap<String, String>, name: &str) -> Result
 }
 
 fn usage() -> &'static str {
-    "用法:\n  ssdev-plugin-tool prepare --source DIR --staging DIR --request FILE --matrix-template FILE --plugin-id ID --version SEMVER [--display-name NAME] --key-id ID --trust-store FILE [--matrix-seed FILE]\n  ssdev-plugin-tool finalize --staging DIR --request FILE --signature FILE --trust-store FILE --package FILE.ssdev-plugin\n  ssdev-plugin-tool verify --package FILE.ssdev-plugin --trust-store FILE\n  ssdev-plugin-tool catalog --spec FILE --trust-store FILE --catalog FILE\n  ssdev-plugin-tool matrix-check (--plugin-root DIR | --plugin-dir DIR) --matrix FILE"
+    "用法:\n  ssdev-plugin-tool prepare --source DIR --staging DIR --request FILE --matrix-template FILE --plugin-id ID --version SEMVER [--display-name NAME] --key-id ID --trust-store FILE [--matrix-seed FILE]\n  ssdev-plugin-tool finalize --staging DIR --request FILE --signature FILE --trust-store FILE --package FILE.ssdev-plugin\n  ssdev-plugin-tool verify --package FILE.ssdev-plugin --trust-store FILE\n  ssdev-plugin-tool release-check --package FILE.ssdev-plugin --trust-store FILE --matrix FILE\n  ssdev-plugin-tool catalog --spec FILE --trust-store FILE --catalog FILE\n  ssdev-plugin-tool matrix-check (--plugin-root DIR | --plugin-dir DIR) --matrix FILE"
 }
 
 #[cfg(test)]
@@ -180,5 +191,8 @@ mod tests {
         ])
         .unwrap_err()
         .contains("必须且只能指定"));
+        assert!(run(["release-check".into()])
+            .unwrap_err()
+            .contains("缺少 --package"));
     }
 }

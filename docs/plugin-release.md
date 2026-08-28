@@ -48,7 +48,7 @@ COM/OCX 的 ProgID 和真实注册状态无法在离线准备阶段验证，必�
 - 签名请求：显式记录 `pluginId`、`version` 和 `keyId`；`payloadBase64` 是 KMS/HSM 要签名的原始字节，`payloadSha256` 用于发布审批和审计；
 - 黄金矩阵草稿：采用通过校验的外部种子，或从每个 service/method 自动生成参数占位符；准备报告会给出 `matrixSeeded`、`matrixCaseCount`、仍含保留占位符的 `matrixPlaceholderCaseCount` 和必须人工确认精确响应的 `matrixReviewRequiredCaseCount`。
 
-黄金矩阵默认带有 `"draft": true`。自动生成或由工作台现场子集用例转换的条目还带有 `"reviewRequired": true`。运行器会在启动 controller 或接触硬件之前拒绝草稿；即使误把草稿改为 `false`，任何启用用例仍要求复核或存在生成器保留的输入/响应占位符也会失败关闭。只有补齐全部声明输入、把子集断言核对为完整精确响应、删除占位符、将每个已复核用例改为 `"reviewRequired": false`，并显式解除全局草稿后才会执行。暂不验证的用例可设置 `"enabled": false`，但正式切换时仍须由其他启用用例覆盖对应生产能力。
+黄金矩阵默认带有 `"draft": true`，并在 `plugins` 中固定本次 `pluginId` 与 SemVer 版本。自动生成或由工作台现场子集用例转换的条目还带有 `"reviewRequired": true`。运行器会在启动 controller 或接触硬件之前拒绝草稿；即使误把草稿改为 `false`，任何启用用例仍要求复核或存在生成器保留的输入/响应占位符也会失败关闭。只有补齐全部声明输入、把子集断言核对为完整精确响应、删除占位符、将每个已复核用例改为 `"reviewRequired": false`，并显式解除全局草稿后才会执行。暂不验证的用例可设置 `"enabled": false`，但正式切换时仍须由其他启用用例覆盖对应生产能力。
 
 ### 跨平台离线检查
 
@@ -60,7 +60,7 @@ cargo run --locked -p ssdev-plugin-tool -- matrix-check `
   --matrix C:\secure-release\reader-2.3.1-matrix.json
 ```
 
-`--plugin-dir` 用于检查一个包含规范化 `plugin.json` 的 `prepare` 暂存目录；多插件联合矩阵则改用 `--plugin-root C:\secure-test-inputs\plugins`，其直接子目录必须是各插件 ID。命令检查严格 schema、草稿/复核/占位符状态、全部用例路由、输入字段精确一致性、忽略 ASCII 大小写后的插件 ID 冲突、跨插件 `serviceId` 冲突和启用用例全方法覆盖，并输出插件、服务、方法和用例计数。
+`--plugin-dir` 用于检查一个包含规范化 `plugin.json` 的 `prepare` 暂存目录；多插件联合矩阵则改用 `--plugin-root C:\secure-test-inputs\plugins`，其直接子目录必须是各插件 ID。命令检查严格 schema、可选的插件身份/版本绑定、草稿/复核/占位符状态、全部用例路由、输入字段精确一致性、忽略 ASCII 大小写后的插件 ID 冲突、跨插件 `serviceId` 冲突和启用用例全方法覆盖，并输出插件、服务、方法、用例计数及 `identityBound`。旧矩阵可在缺少身份绑定时继续做语义和实机回归，但新的正式发布候选不能省略绑定。
 
 这只是无需 Windows 的快速失败门禁，不验证插件签名、厂商 ABI 或设备响应。正式 Windows 运行器会在验签插件后再次调用同一份共享校验逻辑，再启动 x86/x64 宿主，避免离线工具与实机规则漂移。
 
@@ -96,6 +96,17 @@ cargo run --locked -p ssdev-plugin-tool -- verify `
 ```
 
 `finalize` 和 `verify` 的 JSON 结果都会给出 `packageSha256`；`finalize` 还会回显签名审批使用的 `payloadSha256`。制品库应以这两个摘要把签名请求、审批记录和最终安装包关联起来。
+
+正式发布候选还必须把定稿黄金矩阵与实际签名包联合检查，不能只分别验证暂存目录和包：
+
+```powershell
+cargo run --locked -p ssdev-plugin-tool -- release-check `
+  --package C:\secure-release\reader-plugin-2.3.1.ssdev-plugin `
+  --trust-store C:\secure-build-inputs\plugin-trust.json `
+  --matrix C:\secure-release\reader-2.3.1-matrix.json
+```
+
+`release-check` 使用桌面安装路径同源的安全解包和运行时验签，再额外要求签名键仍为 `active`，要求矩阵 `plugins` 中的 `pluginId + version` 与包内元数据精确一致，并直接用包内清单执行完整矩阵语义检查。它在检查前后复核包、信任库和矩阵未变化，成功报告同时给出三份 SHA-256、插件身份、版本、覆盖方法数和用例数。发布审批应归档该报告；结构相同但属于旧版本的矩阵也无法通过。该命令仍不会安装插件、加载原生组件或接触硬件。
 
 多个已签名包进入插件仓库时，不要手工维护版本、大小和摘要。使用 [签名插件仓库协议](plugin-repository.md) 中的 `ssdev-plugin-tool catalog` 从这些包生成确定性目录，再通过统一发布签名工具签目录。
 
