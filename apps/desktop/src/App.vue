@@ -208,6 +208,8 @@ type PluginUpdateCheck = {
     availableVersion?: string
     latestCatalogVersion?: string
     installPlanId?: string
+    installedVersionWithdrawn: boolean
+    withdrawalReason?: 'security' | 'defective' | 'publisher-withdrawn'
     catalogAvailable: boolean
     compatibilityLimited: boolean
     updateAvailable: boolean
@@ -267,6 +269,11 @@ const projectActionLabels = {
   reinstall: '同版本修复',
   replace: '替换映射',
   retain: '保留',
+} as const
+const withdrawalReasonLabels = {
+  security: '安全原因',
+  defective: '发布缺陷',
+  'publisher-withdrawn': '发布方撤回',
 } as const
 let unlistenSsoStatus: UnlistenFn | undefined
 let ssoStatusEventSeen = false
@@ -536,8 +543,11 @@ async function checkPluginUpdates(requestedPluginId?: string) {
   }, '')
   if (!result) return
   const available = result.updates.filter((item) => item.updateAvailable)
+  const withdrawn = result.updates.filter((item) => item.installedVersionWithdrawn)
   if (result.updates.length === 0) {
     notice.value = '当前没有已安装插件可检查。'
+  } else if (withdrawn.length > 0) {
+    notice.value = `发现 ${withdrawn.length} 个已安装插件版本已被签名仓库撤回，请优先升级或卸载。`
   } else if (available.length === 0) {
     notice.value = '签名仓库中未发现可安装的新版本。'
   } else {
@@ -804,7 +814,7 @@ async function runDeploymentCheck() {
           <div class="plugin-list">
             <form class="catalog-install" @submit.prevent="checkPluginUpdates(catalogPluginId)"><input v-model.trim="catalogPluginId" type="text" placeholder="输入签名仓库中的插件 ID" /><button type="submit" :disabled="busy">查询版本</button><button type="button" :disabled="busy" @click="checkPluginUpdates()">检查全部更新</button></form>
             <div v-if="pluginUpdates" class="plugin-update-results" aria-live="polite">
-              <div v-for="update in pluginUpdates.updates" :key="update.pluginId"><span><strong>{{ update.pluginId }}</strong><small>已安装 {{ update.installedVersion ?? '无' }} · 当前客户端可用 {{ update.availableVersion ?? '无' }}<template v-if="update.compatibilityLimited"> · 仓库最新 {{ update.latestCatalogVersion }} 需要其他 Desktop 版本</template></small></span><button v-if="update.updateAvailable && update.availableVersion && update.installPlanId" type="button" :disabled="busy" @click="installFromCatalog(update.pluginId, update.availableVersion, update.installPlanId)">{{ update.installedVersion ? `安装更新 ${update.availableVersion}` : `安装 ${update.availableVersion}` }}</button><em v-else>{{ update.catalogAvailable ? (update.compatibilityLimited ? '新版本与当前客户端不兼容' : '已是最新版本') : '仓库未收录' }}</em></div>
+              <div v-for="update in pluginUpdates.updates" :key="update.pluginId"><span><strong>{{ update.pluginId }}</strong><small>已安装 {{ update.installedVersion ?? '无' }} · 当前客户端可用 {{ update.availableVersion ?? '无' }}<template v-if="update.installedVersionWithdrawn"> · 当前版本已撤回（{{ update.withdrawalReason ? withdrawalReasonLabels[update.withdrawalReason] : '原因未分类' }}）</template><template v-if="update.compatibilityLimited"> · 仓库最新 {{ update.latestCatalogVersion }} 需要其他 Desktop 版本</template></small></span><button v-if="update.updateAvailable && update.availableVersion && update.installPlanId" type="button" :disabled="busy" @click="installFromCatalog(update.pluginId, update.availableVersion, update.installPlanId)">{{ update.installedVersion ? `安装更新 ${update.availableVersion}` : `安装 ${update.availableVersion}` }}</button><em v-else>{{ update.installedVersionWithdrawn ? '当前版本已撤回，请升级或卸载' : update.catalogAvailable ? (update.compatibilityLimited ? '新版本与当前客户端不兼容' : '已是最新版本') : '仓库未收录' }}</em></div>
             </div>
             <article v-for="plugin in inventory?.plugins ?? []" :key="plugin.pluginId">
               <header><span><strong>{{ plugin.displayName }}</strong><small>{{ plugin.pluginId }} · {{ plugin.source === 'local-mapping' ? '本机动态映射' : `${plugin.version ?? '未知版本'} · Desktop ${plugin.desktopVersionRequirement ?? '未声明'}` }}</small></span><div v-if="plugin.source === 'signed-package'" class="plugin-actions"><button type="button" :disabled="busy" @click="checkPluginUpdates(plugin.pluginId)">检查更新</button><button class="danger-link" type="button" :disabled="busy" @click="uninstallSignedPlugin(plugin.pluginId, plugin.displayName)">卸载</button></div></header>

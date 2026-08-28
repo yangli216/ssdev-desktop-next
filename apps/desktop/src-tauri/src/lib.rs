@@ -51,7 +51,8 @@ use webplus_controller::{
 use webplus_plugin_config::{discover_plugins, PluginManifest, ServiceDefinition};
 use webplus_plugin_package::{prepare_plugin_removal, PluginActivation, PreparedPlugin};
 use webplus_plugin_repository::{
-    download_package, fetch_catalog, secure_http_client, CatalogEntry, PluginCatalog,
+    download_package, fetch_catalog, secure_http_client, CatalogEntry, CatalogWithdrawalReason,
+    PluginCatalog,
 };
 use webplus_plugin_trust::{prepare_signing_material, read_identity, TrustStore};
 use webplus_protocol::{InvokeRequest, InvokeResponse, PluginArchitecture, HOST_PROTOCOL_VERSION};
@@ -1600,6 +1601,8 @@ struct PluginUpdateItem {
     available_version: Option<String>,
     latest_catalog_version: Option<String>,
     install_plan_id: Option<String>,
+    installed_version_withdrawn: bool,
+    withdrawal_reason: Option<CatalogWithdrawalReason>,
     catalog_available: bool,
     compatibility_limited: bool,
     update_available: bool,
@@ -1819,6 +1822,8 @@ fn collect_plugin_updates(
                 .map(|metadata| &metadata.version);
             let latest_catalog_version =
                 catalog.select(&plugin_id, None).map(|entry| &entry.version);
+            let withdrawal =
+                installed_version.and_then(|version| catalog.withdrawal(&plugin_id, version));
             let available_entry = catalog.select_compatible(&plugin_id, None, desktop_version);
             let available_version = available_entry.map(|entry| &entry.version);
             let update_available = is_plugin_update_available(installed_version, available_version);
@@ -1844,6 +1849,8 @@ fn collect_plugin_updates(
                 available_version: available_version.map(ToString::to_string),
                 latest_catalog_version: latest_catalog_version.map(ToString::to_string),
                 install_plan_id,
+                installed_version_withdrawn: withdrawal.is_some(),
+                withdrawal_reason: withdrawal.map(|withdrawal| withdrawal.reason),
                 catalog_available: latest_catalog_version.is_some(),
                 compatibility_limited: latest_catalog_version != available_version,
                 update_available,
@@ -3656,7 +3663,7 @@ mod tests {
         legacy_config_candidates, open_project_bundle_for_mode,
         plugin_update_installed_state_digest, plugin_update_plan_id, project_bundle,
         project_import_plan_id, project_import_state_digest, select_runtime_path,
-        service_inventory_item,
+        service_inventory_item, CatalogWithdrawalReason,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -3887,6 +3894,11 @@ mod tests {
                     "url": "https://plugins.example.test/reader-2.0.0.ssdev-plugin",
                     "sha256": "22".repeat(32),
                     "size": 10
+                }],
+                "withdrawals": [{
+                    "pluginId": "reader",
+                    "version": "1.0.0",
+                    "reason": "security"
                 }]
             }))
             .unwrap(),
@@ -3910,6 +3922,11 @@ mod tests {
             .install_plan_id
             .as_deref()
             .is_some_and(is_lowercase_sha256));
+        assert!(updates[0].installed_version_withdrawn);
+        assert_eq!(
+            updates[0].withdrawal_reason,
+            Some(CatalogWithdrawalReason::Security)
+        );
         assert!(updates[0].compatibility_limited);
         assert!(updates[0].update_available);
     }

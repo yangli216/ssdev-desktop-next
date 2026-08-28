@@ -18,6 +18,13 @@
       "sha256": "<64 lowercase hex characters>",
       "size": 1234567
     }
+  ],
+  "withdrawals": [
+    {
+      "pluginId": "reader-plugin",
+      "version": "2.2.0",
+      "reason": "security"
+    }
   ]
 }
 ```
@@ -27,6 +34,8 @@
 - `desktopVersionRequirement` 必须与包内签名 `plugin.json` 完全一致。旧目录缺少该字段时可被解析用于诊断，但条目不可安装，目录生成器和统一签名工具也拒绝正式签发。
 - 包 URL 必须是无凭据、无 fragment 的 HTTPS URL。
 - 包大小为 1 字节到 512 MiB；下载字节数必须与签名值完全一致。
+- `withdrawals` 可省略，只能按 `pluginId + 精确 SemVer` 使用 `security`、`defective` 或 `publisher-withdrawn` 三种固定原因码。相同撤回不能重复；一个版本不能同时出现在 `entries` 和 `withdrawals`，因此被撤回版本没有可解析下载地址，也不能重新安装。
+- 撤回记录属于同一个短期目录签名。首次发布带 `withdrawals` 的目录前必须先让目标机器升级到支持该字段的 Desktop；旧客户端因拒绝未知字段会失败关闭，不会忽略撤回信息。
 
 ## 从已验签包生成目录
 
@@ -42,6 +51,13 @@
       "package": "packages/reader-plugin-2.3.1.ssdev-plugin",
       "url": "https://plugins.example.internal/packages/reader-plugin-2.3.1.ssdev-plugin"
     }
+  ],
+  "withdrawals": [
+    {
+      "pluginId": "reader-plugin",
+      "version": "2.2.0",
+      "reason": "security"
+    }
   ]
 }
 ```
@@ -55,7 +71,7 @@ cargo run --locked -p ssdev-plugin-tool -- catalog `
   --catalog C:\secure-release\catalog.json
 ```
 
-工具拒绝符号链接和重复包路径，用与桌面安装器相同的安全解包路径验证每个插件的内部签名，并从签名覆盖的 `plugin.json` 提取 ID、版本和 Desktop 兼容范围。缺少兼容范围的包不能进入新目录。工具在验证前后分别计算包大小和 SHA-256，检测生成过程中的文件变化；URL 必须唯一，目录按 `pluginId + version` 排序，因此相同输入产生相同 JSON。输出报告包含目录 SHA-256，但不输出本地包路径。
+工具拒绝符号链接和重复包路径，用与桌面安装器相同的安全解包路径验证每个插件的内部签名，并从签名覆盖的 `plugin.json` 提取 ID、版本和 Desktop 兼容范围。缺少兼容范围的包不能进入新目录。工具在验证前后分别计算包大小和 SHA-256，检测生成过程中的文件变化；URL 必须唯一，安装条目和撤回记录分别按 `pluginId + version` 排序，因此相同输入产生相同 JSON。撤回身份和固定原因码由发布审批规格显式提供，但工具拒绝与可安装包重叠、重复或不可移植的身份。输出报告包含目录 SHA-256、包数和撤回数，不输出本地包路径。
 
 目录生成后，再使用 [统一发布文档签名](release-signing.md) 的 `prepare/finalize --kind plugin-catalog` 交给 KMS/HSM 签名。目录文件或任一包在两步之间变化都会被后续摘要校验发现。
 
@@ -78,7 +94,7 @@ cargo run --locked -p ssdev-plugin-tool -- catalog `
 
 1. 两个索引 URL 都必须使用 HTTPS，启用系统证书校验、连接/总超时和有限重定向。
 2. 限制索引和签名各 4 MiB，再验证 Ed25519 和有效期。
-3. 按插件 ID、可选精确版本和当前 Desktop SemVer 选择签名条目；缺少兼容范围或范围不匹配时不下载。
+3. 先拒绝与 `withdrawals` 重叠的版本，再按插件 ID、可选精确版本和当前 Desktop SemVer 选择签名条目；缺少兼容范围或范围不匹配时不下载。
 4. 同时限制实际下载大小并校验签名索引中的精确大小、SHA-256。
 5. 解包后再次验证 `plugin.json` 的 ID、版本、Desktop 兼容范围与目录完全一致，并验证插件内部完整文件签名。
 6. 在签名暂存目录中，为候选插件使用的每种 x86/x64 架构启动一次真实隔离宿主，完成认证管道、二次验签和 Health 往返后立即停止；预检不执行业务方法，也不停止当前健康宿主。失败时旧目录和旧路由完全不变。
@@ -99,6 +115,8 @@ cargo run --locked -p ssdev-plugin-tool -- catalog `
 ## 客户端检查与安装交互
 
 本地控制台的“检查更新”只下载并验证短期目录，不下载或激活插件。它展示已安装版本、与当前 Desktop 兼容的最高版本，以及仓库是否存在更新但只支持其他 Desktop 版本；未安装插件也可以按精确插件 ID 查询。不兼容版本不提供安装操作。
+
+如果已安装的精确版本出现在签名 `withdrawals` 中，控制台以高优先级显示固定原因，并引导升级到仍可安装的兼容版本或显式卸载。一次在线检查不会直接终止正在运行的硬件调用，也不会把短期网络目录变成离线运行授权；需要立即隔离某把泄露密钥签发的全部插件时仍必须在 Desktop 信任库中把该 keyId 设为 `revoked`。精确版本撤回用于有目标地阻止重新安装和辅助现场处置，不能替代密钥泄露响应。
 
 每个可安装版本同时获得一个只用于本次确认的安装计划标识。该标识以域分隔 SHA-256 绑定完整目录条目（插件 ID、版本、Desktop 兼容范围、包 URL、大小和摘要）、验签目录的 keyId、当前 Desktop 版本，以及目标插件当前全部签名文件的确定性载荷；未安装状态也被显式绑定。本机存在同名目录但它未通过签名或兼容性检查时不生成计划，避免把隔离项误当成“尚未安装”。
 

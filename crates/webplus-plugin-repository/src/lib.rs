@@ -30,12 +30,29 @@ pub struct CatalogEntry {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CatalogWithdrawalReason {
+    Security,
+    Defective,
+    PublisherWithdrawn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogWithdrawal {
+    pub plugin_id: String,
+    pub version: Version,
+    pub reason: CatalogWithdrawalReason,
+}
+
 #[derive(Debug, Clone)]
 pub struct PluginCatalog {
     issued_at: u64,
     expires_at: u64,
     signing_key_id: Option<String>,
     entries: Vec<CatalogEntry>,
+    withdrawals: Vec<CatalogWithdrawal>,
 }
 
 impl PluginCatalog {
@@ -83,6 +100,11 @@ impl PluginCatalog {
                 "catalog contains more than {MAX_CATALOG_ENTRIES} entries"
             )));
         }
+        if document.withdrawals.len() > MAX_CATALOG_ENTRIES {
+            return Err(RepositoryError::Invalid(format!(
+                "catalog contains more than {MAX_CATALOG_ENTRIES} withdrawals"
+            )));
+        }
         if document.expires_at <= document.issued_at
             || document.expires_at - document.issued_at > MAX_CATALOG_LIFETIME
         {
@@ -109,11 +131,29 @@ impl PluginCatalog {
                 )));
             }
         }
+        let mut withdrawn_identities = HashSet::new();
+        for withdrawal in &document.withdrawals {
+            validate_withdrawal(withdrawal)?;
+            let identity = (withdrawal.plugin_id.clone(), withdrawal.version.clone());
+            if !withdrawn_identities.insert(identity.clone()) {
+                return Err(RepositoryError::Invalid(format!(
+                    "duplicate catalog withdrawal [{} {}]",
+                    withdrawal.plugin_id, withdrawal.version
+                )));
+            }
+            if identities.contains(&identity) {
+                return Err(RepositoryError::Invalid(format!(
+                    "catalog release [{} {}] cannot be both installable and withdrawn",
+                    withdrawal.plugin_id, withdrawal.version
+                )));
+            }
+        }
         Ok(Self {
             issued_at: document.issued_at,
             expires_at: document.expires_at,
             signing_key_id: None,
             entries: document.entries,
+            withdrawals: document.withdrawals,
         })
     }
 
@@ -148,6 +188,16 @@ impl PluginCatalog {
 
     pub fn entries(&self) -> &[CatalogEntry] {
         &self.entries
+    }
+
+    pub fn withdrawals(&self) -> &[CatalogWithdrawal] {
+        &self.withdrawals
+    }
+
+    pub fn withdrawal(&self, plugin_id: &str, version: &Version) -> Option<&CatalogWithdrawal> {
+        self.withdrawals
+            .iter()
+            .find(|withdrawal| withdrawal.plugin_id == plugin_id && &withdrawal.version == version)
     }
 
     /// Rejects legacy catalog entries that do not bind a signed plugin release
@@ -207,10 +257,25 @@ pub fn signing_payload(catalog_bytes: &[u8]) -> Vec<u8> {
 pub fn encode_catalog_document(
     issued_at: u64,
     expires_at: u64,
+    entries: Vec<CatalogEntry>,
+    now: SystemTime,
+) -> Result<Vec<u8>, RepositoryError> {
+    encode_catalog_document_with_withdrawals(issued_at, expires_at, entries, Vec::new(), now)
+}
+
+pub fn encode_catalog_document_with_withdrawals(
+    issued_at: u64,
+    expires_at: u64,
     mut entries: Vec<CatalogEntry>,
+    mut withdrawals: Vec<CatalogWithdrawal>,
     now: SystemTime,
 ) -> Result<Vec<u8>, RepositoryError> {
     entries.sort_by(|left, right| {
+        left.plugin_id
+            .cmp(&right.plugin_id)
+            .then_with(|| left.version.cmp(&right.version))
+    });
+    withdrawals.sort_by(|left, right| {
         left.plugin_id
             .cmp(&right.plugin_id)
             .then_with(|| left.version.cmp(&right.version))
@@ -220,6 +285,7 @@ pub fn encode_catalog_document(
         issued_at,
         expires_at,
         entries,
+        withdrawals,
     };
     let mut bytes = serde_json::to_vec_pretty(&document)?;
     bytes.push(b'\n');
@@ -358,19 +424,7 @@ async fn fetch_limited(
 }
 
 fn validate_entry(entry: &CatalogEntry) -> Result<(), RepositoryError> {
-    if entry.plugin_id.is_empty()
-        || entry.plugin_id.len() > 128
-        || entry.plugin_id.starts_with('.')
-        || !entry
-            .plugin_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        return Err(RepositoryError::Invalid(format!(
-            "catalog plugin ID [{}] is not portable",
-            entry.plugin_id
-        )));
-    }
+    validate_plugin_id(&entry.plugin_id)?;
     if entry
         .desktop_version_requirement
         .as_ref()
@@ -407,6 +461,26 @@ fn validate_entry(entry: &CatalogEntry) -> Result<(), RepositoryError> {
     Ok(())
 }
 
+fn validate_withdrawal(withdrawal: &CatalogWithdrawal) -> Result<(), RepositoryError> {
+    validate_plugin_id(&withdrawal.plugin_id)
+}
+
+fn validate_plugin_id(plugin_id: &str) -> Result<(), RepositoryError> {
+    if plugin_id.is_empty()
+        || plugin_id.len() > 128
+        || plugin_id.starts_with('.')
+        || !plugin_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(RepositoryError::Invalid(format!(
+            "catalog plugin ID [{}] is not portable",
+            plugin_id
+        )));
+    }
+    Ok(())
+}
+
 fn require_https(url: &Url) -> Result<(), RepositoryError> {
     if url.scheme() != "https" || url.host_str().is_none() {
         return Err(RepositoryError::Invalid(format!(
@@ -423,6 +497,8 @@ struct CatalogDocument {
     issued_at: u64,
     expires_at: u64,
     entries: Vec<CatalogEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    withdrawals: Vec<CatalogWithdrawal>,
 }
 
 #[derive(Debug, Error)]
@@ -586,6 +662,79 @@ mod tests {
             1_700_000_000,
             1_700_003_600,
             vec![first.clone(), first],
+            now,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn catalog_withdrawals_are_canonical_and_cannot_remain_installable() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+        let entry = CatalogEntry {
+            plugin_id: "reader-plugin".into(),
+            version: Version::new(2, 0, 0),
+            desktop_version_requirement: Some(VersionReq::STAR),
+            url: Url::parse("https://plugins.example.test/reader-2.ssdev-plugin").unwrap(),
+            sha256: "ab".repeat(32),
+            size: 10,
+        };
+        let security = CatalogWithdrawal {
+            plugin_id: "reader-plugin".into(),
+            version: Version::new(1, 0, 0),
+            reason: CatalogWithdrawalReason::Security,
+        };
+        let defective = CatalogWithdrawal {
+            plugin_id: "printer-plugin".into(),
+            version: Version::new(3, 1, 4),
+            reason: CatalogWithdrawalReason::Defective,
+        };
+        let forward = encode_catalog_document_with_withdrawals(
+            1_700_000_000,
+            1_700_003_600,
+            vec![entry.clone()],
+            vec![security.clone(), defective.clone()],
+            now,
+        )
+        .unwrap();
+        let reverse = encode_catalog_document_with_withdrawals(
+            1_700_000_000,
+            1_700_003_600,
+            vec![entry.clone()],
+            vec![defective, security.clone()],
+            now,
+        )
+        .unwrap();
+        assert_eq!(forward, reverse);
+        let catalog = PluginCatalog::from_unsigned_bytes(&forward, now).unwrap();
+        assert_eq!(catalog.withdrawals().len(), 2);
+        assert_eq!(
+            catalog
+                .withdrawal("reader-plugin", &Version::new(1, 0, 0))
+                .map(|withdrawal| withdrawal.reason),
+            Some(CatalogWithdrawalReason::Security)
+        );
+        assert!(catalog
+            .select("reader-plugin", Some(&Version::new(1, 0, 0)))
+            .is_none());
+
+        let overlapping = CatalogWithdrawal {
+            plugin_id: entry.plugin_id.clone(),
+            version: entry.version.clone(),
+            reason: CatalogWithdrawalReason::PublisherWithdrawn,
+        };
+        assert!(encode_catalog_document_with_withdrawals(
+            1_700_000_000,
+            1_700_003_600,
+            vec![entry],
+            vec![overlapping],
+            now,
+        )
+        .is_err());
+        assert!(encode_catalog_document_with_withdrawals(
+            1_700_000_000,
+            1_700_003_600,
+            Vec::new(),
+            vec![security.clone(), security],
             now,
         )
         .is_err());

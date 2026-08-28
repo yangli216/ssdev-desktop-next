@@ -42,7 +42,7 @@ cargo run --locked -p ssdev-release-signing -- prepare `
 
 - 来源策略检查 schema 2、精确 origin/service/method、重复项、通配符和 HTTP 例外；
 - 进程策略检查固定绝对路径、参数上限、SHA-256 格式、重复 ID 和条目上限；
-- 插件目录检查 schema、SemVer、HTTPS URL、包大小/摘要、重复版本，以及当前签发/过期时间和最长 31 天有效期。目录本身应先由 `ssdev-plugin-tool catalog` 从已验签包生成，避免人工录入包字段。
+- 插件目录检查 schema、SemVer、HTTPS URL、包大小/摘要、重复版本、结构化精确版本撤回，以及当前签发/过期时间和最长 31 天有效期。可安装条目不得与撤回身份重叠；目录本身应先由 `ssdev-plugin-tool catalog` 从已验签包和已审批撤回清单生成，避免人工录入包字段。
 - 项目包先通过与客户端相同的受限 ZIP、配置、组件清单、大小和摘要校验，再对整个原始 `.ssdev-project` 文件建立独立域签名；审核摘要只公开创建版本、组件分类计数、包大小和 SHA-256。
 - 切换决策检查严格 schema、源码提交、应用版本、策略/信任库/三份证据/三个封套摘要和阻塞码一致性；只有 `eligible: true` 的 `GO` 决策可以进入签名请求，且请求、封套和独立验证的 keyId 都必须等于策略选定的 `approvalSignerKeyId`。`NO-GO` 决策只能归档，不能获准发布。
 - 三类执行证据分别检查自身严格 schema、来源提交、执行环境、输入摘要、覆盖与结果一致性，并使用不同域分隔 payload；插件矩阵 schema 2 的审核摘要额外公开 `packageSetSha256`，把硬件结论绑定到批准的确定性包集合。它们共享 `cutover-evidence` 用途，但生产策略可为每类证据指定不同 `keyId` 以隔离 QA 职责。

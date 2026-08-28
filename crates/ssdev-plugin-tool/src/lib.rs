@@ -14,7 +14,9 @@ use tempfile::Builder as TempBuilder;
 use thiserror::Error;
 use webplus_plugin_config::{discover_plugins, PluginManifest, PluginMetadata};
 use webplus_plugin_package::{create_deterministic_package, PreparedPlugin};
-use webplus_plugin_repository::{encode_catalog_document, CatalogEntry};
+use webplus_plugin_repository::{
+    encode_catalog_document_with_withdrawals, CatalogEntry, CatalogWithdrawal,
+};
 use webplus_plugin_trust::{
     encode_signature_document, portable_plugin_path, prepare_signing_material, TrustPurpose,
     TrustStore, SIGNATURE_FILENAME,
@@ -205,6 +207,7 @@ pub struct CatalogReport {
     pub issued_at: u64,
     pub expires_at: u64,
     pub package_count: usize,
+    pub withdrawal_count: usize,
     pub catalog_sha256: String,
 }
 
@@ -291,6 +294,8 @@ struct CatalogSpec {
     issued_at: u64,
     expires_at: u64,
     packages: Vec<CatalogPackageSpec>,
+    #[serde(default)]
+    withdrawals: Vec<CatalogWithdrawal>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -929,6 +934,11 @@ pub fn create_catalog(options: &CatalogOptions<'_>) -> Result<CatalogReport, Too
             "catalog build spec contains more than {MAX_CATALOG_PACKAGES} packages"
         )));
     }
+    if spec.withdrawals.len() > MAX_CATALOG_PACKAGES {
+        return Err(ToolError::Invalid(format!(
+            "catalog build spec contains more than {MAX_CATALOG_PACKAGES} withdrawals"
+        )));
+    }
     let spec_parent = canonical_real_directory(output_parent(options.spec))?;
     let trust_store = TrustStore::load(options.trust_store)?;
     let verification_root = tempfile::tempdir().map_err(|source| ToolError::Io {
@@ -1010,7 +1020,14 @@ pub fn create_catalog(options: &CatalogOptions<'_>) -> Result<CatalogReport, Too
             size: size_before,
         });
     }
-    let bytes = encode_catalog_document(spec.issued_at, spec.expires_at, entries, options.now)?;
+    let withdrawal_count = spec.withdrawals.len();
+    let bytes = encode_catalog_document_with_withdrawals(
+        spec.issued_at,
+        spec.expires_at,
+        entries,
+        spec.withdrawals,
+        options.now,
+    )?;
     let catalog_sha256 = sha256_hex(&bytes);
     write_new_bytes(options.catalog, &bytes)?;
     Ok(CatalogReport {
@@ -1018,6 +1035,7 @@ pub fn create_catalog(options: &CatalogOptions<'_>) -> Result<CatalogReport, Too
         issued_at: spec.issued_at,
         expires_at: spec.expires_at,
         package_count: package_urls.len(),
+        withdrawal_count,
         catalog_sha256,
     })
 }
@@ -2508,6 +2526,11 @@ mod tests {
                 "packages": [{
                     "package": "reader.ssdev-plugin",
                     "url": "https://plugins.example.test/reader.ssdev-plugin"
+                }],
+                "withdrawals": [{
+                    "pluginId": "reader-plugin",
+                    "version": "1.2.2",
+                    "reason": "defective"
                 }]
             }))
             .unwrap(),
@@ -2522,6 +2545,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(catalog_report.package_count, 1);
+        assert_eq!(catalog_report.withdrawal_count, 1);
         let catalog_bytes = fs::read(&catalog_path).unwrap();
         assert_eq!(catalog_report.catalog_sha256, sha256_hex(&catalog_bytes));
         let catalog =
@@ -2541,6 +2565,10 @@ mod tests {
             ">=0.1.0, <0.2.0"
         );
         assert_eq!(catalog.entries()[0].sha256, finalized.package_sha256);
+        assert_eq!(catalog.withdrawals().len(), 1);
+        assert!(catalog
+            .withdrawal("reader-plugin", &Version::parse("1.2.2").unwrap())
+            .is_some());
     }
 
     #[test]
