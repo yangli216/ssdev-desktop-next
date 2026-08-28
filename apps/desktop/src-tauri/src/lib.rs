@@ -1630,6 +1630,44 @@ fn validate_project_delivery_routes(
     Ok(())
 }
 
+fn validate_signed_plugin_activation_routes(
+    desktop_state: &desktop::DesktopState,
+    manifests: &[PluginManifest],
+    local_mapping_root: &std::path::Path,
+) -> Result<(), String> {
+    PluginController::validate_manifests(manifests).map_err(|error| error.to_string())?;
+    // Local mappings must remain usable while an implementation engineer is still
+    // defining its policy. Project delivery and deployment checks gate the combined
+    // signed and local route set before it can be treated as deployable.
+    let signed_manifests = manifests
+        .iter()
+        .filter(|manifest| !is_local_manifest(manifest, local_mapping_root))
+        .cloned()
+        .collect::<Vec<_>>();
+    let config = desktop_state.config.snapshot();
+    let coverage = desktop_state.plugin_route_policy_coverage(&config, &signed_manifests)?;
+    ensure_signed_plugin_route_coverage(coverage)
+}
+
+fn ensure_signed_plugin_route_coverage(
+    coverage: ssdev_origin_policy::InvocationPolicyCoverage,
+) -> Result<(), String> {
+    if coverage.uncovered_route_count == 0 {
+        return Ok(());
+    }
+    tracing::warn!(
+        event_code = "plugin-activation-policy-blocked",
+        error_code = "plugin-route-policy-uncovered",
+        route_count = coverage.route_count,
+        uncovered_routes = coverage.uncovered_route_count,
+        "signed plugin activation was blocked by incomplete business route authorization"
+    );
+    Err(format!(
+        "候选签名插件有 {} 条调用路由未被当前业务来源策略授权；请先发布并配置匹配的来源策略",
+        coverage.uncovered_route_count
+    ))
+}
+
 fn ensure_project_export_runtime_matches(
     declared_service_count: usize,
     active_service_count: usize,
@@ -2020,6 +2058,7 @@ enum PluginInstallSource {
 async fn inspect_plugin_package(
     caller: WebviewWindow,
     state: State<'_, BridgeState>,
+    desktop_state: State<'_, desktop::DesktopState>,
     package_path: PathBuf,
 ) -> Result<PluginPackagePreview, String> {
     desktop::require_control(&caller)?;
@@ -2036,7 +2075,8 @@ async fn inspect_plugin_package(
         Arc::clone(&trust_store),
     )
     .await?;
-    let context = local_plugin_install_context(&state, &trust_store, &prepared).await?;
+    let context =
+        local_plugin_install_context(&state, &desktop_state, &trust_store, &prepared).await?;
     let candidate_payload = prepared_plugin_signing_payload(&prepared)?;
     let plan_id = local_plugin_install_plan_id(
         &candidate_payload,
@@ -2112,6 +2152,7 @@ async fn inspect_plugin_package(
 async fn install_plugin_package(
     caller: WebviewWindow,
     state: State<'_, BridgeState>,
+    desktop_state: State<'_, desktop::DesktopState>,
     package_path: PathBuf,
     expected_plan_id: String,
 ) -> Result<PluginInstallResult, String> {
@@ -2132,7 +2173,8 @@ async fn install_plugin_package(
         Arc::clone(&trust_store),
     )
     .await?;
-    let context = local_plugin_install_context(&state, &trust_store, &prepared).await?;
+    let context =
+        local_plugin_install_context(&state, &desktop_state, &trust_store, &prepared).await?;
     let candidate_payload = prepared_plugin_signing_payload(&prepared)?;
     let actual_plan_id = local_plugin_install_plan_id(
         &candidate_payload,
@@ -2142,6 +2184,7 @@ async fn install_plugin_package(
     ensure_local_plugin_install_plan_matches(&expected_plan_id, &actual_plan_id)?;
     activate_prepared_plugin(
         &state,
+        &desktop_state,
         &trust_store,
         prepared,
         Some(&context.current_state_sha256),
@@ -2261,6 +2304,7 @@ async fn install_plugin_from_catalog(
     verify_catalog_identity(&entry, &prepared)?;
     activate_prepared_plugin(
         &bridge_state,
+        &desktop_state,
         &trust_store,
         prepared,
         Some(&current_state_sha256),
@@ -2614,6 +2658,7 @@ fn prepared_plugin_signing_payload(prepared: &PreparedPlugin) -> Result<Vec<u8>,
 
 async fn local_plugin_install_context(
     state: &BridgeState,
+    desktop_state: &desktop::DesktopState,
     trust_store: &TrustStore,
     prepared: &PreparedPlugin,
 ) -> Result<LocalPluginInstallContext, String> {
@@ -2660,7 +2705,11 @@ async fn local_plugin_install_context(
     let mut candidates = before.manifests;
     candidates.retain(|manifest| manifest.plugin_id != *plugin_id);
     candidates.push(prepared.manifest().clone());
-    PluginController::validate_manifests(&candidates).map_err(|error| error.to_string())?;
+    validate_signed_plugin_activation_routes(
+        desktop_state,
+        &candidates,
+        &state.local_mapping_root,
+    )?;
 
     let action = classify_local_plugin_install_action(
         current_version.as_ref(),
@@ -2715,6 +2764,7 @@ fn verify_catalog_identity(entry: &CatalogEntry, prepared: &PreparedPlugin) -> R
 
 async fn activate_prepared_plugin(
     state: &BridgeState,
+    desktop_state: &desktop::DesktopState,
     trust_store: &TrustStore,
     prepared: PreparedPlugin,
     expected_current_state_sha256: Option<&str>,
@@ -2762,7 +2812,11 @@ async fn activate_prepared_plugin(
     let mut candidates = before.manifests.clone();
     candidates.retain(|manifest| manifest.plugin_id != plugin_id);
     candidates.push(prepared.manifest().clone());
-    PluginController::validate_manifests(&candidates).map_err(|error| error.to_string())?;
+    validate_signed_plugin_activation_routes(
+        desktop_state,
+        &candidates,
+        &state.local_mapping_root,
+    )?;
 
     let preflight = match state
         .controller
@@ -2977,6 +3031,7 @@ async fn uninstall_signed_plugin(
 async fn reload_plugins(
     caller: WebviewWindow,
     state: State<'_, BridgeState>,
+    desktop_state: State<'_, desktop::DesktopState>,
 ) -> Result<PluginReloadResult, String> {
     desktop::require_control(&caller)?;
     let _install = state.install_lock.lock().await;
@@ -2987,7 +3042,11 @@ async fn reload_plugins(
         state.trust_store.as_deref(),
         &state.desktop_version,
     )?;
-    PluginController::validate_manifests(&plugins.manifests).map_err(|error| error.to_string())?;
+    validate_signed_plugin_activation_routes(
+        &desktop_state,
+        &plugins.manifests,
+        &state.local_mapping_root,
+    )?;
     let preflighted_hosts =
         preflight_manifests(&state, &plugins.manifests, "待重载插件或映射").await?;
     state
@@ -4652,14 +4711,15 @@ mod tests {
         collect_plugin_updates, desktop, ensure_local_plugin_install_plan_matches,
         ensure_plugin_update_plan_matches, ensure_plugin_version_change_allowed,
         ensure_project_export_active_manifests_match, ensure_project_export_runtime_matches,
-        ensure_signed_plugin_compatible, ensure_upgrade_allowed, inspect_all_plugins,
-        is_lowercase_sha256, is_plugin_update_available, legacy_config_candidates,
-        local_plugin_install_plan_id, open_project_bundle_for_mode,
-        persist_startup_failure_document, plugin_update_installed_state_digest,
-        plugin_update_plan_id, project_bundle, project_import_plan_id, project_import_state_digest,
-        resolve_startup_failure_document, select_runtime_path, service_inventory_item,
-        startup_failure_message, CatalogWithdrawalReason, FrontendRuntime, InspectedPlugins,
-        PluginInstallBlocker, PluginInstallSource, PluginPackagePreview,
+        ensure_signed_plugin_compatible, ensure_signed_plugin_route_coverage,
+        ensure_upgrade_allowed, inspect_all_plugins, is_lowercase_sha256,
+        is_plugin_update_available, legacy_config_candidates, local_plugin_install_plan_id,
+        open_project_bundle_for_mode, persist_startup_failure_document,
+        plugin_update_installed_state_digest, plugin_update_plan_id, project_bundle,
+        project_import_plan_id, project_import_state_digest, resolve_startup_failure_document,
+        select_runtime_path, service_inventory_item, startup_failure_message,
+        validate_signed_plugin_activation_routes, CatalogWithdrawalReason, FrontendRuntime,
+        InspectedPlugins, PluginInstallBlocker, PluginInstallSource, PluginPackagePreview,
         PluginPackageServicePreview, ProjectBundlePreview, StartupFailureDocument, StartupStage,
         FRONTEND_READY_TIMEOUT,
     };
@@ -4667,6 +4727,8 @@ mod tests {
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
     use semver::Version;
+    use ssdev_config::{ConfigStore, DesktopConfig};
+    use ssdev_origin_policy::{InvocationPolicyCoverage, OriginPolicy};
     use std::{
         collections::HashSet,
         fs,
@@ -4848,6 +4910,96 @@ mod tests {
             Some(&current),
             &Version::new(2, 3, 9),
             PluginInstallSource::SignedCatalog,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn signed_plugin_activation_requires_every_candidate_route_to_be_authorized() {
+        let covered = InvocationPolicyCoverage {
+            origin_count: 2,
+            route_count: 3,
+            evaluated_grant_count: 6,
+            authorized_grant_count: 3,
+            uncovered_origin_count: 1,
+            uncovered_route_count: 0,
+        };
+        assert!(ensure_signed_plugin_route_coverage(covered).is_ok());
+
+        let uncovered = InvocationPolicyCoverage {
+            uncovered_route_count: 1,
+            ..covered
+        };
+        let error = ensure_signed_plugin_route_coverage(uncovered).unwrap_err();
+        assert!(error.contains("1 条调用路由"));
+        assert!(!error.contains("serviceId"));
+        assert!(!error.contains("origin"));
+    }
+
+    #[test]
+    fn signed_plugin_activation_gate_exempts_only_local_mapping_routes() {
+        let root = tempfile::tempdir().unwrap();
+        let local_mapping_root = root.path().join("local-mappings");
+        let config_path = root.path().join("config.json");
+        let config = DesktopConfig {
+            website: Some("https://business.example.test/app".into()),
+            ..DesktopConfig::default()
+        };
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let store = ConfigStore::open(&config_path, Vec::<PathBuf>::new()).unwrap();
+        let policy = OriginPolicy::from_unsigned_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "businessGrants": [{
+                    "origin": "https://business.example.test",
+                    "services": [{"serviceId": "authorized", "methods": ["invoke"]}]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let desktop_state = desktop::DesktopState::new(store, policy);
+
+        let create_manifest = |plugin_id: &str, directory: PathBuf, service_id: &str| {
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join(API_FILENAME),
+                serde_json::to_vec(&serde_json::json!({
+                    "serviceId": service_id,
+                    "mainClass": "fixture.dll",
+                    "methods": [{"name": "invoke"}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            PluginManifest::load(plugin_id, &directory).unwrap()
+        };
+        let signed = create_manifest(
+            "signed-plugin",
+            root.path().join("plugins/signed-plugin"),
+            "unauthorized",
+        );
+        let local = create_manifest(
+            "local-plugin",
+            local_mapping_root.join("local-plugin"),
+            "unauthorized-local",
+        );
+        let authorized = create_manifest(
+            "authorized-plugin",
+            root.path().join("plugins/authorized-plugin"),
+            "authorized",
+        );
+
+        assert!(validate_signed_plugin_activation_routes(
+            &desktop_state,
+            &[signed],
+            &local_mapping_root
+        )
+        .is_err());
+        assert!(validate_signed_plugin_activation_routes(
+            &desktop_state,
+            &[authorized, local],
+            &local_mapping_root
         )
         .is_ok());
     }

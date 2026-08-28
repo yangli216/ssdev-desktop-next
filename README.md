@@ -36,6 +36,7 @@ business webview -> narrow Tauri command -> Rust controller
 控制台可从验签目录直接发现未安装插件并同时检查已安装更新；目录浏览不会下载或激活插件，只有明确版本和确认计划才能进入安装。
 本地映射即使因定义损坏而被隔离，其规范化磁盘身份仍会参与仓库和本地包安装冲突检查；Windows 下仅大小写不同的同名目标也不会被当成可覆盖的空位。
 对已安装签名插件执行精确仓库查询时，控制台还会提供当前 Desktop 兼容、未撤回的受控回退版本；回退必须单独确认并复用验签、宿主预检、状态绑定和原子激活，本地文件安装仍默认禁止降级。
+本地签名包预检、仓库安装/更新/回退和管理员显式重扫还会在启动候选宿主前核对当前业务来源策略：正式签名插件的每条公开方法或 alias 至少要被一个当前配置来源授权，否则不进入激活流程。该门禁不阻断尚在开发调试的本地映射；项目包交付和部署自检仍对签名插件与本地映射执行严格联合覆盖检查。
 声明式快捷键与签名进程策略见 [docs/desktop-policies.md](docs/desktop-policies.md)。
 业务 WebView 的发布方签名来源边界见 [docs/origin-policy.md](docs/origin-policy.md)：正式策略使用 schema 2，把权限精确收敛到 origin、service 和 method，拒绝无范围或通配授权。
 SSO 的 HTTPS-only、禁止重定向、输入/响应上限和 WebView 权限隔离见 [docs/sso-security.md](docs/sso-security.md)。
