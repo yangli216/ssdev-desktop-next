@@ -350,6 +350,8 @@ struct ProjectBundleExportResult {
     bytes: u64,
     signed_plugins: usize,
     local_mappings: usize,
+    service_count: usize,
+    preflighted_hosts: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -594,6 +596,14 @@ async fn export_project_bundle(
             inspected.failures.len()
         ));
     }
+    validate_project_delivery_routes(&desktop_state, &config, &inspected.manifests)?;
+    let service_count = inspected
+        .manifests
+        .iter()
+        .map(|manifest| manifest.services.len())
+        .sum::<usize>();
+    ensure_project_export_runtime_matches(service_count, state.controller.service_count().await)?;
+    let preflighted_hosts = preflight_project_manifests(&state, &inspected.manifests).await?;
     let trust_store = state.trust_store.clone();
     let local_mapping_root = state.local_mapping_root.clone();
     let version = app.package_info().version.to_string();
@@ -647,6 +657,8 @@ async fn export_project_bundle(
             bytes,
             signed_plugins,
             local_mappings,
+            service_count,
+            preflighted_hosts,
         })
     })
     .await
@@ -656,6 +668,8 @@ async fn export_project_bundle(
         bytes = result.bytes,
         signed_plugins = result.signed_plugins,
         local_mappings = result.local_mappings,
+        service_count = result.service_count,
+        preflighted_hosts = result.preflighted_hosts,
         "project deployment bundle exported"
     );
     Ok(result)
@@ -1072,35 +1086,12 @@ async fn prepare_project_bundle(
             .iter()
             .map(|component| component.manifest().clone()),
     );
-    PluginController::validate_manifests(&candidates).map_err(|error| error.to_string())?;
-    let coverage = desktop_state.plugin_route_policy_coverage(&opened.config, &candidates)?;
-    if coverage.uncovered_origin_count > 0 || coverage.uncovered_route_count > 0 {
-        return Err(format!(
-            "项目来源与插件能力授权不完整：{} 个来源无法访问任何能力，{} 条调用路由未被当前来源授权",
-            coverage.uncovered_origin_count, coverage.uncovered_route_count
-        ));
-    }
-    let mut preflighted_hosts = 0_usize;
-    for component in &components {
-        let report = state
-            .controller
-            .preflight_candidate_manifest(component.manifest())
-            .await
-            .map_err(|error| {
-                state
-                    .plugin_preflight_failures
-                    .fetch_add(1, Ordering::AcqRel);
-                format!(
-                    "项目组件 [{}] 宿主预检失败 ({})：{error}",
-                    component.manifest().plugin_id,
-                    error.diagnostic_code()
-                )
-            })?;
-        preflighted_hosts = preflighted_hosts.saturating_add(report.hosts_started);
-    }
-    state
-        .preflighted_plugin_hosts
-        .fetch_add(preflighted_hosts, Ordering::AcqRel);
+    validate_project_delivery_routes(desktop_state, &opened.config, &candidates)?;
+    let project_manifests = components
+        .iter()
+        .map(|component| component.manifest().clone())
+        .collect::<Vec<_>>();
+    let preflighted_hosts = preflight_project_manifests(state, &project_manifests).await?;
     let signed_plugins = previews
         .iter()
         .filter(|component| component.source == "signed-package")
@@ -1146,6 +1137,62 @@ async fn prepare_project_bundle(
             retained_components,
         },
     })
+}
+
+fn validate_project_delivery_routes(
+    desktop_state: &desktop::DesktopState,
+    config: &ssdev_config::DesktopConfig,
+    manifests: &[PluginManifest],
+) -> Result<(), String> {
+    PluginController::validate_manifests(manifests).map_err(|error| error.to_string())?;
+    let coverage = desktop_state.plugin_route_policy_coverage(config, manifests)?;
+    if coverage.uncovered_origin_count > 0 || coverage.uncovered_route_count > 0 {
+        return Err(format!(
+            "项目来源与插件能力授权不完整：{} 个来源无法访问任何能力，{} 条调用路由未被当前来源授权",
+            coverage.uncovered_origin_count, coverage.uncovered_route_count
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_project_export_runtime_matches(
+    declared_service_count: usize,
+    active_service_count: usize,
+) -> Result<(), String> {
+    if declared_service_count != active_service_count {
+        return Err(format!(
+            "当前项目运行状态不一致：磁盘插件声明 {declared_service_count} 个服务，但控制器只有 {active_service_count} 个活动服务；请先重新加载插件或重启客户端"
+        ));
+    }
+    Ok(())
+}
+
+async fn preflight_project_manifests(
+    state: &BridgeState,
+    manifests: &[PluginManifest],
+) -> Result<usize, String> {
+    let mut preflighted_hosts = 0_usize;
+    for manifest in manifests {
+        let report = state
+            .controller
+            .preflight_candidate_manifest(manifest)
+            .await
+            .map_err(|error| {
+                state
+                    .plugin_preflight_failures
+                    .fetch_add(1, Ordering::AcqRel);
+                format!(
+                    "项目组件 [{}] 宿主预检失败 ({})：{error}",
+                    manifest.plugin_id,
+                    error.diagnostic_code()
+                )
+            })?;
+        preflighted_hosts = preflighted_hosts.saturating_add(report.hosts_started);
+    }
+    state
+        .preflighted_plugin_hosts
+        .fetch_add(preflighted_hosts, Ordering::AcqRel);
+    Ok(preflighted_hosts)
 }
 
 fn classify_project_component_action(
@@ -3311,7 +3358,8 @@ fn select_runtime_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_project_component_action, collect_plugin_updates, ensure_signed_plugin_compatible,
+        classify_project_component_action, collect_plugin_updates,
+        ensure_project_export_runtime_matches, ensure_signed_plugin_compatible,
         ensure_upgrade_allowed, is_lowercase_sha256, is_plugin_update_available,
         legacy_config_candidates, open_project_bundle_for_mode, project_bundle,
         project_import_plan_id, project_import_state_digest, select_runtime_path,
@@ -3376,6 +3424,15 @@ mod tests {
             classify_project_component_action(LocalMapping, true, None, None),
             "replace"
         );
+    }
+
+    #[test]
+    fn project_export_requires_disk_and_active_services_to_match() {
+        assert!(ensure_project_export_runtime_matches(0, 0).is_ok());
+        assert!(ensure_project_export_runtime_matches(4, 4).is_ok());
+        let error = ensure_project_export_runtime_matches(4, 3).unwrap_err();
+        assert!(error.contains("磁盘插件声明 4 个服务"));
+        assert!(error.contains("3 个活动服务"));
     }
 
     #[test]
