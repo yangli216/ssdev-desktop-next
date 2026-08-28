@@ -265,8 +265,16 @@ type PluginUpdateCheck = {
     compatibilityLimited: boolean
     updateAvailable: boolean
     installBlocker?: 'local-mapping-conflict' | 'invalid-target-state'
+    rollbackVersionCount: number
+    rollbackVersions: Array<{
+      version: string
+      desktopVersionRequirement: string
+      installPlanId: string
+    }>
   }>
 }
+
+type CatalogInstallAction = 'install' | 'upgrade' | 'rollback'
 
 type AppUpdateCheck = {
   configured: boolean
@@ -666,24 +674,28 @@ async function checkPluginUpdates(requestedPluginId?: string) {
   const upgrades = available.filter((item) => item.installedVersion)
   const withdrawn = result.updates.filter((item) => item.installedVersionWithdrawn)
   const blocked = result.updates.filter((item) => item.installBlocker)
+  const rollbackVersions = result.updates.reduce((count, item) => count + item.rollbackVersionCount, 0)
   if (result.updates.length === 0) {
     notice.value = '签名仓库当前没有可展示的插件。'
   } else if (withdrawn.length > 0) {
-    notice.value = `发现 ${withdrawn.length} 个已安装插件版本已被签名仓库撤回，请优先升级或卸载。`
+    notice.value = `发现 ${withdrawn.length} 个已安装插件版本已被签名仓库撤回，请精确检查后升级、受控回退或卸载。`
   } else if (available.length === 0) {
     notice.value = blocked.length
       ? `仓库目录已验证，但有 ${blocked.length} 个候选被本机同名能力或异常目录阻止。`
-      : '仓库目录已验证，当前没有与本机 Desktop 兼容的新插件或更新。'
+      : rollbackVersions > 0
+        ? `当前插件已是最新版本；精确查询中有 ${rollbackVersions} 个受控回退版本可选。`
+        : '仓库目录已验证，当前没有与本机 Desktop 兼容的新插件或更新。'
   } else {
     notice.value = `仓库目录已验证：${newPlugins.length} 个新插件、${upgrades.length} 个更新可安装，请确认明确版本后继续。`
   }
 }
 
-async function installFromCatalog(pluginId: string, version?: string, installPlanId?: string) {
+async function installFromCatalog(pluginId: string, version?: string, installPlanId?: string, action: CatalogInstallAction = 'upgrade') {
   if (!pluginId.trim() || !version || !installPlanId) {
     error.value = '请先检查仓库并选择明确的插件版本。'
     return
   }
+  if (action === 'rollback' && !window.confirm(`确定将插件「${pluginId}」回退到 ${version} 吗？这只替换插件程序，不会恢复设备状态或业务数据。`)) return
   let result: PluginInstallResult | undefined
   await run(async () => {
     result = await invoke<PluginInstallResult>('install_plugin_from_catalog', {
@@ -699,8 +711,8 @@ async function installFromCatalog(pluginId: string, version?: string, installPla
     ])
   }, '')
   if (result) {
-    const action = result.replacedExisting ? '更新' : '安装'
-    notice.value = `${result.pluginId} ${result.pluginVersion} 已从签名仓库${action}，${result.preflightedHosts} 个架构宿主预检通过并热加载。`
+    const actionLabel = action === 'rollback' ? '回退到' : result.replacedExisting ? '更新到' : '安装为'
+    notice.value = `${result.pluginId} 已从签名仓库${actionLabel} ${result.pluginVersion}，${result.preflightedHosts} 个架构宿主预检通过并热加载。`
   }
 }
 
@@ -1016,7 +1028,7 @@ async function exportDeploymentCheck() {
             <form class="catalog-install" @submit.prevent="checkPluginUpdates(catalogPluginId)"><input v-model.trim="catalogPluginId" type="text" placeholder="按插件 ID 精确查询（可选）" /><button type="submit" :disabled="busy">查询版本</button><button type="button" :disabled="busy" @click="checkPluginUpdates()">浏览仓库并检查更新</button></form>
             <div v-if="pluginUpdates" class="plugin-update-results" aria-live="polite">
               <header><strong>已验证签名目录</strong><small>{{ pluginUpdates.updates.length }} 个插件 · 目录有效期至 {{ new Date(pluginUpdates.catalogExpiresAt * 1000).toLocaleString() }}</small></header>
-              <div v-for="update in pluginUpdates.updates" :key="update.pluginId"><span><strong>{{ update.pluginId }}<b v-if="!update.installedVersion && update.catalogAvailable" class="catalog-new">新插件</b></strong><small>已安装 {{ update.installedVersion ?? '无' }} · 当前客户端可用 {{ update.availableVersion ?? '无' }}<template v-if="update.installedVersionWithdrawn"> · 当前版本已撤回（{{ update.withdrawalReason ? withdrawalReasonLabels[update.withdrawalReason] : '原因未分类' }}）</template><template v-if="update.compatibilityLimited"> · 仓库最新 {{ update.latestCatalogVersion }} 需要其他 Desktop 版本</template></small></span><button v-if="update.updateAvailable && update.availableVersion && update.installPlanId" type="button" :disabled="busy" @click="installFromCatalog(update.pluginId, update.availableVersion, update.installPlanId)">{{ update.installedVersion ? `安装更新 ${update.availableVersion}` : `安装 ${update.availableVersion}` }}</button><em v-else>{{ update.installBlocker === 'local-mapping-conflict' ? '同名本地映射占用，请先调整' : update.installBlocker === 'invalid-target-state' ? '本机同名插件目录异常，请先处理隔离项' : update.installedVersionWithdrawn ? '当前版本已撤回，请升级或卸载' : update.catalogAvailable ? (update.compatibilityLimited ? '新版本与当前客户端不兼容' : '已是最新版本') : '仓库未收录' }}</em></div>
+              <div v-for="update in pluginUpdates.updates" :key="update.pluginId"><span><strong>{{ update.pluginId }}<b v-if="!update.installedVersion && update.catalogAvailable" class="catalog-new">新插件</b></strong><small>已安装 {{ update.installedVersion ?? '无' }} · 当前客户端可用 {{ update.availableVersion ?? '无' }}<template v-if="update.installedVersionWithdrawn"> · 当前版本已撤回（{{ update.withdrawalReason ? withdrawalReasonLabels[update.withdrawalReason] : '原因未分类' }}）</template><template v-if="update.compatibilityLimited"> · 仓库最新 {{ update.latestCatalogVersion }} 需要其他 Desktop 版本</template></small></span><button v-if="update.updateAvailable && update.availableVersion && update.installPlanId" type="button" :disabled="busy" @click="installFromCatalog(update.pluginId, update.availableVersion, update.installPlanId, update.installedVersion ? 'upgrade' : 'install')">{{ update.installedVersion ? `安装更新 ${update.availableVersion}` : `安装 ${update.availableVersion}` }}</button><em v-else>{{ update.installBlocker === 'local-mapping-conflict' ? '同名本地映射占用，请先调整' : update.installBlocker === 'invalid-target-state' ? '本机同名插件目录异常，请先处理隔离项' : update.installedVersionWithdrawn ? '当前版本已撤回，请升级、受控回退或卸载' : update.catalogAvailable ? (update.compatibilityLimited ? '新版本与当前客户端不兼容' : '已是最新版本') : '仓库未收录' }}</em><details v-if="update.rollbackVersions.length" class="plugin-rollback-options"><summary>受控回退版本（{{ update.rollbackVersionCount }}）</summary><p>仅列出当前 Desktop 兼容且仍可安装的签名版本；回退前仍会重新验签、预检宿主并核对本机状态。</p><ul><li v-for="rollback in update.rollbackVersions" :key="rollback.version"><span><strong>{{ rollback.version }}</strong><small>Desktop {{ rollback.desktopVersionRequirement }}</small></span><button class="danger-link" type="button" :disabled="busy" @click="installFromCatalog(update.pluginId, rollback.version, rollback.installPlanId, 'rollback')">回退到此版本</button></li></ul><small v-if="update.rollbackVersionCount > update.rollbackVersions.length">仅显示最近 {{ update.rollbackVersions.length }} 个版本。</small></details></div>
             </div>
             <article v-for="plugin in inventory?.plugins ?? []" :key="plugin.pluginId">
               <header><span><strong>{{ plugin.displayName }}</strong><small>{{ plugin.pluginId }} · {{ plugin.source === 'local-mapping' ? '本机动态映射' : `${plugin.version ?? '未知版本'} · Desktop ${plugin.desktopVersionRequirement ?? '未声明'}` }}</small></span><div v-if="plugin.source === 'signed-package'" class="plugin-actions"><button type="button" :disabled="busy" @click="checkPluginUpdates(plugin.pluginId)">检查更新</button><button class="danger-link" type="button" :disabled="busy" @click="uninstallSignedPlugin(plugin.pluginId, plugin.displayName)">卸载</button></div></header>

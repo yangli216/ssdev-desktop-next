@@ -206,12 +206,18 @@ button:disabled { cursor: wait !important; opacity: .5; }
 .plugin-update-results > header { display: flex; justify-content: space-between; gap: 16px; align-items: center; padding: 2px 2px 9px; border-bottom: 1px solid #dce5de; }
 .plugin-update-results > header strong { color: #345242; font-size: 11px; }
 .plugin-update-results > header small { color: #7a877f; font-size: 10px; }
-.plugin-update-results > div { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
+.plugin-update-results > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px; align-items: center; }
 .plugin-update-results span { display: grid; gap: 3px; }
 .plugin-update-results span > strong { display: flex; gap: 7px; align-items: center; }
 .catalog-new { padding: 2px 6px; border-radius: 999px; background: #dceee2; color: #27613e; font-size: 9px; font-weight: 750; }
 .plugin-update-results small { color: #718078; font-size: 11px; }
 .plugin-update-results em { color: #607168; font-size: 11px; font-style: normal; }
+.plugin-rollback-options { flex: 1 0 100%; padding: 10px 12px; border: 1px solid #dcc7b9; border-radius: 9px; background: #fffaf5; }
+.plugin-rollback-options summary { color: #7c4c2e; font-size: 11px; font-weight: 700; cursor: pointer; }
+.plugin-rollback-options p { margin: 8px 0; color: #806e62; font-size: 10px; }
+.plugin-rollback-options ul { margin: 0; padding: 0; border-top: 1px solid #eee1d8; }
+.plugin-rollback-options li { padding: 9px 0; }
+.plugin-rollback-options > small { display: block; margin-top: 8px; color: #88776b; }
 .plugin-list ul { margin: 0; padding: 0; list-style: none; }
 .plugin-list li { display: flex; justify-content: space-between; gap: 18px; padding: 11px 18px; border-top: 1px solid #edf0eb; color: #68766d; font-size: 11px; }
 .plugin-list code { color: #1e4934; font-size: 11px; overflow-wrap: anywhere; }

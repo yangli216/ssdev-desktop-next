@@ -1989,6 +1989,18 @@ struct PluginUpdateItem {
     compatibility_limited: bool,
     update_available: bool,
     install_blocker: Option<PluginInstallBlocker>,
+    rollback_version_count: usize,
+    rollback_versions: Vec<PluginRollbackOption>,
+}
+
+const MAX_PLUGIN_ROLLBACK_OPTIONS: usize = 16;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginRollbackOption {
+    version: String,
+    desktop_version_requirement: String,
+    install_plan_id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -1996,6 +2008,12 @@ struct PluginUpdateItem {
 enum PluginInstallBlocker {
     LocalMappingConflict,
     InvalidTargetState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PluginInstallSource {
+    LocalPackage,
+    SignedCatalog,
 }
 
 #[tauri::command]
@@ -2127,6 +2145,7 @@ async fn install_plugin_package(
         &trust_store,
         prepared,
         Some(&context.current_state_sha256),
+        PluginInstallSource::LocalPackage,
     )
     .await
 }
@@ -2214,6 +2233,17 @@ async fn install_plugin_from_catalog(
         &bridge_state.desktop_version,
     )?;
     ensure_plugin_update_plan_matches(&expected_plan_id, &actual_plan_id)?;
+    if installed_manifest
+        .and_then(|manifest| manifest.metadata.as_ref())
+        .is_some_and(|metadata| requested_version < metadata.version)
+    {
+        tracing::warn!(
+            event_code = "plugin-catalog-rollback-confirmed",
+            plugin_id,
+            target_version = %requested_version,
+            "an explicit signed catalog plugin rollback was confirmed"
+        );
+    }
     let temporary_directory = bridge_state.plugin_root.join(".downloads");
     let downloaded = download_package(
         &bridge_state.repository_client,
@@ -2234,6 +2264,7 @@ async fn install_plugin_from_catalog(
         &trust_store,
         prepared,
         Some(&current_state_sha256),
+        PluginInstallSource::SignedCatalog,
     )
     .await
 }
@@ -2347,31 +2378,82 @@ fn collect_plugin_updates(
             let available_version = available_entry.map(|entry| &entry.version);
             let has_install_candidate =
                 is_plugin_update_available(installed_version, available_version);
-            let (update_available, install_plan_id, install_blocker) = if !has_install_candidate {
-                (false, None, None)
-            } else if local_mapping_conflict {
-                (
-                    false,
-                    None,
-                    Some(PluginInstallBlocker::LocalMappingConflict),
-                )
+            let mut rollback_entries = if requested_plugin_id.is_some() {
+                installed_version.map_or_else(Vec::new, |installed_version| {
+                    catalog
+                        .entries()
+                        .iter()
+                        .filter(|entry| {
+                            entry.plugin_id == plugin_id
+                                && entry.version < *installed_version
+                                && entry
+                                    .desktop_version_requirement
+                                    .as_ref()
+                                    .is_some_and(|requirement| requirement.matches(desktop_version))
+                        })
+                        .collect::<Vec<_>>()
+                })
             } else {
-                let entry = available_entry.expect("an available version must have an entry");
+                Vec::new()
+            };
+            rollback_entries.sort_by(|left, right| right.version.cmp(&left.version));
+            let rollback_version_count = rollback_entries.len();
+            rollback_entries.truncate(MAX_PLUGIN_ROLLBACK_OPTIONS);
+            let has_any_candidate = has_install_candidate || !rollback_entries.is_empty();
+            let (update_available, install_plan_id, install_blocker, rollback_versions) =
+                if !has_any_candidate {
+                    (false, None, None, Vec::new())
+                } else if local_mapping_conflict {
+                    (
+                        false,
+                        None,
+                        Some(PluginInstallBlocker::LocalMappingConflict),
+                        Vec::new(),
+                    )
+                } else {
                 match plugin_update_installed_state_digest(
                     plugin_root,
                     &plugin_id,
                     installed_manifest,
                 ) {
-                    Ok(current_state_sha256) => (
-                        true,
-                        Some(plugin_update_plan_id(
-                            entry,
-                            catalog_signing_key_id,
-                            &current_state_sha256,
-                            desktop_version,
-                        )?),
-                        None,
-                    ),
+                    Ok(current_state_sha256) => {
+                        let install_plan_id = available_entry
+                            .filter(|_| has_install_candidate)
+                            .map(|entry| {
+                                plugin_update_plan_id(
+                                    entry,
+                                    catalog_signing_key_id,
+                                    &current_state_sha256,
+                                    desktop_version,
+                                )
+                            })
+                            .transpose()?;
+                        let rollback_versions = rollback_entries
+                            .into_iter()
+                            .map(|entry| {
+                                Ok(PluginRollbackOption {
+                                    version: entry.version.to_string(),
+                                    desktop_version_requirement: entry
+                                        .desktop_version_requirement
+                                        .as_ref()
+                                        .expect("rollback candidates require compatibility metadata")
+                                        .to_string(),
+                                    install_plan_id: plugin_update_plan_id(
+                                        entry,
+                                        catalog_signing_key_id,
+                                        &current_state_sha256,
+                                        desktop_version,
+                                    )?,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, String>>()?;
+                        (
+                            has_install_candidate,
+                            install_plan_id,
+                            None,
+                            rollback_versions,
+                        )
+                    }
                     Err(_) => {
                         tracing::warn!(
                             event_code = "plugin-catalog-target-blocked",
@@ -2379,7 +2461,12 @@ fn collect_plugin_updates(
                             plugin_id,
                             "catalog candidate blocked by invalid local target state"
                         );
-                        (false, None, Some(PluginInstallBlocker::InvalidTargetState))
+                        (
+                            false,
+                            None,
+                            Some(PluginInstallBlocker::InvalidTargetState),
+                            Vec::new(),
+                        )
                     }
                 }
             };
@@ -2395,6 +2482,8 @@ fn collect_plugin_updates(
                 compatibility_limited: latest_catalog_version != available_version,
                 update_available,
                 install_blocker,
+                rollback_version_count,
+                rollback_versions,
             })
         })
         .collect()
@@ -2629,6 +2718,7 @@ async fn activate_prepared_plugin(
     trust_store: &TrustStore,
     prepared: PreparedPlugin,
     expected_current_state_sha256: Option<&str>,
+    install_source: PluginInstallSource,
 ) -> Result<PluginInstallResult, String> {
     let plugin_root = state.plugin_root.clone();
 
@@ -2667,7 +2757,7 @@ async fn activate_prepared_plugin(
         .as_ref()
         .and_then(|manifest| manifest.metadata.as_ref())
         .map(|metadata| &metadata.version);
-    ensure_upgrade_allowed(current_version, &plugin_version)?;
+    ensure_plugin_version_change_allowed(current_version, &plugin_version, install_source)?;
     let replaced_existing = plugin_root.join(&plugin_id).exists();
     let mut candidates = before.manifests.clone();
     candidates.retain(|manifest| manifest.plugin_id != plugin_id);
@@ -4129,6 +4219,17 @@ fn ensure_upgrade_allowed(
     Ok(())
 }
 
+fn ensure_plugin_version_change_allowed(
+    current: Option<&semver::Version>,
+    candidate: &semver::Version,
+    install_source: PluginInstallSource,
+) -> Result<(), String> {
+    match install_source {
+        PluginInstallSource::LocalPackage => ensure_upgrade_allowed(current, candidate),
+        PluginInstallSource::SignedCatalog => Ok(()),
+    }
+}
+
 fn ensure_signed_plugin_compatible(
     manifest: &PluginManifest,
     desktop_version: &semver::Version,
@@ -4549,17 +4650,18 @@ mod tests {
     use super::{
         classify_local_plugin_install_action, classify_project_component_action,
         collect_plugin_updates, desktop, ensure_local_plugin_install_plan_matches,
-        ensure_plugin_update_plan_matches, ensure_project_export_active_manifests_match,
-        ensure_project_export_runtime_matches, ensure_signed_plugin_compatible,
-        ensure_upgrade_allowed, inspect_all_plugins, is_lowercase_sha256,
-        is_plugin_update_available, legacy_config_candidates, local_plugin_install_plan_id,
-        open_project_bundle_for_mode, persist_startup_failure_document,
-        plugin_update_installed_state_digest, plugin_update_plan_id, project_bundle,
-        project_import_plan_id, project_import_state_digest, resolve_startup_failure_document,
-        select_runtime_path, service_inventory_item, startup_failure_message,
-        CatalogWithdrawalReason, FrontendRuntime, InspectedPlugins, PluginInstallBlocker,
-        PluginPackagePreview, PluginPackageServicePreview, ProjectBundlePreview,
-        StartupFailureDocument, StartupStage, FRONTEND_READY_TIMEOUT,
+        ensure_plugin_update_plan_matches, ensure_plugin_version_change_allowed,
+        ensure_project_export_active_manifests_match, ensure_project_export_runtime_matches,
+        ensure_signed_plugin_compatible, ensure_upgrade_allowed, inspect_all_plugins,
+        is_lowercase_sha256, is_plugin_update_available, legacy_config_candidates,
+        local_plugin_install_plan_id, open_project_bundle_for_mode,
+        persist_startup_failure_document, plugin_update_installed_state_digest,
+        plugin_update_plan_id, project_bundle, project_import_plan_id, project_import_state_digest,
+        resolve_startup_failure_document, select_runtime_path, service_inventory_item,
+        startup_failure_message, CatalogWithdrawalReason, FrontendRuntime, InspectedPlugins,
+        PluginInstallBlocker, PluginInstallSource, PluginPackagePreview,
+        PluginPackageServicePreview, ProjectBundlePreview, StartupFailureDocument, StartupStage,
+        FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -4736,6 +4838,18 @@ mod tests {
         assert!(ensure_upgrade_allowed(Some(&current), &Version::new(2, 4, 0)).is_ok());
         assert!(ensure_upgrade_allowed(Some(&current), &Version::new(3, 0, 0)).is_ok());
         assert!(ensure_upgrade_allowed(None, &Version::new(1, 0, 0)).is_ok());
+        assert!(ensure_plugin_version_change_allowed(
+            Some(&current),
+            &Version::new(2, 3, 9),
+            PluginInstallSource::LocalPackage,
+        )
+        .is_err());
+        assert!(ensure_plugin_version_change_allowed(
+            Some(&current),
+            &Version::new(2, 3, 9),
+            PluginInstallSource::SignedCatalog,
+        )
+        .is_ok());
     }
 
     #[test]
@@ -5029,6 +5143,151 @@ mod tests {
         );
         assert!(updates[0].compatibility_limited);
         assert!(updates[0].update_available);
+        assert_eq!(updates[0].rollback_version_count, 0);
+        assert!(updates[0].rollback_versions.is_empty());
+    }
+
+    #[test]
+    fn exact_plugin_query_offers_only_compatible_signed_rollback_versions() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_root = root.path().join("plugins");
+        let local_root = root.path().join("local-mappings");
+        let plugin = plugin_root.join("reader");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::create_dir_all(&local_root).unwrap();
+        fs::write(
+            plugin.join(API_FILENAME),
+            r#"{"serviceId":"reader","mainClass":"reader.dll"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin.join("plugin.json"),
+            r#"{"schemaVersion":1,"pluginId":"reader","version":"2.0.0","desktopVersionRequirement":">=0.1.0, <0.2.0"}"#,
+        )
+        .unwrap();
+        let signing_key = SigningKey::from_bytes(&[92_u8; 32]);
+        let material = prepare_signing_material(&plugin, "reader", "test-key").unwrap();
+        let signature = BASE64.encode(signing_key.sign(&material.payload).to_bytes());
+        fs::write(
+            plugin.join(SIGNATURE_FILENAME),
+            encode_signature_document(&material, &signature).unwrap(),
+        )
+        .unwrap();
+        let installed = PluginManifest::load("reader", &plugin).unwrap();
+        let installed = inspected_plugins(vec![installed], HashSet::new());
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+        let catalog = PluginCatalog::from_unsigned_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "issuedAt": 1_700_000_000_u64,
+                "expiresAt": 1_700_003_600_u64,
+                "entries": [{
+                    "pluginId": "reader",
+                    "version": "1.7.0",
+                    "desktopVersionRequirement": ">=0.1.0, <0.2.0",
+                    "url": "https://plugins.example.test/reader-1.7.0.ssdev-plugin",
+                    "sha256": "17".repeat(32),
+                    "size": 10
+                }, {
+                    "pluginId": "reader",
+                    "version": "1.8.0",
+                    "desktopVersionRequirement": ">=0.1.0, <0.2.0",
+                    "url": "https://plugins.example.test/reader-1.8.0.ssdev-plugin",
+                    "sha256": "18".repeat(32),
+                    "size": 10
+                }, {
+                    "pluginId": "reader",
+                    "version": "1.9.0",
+                    "desktopVersionRequirement": ">=0.2.0, <0.3.0",
+                    "url": "https://plugins.example.test/reader-1.9.0.ssdev-plugin",
+                    "sha256": "19".repeat(32),
+                    "size": 10
+                }, {
+                    "pluginId": "reader",
+                    "version": "2.0.0",
+                    "desktopVersionRequirement": ">=0.1.0, <0.2.0",
+                    "url": "https://plugins.example.test/reader-2.0.0.ssdev-plugin",
+                    "sha256": "20".repeat(32),
+                    "size": 10
+                }, {
+                    "pluginId": "reader",
+                    "version": "2.1.0",
+                    "desktopVersionRequirement": ">=0.1.0, <0.2.0",
+                    "url": "https://plugins.example.test/reader-2.1.0.ssdev-plugin",
+                    "sha256": "21".repeat(32),
+                    "size": 10
+                }]
+            }))
+            .unwrap(),
+            now,
+        )
+        .unwrap();
+        let desktop = Version::new(0, 1, 5);
+
+        let exact = collect_plugin_updates(
+            &installed,
+            &plugin_root,
+            &local_root,
+            &catalog,
+            "catalog-key",
+            Some("reader"),
+            &desktop,
+        )
+        .unwrap();
+        assert_eq!(exact.len(), 1);
+        assert!(exact[0].update_available);
+        assert_eq!(exact[0].available_version.as_deref(), Some("2.1.0"));
+        assert_eq!(exact[0].rollback_version_count, 2);
+        assert_eq!(
+            exact[0]
+                .rollback_versions
+                .iter()
+                .map(|option| option.version.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1.8.0", "1.7.0"]
+        );
+        assert!(exact[0]
+            .rollback_versions
+            .iter()
+            .all(|option| is_lowercase_sha256(&option.install_plan_id)));
+        assert!(exact[0]
+            .rollback_versions
+            .iter()
+            .all(|option| option.desktop_version_requirement == ">=0.1.0, <0.2.0"));
+
+        let browse = collect_plugin_updates(
+            &installed,
+            &plugin_root,
+            &local_root,
+            &catalog,
+            "catalog-key",
+            None,
+            &desktop,
+        )
+        .unwrap();
+        assert_eq!(browse[0].rollback_version_count, 0);
+        assert!(browse[0].rollback_versions.is_empty());
+
+        let conflicting = inspected_plugins(
+            installed.manifests.clone(),
+            HashSet::from(["reader".to_owned()]),
+        );
+        let blocked = collect_plugin_updates(
+            &conflicting,
+            &plugin_root,
+            &local_root,
+            &catalog,
+            "catalog-key",
+            Some("reader"),
+            &desktop,
+        )
+        .unwrap();
+        assert_eq!(blocked[0].rollback_version_count, 2);
+        assert!(blocked[0].rollback_versions.is_empty());
+        assert_eq!(
+            blocked[0].install_blocker,
+            Some(PluginInstallBlocker::LocalMappingConflict)
+        );
     }
 
     #[test]
