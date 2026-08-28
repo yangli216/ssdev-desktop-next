@@ -1624,33 +1624,49 @@ fn project_import_state_digest(
     let config = serde_json::to_vec(config).map_err(|error| error.to_string())?;
     hash_plan_field(&mut hasher, &config);
 
+    hash_complete_plugin_state(&mut hasher, manifests, local_mapping_root)?;
+    Ok(lowercase_hex(&hasher.finalize()))
+}
+
+fn hash_complete_plugin_state(
+    hasher: &mut Sha256,
+    manifests: &[PluginManifest],
+    local_mapping_root: &std::path::Path,
+) -> Result<(), String> {
     let mut manifests = manifests.iter().collect::<Vec<_>>();
     manifests.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
-    let temporary =
-        tempfile::tempdir().map_err(|error| format!("无法创建项目导入基线暂存目录: {error}"))?;
+    let temporary = manifests
+        .iter()
+        .any(|manifest| is_local_manifest(manifest, local_mapping_root))
+        .then(tempfile::tempdir)
+        .transpose()
+        .map_err(|error| format!("无法创建插件状态暂存目录: {error}"))?;
     for (index, manifest) in manifests.into_iter().enumerate() {
-        hash_plan_field(&mut hasher, manifest.plugin_id.as_bytes());
+        hash_plan_field(hasher, manifest.plugin_id.as_bytes());
         if is_local_manifest(manifest, local_mapping_root) {
-            hash_plan_field(&mut hasher, b"local-mapping");
+            hash_plan_field(hasher, b"local-mapping");
             let package = temporary
+                .as_ref()
+                .expect("local mapping state requires a temporary directory")
                 .path()
                 .join(format!("mapping-{index}.ssdev-mapping"));
             local_mappings::export_bundle(local_mapping_root, &manifest.plugin_id, &package)?;
-            hash_plan_file(&mut hasher, &package)?;
+            hash_plan_file(hasher, &package)?;
         } else {
-            hash_plan_field(&mut hasher, b"signed-package");
+            hash_plan_field(hasher, b"signed-package");
             let key_id = match read_identity(&manifest.plugin_dir) {
-                Ok(identity) => identity.key_id,
+                Ok(identity) if identity.plugin_id == manifest.plugin_id => identity.key_id,
+                Ok(_) => return Err("插件状态基线签名身份不一致".to_owned()),
                 Err(_) if allow_unsigned_plugins() => "debug-unsigned".to_owned(),
                 Err(error) => return Err(error.to_string()),
             };
             let material =
                 prepare_signing_material(&manifest.plugin_dir, &manifest.plugin_id, &key_id)
                     .map_err(|error| error.to_string())?;
-            hash_plan_field(&mut hasher, &material.payload);
+            hash_plan_field(hasher, &material.payload);
         }
     }
-    Ok(lowercase_hex(&hasher.finalize()))
+    Ok(())
 }
 
 fn project_import_plan_id(

@@ -14,8 +14,6 @@ use tauri::{AppHandle, State, WebviewWindow};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tempfile::{Builder as TempBuilder, NamedTempFile};
 use tokio::io::AsyncWriteExt;
-use webplus_plugin_config::PluginManifest;
-use webplus_plugin_trust::{prepare_signing_material, read_identity};
 
 const POLICY_FILENAME: &str = "app-update.json";
 const MAX_POLICY_BYTES: u64 = 64 * 1024;
@@ -138,7 +136,7 @@ pub(crate) struct AppUpdateCheck {
     current_version: String,
     available: bool,
     compatible: bool,
-    plugin_blockers: usize,
+    capability_blockers: usize,
     install_plan_id: Option<String>,
     version: Option<String>,
     date: Option<String>,
@@ -206,7 +204,7 @@ pub(crate) async fn check_app_update(
                 current_version,
                 available: false,
                 compatible: true,
-                plugin_blockers: 0,
+                capability_blockers: 0,
                 install_plan_id: None,
                 version: None,
                 date: None,
@@ -238,7 +236,7 @@ pub(crate) async fn check_app_update(
             current_version,
             available: false,
             compatible: true,
-            plugin_blockers: 0,
+            capability_blockers: 0,
             install_plan_id: None,
             version: None,
             date: None,
@@ -250,17 +248,19 @@ pub(crate) async fn check_app_update(
         .map_err(|error| format!("更新版本不是合法 SemVer: {error}"))?;
     let _install = bridge.install_lock.lock().await;
     crate::recover_plugin_store(&bridge)?;
-    let inspected = crate::inspect_plugins(
+    let inspected = crate::inspect_all_plugins(
         &bridge.plugin_root,
+        &bridge.local_mapping_root,
         bridge.trust_store.as_deref(),
         &target_version,
     )?;
-    let plugin_blockers = inspected.failures.len();
-    let install_plan_id = if plugin_blockers == 0 {
-        let plugin_state_sha256 = app_update_plugin_state_digest(&inspected.manifests)?;
+    let capability_blockers = inspected.failures.len();
+    let install_plan_id = if capability_blockers == 0 {
+        let capability_state_sha256 =
+            app_update_capability_state_digest(&inspected.manifests, &bridge.local_mapping_root)?;
         Some(app_update_plan_id(
             &AppUpdatePlanMetadata::from_update(&update),
-            &plugin_state_sha256,
+            &capability_state_sha256,
         )?)
     } else {
         None
@@ -269,8 +269,8 @@ pub(crate) async fn check_app_update(
         configured: true,
         current_version: update.current_version.clone(),
         available: true,
-        compatible: plugin_blockers == 0,
-        plugin_blockers,
+        compatible: capability_blockers == 0,
+        capability_blockers,
         install_plan_id,
         version: Some(update.version.clone()),
         date: update.date.map(|date| date.to_string()),
@@ -320,21 +320,23 @@ pub(crate) async fn install_app_update(
     };
     let target_version = semver::Version::parse(&pending_update.version)
         .map_err(|error| format!("更新版本不是合法 SemVer: {error}"))?;
-    let inspected = crate::inspect_plugins(
+    let inspected = crate::inspect_all_plugins(
         &bridge.plugin_root,
+        &bridge.local_mapping_root,
         bridge.trust_store.as_deref(),
         &target_version,
     )?;
-    let plugin_blockers = inspected.failures.len();
-    if plugin_blockers > 0 {
+    let capability_blockers = inspected.failures.len();
+    if capability_blockers > 0 {
         return Err(format!(
-            "有 {plugin_blockers} 个签名插件未声明支持 SSDEV Desktop {target_version} 或未通过完整性检查；请先安装兼容插件版本"
+            "有 {capability_blockers} 个插件或本地映射未声明支持 SSDEV Desktop {target_version}，或未通过完整性检查；请先修复对应能力"
         ));
     }
-    let expected_plugin_state_sha256 = app_update_plugin_state_digest(&inspected.manifests)?;
+    let expected_capability_state_sha256 =
+        app_update_capability_state_digest(&inspected.manifests, &bridge.local_mapping_root)?;
     let actual_plan_id = app_update_plan_id(
         &AppUpdatePlanMetadata::from_update(&pending_update),
-        &expected_plugin_state_sha256,
+        &expected_capability_state_sha256,
     )?;
     ensure_app_update_plan_matches(&expected_plan_id, &actual_plan_id)?;
     let update = state
@@ -357,17 +359,21 @@ pub(crate) async fn install_app_update(
     let bytes = read_verified_package(package, policy.max_download_bytes)
         .await
         .map_err(|error| format!("无法读取已验签更新包: {error}"))?;
-    let current_plugins = crate::inspect_plugins(
+    let current_plugins = crate::inspect_all_plugins(
         &bridge.plugin_root,
+        &bridge.local_mapping_root,
         bridge.trust_store.as_deref(),
         &target_version,
     )?;
     if !current_plugins.failures.is_empty() {
-        return Err("下载期间插件兼容性或完整性发生变化，请重新检查应用更新".to_owned());
+        return Err(
+            "下载期间插件或本地映射的兼容性、完整性发生变化，请重新检查应用更新".to_owned(),
+        );
     }
-    let current_plugin_state_sha256 = app_update_plugin_state_digest(&current_plugins.manifests)?;
-    if current_plugin_state_sha256 != expected_plugin_state_sha256 {
-        return Err("下载期间插件集合发生变化，请重新检查应用更新".to_owned());
+    let current_capability_state_sha256 =
+        app_update_capability_state_digest(&current_plugins.manifests, &bridge.local_mapping_root)?;
+    if current_capability_state_sha256 != expected_capability_state_sha256 {
+        return Err("下载期间插件或本地映射集合发生变化，请重新检查应用更新".to_owned());
     }
     tracing::info!(
         event_code = "app-update-verified",
@@ -401,37 +407,26 @@ pub(crate) async fn install_app_update(
     app.restart();
 }
 
-fn app_update_plugin_state_digest(manifests: &[PluginManifest]) -> Result<String, String> {
-    let mut manifests = manifests.iter().collect::<Vec<_>>();
-    manifests.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+fn app_update_capability_state_digest(
+    manifests: &[webplus_plugin_config::PluginManifest],
+    local_mapping_root: &Path,
+) -> Result<String, String> {
     let mut hasher = Sha256::new();
-    hasher.update(b"SSDEV-APP-UPDATE-PLUGIN-STATE\0");
-    for manifest in manifests {
-        let key_id = match read_identity(&manifest.plugin_dir) {
-            Ok(identity) if identity.plugin_id == manifest.plugin_id => identity.key_id,
-            Ok(_) => return Err("应用更新插件基线签名身份不一致".to_owned()),
-            Err(_) if crate::allow_unsigned_plugins() => "debug-unsigned".to_owned(),
-            Err(error) => return Err(error.to_string()),
-        };
-        let material = prepare_signing_material(&manifest.plugin_dir, &manifest.plugin_id, &key_id)
-            .map_err(|error| error.to_string())?;
-        crate::hash_plan_field(&mut hasher, manifest.plugin_id.as_bytes());
-        crate::hash_plan_field(&mut hasher, key_id.as_bytes());
-        crate::hash_plan_field(&mut hasher, &material.payload);
-    }
+    hasher.update(b"SSDEV-APP-UPDATE-CAPABILITY-STATE\0");
+    crate::hash_complete_plugin_state(&mut hasher, manifests, local_mapping_root)?;
     Ok(crate::lowercase_hex(&hasher.finalize()))
 }
 
 fn app_update_plan_id(
     metadata: &AppUpdatePlanMetadata,
-    plugin_state_sha256: &str,
+    capability_state_sha256: &str,
 ) -> Result<String, String> {
     let metadata = serde_json::to_vec(metadata)
         .map_err(|error| format!("无法生成应用更新确认标识: {error}"))?;
     let mut hasher = Sha256::new();
     hasher.update(b"SSDEV-APP-UPDATE-PLAN\0");
     crate::hash_plan_field(&mut hasher, &metadata);
-    crate::hash_plan_field(&mut hasher, plugin_state_sha256.as_bytes());
+    crate::hash_plan_field(&mut hasher, capability_state_sha256.as_bytes());
     Ok(crate::lowercase_hex(&hasher.finalize()))
 }
 
@@ -650,7 +645,9 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
     use webplus_plugin_config::{PluginManifest, API_FILENAME};
-    use webplus_plugin_trust::{encode_signature_document, SIGNATURE_FILENAME};
+    use webplus_plugin_trust::{
+        encode_signature_document, prepare_signing_material, SIGNATURE_FILENAME,
+    };
 
     #[test]
     fn disabled_policy_is_explicit_and_empty() {
@@ -812,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn app_update_plugin_state_digest_binds_signed_plugin_content() {
+    fn app_update_capability_state_digest_binds_signed_plugin_content() {
         let root = tempdir().unwrap();
         let plugin = root.path().join("reader");
         fs::create_dir(&plugin).unwrap();
@@ -837,11 +834,45 @@ mod tests {
         .unwrap();
         let manifest = PluginManifest::load("reader", &plugin).unwrap();
 
-        let empty = app_update_plugin_state_digest(&[]).unwrap();
-        let before = app_update_plugin_state_digest(std::slice::from_ref(&manifest)).unwrap();
+        let local_mapping_root = root.path().join("local-mappings");
+        let empty = app_update_capability_state_digest(&[], &local_mapping_root).unwrap();
+        let before = app_update_capability_state_digest(
+            std::slice::from_ref(&manifest),
+            &local_mapping_root,
+        )
+        .unwrap();
         fs::write(plugin.join("reader.dll"), b"second payload").unwrap();
-        let after = app_update_plugin_state_digest(&[manifest]).unwrap();
+        let after = app_update_capability_state_digest(&[manifest], &local_mapping_root).unwrap();
         assert_ne!(empty, before);
+        assert_ne!(before, after);
+
+        let mut mismatched = PluginManifest::load("reader", &plugin).unwrap();
+        mismatched.plugin_id = "another-reader".into();
+        assert!(app_update_capability_state_digest(&[mismatched], &local_mapping_root).is_err());
+    }
+
+    #[test]
+    fn app_update_capability_state_digest_binds_local_mapping_content() {
+        let root = tempdir().unwrap();
+        let local_mapping_root = root.path().join("local-mappings");
+        let plugin = local_mapping_root.join("reader.local");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(
+            plugin.join(API_FILENAME),
+            r#"{"serviceId":"reader","mainClass":"reader.dll"}"#,
+        )
+        .unwrap();
+        fs::write(plugin.join("reader.dll"), b"first local payload").unwrap();
+        let manifest = PluginManifest::load("reader.local", &plugin).unwrap();
+
+        let before = app_update_capability_state_digest(
+            std::slice::from_ref(&manifest),
+            &local_mapping_root,
+        )
+        .unwrap();
+        fs::write(plugin.join("reader.dll"), b"second local payload").unwrap();
+        let after = app_update_capability_state_digest(&[manifest], &local_mapping_root).unwrap();
+
         assert_ne!(before, after);
     }
 }

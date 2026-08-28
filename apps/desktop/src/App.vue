@@ -254,7 +254,7 @@ type AppUpdateCheck = {
   currentVersion: string
   available: boolean
   compatible: boolean
-  pluginBlockers: number
+  capabilityBlockers: number
   installPlanId?: string
   version?: string
   date?: string
@@ -660,7 +660,7 @@ async function checkAppUpdate() {
   if (!result.configured) {
     notice.value = '当前构建未配置生产更新端点与公钥。'
   } else if (result.available && !result.compatible) {
-    notice.value = `发现签名更新 ${result.version}，但有 ${result.pluginBlockers} 个插件未声明兼容或未通过完整性检查。`
+    notice.value = `发现签名更新 ${result.version}，但有 ${result.capabilityBlockers} 个插件或本地映射未声明兼容，或未通过完整性检查。`
   } else if (result.available) {
     notice.value = `发现签名更新 ${result.version}，安装前可以查看发布说明。`
   } else {
@@ -673,7 +673,7 @@ async function installAppUpdate() {
     error.value = appUpdate.value?.available
       ? appUpdate.value.compatible
         ? '应用更新确认状态已失效，请重新检查更新。'
-        : '当前插件集合与目标 Desktop 版本不兼容，请先安装兼容插件版本。'
+        : '当前插件或本地映射集合与目标 Desktop 版本不兼容，请先修复对应能力。'
       : '请先检查并确认存在可用更新。'
     return
   }
@@ -990,7 +990,7 @@ async function exportDeploymentCheck() {
           <article><span>隐私诊断日志</span><strong>{{ status?.diagnosticsAvailable ? '可用' : '不可用' }}</strong><small :title="status?.diagnosticsLogDir">{{ status?.diagnosticsError ?? `${status?.diagnostics?.logFiles ?? '—'} 个文件 · ${((status?.diagnostics?.logBytes ?? 0) / 1024).toFixed(1)} KiB` }}</small></article>
           <article><span>协议与兼容网关</span><strong>v{{ status?.protocolVersion ?? '—' }}</strong><small>宿主 v{{ status?.pluginHostProtocolVersion ?? '—' }} · HTTP 网关{{ status?.httpGatewayEnabled ? '已启用' : '关闭' }}</small></article>
         </section>
-        <section class="maintenance-panel"><div><p class="eyebrow">CLIENT MAINTENANCE</p><h2>客户端维护</h2><p>{{ status?.appUpdateError ?? (status?.appUpdateConfigured ? '应用更新包必须通过签名验证，并与当前插件兼容。' : '当前构建未配置生产更新端点。') }}</p></div><div class="maintenance-actions"><button type="button" :disabled="busy || !status?.appUpdateConfigured" @click="checkAppUpdate">检查应用更新</button><button class="primary" type="button" :disabled="busy || !appUpdate?.available || !appUpdate.compatible || !appUpdate.installPlanId" @click="installAppUpdate">安装签名更新</button></div><details v-if="appUpdate?.available" class="update-details" open><summary>版本 {{ appUpdate.version }}{{ appUpdate.date ? ` · ${appUpdate.date}` : '' }}</summary><p v-if="!appUpdate.compatible">{{ appUpdate.pluginBlockers }} 个插件阻止升级；请先从签名仓库安装兼容版本。</p><p>{{ appUpdate.notes || '此版本未提供发布说明。' }}</p><small v-if="updateProgress">{{ updateProgress }}</small></details></section>
+        <section class="maintenance-panel"><div><p class="eyebrow">CLIENT MAINTENANCE</p><h2>客户端维护</h2><p>{{ status?.appUpdateError ?? (status?.appUpdateConfigured ? '应用更新包必须通过签名验证，并与当前插件及本地映射兼容。' : '当前构建未配置生产更新端点。') }}</p></div><div class="maintenance-actions"><button type="button" :disabled="busy || !status?.appUpdateConfigured" @click="checkAppUpdate">检查应用更新</button><button class="primary" type="button" :disabled="busy || !appUpdate?.available || !appUpdate.compatible || !appUpdate.installPlanId" @click="installAppUpdate">安装签名更新</button></div><details v-if="appUpdate?.available" class="update-details" open><summary>版本 {{ appUpdate.version }}{{ appUpdate.date ? ` · ${appUpdate.date}` : '' }}</summary><p v-if="!appUpdate.compatible">{{ appUpdate.capabilityBlockers }} 个插件或本地映射阻止升级；请先修复对应能力。</p><p>{{ appUpdate.notes || '此版本未提供发布说明。' }}</p><small v-if="updateProgress">{{ updateProgress }}</small></details></section>
         <section class="boundary"><div><p class="eyebrow">TRUST BOUNDARY</p><h2>第三方 DLL 永不进入主进程</h2></div><ol><li><b>业务 WebView</b><span>只调用受限的业务命令</span></li><li><b>Rust Controller</b><span>执行路由、策略、超时和监督</span></li><li><b>Plugin Host</b><span>加载 DLL、COM、OCX、EXE 或 BAT</span></li></ol></section>
       </section>
     </main>
