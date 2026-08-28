@@ -367,12 +367,12 @@ async function exportProjectBundle() {
     filters: [{ name: 'SSDEV 项目部署包', extensions: ['ssdev-project'] }],
   })
   if (typeof destination !== 'string') return
-  let result: { bytes: number; signedPlugins: number; localMappings: number; serviceCount: number; preflightedHosts: number } | undefined
+  let result: { bytes: number; bundleSha256: string; signedPlugins: number; localMappings: number; serviceCount: number; preflightedHosts: number } | undefined
   await run(async () => {
-    result = await invoke<{ bytes: number; signedPlugins: number; localMappings: number; serviceCount: number; preflightedHosts: number }>('export_project_bundle', { destination })
+    result = await invoke<{ bytes: number; bundleSha256: string; signedPlugins: number; localMappings: number; serviceCount: number; preflightedHosts: number }>('export_project_bundle', { destination })
   }, '')
   if (result) {
-    notice.value = `项目部署包草稿已导出（${(result.bytes / 1024 / 1024).toFixed(1)} MiB）：${result.signedPlugins} 个签名插件，${result.localMappings} 个本地映射，共 ${result.serviceCount} 个原生服务；${result.preflightedHosts} 个架构宿主已预检。正式交付前请使用组织签名工具生成同目录旁签文件。`
+    notice.value = `项目部署包草稿已导出（${(result.bytes / 1024 / 1024).toFixed(1)} MiB）：${result.signedPlugins} 个签名插件，${result.localMappings} 个本地映射，共 ${result.serviceCount} 个原生服务；${result.preflightedHosts} 个架构宿主已按封装候选预检。SHA-256：${result.bundleSha256}。正式交付前请核对签名请求中的同一摘要，并使用组织签名工具生成同目录旁签文件。`
   }
 }
 

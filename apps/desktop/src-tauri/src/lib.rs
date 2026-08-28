@@ -348,10 +348,18 @@ struct DiagnosticsExportResult {
 #[serde(rename_all = "camelCase")]
 struct ProjectBundleExportResult {
     bytes: u64,
+    bundle_sha256: String,
     signed_plugins: usize,
     local_mappings: usize,
     service_count: usize,
     preflighted_hosts: usize,
+}
+
+struct StagedProjectExport {
+    temporary: tempfile::TempDir,
+    inputs: Vec<project_bundle::PreparedProjectBundleInput>,
+    signed_plugins: usize,
+    local_mappings: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -603,58 +611,68 @@ async fn export_project_bundle(
         .map(|manifest| manifest.services.len())
         .sum::<usize>();
     ensure_project_export_runtime_matches(service_count, state.controller.service_count().await)?;
-    let preflighted_hosts = preflight_project_manifests(&state, &inspected.manifests).await?;
     let trust_store = state.trust_store.clone();
     let local_mapping_root = state.local_mapping_root.clone();
+    let staged_trust_store = trust_store.clone();
+    let staged_local_mapping_root = local_mapping_root.clone();
+    let staged = tokio::task::spawn_blocking(move || {
+        stage_project_export_components(
+            inspected.manifests,
+            &staged_local_mapping_root,
+            staged_trust_store.as_deref(),
+        )
+    })
+    .await
+    .map_err(|_| "项目组件封装任务异常终止".to_owned())??;
+
+    let candidate_inputs = staged.inputs.clone();
+    let candidate_plugin_root = state.plugin_root.clone();
+    let candidate_local_mapping_root = state.local_mapping_root.clone();
+    let candidate_trust_store = trust_store.clone();
+    let candidate_desktop_version = state.desktop_version.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare_project_export_candidates(
+            candidate_inputs,
+            &candidate_plugin_root,
+            &candidate_local_mapping_root,
+            candidate_trust_store.as_deref(),
+            &candidate_desktop_version,
+        )
+    })
+    .await
+    .map_err(|_| "项目候选组件检查任务异常终止".to_owned())??;
+    let candidates = prepared
+        .iter()
+        .map(|component| component.manifest().clone())
+        .collect::<Vec<_>>();
+    validate_project_delivery_routes(&desktop_state, &config, &candidates)?;
+    let service_count = candidates
+        .iter()
+        .map(|manifest| manifest.services.len())
+        .sum::<usize>();
+    ensure_project_export_runtime_matches(service_count, state.controller.service_count().await)?;
+    let preflighted_hosts = preflight_project_manifests(&state, &candidates).await?;
+    drop(prepared);
+
     let version = app.package_info().version.to_string();
     let result = tokio::task::spawn_blocking(move || {
-        let temporary =
-            tempfile::tempdir().map_err(|error| format!("无法创建项目包组件暂存目录: {error}"))?;
-        let mut inputs = Vec::with_capacity(inspected.manifests.len());
-        let mut signed_plugins = 0_usize;
-        let mut local_mappings = 0_usize;
-        for manifest in inspected.manifests {
-            let plugin_id = manifest.plugin_id.clone();
-            if is_local_manifest(&manifest, &local_mapping_root) {
-                let path = temporary.path().join(format!("{plugin_id}.ssdev-mapping"));
-                local_mappings::export_bundle(&local_mapping_root, &plugin_id, &path)?;
-                inputs.push(project_bundle::ProjectBundleInput {
-                    plugin_id,
-                    version: None,
-                    kind: project_bundle::ProjectComponentKind::LocalMapping,
-                    path,
-                });
-                local_mappings += 1;
-            } else {
-                let trust_store = trust_store.as_deref().ok_or_else(|| {
-                    "开发态未签名插件不能进入项目部署包，请使用本地映射或正式签名插件".to_owned()
-                })?;
-                let metadata = manifest
-                    .metadata
-                    .as_ref()
-                    .ok_or_else(|| format!("签名插件 [{plugin_id}] 缺少版本元数据"))?;
-                let path = temporary.path().join(format!("{plugin_id}.ssdev-plugin"));
-                webplus_plugin_package::create_deterministic_package(
-                    &manifest.plugin_dir,
-                    &path,
-                    trust_store,
-                )
-                .map_err(|error| format!("无法导出签名插件 [{plugin_id}]: {error}"))?;
-                inputs.push(project_bundle::ProjectBundleInput {
-                    plugin_id,
-                    version: Some(metadata.version.to_string()),
-                    kind: project_bundle::ProjectComponentKind::SignedPlugin,
-                    path,
-                });
-                signed_plugins += 1;
-            }
+        let StagedProjectExport {
+            temporary,
+            inputs,
+            signed_plugins,
+            local_mappings,
+        } = staged;
+        let _temporary = temporary;
+        let summary =
+            project_bundle::create_from_prepared(&destination, &config, &version, inputs)?;
+        if summary.signed_plugin_count != signed_plugins
+            || summary.local_mapping_count != local_mappings
+        {
+            return Err("项目包复核后的组件计数不一致".to_owned());
         }
-        project_bundle::create(&destination, &config, &version, inputs)?;
-        let bytes = fs::metadata(&destination)
-            .map_err(|error| format!("无法读取已导出项目包: {error}"))?
-            .len();
         Ok::<_, String>(ProjectBundleExportResult {
-            bytes,
+            bytes: summary.bundle_bytes,
+            bundle_sha256: summary.bundle_sha256,
             signed_plugins,
             local_mappings,
             service_count,
@@ -1137,6 +1155,114 @@ async fn prepare_project_bundle(
             retained_components,
         },
     })
+}
+
+fn stage_project_export_components(
+    manifests: Vec<PluginManifest>,
+    local_mapping_root: &std::path::Path,
+    trust_store: Option<&TrustStore>,
+) -> Result<StagedProjectExport, String> {
+    let temporary =
+        tempfile::tempdir().map_err(|error| format!("无法创建项目包组件暂存目录: {error}"))?;
+    let mut inputs = Vec::with_capacity(manifests.len());
+    let mut signed_plugins = 0_usize;
+    let mut local_mappings = 0_usize;
+    for manifest in manifests {
+        let plugin_id = manifest.plugin_id.clone();
+        if is_local_manifest(&manifest, local_mapping_root) {
+            let path = temporary.path().join(format!("{plugin_id}.ssdev-mapping"));
+            local_mappings::export_bundle(local_mapping_root, &plugin_id, &path)?;
+            inputs.push(project_bundle::ProjectBundleInput {
+                plugin_id,
+                version: None,
+                kind: project_bundle::ProjectComponentKind::LocalMapping,
+                path,
+            });
+            local_mappings += 1;
+        } else {
+            let trust_store = trust_store.ok_or_else(|| {
+                "开发态未签名插件不能进入项目部署包，请使用本地映射或正式签名插件".to_owned()
+            })?;
+            let metadata = manifest
+                .metadata
+                .as_ref()
+                .ok_or_else(|| format!("签名插件 [{plugin_id}] 缺少版本元数据"))?;
+            let path = temporary.path().join(format!("{plugin_id}.ssdev-plugin"));
+            let identity = webplus_plugin_package::create_deterministic_package(
+                &manifest.plugin_dir,
+                &path,
+                trust_store,
+            )
+            .map_err(|error| format!("无法导出签名插件 [{plugin_id}]: {error}"))?;
+            if identity.plugin_id != plugin_id {
+                return Err(format!("签名插件 [{plugin_id}] 封装后身份发生变化"));
+            }
+            inputs.push(project_bundle::ProjectBundleInput {
+                plugin_id,
+                version: Some(metadata.version.to_string()),
+                kind: project_bundle::ProjectComponentKind::SignedPlugin,
+                path,
+            });
+            signed_plugins += 1;
+        }
+    }
+    let inputs = project_bundle::prepare_inputs(inputs)?;
+    Ok(StagedProjectExport {
+        temporary,
+        inputs,
+        signed_plugins,
+        local_mappings,
+    })
+}
+
+fn prepare_project_export_candidates(
+    inputs: Vec<project_bundle::PreparedProjectBundleInput>,
+    plugin_root: &std::path::Path,
+    local_mapping_root: &std::path::Path,
+    trust_store: Option<&TrustStore>,
+    desktop_version: &semver::Version,
+) -> Result<Vec<PreparedProjectComponent>, String> {
+    let mut candidates = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        match input.kind() {
+            project_bundle::ProjectComponentKind::SignedPlugin => {
+                let trust_store =
+                    trust_store.ok_or_else(|| "正式项目导出要求启用插件签名信任".to_owned())?;
+                let prepared = PreparedPlugin::prepare(input.path(), plugin_root, trust_store)
+                    .map_err(|error| {
+                        format!("无法复核待导出的签名插件 [{}]: {error}", input.plugin_id())
+                    })?;
+                ensure_signed_plugin_compatible(prepared.manifest(), desktop_version)?;
+                let actual_version = prepared.metadata().version.to_string();
+                if prepared.identity().plugin_id != input.plugin_id()
+                    || input.version() != Some(actual_version.as_str())
+                {
+                    return Err(format!(
+                        "待导出签名插件 [{}] 的封装身份或版本不一致",
+                        input.plugin_id()
+                    ));
+                }
+                candidates.push(PreparedProjectComponent::Signed(prepared));
+            }
+            project_bundle::ProjectComponentKind::LocalMapping => {
+                if input.version().is_some() {
+                    return Err(format!(
+                        "待导出本地映射 [{}] 不应声明版本",
+                        input.plugin_id()
+                    ));
+                }
+                let prepared = local_mappings::prepare_import(local_mapping_root, input.path())?;
+                if prepared.plugin_id() != input.plugin_id() {
+                    return Err(format!(
+                        "待导出本地映射 [{}] 的封装身份不一致",
+                        input.plugin_id()
+                    ));
+                }
+                candidates.push(PreparedProjectComponent::Local(prepared));
+            }
+        }
+    }
+    Ok(candidates)
 }
 
 fn validate_project_delivery_routes(

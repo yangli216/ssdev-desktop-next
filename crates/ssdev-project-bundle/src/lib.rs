@@ -30,6 +30,31 @@ pub struct ProjectBundleInput {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedProjectBundleInput {
+    input: ProjectBundleInput,
+    bytes: u64,
+    sha256: String,
+}
+
+impl PreparedProjectBundleInput {
+    pub fn plugin_id(&self) -> &str {
+        &self.input.plugin_id
+    }
+
+    pub fn version(&self) -> Option<&str> {
+        self.input.version.as_deref()
+    }
+
+    pub fn kind(&self) -> ProjectComponentKind {
+        self.input.kind
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.input.path
+    }
+}
+
 #[derive(Debug)]
 pub struct OpenedProjectBundle {
     staging: TempDir,
@@ -123,21 +148,32 @@ pub fn create(
     destination: &Path,
     config: &DesktopConfig,
     created_by_version: &str,
-    mut inputs: Vec<ProjectBundleInput>,
+    inputs: Vec<ProjectBundleInput>,
 ) -> Result<(), String> {
-    require_extension(destination)?;
-    config.validate().map_err(|error| error.to_string())?;
-    if created_by_version.is_empty() || created_by_version.len() > 64 {
-        return Err("项目包创建版本无效".into());
-    }
+    create_with_summary(destination, config, created_by_version, inputs).map(|_| ())
+}
+
+pub fn create_with_summary(
+    destination: &Path,
+    config: &DesktopConfig,
+    created_by_version: &str,
+    inputs: Vec<ProjectBundleInput>,
+) -> Result<ProjectBundleSummary, String> {
+    let inputs = prepare_inputs(inputs)?;
+    create_from_prepared(destination, config, created_by_version, inputs)
+}
+
+pub fn prepare_inputs(
+    mut inputs: Vec<ProjectBundleInput>,
+) -> Result<Vec<PreparedProjectBundleInput>, String> {
     if inputs.len() > MAX_COMPONENTS {
         return Err(format!("项目包最多包含 {MAX_COMPONENTS} 个插件或映射"));
     }
     inputs.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
     let mut ids = BTreeSet::new();
-    let mut manifests = Vec::with_capacity(inputs.len());
+    let mut prepared = Vec::with_capacity(inputs.len());
     let mut total_bytes = 0_u64;
-    for input in &inputs {
+    for input in inputs {
         validate_plugin_id(&input.plugin_id)?;
         if !ids.insert(input.plugin_id.clone()) {
             return Err(format!("项目包包含重复插件 ID [{}]", input.plugin_id));
@@ -151,14 +187,45 @@ pub fn create(
             return Err(format!("项目组件 [{}] 超过 1 GiB 上限", input.plugin_id));
         }
         total_bytes = total_bytes.saturating_add(metadata.len());
-        let archive = component_archive(&input.plugin_id, input.kind);
-        manifests.push(ProjectComponentManifest {
-            plugin_id: input.plugin_id.clone(),
-            version: input.version.clone(),
-            kind: input.kind,
-            archive,
-            sha256: sha256_file(&input.path)?,
+        let sha256 = sha256_file(&input.path)?;
+        prepared.push(PreparedProjectBundleInput {
+            input,
             bytes: metadata.len(),
+            sha256,
+        });
+    }
+    if total_bytes > MAX_BUNDLE_BYTES {
+        return Err("项目组件总大小超过 4 GiB 上限".into());
+    }
+    Ok(prepared)
+}
+
+pub fn create_from_prepared(
+    destination: &Path,
+    config: &DesktopConfig,
+    created_by_version: &str,
+    inputs: Vec<PreparedProjectBundleInput>,
+) -> Result<ProjectBundleSummary, String> {
+    require_extension(destination)?;
+    config.validate().map_err(|error| error.to_string())?;
+    if created_by_version.is_empty() || created_by_version.len() > 64 {
+        return Err("项目包创建版本无效".into());
+    }
+    if inputs.len() > MAX_COMPONENTS {
+        return Err(format!("项目包最多包含 {MAX_COMPONENTS} 个插件或映射"));
+    }
+    let mut manifests = Vec::with_capacity(inputs.len());
+    let mut total_bytes = 0_u64;
+    for input in &inputs {
+        total_bytes = total_bytes.saturating_add(input.bytes);
+        let archive = component_archive(input.plugin_id(), input.kind());
+        manifests.push(ProjectComponentManifest {
+            plugin_id: input.plugin_id().to_owned(),
+            version: input.version().map(str::to_owned),
+            kind: input.kind(),
+            archive,
+            sha256: input.sha256.clone(),
+            bytes: input.bytes,
         });
     }
     if total_bytes > MAX_BUNDLE_BYTES {
@@ -225,10 +292,15 @@ pub fn create(
             archive
                 .start_file(&component.archive, options)
                 .map_err(|error| format!("无法写入项目组件: {error}"))?;
-            let mut source = File::open(&input.path)
-                .map_err(|error| format!("无法读取项目组件 [{}]: {error}", input.plugin_id))?;
-            io::copy(&mut source, &mut archive)
-                .map_err(|error| format!("无法复制项目组件 [{}]: {error}", input.plugin_id))?;
+            let source = File::open(input.path())
+                .map_err(|error| format!("无法读取项目组件 [{}]: {error}", input.plugin_id()))?;
+            copy_component_checked(
+                source,
+                &mut archive,
+                input.bytes,
+                &input.sha256,
+                input.plugin_id(),
+            )?;
         }
         archive
             .finish()
@@ -238,9 +310,67 @@ pub fn create(
         .as_file()
         .sync_all()
         .map_err(|error| format!("无法持久化项目包: {error}"))?;
+    let bundle_bytes = temporary
+        .as_file()
+        .metadata()
+        .map_err(|error| format!("无法读取项目包暂存结果: {error}"))?
+        .len();
+    let bundle_sha256 = sha256_file(temporary.path())?;
+    let signed_plugin_count = manifest
+        .components
+        .iter()
+        .filter(|component| component.kind == ProjectComponentKind::SignedPlugin)
+        .count();
+    let summary = ProjectBundleSummary {
+        schema_version: manifest.schema_version,
+        created_by_version: manifest.created_by_version,
+        component_count: manifest.components.len(),
+        signed_plugin_count,
+        local_mapping_count: manifest
+            .components
+            .len()
+            .saturating_sub(signed_plugin_count),
+        bundle_bytes,
+        bundle_sha256,
+    };
     temporary
         .persist_noclobber(destination)
         .map_err(|error| format!("无法保存项目包: {}", error.error))?;
+    Ok(summary)
+}
+
+fn copy_component_checked(
+    mut source: impl Read,
+    destination: &mut impl Write,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    plugin_id: &str,
+) -> Result<(), String> {
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|error| format!("无法读取项目组件 [{plugin_id}]: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        copied = copied.saturating_add(read as u64);
+        if copied > MAX_COMPONENT_BYTES {
+            return Err(format!("项目组件 [{plugin_id}] 在封装期间超过 1 GiB 上限"));
+        }
+        hasher.update(&buffer[..read]);
+        destination
+            .write_all(&buffer[..read])
+            .map_err(|error| format!("无法复制项目组件 [{plugin_id}]: {error}"))?;
+    }
+    let actual_sha256 = hex_digest(&hasher.finalize());
+    if copied != expected_bytes || actual_sha256 != expected_sha256 {
+        return Err(format!(
+            "项目组件 [{plugin_id}] 在封装期间发生变化，请稳定组件后重新导出"
+        ));
+    }
     Ok(())
 }
 
@@ -622,7 +752,7 @@ mod tests {
         fs::write(&plugin, b"signed plugin fixture").unwrap();
         fs::write(&mapping, b"local mapping fixture").unwrap();
         let destination = root.path().join("clinic.ssdev-project");
-        create(
+        let created = create_with_summary(
             &destination,
             &config(),
             "1.2.3",
@@ -642,6 +772,10 @@ mod tests {
             ],
         )
         .unwrap();
+        assert_eq!(created.component_count, 2);
+        assert_eq!(created.signed_plugin_count, 1);
+        assert_eq!(created.local_mapping_count, 1);
+        assert!(is_sha256(&created.bundle_sha256));
 
         let opened = open(&destination).unwrap();
         assert_eq!(
@@ -652,6 +786,7 @@ mod tests {
         let components = opened.components().collect::<Vec<_>>();
         assert_eq!(components.len(), 2);
         assert!(components.iter().all(|component| component.path.is_file()));
+        assert_eq!(signing_material(&destination).unwrap().summary, created);
     }
 
     #[test]
@@ -690,6 +825,53 @@ mod tests {
             }],
         )
         .is_err());
+    }
+
+    #[test]
+    fn project_creation_rejects_component_bytes_that_drift_after_fingerprinting() {
+        let expected = b"stable component";
+        let expected_sha256 = sha256_bytes(expected);
+        let mut copied = Vec::new();
+        copy_component_checked(
+            io::Cursor::new(expected),
+            &mut copied,
+            expected.len() as u64,
+            &expected_sha256,
+            "reader",
+        )
+        .unwrap();
+        assert_eq!(copied, expected);
+
+        let mut rejected_output = Vec::new();
+        let error = copy_component_checked(
+            io::Cursor::new(b"changed component"),
+            &mut rejected_output,
+            expected.len() as u64,
+            &expected_sha256,
+            "reader",
+        )
+        .unwrap_err();
+        assert!(error.contains("在封装期间发生变化"));
+    }
+
+    #[test]
+    fn prepared_project_inputs_cannot_be_rebound_after_candidate_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let component = root.path().join("reader.ssdev-plugin");
+        fs::write(&component, b"validated candidate bytes").unwrap();
+        let prepared = prepare_inputs(vec![ProjectBundleInput {
+            plugin_id: "reader".into(),
+            version: Some("1.0.0".into()),
+            kind: ProjectComponentKind::SignedPlugin,
+            path: component.clone(),
+        }])
+        .unwrap();
+        fs::write(&component, b"replacement after candidate validation").unwrap();
+        let destination = root.path().join("clinic.ssdev-project");
+
+        let error = create_from_prepared(&destination, &config(), "1.0.0", prepared).unwrap_err();
+        assert!(error.contains("在封装期间发生变化"));
+        assert!(!destination.exists());
     }
 
     #[test]
