@@ -187,6 +187,15 @@ const ssoActive = ref(false)
 const ssoError = ref('')
 const notice = ref('')
 const busy = ref(false)
+type ConsoleSection = 'overview' | 'configuration' | 'native' | 'plugins' | 'security'
+const activeSection = ref<ConsoleSection>('overview')
+const sections: Array<{ id: ConsoleSection; label: string; description: string }> = [
+  { id: 'overview', label: '运行概览', description: '状态与常用操作' },
+  { id: 'configuration', label: '项目配置', description: '环境、来源与启动项' },
+  { id: 'native', label: '原生映射', description: 'DLL / COM 可视化调试' },
+  { id: 'plugins', label: '插件管理', description: '安装、签名与更新' },
+  { id: 'security', label: '安全与诊断', description: '策略、运行指标与日志' },
+]
 let unlistenSsoStatus: UnlistenFn | undefined
 let ssoStatusEventSeen = false
 
@@ -461,285 +470,179 @@ async function exportDiagnostics() {
 </script>
 
 <template>
-  <main class="shell">
-    <header class="hero">
-      <div>
-        <p class="eyebrow">SSDEV DESKTOP · NEXT</p>
-        <h1>本地能力控制台</h1>
-        <p class="lede">Tauri 只负责可信桌面边界，业务插件在隔离进程中运行。</p>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">S</span>
+        <span><strong>SSDEV</strong><small>Desktop Next</small></span>
       </div>
-      <span class="phase">等待外部验收</span>
-    </header>
-
-    <section class="status-grid" aria-label="运行状态">
-      <article>
-        <span>桌面通信</span>
-        <strong>{{ status?.transport ?? '正在连接…' }}</strong>
-        <small>无 localhost 端口</small>
-      </article>
-      <article>
-        <span>插件隔离</span>
-        <strong>x86 / x64</strong>
-        <small>每个插件独立宿主</small>
-      </article>
-      <article>
-        <span>协议版本</span>
-        <strong>v{{ status?.protocolVersion ?? '—' }}</strong>
-        <small>业务桥接；内部宿主协议 v{{ status?.pluginHostProtocolVersion ?? '—' }}</small>
-      </article>
-      <article>
-        <span>HTTP 兼容网关</span>
-        <strong>{{ status?.httpGatewayEnabled ? '已启用' : '默认关闭' }}</strong>
-        <small>仅为外部浏览器保留</small>
-      </article>
-      <article>
-        <span>已注册服务</span>
-        <strong>{{ status?.serviceCount ?? '—' }}</strong>
-        <small>隔离 {{ status?.pluginLoadFailures ?? '—' }} 个无效插件</small>
-      </article>
-      <article>
-        <span>插件调用背压</span>
-        <strong v-if="status?.globalPluginMaintenanceActive">正在全局维护</strong>
-        <strong v-else-if="status?.activePluginMaintenances">{{ status.activePluginMaintenances }} 个插件正在安全热更新</strong>
-        <strong v-else-if="status?.acceptingPluginInvocations">{{ status.inFlightInvocations }} / {{ status.maxInFlightInvocations }}</strong>
-        <strong v-else>{{ status ? '正在安全退出' : '—' }}</strong>
-        <small>容量拒绝 {{ status?.rejectedInvocations ?? '—' }} 次；执行槽超时 {{ status?.executionLaneTimeouts ?? '—' }} 次；热更新拒绝 {{ status?.maintenanceRejectedInvocations ?? '—' }} 次；退出期拒绝 {{ status?.shutdownRejectedInvocations ?? '—' }} 次；等待者脱离 {{ status?.callerDetachments ?? '—' }} 次</small>
-      </article>
-      <article>
-        <span>隔离宿主监督</span>
-        <strong>{{ status?.activePluginHosts ?? '—' }} 个活动宿主</strong>
-        <small>累计启动 {{ status?.pluginHostStarts ?? '—' }} 次；失败 {{ status?.pluginHostStartFailures ?? '—' }} 次</small>
-      </article>
-      <article>
-        <span>原生操作防重放</span>
-        <strong>{{ status?.trackedInvocationsAvailable ? (status.trackedInvocationsAccepting ? '持久协调可用' : '正在排空') : '不可用' }}</strong>
-        <small v-if="status?.trackedInvocationsAvailable">等待 {{ status.trackedPendingOperations }} 项；可找回 {{ status.trackedRetainedResults }} 项结果；账本 {{ status.trackedDurableOperations }} 项；落盘异常 {{ status.trackedPersistenceFailures }} 次</small>
-        <small v-else>{{ status?.trackedInvocationsError ?? '状态尚未加载' }}</small>
-      </article>
-      <article>
-        <span>插件信任</span>
-        <strong>{{ status?.pluginTrustMode === 'ed25519-strict' ? '严格签名' : '开发模式' }}</strong>
-        <small :title="status?.pluginRoot">{{ status ? `${status.trustKeyCount} 把密钥：启用 ${status.activeTrustKeyCount}，退役 ${status.retiredTrustKeyCount}，吊销 ${status.revokedTrustKeyCount}` : '完整文件清单与 SHA-256 校验' }}</small>
-      </article>
-      <article>
-        <span>插件安装事务</span>
-        <strong>{{ status?.recoveredPluginTransactions ? '已自动恢复' : '状态正常' }}</strong>
-        <small>本次运行累计清理或回滚 {{ status?.recoveredPluginTransactions ?? '—' }} 项</small>
-      </article>
-      <article>
-        <span>安装前宿主预检</span>
-        <strong>{{ status?.pluginPreflightFailures ? '存在失败' : '状态正常' }}</strong>
-        <small>通过 {{ status?.preflightedPluginHosts ?? '—' }} 个架构宿主；失败 {{ status?.pluginPreflightFailures ?? '—' }} 次</small>
-      </article>
-      <article>
-        <span>受控进程策略</span>
-        <strong>{{ status?.processPolicyEntries ?? '—' }} 项</strong>
-        <small>启动失败 {{ status?.managedProcessFailures ?? '—' }} 项；不经过 Shell</small>
-      </article>
-      <article>
-        <span>开机启动</span>
-        <strong>{{ status?.autoStartEnabled == null ? '状态未知' : status.autoStartEnabled ? '已启用' : '未启用' }}</strong>
-        <small :title="status?.autoStartError">{{ status?.autoStartError ?? '由本机系统机制管理' }}</small>
-      </article>
-      <article>
-        <span>应用更新</span>
-        <strong>{{ status?.appUpdateConfigured ? '严格签名' : '未配置' }}</strong>
-        <small :title="status?.appUpdateError">{{ status?.appUpdateError ?? '仅本地控制台可触发' }}</small>
-      </article>
-      <article>
-        <span>SSO 传输</span>
-        <strong>{{ ssoActive ? '登录处理中' : ssoError ? '最近失败' : 'HTTPS-only' }}</strong>
-        <small>禁止重定向；请求和响应均有上限</small>
-      </article>
-      <article>
-        <span>业务来源策略</span>
-        <strong>{{ status?.originPolicy.allowConfiguredBusinessOrigins ? '配置地址兼容' : status?.originPolicy.enforced ? '发布方签名' : '开发模式' }}</strong>
-        <small :title="status?.originPolicyError">
-          {{ status?.originPolicyError ?? (status?.originPolicy.allowConfiguredBusinessOrigins ? `仅当前配置的业务地址可调用已安装原生路由；HTTP ${status?.originPolicy.allowInsecureHttp ? '允许' : '禁止'}` : `${status?.originPolicy.businessOrigins ?? '—'} 个业务来源，${status?.originPolicy.serviceGrants ?? '—'} 个服务授权，${status?.originPolicy.methodGrants ?? '—'} 个方法授权；HTTP ${status?.originPolicy.allowInsecureHttp ? '已例外放行' : '禁止'}`) }}
-        </small>
-      </article>
-      <article>
-        <span>隐私诊断日志</span>
-        <strong>{{ status?.diagnosticsAvailable ? '可用' : '不可用' }}</strong>
-        <small :title="status?.diagnosticsError">
-          {{ status?.diagnosticsError ?? `${status?.diagnostics?.logFiles ?? '—'} 个文件 · ${((status?.diagnostics?.logBytes ?? 0) / 1024).toFixed(1)} KiB` }}
-        </small>
-      </article>
-    </section>
-
-    <section class="operations" aria-label="桌面配置">
-      <div class="operation-copy">
-        <p class="eyebrow">BUSINESS ENTRY</p>
-        <h2>受控业务入口</h2>
-        <p>业务页面只能访问发布方签名策略批准的来源，并且只获得插件调用能力。</p>
-        <p v-if="snapshot?.migratedFrom" class="migration">
-          已合并 {{ snapshot.migrationSources.length }} 个旧配置来源；首选来源：{{ snapshot.migratedFrom }}
-        </p>
-        <p v-if="snapshot?.migrationWarnings.length" class="migration warning">
-          有 {{ snapshot.migrationWarnings.length }} 项旧配置未能自动读取，请查看运行日志并人工核对。
-        </p>
+      <nav aria-label="控制台导航">
+        <button
+          v-for="(section, index) in sections"
+          :key="section.id"
+          type="button"
+          :class="{ active: activeSection === section.id }"
+          :aria-current="activeSection === section.id ? 'page' : undefined"
+          @click="activeSection = section.id"
+        >
+          <span class="nav-index">0{{ index + 1 }}</span>
+          <span><strong>{{ section.label }}</strong><small>{{ section.description }}</small></span>
+          <i v-if="section.id === 'plugins' && inventory?.quarantined.length" class="nav-alert">{{ inventory.quarantined.length }}</i>
+        </button>
+      </nav>
+      <div class="sidebar-status">
+        <span :class="['status-dot', { ready: Boolean(status), warning: Boolean(error || ssoError) }]" />
+        <span><strong>{{ error || ssoError ? '需要处理' : status ? '桌面服务正常' : '正在连接' }}</strong><small>{{ status?.serviceCount ?? '—' }} 个原生服务可用</small></span>
       </div>
-      <form v-if="snapshot" @submit.prevent="saveConfig">
-        <label>
-          <span>业务系统地址</span>
-          <input v-model.trim="snapshot.config.website" type="url" maxlength="4096" placeholder="https://example.internal" />
-        </label>
-        <label>
-          <span>默认租户</span>
-          <input v-model.trim="snapshot.config.tenantId" type="text" placeholder="可选" />
-        </label>
-        <fieldset class="environments">
-          <legend>业务环境</legend>
-          <p>默认项用于“进入业务系统”；启用切换后，可保存并直接打开任一已授权环境。</p>
-          <div v-for="(environment, index) in snapshot.config.environments" :key="index" class="environment-row">
-            <label class="environment-default" title="设为默认环境">
-              <input v-model="snapshot.config.website" type="radio" :value="environment.url" />
-              <span>默认</span>
-            </label>
-            <input v-model.trim="environment.name" type="text" maxlength="128" placeholder="环境名称" />
-            <input
-              :value="environment.url"
-              type="url"
-              maxlength="4096"
-              placeholder="https://example.internal"
-              @input="changeEnvironmentUrl(environment, ($event.target as HTMLInputElement).value)"
-            />
-            <button
-              type="button"
-              :disabled="busy || !snapshot.config.allowSwitch || !environment.name || !environment.url"
-              @click="openEnvironment(environment)"
-            >打开</button>
-            <button type="button" :disabled="busy" aria-label="删除环境" @click="removeEnvironment(index)">删除</button>
+    </aside>
+
+    <main class="workspace">
+      <div v-if="notice || ssoError || error" class="message-stack" aria-live="polite">
+        <p v-if="notice" class="notice" role="status">{{ notice }}</p>
+        <p v-if="ssoError" class="error" role="alert">{{ ssoError }}</p>
+        <p v-if="error" class="error" role="alert">操作失败：{{ error }}</p>
+      </div>
+
+      <section v-show="activeSection === 'overview'" class="page page-overview" aria-labelledby="overview-title">
+        <header class="page-hero">
+          <div>
+            <p class="eyebrow">WORKSPACE OVERVIEW</p>
+            <h1 id="overview-title">本地能力控制台</h1>
+            <p class="lede">集中查看运行状态，并快速进入当前项目或专业配置工作区。</p>
           </div>
-          <button class="environment-add" type="button" :disabled="busy || snapshot.config.environments.length >= 32" @click="addEnvironment">新增环境</button>
-        </fieldset>
-        <label>
-          <span>SSO 额外可信来源</span>
-          <textarea
-            :value="snapshot.config.trustedOrigins.join('\n')"
-            placeholder="每行一个来源，例如 https://sso.example.internal"
-            @input="snapshot.config.trustedOrigins = ($event.target as HTMLTextAreaElement).value.split(/\s+/).filter(Boolean)"
-          />
-        </label>
-        <label>
-          <span>允许在系统浏览器打开的来源</span>
-          <textarea
-            :value="snapshot.config.externalOrigins.join('\n')"
-            placeholder="默认只允许业务来源；每行可追加一个 https:// 来源"
-            @input="snapshot.config.externalOrigins = ($event.target as HTMLTextAreaElement).value.split(/\s+/).filter(Boolean)"
-          />
-        </label>
-        <label>
-          <span>签名插件仓库索引</span>
-          <input v-model.trim="snapshot.config.pluginCatalogUrl" type="url" placeholder="https://plugins.example/catalog.json" />
-        </label>
-        <label>
-          <span>仓库索引签名</span>
-          <input v-model.trim="snapshot.config.pluginCatalogSignatureUrl" type="url" placeholder="https://plugins.example/catalog.sig.json" />
-        </label>
-        <div class="toggles">
-          <label><input v-model="snapshot.config.allowSwitch" type="checkbox" />允许环境切换</label>
-          <label><input v-model="snapshot.config.autoClose" type="checkbox" />关闭前确认</label>
-          <label><input v-model="snapshot.config.autoStart" type="checkbox" />开机自动启动</label>
-        </div>
-        <div class="actions">
-          <button class="primary" type="submit" :disabled="busy">保存配置</button>
-          <button type="button" :disabled="busy" @click="importConfig">导入配置</button>
-          <button type="button" :disabled="busy" @click="exportConfig">导出配置</button>
-          <button type="button" :disabled="busy" @click="openBusiness">进入业务系统</button>
-          <button type="button" :disabled="busy" @click="reloadBusiness">刷新业务窗口</button>
-          <button type="button" :disabled="busy" @click="clearBusinessData">清理站点数据</button>
-          <button type="button" :disabled="busy" @click="installPlugin">安装签名插件</button>
-          <button type="button" :disabled="busy" @click="reloadPlugins">重新扫描插件</button>
-          <button type="button" :disabled="busy || !status?.appUpdateConfigured" @click="checkAppUpdate">检查应用更新</button>
-          <button type="button" :disabled="busy || !appUpdate?.available" @click="installAppUpdate">安装签名更新</button>
-          <button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button>
-        </div>
-        <details v-if="appUpdate?.available" class="update-details" open>
-          <summary>版本 {{ appUpdate.version }}{{ appUpdate.date ? ` · ${appUpdate.date}` : '' }}</summary>
-          <p>{{ appUpdate.notes || '此版本未提供发布说明。' }}</p>
-          <small v-if="updateProgress">{{ updateProgress }}</small>
-        </details>
-        <small class="config-path">配置位置：{{ snapshot.path }}</small>
-      </form>
-    </section>
+          <span class="phase">{{ status?.acceptingPluginInvocations ? '服务就绪' : '正在初始化' }}</span>
+        </header>
 
-    <LocalMappingStudio :disabled="busy" @changed="refreshPluginsAfterMapping" />
+        <section class="summary-grid" aria-label="关键运行状态">
+          <article><span>桌面通信</span><strong>{{ status?.transport ?? '连接中' }}</strong><small>不开放 localhost 端口</small></article>
+          <article><span>原生服务</span><strong>{{ status?.serviceCount ?? '—' }}</strong><small>{{ status?.pluginCount ?? '—' }} 个插件 · x86 / x64 隔离</small></article>
+          <article><span>当前调用</span><strong>{{ status ? `${status.inFlightInvocations} / ${status.maxInFlightInvocations}` : '—' }}</strong><small>{{ status?.acceptingPluginInvocations ? '正在接受新调用' : '暂不接受新调用' }}</small></article>
+          <article><span>安全状态</span><strong>{{ status?.pluginLoadFailures || inventory?.quarantined.length ? '需要检查' : '正常' }}</strong><small>{{ inventory?.quarantined.length ?? 0 }} 个隔离项 · {{ status?.pluginLoadFailures ?? 0 }} 次加载失败</small></article>
+        </section>
 
-    <section class="plugin-inventory" aria-label="已安装插件">
-      <div>
-        <p class="eyebrow">PLUGIN INVENTORY</p>
-        <h2>已验证插件</h2>
-        <p>展示通过签名校验的发布插件，以及由本机管理员创建并隔离运行的动态映射；无效项不会进入服务路由。</p>
-      </div>
-      <div class="plugin-list">
-        <form class="catalog-install" @submit.prevent="checkPluginUpdates(catalogPluginId)">
-          <input v-model.trim="catalogPluginId" type="text" placeholder="输入签名仓库中的插件 ID" />
-          <button type="submit" :disabled="busy">查询仓库版本</button>
-          <button type="button" :disabled="busy" @click="checkPluginUpdates()">检查全部已安装插件</button>
-        </form>
-        <div v-if="pluginUpdates" class="plugin-update-results" aria-live="polite">
-          <div v-for="update in pluginUpdates.updates" :key="update.pluginId">
-            <span>
-              <strong>{{ update.pluginId }}</strong>
-              <small>已安装 {{ update.installedVersion ?? '无' }} · 仓库 {{ update.availableVersion ?? '无匹配版本' }}</small>
-            </span>
-            <button
-              v-if="update.updateAvailable && update.availableVersion"
-              type="button"
-              :disabled="busy"
-              @click="installFromCatalog(update.pluginId, update.availableVersion)"
-            >
-              {{ update.installedVersion ? `安装更新 ${update.availableVersion}` : `安装 ${update.availableVersion}` }}
-            </button>
-            <em v-else>{{ update.catalogAvailable ? '已是最新版本' : '仓库未收录' }}</em>
-          </div>
-        </div>
-        <article v-for="plugin in inventory?.plugins ?? []" :key="plugin.pluginId">
-          <header>
-            <span><strong>{{ plugin.displayName }}</strong><small>{{ plugin.pluginId }} · {{ plugin.source === 'local-mapping' ? '本机动态映射' : (plugin.version ?? '旧版未知版本') }}</small></span>
-            <button v-if="plugin.source === 'signed-package'" type="button" :disabled="busy" @click="checkPluginUpdates(plugin.pluginId)">检查更新</button>
-          </header>
-          <details v-for="service in plugin.services" :key="service.serviceId" class="service-mapping">
-            <summary>
-              <code>{{ service.serviceId }}</code>
-              <span>{{ service.architecture }} / {{ service.mainType }} / {{ service.methodCount }} 个方法</span>
-            </summary>
-            <dl>
-              <div><dt>原生目标</dt><dd><code>{{ service.mainClass }}</code></dd></div>
-              <div><dt>调用约定</dt><dd>{{ service.callingConvention || '默认' }} · {{ service.charset || '默认字符集' }}</dd></div>
-              <div><dt>服务策略</dt><dd>{{ service.timeoutMs || '默认' }} ms · {{ service.cacheable ? '缓存实例' : '按需实例' }} · {{ service.dependencyCount }} 个依赖</dd></div>
-            </dl>
-            <div class="method-mapping" v-for="method in service.methods" :key="`${service.serviceId}:${method.requestName}`">
-              <code>{{ method.requestName }}</code>
-              <span aria-hidden="true">→</span>
-              <code>{{ method.nativeName }}</code>
-              <small>{{ method.returnType || '默认返回类型' }} · {{ method.parameterCount }} 参数 · {{ method.timeoutMs || '默认' }} ms</small>
+        <div class="overview-layout">
+          <section class="launch-panel">
+            <div>
+              <p class="eyebrow">QUICK START</p>
+              <h2>进入业务系统</h2>
+              <p>{{ snapshot?.config.website || '尚未配置默认业务地址' }}</p>
             </div>
-          </details>
-        </article>
-        <p v-if="inventory && inventory.plugins.length === 0" class="empty">尚未安装通过验签的插件。</p>
-        <details v-if="inventory?.quarantined.length" class="quarantined">
-          <summary>{{ inventory.quarantined.length }} 个插件已隔离</summary>
-          <ul><li v-for="failure in inventory.quarantined" :key="failure">{{ failure }}</li></ul>
-        </details>
-      </div>
-    </section>
+            <button class="primary large" type="button" :disabled="busy || !snapshot?.config.website" @click="openBusiness">启动默认环境</button>
+            <div v-if="snapshot?.config.allowSwitch && snapshot.config.environments.length" class="environment-shortcuts">
+              <button
+                v-for="environment in snapshot.config.environments"
+                :key="`${environment.name}:${environment.url}`"
+                type="button"
+                :disabled="busy || !environment.name || !environment.url"
+                @click="openEnvironment(environment)"
+              >{{ environment.name || '未命名环境' }}</button>
+            </div>
+          </section>
 
-    <section class="boundary">
-      <div>
-        <p class="eyebrow">TRUST BOUNDARY</p>
-        <h2>第三方 DLL 永不进入主进程</h2>
-      </div>
-      <ol>
-        <li><b>业务 WebView</b><span>只调用受限的业务命令</span></li>
-        <li><b>Rust Controller</b><span>执行路由、策略、超时和监督</span></li>
-        <li><b>Plugin Host</b><span>加载 DLL、COM、OCX、EXE 或 BAT</span></li>
-      </ol>
-    </section>
+          <section class="module-panel" aria-label="能力工作区">
+            <header><div><p class="eyebrow">CAPABILITIES</p><h2>能力工作区</h2></div><small>按任务进入，避免在首页堆叠低频配置。</small></header>
+            <div class="module-grid">
+              <button type="button" @click="activeSection = 'configuration'"><span>项目配置</span><small>{{ snapshot?.config.environments.length ?? 0 }} 个业务环境</small><b>→</b></button>
+              <button type="button" @click="activeSection = 'native'"><span>原生映射</span><small>DLL / COM 配置与调试</small><b>→</b></button>
+              <button type="button" @click="activeSection = 'plugins'"><span>插件管理</span><small>{{ inventory?.plugins.length ?? 0 }} 个已验证插件</small><b>→</b></button>
+              <button type="button" @click="activeSection = 'security'"><span>安全与诊断</span><small>策略、日志和应用维护</small><b>→</b></button>
+            </div>
+          </section>
+        </div>
 
-    <p v-if="notice" class="notice" role="status">{{ notice }}</p>
-    <p v-if="ssoError" class="error" role="alert">{{ ssoError }}</p>
-    <p v-if="error" class="error" role="alert">操作失败：{{ error }}</p>
-  </main>
+        <section v-if="status?.pluginLoadFailures || status?.pluginPreflightFailures || inventory?.quarantined.length || ssoError" class="attention-panel">
+          <div><p class="eyebrow">ATTENTION</p><h2>待处理事项</h2></div>
+          <ul>
+            <li v-if="inventory?.quarantined.length"><strong>{{ inventory.quarantined.length }} 个插件已隔离</strong><button type="button" @click="activeSection = 'plugins'">查看插件</button></li>
+            <li v-if="status?.pluginPreflightFailures"><strong>{{ status.pluginPreflightFailures }} 次宿主预检失败</strong><button type="button" @click="activeSection = 'security'">查看诊断</button></li>
+            <li v-if="ssoError"><strong>最近一次 SSO 登录失败</strong><button type="button" @click="activeSection = 'security'">查看详情</button></li>
+          </ul>
+        </section>
+      </section>
+
+      <section v-show="activeSection === 'configuration'" class="page" aria-labelledby="configuration-title">
+        <header class="section-header"><div><p class="eyebrow">PROJECT CONFIGURATION</p><h1 id="configuration-title">项目配置</h1><p>管理业务环境、来源边界和桌面启动行为。</p></div><div class="header-actions"><button type="button" :disabled="busy" @click="importConfig">导入</button><button type="button" :disabled="busy" @click="exportConfig">导出</button></div></header>
+        <section class="operations" aria-label="桌面配置">
+          <div class="operation-copy">
+            <p class="eyebrow">BUSINESS ENTRY</p><h2>受控业务入口</h2>
+            <p>配置的项目地址将直接成为该项目允许访问原生能力的来源。</p>
+            <p v-if="snapshot?.migratedFrom" class="migration">已合并 {{ snapshot.migrationSources.length }} 个旧配置来源；首选来源：{{ snapshot.migratedFrom }}</p>
+            <p v-if="snapshot?.migrationWarnings.length" class="migration warning">有 {{ snapshot.migrationWarnings.length }} 项旧配置未能自动读取，请查看运行日志并人工核对。</p>
+          </div>
+          <form v-if="snapshot" @submit.prevent="saveConfig">
+            <label><span>业务系统地址</span><input v-model.trim="snapshot.config.website" type="url" maxlength="4096" placeholder="http://project.internal" /></label>
+            <label><span>默认租户</span><input v-model.trim="snapshot.config.tenantId" type="text" placeholder="可选" /></label>
+            <fieldset class="environments">
+              <legend>业务环境</legend><p>默认项用于首页快捷启动；启用切换后，可直接打开任一环境。</p>
+              <div v-for="(environment, index) in snapshot.config.environments" :key="index" class="environment-row">
+                <label class="environment-default" title="设为默认环境"><input v-model="snapshot.config.website" type="radio" :value="environment.url" /><span>默认</span></label>
+                <input v-model.trim="environment.name" type="text" maxlength="128" placeholder="环境名称" />
+                <input :value="environment.url" type="url" maxlength="4096" placeholder="http://project.internal" @input="changeEnvironmentUrl(environment, ($event.target as HTMLInputElement).value)" />
+                <button type="button" :disabled="busy || !snapshot.config.allowSwitch || !environment.name || !environment.url" @click="openEnvironment(environment)">打开</button>
+                <button type="button" :disabled="busy" aria-label="删除环境" @click="removeEnvironment(index)">删除</button>
+              </div>
+              <button class="environment-add" type="button" :disabled="busy || snapshot.config.environments.length >= 32" @click="addEnvironment">新增环境</button>
+            </fieldset>
+            <div class="form-columns">
+              <label><span>SSO 额外可信来源</span><textarea :value="snapshot.config.trustedOrigins.join('\n')" placeholder="每行一个来源，例如 https://sso.example.internal" @input="snapshot.config.trustedOrigins = ($event.target as HTMLTextAreaElement).value.split(/\s+/).filter(Boolean)" /></label>
+              <label><span>系统浏览器允许来源</span><textarea :value="snapshot.config.externalOrigins.join('\n')" placeholder="每行一个来源" @input="snapshot.config.externalOrigins = ($event.target as HTMLTextAreaElement).value.split(/\s+/).filter(Boolean)" /></label>
+            </div>
+            <details class="advanced-settings">
+              <summary>插件仓库高级配置</summary>
+              <label><span>签名插件仓库索引</span><input v-model.trim="snapshot.config.pluginCatalogUrl" type="url" placeholder="https://plugins.example/catalog.json" /></label>
+              <label><span>仓库索引签名</span><input v-model.trim="snapshot.config.pluginCatalogSignatureUrl" type="url" placeholder="https://plugins.example/catalog.sig.json" /></label>
+            </details>
+            <div class="toggles"><label><input v-model="snapshot.config.allowSwitch" type="checkbox" />允许环境切换</label><label><input v-model="snapshot.config.autoClose" type="checkbox" />关闭前确认</label><label><input v-model="snapshot.config.autoStart" type="checkbox" />开机自动启动</label></div>
+            <div class="actions"><button class="primary" type="submit" :disabled="busy">保存配置</button><button type="button" :disabled="busy" @click="openBusiness">进入业务系统</button></div>
+            <small class="config-path">配置位置：{{ snapshot.path }}</small>
+          </form>
+        </section>
+        <section class="compact-panel"><div><h2>业务窗口维护</h2><p>仅在页面显示异常或需要清除登录状态时使用。</p></div><div class="actions"><button type="button" :disabled="busy" @click="reloadBusiness">刷新业务窗口</button><button type="button" :disabled="busy" @click="clearBusinessData">清理站点数据</button></div></section>
+      </section>
+
+      <section v-show="activeSection === 'native'" class="page page-native" aria-labelledby="native-title">
+        <header class="section-header"><div><p class="eyebrow">NATIVE MAPPING STUDIO</p><h1 id="native-title">原生映射</h1><p>发现本机组件、配置调用映射，并在发布前完成受控调试。</p></div><span class="section-chip">本机管理员能力</span></header>
+        <LocalMappingStudio :disabled="busy" @changed="refreshPluginsAfterMapping" />
+      </section>
+
+      <section v-show="activeSection === 'plugins'" class="page" aria-labelledby="plugins-title">
+        <header class="section-header"><div><p class="eyebrow">PLUGIN MANAGEMENT</p><h1 id="plugins-title">插件管理</h1><p>管理签名插件包、本机动态映射和仓库更新。</p></div><div class="header-actions"><button type="button" :disabled="busy" @click="installPlugin">安装签名插件</button><button type="button" :disabled="busy" @click="reloadPlugins">重新扫描</button></div></header>
+        <section class="plugin-inventory" aria-label="已安装插件">
+          <div><p class="eyebrow">VERIFIED INVENTORY</p><h2>已验证插件</h2><p>无效项不会进入服务路由；动态映射始终与主进程隔离。</p><div class="inventory-count"><strong>{{ inventory?.plugins.length ?? '—' }}</strong><span>个可用插件</span></div></div>
+          <div class="plugin-list">
+            <form class="catalog-install" @submit.prevent="checkPluginUpdates(catalogPluginId)"><input v-model.trim="catalogPluginId" type="text" placeholder="输入签名仓库中的插件 ID" /><button type="submit" :disabled="busy">查询版本</button><button type="button" :disabled="busy" @click="checkPluginUpdates()">检查全部更新</button></form>
+            <div v-if="pluginUpdates" class="plugin-update-results" aria-live="polite">
+              <div v-for="update in pluginUpdates.updates" :key="update.pluginId"><span><strong>{{ update.pluginId }}</strong><small>已安装 {{ update.installedVersion ?? '无' }} · 仓库 {{ update.availableVersion ?? '无匹配版本' }}</small></span><button v-if="update.updateAvailable && update.availableVersion" type="button" :disabled="busy" @click="installFromCatalog(update.pluginId, update.availableVersion)">{{ update.installedVersion ? `安装更新 ${update.availableVersion}` : `安装 ${update.availableVersion}` }}</button><em v-else>{{ update.catalogAvailable ? '已是最新版本' : '仓库未收录' }}</em></div>
+            </div>
+            <article v-for="plugin in inventory?.plugins ?? []" :key="plugin.pluginId">
+              <header><span><strong>{{ plugin.displayName }}</strong><small>{{ plugin.pluginId }} · {{ plugin.source === 'local-mapping' ? '本机动态映射' : (plugin.version ?? '旧版未知版本') }}</small></span><button v-if="plugin.source === 'signed-package'" type="button" :disabled="busy" @click="checkPluginUpdates(plugin.pluginId)">检查更新</button></header>
+              <details v-for="service in plugin.services" :key="service.serviceId" class="service-mapping"><summary><code>{{ service.serviceId }}</code><span>{{ service.architecture }} / {{ service.mainType }} / {{ service.methodCount }} 个方法</span></summary><dl><div><dt>原生目标</dt><dd><code>{{ service.mainClass }}</code></dd></div><div><dt>调用约定</dt><dd>{{ service.callingConvention || '默认' }} · {{ service.charset || '默认字符集' }}</dd></div><div><dt>服务策略</dt><dd>{{ service.timeoutMs || '默认' }} ms · {{ service.cacheable ? '缓存实例' : '按需实例' }} · {{ service.dependencyCount }} 个依赖</dd></div></dl><div v-for="method in service.methods" :key="`${service.serviceId}:${method.requestName}`" class="method-mapping"><code>{{ method.requestName }}</code><span aria-hidden="true">→</span><code>{{ method.nativeName }}</code><small>{{ method.returnType || '默认返回类型' }} · {{ method.parameterCount }} 参数 · {{ method.timeoutMs || '默认' }} ms</small></div></details>
+            </article>
+            <p v-if="inventory && inventory.plugins.length === 0" class="empty">尚未安装通过验签的插件。</p>
+            <details v-if="inventory?.quarantined.length" class="quarantined" open><summary>{{ inventory.quarantined.length }} 个插件已隔离</summary><ul><li v-for="failure in inventory.quarantined" :key="failure">{{ failure }}</li></ul></details>
+          </div>
+        </section>
+      </section>
+
+      <section v-show="activeSection === 'security'" class="page" aria-labelledby="security-title">
+        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>查看详细运行指标、来源策略和客户端维护状态。</p></div><div class="header-actions"><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
+        <section class="diagnostic-grid" aria-label="详细运行状态">
+          <article><span>插件调用背压</span><strong v-if="status?.globalPluginMaintenanceActive">全局维护中</strong><strong v-else>{{ status ? `${status.inFlightInvocations} / ${status.maxInFlightInvocations}` : '—' }}</strong><small>容量拒绝 {{ status?.rejectedInvocations ?? '—' }} · 槽超时 {{ status?.executionLaneTimeouts ?? '—' }} · 维护拒绝 {{ status?.maintenanceRejectedInvocations ?? '—' }}</small></article>
+          <article><span>隔离宿主监督</span><strong>{{ status?.activePluginHosts ?? '—' }} 个活动宿主</strong><small>累计启动 {{ status?.pluginHostStarts ?? '—' }} · 失败 {{ status?.pluginHostStartFailures ?? '—' }}</small></article>
+          <article><span>原生操作防重放</span><strong>{{ status?.trackedInvocationsAvailable ? (status.trackedInvocationsAccepting ? '持久协调可用' : '正在排空') : '不可用' }}</strong><small>{{ status?.trackedInvocationsAvailable ? `等待 ${status.trackedPendingOperations} · 可找回 ${status.trackedRetainedResults} · 落盘异常 ${status.trackedPersistenceFailures}` : status?.trackedInvocationsError ?? '状态尚未加载' }}</small></article>
+          <article><span>插件信任</span><strong>{{ status?.pluginTrustMode === 'ed25519-strict' ? '严格签名' : '开发模式' }}</strong><small :title="status?.pluginRoot">{{ status ? `${status.trustKeyCount} 把密钥 · 启用 ${status.activeTrustKeyCount} · 吊销 ${status.revokedTrustKeyCount}` : '完整清单与 SHA-256 校验' }}</small></article>
+          <article><span>安装事务</span><strong>{{ status?.recoveredPluginTransactions ? '已自动恢复' : '状态正常' }}</strong><small>已清理或回滚 {{ status?.recoveredPluginTransactions ?? '—' }} 项</small></article>
+          <article><span>宿主预检</span><strong>{{ status?.pluginPreflightFailures ? '存在失败' : '状态正常' }}</strong><small>通过 {{ status?.preflightedPluginHosts ?? '—' }} · 失败 {{ status?.pluginPreflightFailures ?? '—' }}</small></article>
+          <article><span>受控进程策略</span><strong>{{ status?.processPolicyEntries ?? '—' }} 项</strong><small>启动失败 {{ status?.managedProcessFailures ?? '—' }} · 不经过 Shell</small></article>
+          <article><span>开机启动</span><strong>{{ status?.autoStartEnabled == null ? '状态未知' : status.autoStartEnabled ? '已启用' : '未启用' }}</strong><small :title="status?.autoStartError">{{ status?.autoStartError ?? '由本机系统机制管理' }}</small></article>
+          <article><span>SSO 传输</span><strong>{{ ssoActive ? '登录处理中' : ssoError ? '最近失败' : 'HTTPS-only' }}</strong><small>禁止重定向 · 请求与响应均有上限</small></article>
+          <article><span>业务来源策略</span><strong>{{ status?.originPolicy.allowConfiguredBusinessOrigins ? '项目地址兼容' : status?.originPolicy.enforced ? '发布方签名' : '开发模式' }}</strong><small :title="status?.originPolicyError">{{ status?.originPolicyError ?? `${status?.originPolicy.businessOrigins ?? '—'} 个来源 · HTTP ${status?.originPolicy.allowInsecureHttp ? '允许' : '禁止'}` }}</small></article>
+          <article><span>隐私诊断日志</span><strong>{{ status?.diagnosticsAvailable ? '可用' : '不可用' }}</strong><small :title="status?.diagnosticsError">{{ status?.diagnosticsError ?? `${status?.diagnostics?.logFiles ?? '—'} 个文件 · ${((status?.diagnostics?.logBytes ?? 0) / 1024).toFixed(1)} KiB` }}</small></article>
+          <article><span>协议与兼容网关</span><strong>v{{ status?.protocolVersion ?? '—' }}</strong><small>宿主 v{{ status?.pluginHostProtocolVersion ?? '—' }} · HTTP 网关{{ status?.httpGatewayEnabled ? '已启用' : '关闭' }}</small></article>
+        </section>
+        <section class="maintenance-panel"><div><p class="eyebrow">CLIENT MAINTENANCE</p><h2>客户端维护</h2><p>{{ status?.appUpdateError ?? (status?.appUpdateConfigured ? '应用更新包必须通过签名验证。' : '当前构建未配置生产更新端点。') }}</p></div><div class="maintenance-actions"><button type="button" :disabled="busy || !status?.appUpdateConfigured" @click="checkAppUpdate">检查应用更新</button><button class="primary" type="button" :disabled="busy || !appUpdate?.available" @click="installAppUpdate">安装签名更新</button></div><details v-if="appUpdate?.available" class="update-details" open><summary>版本 {{ appUpdate.version }}{{ appUpdate.date ? ` · ${appUpdate.date}` : '' }}</summary><p>{{ appUpdate.notes || '此版本未提供发布说明。' }}</p><small v-if="updateProgress">{{ updateProgress }}</small></details></section>
+        <section class="boundary"><div><p class="eyebrow">TRUST BOUNDARY</p><h2>第三方 DLL 永不进入主进程</h2></div><ol><li><b>业务 WebView</b><span>只调用受限的业务命令</span></li><li><b>Rust Controller</b><span>执行路由、策略、超时和监督</span></li><li><b>Plugin Host</b><span>加载 DLL、COM、OCX、EXE 或 BAT</span></li></ol></section>
+      </section>
+    </main>
+  </div>
 </template>
