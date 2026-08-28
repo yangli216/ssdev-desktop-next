@@ -33,6 +33,7 @@ business webview -> narrow Tauri command -> Rust controller
 旧插件从安全暂存、外部签名、确定性封包到黄金矩阵草稿的发布流程见 [docs/plugin-release.md](docs/plugin-release.md)。
 业务来源策略、受控进程策略、插件目录和项目部署包共用的外部 Ed25519 发布签名流程见 [docs/release-signing.md](docs/release-signing.md)。
 签名插件仓库协议见 [docs/plugin-repository.md](docs/plugin-repository.md)。
+控制台可从验签目录直接发现未安装插件并同时检查已安装更新；目录浏览不会下载或激活插件，只有明确版本和确认计划才能进入安装。
 声明式快捷键与签名进程策略见 [docs/desktop-policies.md](docs/desktop-policies.md)。
 业务 WebView 的发布方签名来源边界见 [docs/origin-policy.md](docs/origin-policy.md)：正式策略使用 schema 2，把权限精确收敛到 origin、service 和 method，拒绝无范围或通配授权。
 SSO 的 HTTPS-only、禁止重定向、输入/响应上限和 WebView 权限隔离见 [docs/sso-security.md](docs/sso-security.md)。

@@ -1988,6 +1988,14 @@ struct PluginUpdateItem {
     catalog_available: bool,
     compatibility_limited: bool,
     update_available: bool,
+    install_blocker: Option<PluginInstallBlocker>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PluginInstallBlocker {
+    LocalMappingConflict,
+    InvalidTargetState,
 }
 
 #[tauri::command]
@@ -2179,15 +2187,24 @@ async fn install_plugin_from_catalog(
             entry.plugin_id, entry.version, bridge_state.desktop_version, desktop_requirement
         ));
     }
-    let installed = inspect_plugins(
+    let installed = inspect_all_plugins(
         &bridge_state.plugin_root,
+        &bridge_state.local_mapping_root,
         Some(&trust_store),
         &bridge_state.desktop_version,
     )?;
-    let installed_manifest = installed
-        .manifests
-        .iter()
-        .find(|manifest| manifest.plugin_id == plugin_id);
+    if installed.manifests.iter().any(|manifest| {
+        manifest.plugin_id == plugin_id
+            && is_local_manifest(manifest, &bridge_state.local_mapping_root)
+    }) {
+        return Err(format!(
+            "签名插件 ID [{plugin_id}] 与现有本地映射冲突，请重新检查仓库并先调整本地映射"
+        ));
+    }
+    let installed_manifest = installed.manifests.iter().find(|manifest| {
+        manifest.plugin_id == plugin_id
+            && !is_local_manifest(manifest, &bridge_state.local_mapping_root)
+    });
     let current_state_sha256 = plugin_update_installed_state_digest(
         &bridge_state.plugin_root,
         &plugin_id,
@@ -2262,8 +2279,9 @@ async fn check_plugin_updates(
     )
     .await
     .map_err(|error| error.to_string())?;
-    let installed = inspect_plugins(
+    let installed = inspect_all_plugins(
         &bridge_state.plugin_root,
+        &bridge_state.local_mapping_root,
         Some(&trust_store),
         &bridge_state.desktop_version,
     )?;
@@ -2273,6 +2291,7 @@ async fn check_plugin_updates(
     let updates = collect_plugin_updates(
         &installed.manifests,
         &bridge_state.plugin_root,
+        &bridge_state.local_mapping_root,
         &catalog,
         catalog_signing_key_id,
         requested_plugin_id,
@@ -2288,6 +2307,7 @@ async fn check_plugin_updates(
 fn collect_plugin_updates(
     installed: &[PluginManifest],
     plugin_root: &std::path::Path,
+    local_mapping_root: &std::path::Path,
     catalog: &PluginCatalog,
     catalog_signing_key_id: &str,
     requested_plugin_id: Option<&str>,
@@ -2298,7 +2318,14 @@ fn collect_plugin_updates(
     } else {
         installed
             .iter()
+            .filter(|manifest| !is_local_manifest(manifest, local_mapping_root))
             .map(|manifest| manifest.plugin_id.clone())
+            .chain(
+                catalog
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.plugin_id.clone()),
+            )
             .collect()
     };
     plugin_ids.sort();
@@ -2306,9 +2333,12 @@ fn collect_plugin_updates(
     plugin_ids
         .into_iter()
         .map(|plugin_id| {
-            let installed_manifest = installed
-                .iter()
-                .find(|manifest| manifest.plugin_id == plugin_id);
+            let installed_manifest = installed.iter().find(|manifest| {
+                manifest.plugin_id == plugin_id && !is_local_manifest(manifest, local_mapping_root)
+            });
+            let local_mapping_conflict = installed.iter().any(|manifest| {
+                manifest.plugin_id == plugin_id && is_local_manifest(manifest, local_mapping_root)
+            });
             let installed_version = installed_manifest
                 .and_then(|manifest| manifest.metadata.as_ref())
                 .map(|metadata| &metadata.version);
@@ -2318,22 +2348,43 @@ fn collect_plugin_updates(
                 installed_version.and_then(|version| catalog.withdrawal(&plugin_id, version));
             let available_entry = catalog.select_compatible(&plugin_id, None, desktop_version);
             let available_version = available_entry.map(|entry| &entry.version);
-            let update_available = is_plugin_update_available(installed_version, available_version);
-            let install_plan_id = if update_available {
+            let has_install_candidate =
+                is_plugin_update_available(installed_version, available_version);
+            let (update_available, install_plan_id, install_blocker) = if !has_install_candidate {
+                (false, None, None)
+            } else if local_mapping_conflict {
+                (
+                    false,
+                    None,
+                    Some(PluginInstallBlocker::LocalMappingConflict),
+                )
+            } else {
                 let entry = available_entry.expect("an available version must have an entry");
-                let current_state_sha256 = plugin_update_installed_state_digest(
+                match plugin_update_installed_state_digest(
                     plugin_root,
                     &plugin_id,
                     installed_manifest,
-                )?;
-                Some(plugin_update_plan_id(
-                    entry,
-                    catalog_signing_key_id,
-                    &current_state_sha256,
-                    desktop_version,
-                )?)
-            } else {
-                None
+                ) {
+                    Ok(current_state_sha256) => (
+                        true,
+                        Some(plugin_update_plan_id(
+                            entry,
+                            catalog_signing_key_id,
+                            &current_state_sha256,
+                            desktop_version,
+                        )?),
+                        None,
+                    ),
+                    Err(_) => {
+                        tracing::warn!(
+                            event_code = "plugin-catalog-target-blocked",
+                            error_code = "plugin-update-target-state-invalid",
+                            plugin_id,
+                            "catalog candidate blocked by invalid local target state"
+                        );
+                        (false, None, Some(PluginInstallBlocker::InvalidTargetState))
+                    }
+                }
             };
             Ok(PluginUpdateItem {
                 plugin_id,
@@ -2346,6 +2397,7 @@ fn collect_plugin_updates(
                 catalog_available: latest_catalog_version.is_some(),
                 compatibility_limited: latest_catalog_version != available_version,
                 update_available,
+                install_blocker,
             })
         })
         .collect()
@@ -4482,9 +4534,9 @@ mod tests {
         persist_startup_failure_document, plugin_update_installed_state_digest,
         plugin_update_plan_id, project_bundle, project_import_plan_id, project_import_state_digest,
         resolve_startup_failure_document, select_runtime_path, service_inventory_item,
-        startup_failure_message, CatalogWithdrawalReason, FrontendRuntime, PluginPackagePreview,
-        PluginPackageServicePreview, ProjectBundlePreview, StartupFailureDocument, StartupStage,
-        FRONTEND_READY_TIMEOUT,
+        startup_failure_message, CatalogWithdrawalReason, FrontendRuntime, PluginInstallBlocker,
+        PluginPackagePreview, PluginPackageServicePreview, ProjectBundlePreview,
+        StartupFailureDocument, StartupStage, FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -4915,6 +4967,7 @@ mod tests {
         let updates = collect_plugin_updates(
             &[installed],
             root.path(),
+            &root.path().join("local-mappings"),
             &catalog,
             "catalog-key",
             None,
@@ -4935,6 +4988,111 @@ mod tests {
         );
         assert!(updates[0].compatibility_limited);
         assert!(updates[0].update_available);
+    }
+
+    #[test]
+    fn plugin_catalog_browse_discovers_new_plugins_and_classifies_local_conflicts() {
+        let root = tempfile::tempdir().unwrap();
+        let local_root = root.path().join("local-mappings");
+        fs::create_dir(&local_root).unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+        let catalog = PluginCatalog::from_unsigned_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "issuedAt": 1_700_000_000_u64,
+                "expiresAt": 1_700_003_600_u64,
+                "entries": [{
+                    "pluginId": "reader",
+                    "version": "1.1.0",
+                    "desktopVersionRequirement": ">=0.1.0, <0.2.0",
+                    "url": "https://plugins.example.test/reader-1.1.0.ssdev-plugin",
+                    "sha256": "11".repeat(32),
+                    "size": 10
+                }, {
+                    "pluginId": "scanner",
+                    "version": "2.0.0",
+                    "desktopVersionRequirement": ">=0.2.0, <0.3.0",
+                    "url": "https://plugins.example.test/scanner-2.0.0.ssdev-plugin",
+                    "sha256": "22".repeat(32),
+                    "size": 10
+                }]
+            }))
+            .unwrap(),
+            now,
+        )
+        .unwrap();
+        let desktop = Version::new(0, 1, 5);
+
+        let discovered = collect_plugin_updates(
+            &[],
+            root.path(),
+            &local_root,
+            &catalog,
+            "catalog-key",
+            None,
+            &desktop,
+        )
+        .unwrap();
+        assert_eq!(discovered.len(), 2);
+        assert_eq!(discovered[0].plugin_id, "reader");
+        assert!(discovered[0].update_available);
+        assert_eq!(discovered[0].available_version.as_deref(), Some("1.1.0"));
+        assert!(discovered[0]
+            .install_plan_id
+            .as_deref()
+            .is_some_and(is_lowercase_sha256));
+        assert_eq!(discovered[1].plugin_id, "scanner");
+        assert!(!discovered[1].update_available);
+        assert!(discovered[1].compatibility_limited);
+
+        let local_mapping = PluginManifest {
+            plugin_id: "reader".to_owned(),
+            plugin_dir: local_root.join("reader"),
+            metadata: None,
+            services: Vec::new(),
+        };
+        let blocked = collect_plugin_updates(
+            &[local_mapping],
+            root.path(),
+            &local_root,
+            &catalog,
+            "catalog-key",
+            Some("reader"),
+            &desktop,
+        )
+        .unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert!(!blocked[0].update_available);
+        assert_eq!(
+            blocked[0].install_blocker,
+            Some(PluginInstallBlocker::LocalMappingConflict)
+        );
+        assert_eq!(
+            serde_json::to_value(&blocked[0]).unwrap()["installBlocker"],
+            "local-mapping-conflict"
+        );
+        assert!(blocked[0].install_plan_id.is_none());
+
+        fs::create_dir(root.path().join("reader")).unwrap();
+        let invalid_target = collect_plugin_updates(
+            &[],
+            root.path(),
+            &local_root,
+            &catalog,
+            "catalog-key",
+            None,
+            &desktop,
+        )
+        .unwrap();
+        assert_eq!(invalid_target.len(), 2);
+        assert_eq!(
+            invalid_target[0].install_blocker,
+            Some(PluginInstallBlocker::InvalidTargetState)
+        );
+        assert!(!invalid_target[0].update_available);
+        assert!(invalid_target[0].install_plan_id.is_none());
+        assert_eq!(invalid_target[1].plugin_id, "scanner");
+        assert!(invalid_target[1].compatibility_limited);
     }
 
     #[test]
