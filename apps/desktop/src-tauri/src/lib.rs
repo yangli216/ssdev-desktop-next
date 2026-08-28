@@ -4,6 +4,7 @@ mod capture;
 #[cfg(not(any(windows, target_os = "macos")))]
 #[path = "capture_unsupported.rs"]
 mod capture;
+mod com_discovery;
 #[allow(dead_code)]
 // The shared build/runtime ACL declaration intentionally has target-specific subsets.
 mod command_permissions;
@@ -1365,6 +1366,18 @@ fn inspect_native_component(
 }
 
 #[tauri::command]
+async fn discover_registered_com_components(
+    caller: WebviewWindow,
+    query: String,
+    architecture: PluginArchitecture,
+) -> Result<com_discovery::ComDiscoveryResult, String> {
+    desktop::require_control(&caller)?;
+    tokio::task::spawn_blocking(move || com_discovery::discover(&query, architecture))
+        .await
+        .map_err(|_| "COM 注册发现任务异常终止".to_owned())?
+}
+
+#[tauri::command]
 async fn local_mapping_inventory(
     caller: WebviewWindow,
     state: State<'_, BridgeState>,
@@ -2135,6 +2148,7 @@ pub fn run() {
             reload_plugins,
             plugin_inventory,
             inspect_native_component,
+            discover_registered_com_components,
             local_mapping_inventory,
             save_local_mapping,
             export_local_mapping,

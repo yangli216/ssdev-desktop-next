@@ -52,8 +52,9 @@ mod platform {
     use windows::core::{BSTR, GUID, PCWSTR};
     use windows::Win32::Foundation::VARIANT_BOOL;
     use windows::Win32::System::Com::{
-        CLSIDFromProgID, CoCreateInstance, CoInitializeEx, CoUninitialize, IDispatch, CLSCTX_ALL,
-        COINIT_APARTMENTTHREADED, DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPPARAMS, EXCEPINFO,
+        CLSIDFromProgID, CLSIDFromString, CoCreateInstance, CoInitializeEx, CoUninitialize,
+        IDispatch, CLSCTX_ALL, COINIT_APARTMENTTHREADED, DISPATCH_METHOD, DISPATCH_PROPERTYGET,
+        DISPPARAMS, EXCEPINFO,
     };
     use windows::Win32::System::Variant::{
         VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_BSTR, VT_BYREF,
@@ -137,11 +138,7 @@ mod platform {
                     return Ok(dispatch.clone());
                 }
             }
-            let program_id = wide_nul(&service.main_class)?;
-            let class_id =
-                unsafe { CLSIDFromProgID(PCWSTR(program_id.as_ptr())) }.map_err(|error| {
-                    NativeError::Com(format!("ProgID [{}]: {error}", service.main_class))
-                })?;
+            let class_id = resolve_class_id(&service.main_class)?;
             let dispatch: IDispatch = unsafe { CoCreateInstance(&class_id, None, CLSCTX_ALL) }
                 .map_err(|error| {
                     NativeError::Com(format!("create [{}]: {error}", service.main_class))
@@ -152,6 +149,19 @@ mod platform {
             }
             Ok(dispatch)
         }
+    }
+
+    fn resolve_class_id(identifier: &str) -> Result<GUID, NativeError> {
+        let identifier = identifier.trim();
+        let wide = wide_nul(identifier)?;
+        let result = if identifier.starts_with('{') && identifier.ends_with('}') {
+            unsafe { CLSIDFromString(PCWSTR(wide.as_ptr())) }
+        } else {
+            unsafe { CLSIDFromProgID(PCWSTR(wide.as_ptr())) }
+        };
+        result.map_err(|error| {
+            NativeError::Com(format!("resolve ProgID/CLSID [{identifier}]: {error}"))
+        })
     }
 
     impl Drop for WindowsComAdapter {
@@ -417,5 +427,19 @@ mod platform {
             return Err(NativeError::Com("COM name contains an embedded NUL".into()));
         }
         Ok(value.encode_utf16().chain(std::iter::once(0)).collect())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn accepts_a_clsid_identifier_without_registry_prog_id_resolution() {
+            let resolved = resolve_class_id("{00000000-0000-0000-C000-000000000046}").unwrap();
+            assert_eq!(
+                resolved,
+                GUID::from_u128(0x00000000_0000_0000_c000_000000000046)
+            );
+        }
     }
 }

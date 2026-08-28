@@ -4448,6 +4448,7 @@ dependencies = [
  "webplus-plugin-repository",
  "webplus-plugin-trust",
  "webplus-protocol",
+ "windows 0.62.2",
  "xcap",
  "zip 8.6.0",
 ]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-discover-registered-com-components"
+description = "Enables the discover_registered_com_components command without any pre-configured scope."
+commands.allow = ["discover_registered_com_components"]
+
+[[permission]]
+identifier = "deny-discover-registered-com-components"
+description = "Denies the discover_registered_com_components command without any pre-configured scope."
+commands.deny = ["discover_registered_com_components"]

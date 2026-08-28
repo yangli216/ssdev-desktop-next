@@ -19,6 +19,7 @@
     "allow-reload-plugins",
     "allow-plugin-inventory",
     "allow-inspect-native-component",
+    "allow-discover-registered-com-components",
     "allow-local-mapping-inventory",
     "allow-save-local-mapping",
     "allow-export-local-mapping",

@@ -68,6 +68,22 @@ type NativeInspection = {
   warnings: string[]
 }
 
+type ComComponent = {
+  clsid: string
+  progId?: string
+  versionIndependentProgId?: string
+  displayName: string
+  architecture: Architecture
+  componentType: 'com' | 'ocx'
+  serverType: 'in-process' | 'local-process' | 'unknown'
+}
+
+type ComDiscoveryResult = {
+  components: ComComponent[]
+  scanned: number
+  truncated: boolean
+}
+
 type DebugResult = {
   elapsedMs: number
   response: {
@@ -98,6 +114,8 @@ const draft = ref<LocalMappingDefinition>(newMapping())
 const serviceIndex = ref(0)
 const methodIndex = ref(0)
 const inspection = ref<NativeInspection | null>(null)
+const comQuery = ref('')
+const comDiscovery = ref<ComDiscoveryResult | null>(null)
 const debugValues = ref<Record<string, string | boolean | number>>({})
 const debugResult = ref<DebugResult | null>(null)
 const debugCaseName = ref('')
@@ -218,6 +236,8 @@ function resetEditor() {
   serviceIndex.value = 0
   methodIndex.value = 0
   inspection.value = null
+  comQuery.value = ''
+  comDiscovery.value = null
   debugResult.value = null
   debugValues.value = {}
   debugCaseName.value = ''
@@ -235,6 +255,8 @@ function editMapping(mapping: LocalMappingDefinition) {
   serviceIndex.value = 0
   methodIndex.value = 0
   inspection.value = null
+  comQuery.value = ''
+  comDiscovery.value = null
   debugResult.value = null
   debugValues.value = {}
   debugCaseName.value = ''
@@ -251,6 +273,8 @@ function selectService(index: number) {
   serviceIndex.value = index
   methodIndex.value = 0
   inspection.value = null
+  comQuery.value = ''
+  comDiscovery.value = null
   debugResult.value = null
   debugValues.value = {}
   debugCaseName.value = ''
@@ -338,6 +362,38 @@ async function inspectCurrentComponent() {
       ? `已识别 ${inspection.value.exports.length} 个导出函数。`
       : '组件已读取，但没有自动识别到可调用的导出函数。'
   })
+}
+
+async function discoverCom() {
+  if (!service.value || !['com', 'ocx'].includes(service.value.mainType)) return
+  const query = comQuery.value.trim()
+  if (query.length < 2) {
+    error.value = '请输入至少 2 个字符搜索 ProgID、CLSID 或组件名称。'
+    return
+  }
+  await run(async () => {
+    comDiscovery.value = await invoke<ComDiscoveryResult>('discover_registered_com_components', {
+      query,
+      architecture: service.value?.architecture,
+    })
+    notice.value = comDiscovery.value.components.length
+      ? `已在 ${service.value?.architecture} 注册视图找到 ${comDiscovery.value.components.length} 项${comDiscovery.value.truncated ? '（结果已截断，请缩小搜索范围）' : ''}。`
+      : `已扫描 ${comDiscovery.value.scanned} 项注册信息，没有找到匹配组件。`
+  })
+}
+
+function useComComponent(component: ComComponent) {
+  if (!service.value) return
+  service.value.mainClass = component.progId || component.versionIndependentProgId || component.clsid
+  service.value.architecture = component.architecture
+  service.value.mainType = component.componentType
+  notice.value = `已选择 ${service.value.mainClass}；方法和参数仍需依据厂商接口文档配置。`
+}
+
+function comServerLabel(serverType: ComComponent['serverType']): string {
+  if (serverType === 'in-process') return '进程内服务器'
+  if (serverType === 'local-process') return '本地进程服务器'
+  return '服务器类型未知'
 }
 
 function useExport(name: string) {
@@ -628,6 +684,21 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
             <span>{{ service.mainType === 'com' || service.mainType === 'ocx' ? 'ProgID / CLSID' : '组件文件' }}</span>
             <span><input v-model.trim="service.mainClass" required :placeholder="service.mainType === 'com' || service.mainType === 'ocx' ? 'Vendor.Device.1' : '选择本机文件'" /><button v-if="service.mainType !== 'com' && service.mainType !== 'ocx'" type="button" @click="selectComponent">选择并识别</button></span>
           </label>
+          <div v-if="service.mainType === 'com' || service.mainType === 'ocx'" class="com-discovery">
+            <div class="com-search">
+              <label><span>搜索 Windows 已注册组件（{{ service.architecture }}）</span><input v-model.trim="comQuery" maxlength="128" placeholder="输入 ProgID、CLSID 或组件名称" @keydown.enter.prevent="discoverCom" /></label>
+              <button type="button" :disabled="busy || disabled || comQuery.trim().length < 2" @click="discoverCom">搜索注册表</button>
+            </div>
+            <p>仅只读查询当前架构的 COM 注册视图，不创建组件实例；方法、参数和副作用不会自动推断。</p>
+            <div v-if="comDiscovery" class="com-results">
+              <button v-for="item in comDiscovery.components" :key="`${item.architecture}:${item.clsid}`" type="button" @click="useComComponent(item)">
+                <strong>{{ item.progId || item.versionIndependentProgId || item.clsid }}</strong>
+                <span>{{ item.displayName || '未提供组件名称' }}</span>
+                <small>{{ item.architecture }} · {{ item.componentType.toUpperCase() }} · {{ comServerLabel(item.serverType) }} · {{ item.clsid }}</small>
+              </button>
+              <p v-if="comDiscovery.components.length === 0" class="empty">没有匹配的注册组件；请核对架构或缩短厂商名称。</p>
+            </div>
+          </div>
           <div class="field-grid four">
             <label><span>调用约定</span><select v-model="service.callingConvention"><option value="system">system</option><option value="cdecl">cdecl</option><option value="stdcall">stdcall</option></select></label>
             <label><span>字符集</span><select v-model="service.charset"><option value="utf8">UTF-8</option><option value="gbk">GBK</option></select></label>
@@ -762,6 +833,13 @@ fieldset { min-width: 0; margin: 0; padding: 18px; border: 1px solid #c8d1c9; bo
 legend { padding: 0 7px; color: #355746; font-size: 13px; font-weight: 800; }
 .component-path { margin: 13px 0; }
 .component-path > span:last-child { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+.com-discovery { display: grid; gap: 8px; margin: -3px 0 14px; padding: 12px; border: 1px solid #d1d9d2; border-radius: 9px; background: #f6f8f5; }
+.com-search { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: end; }
+.com-discovery > p { margin: 0; color: #718078; font-size: 11px; }
+.com-results { display: grid; gap: 6px; max-height: 260px; overflow: auto; }
+.com-results > button { display: grid; gap: 3px; text-align: left; }
+.com-results > button span { color: #4f6156; font-size: 12px; }
+.com-results > button small { overflow-wrap: anywhere; color: #7b8980; font: 10px ui-monospace, monospace; }
 .check { display: flex; align-items: center; gap: 7px; padding-top: 22px; }
 .check input { width: auto; }
 .dependency-list { display: grid; gap: 7px; margin-top: 14px; color: #4c5d53; font-size: 12px; font-weight: 700; }
