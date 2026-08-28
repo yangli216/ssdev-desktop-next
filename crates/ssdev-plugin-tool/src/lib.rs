@@ -37,6 +37,7 @@ const MAX_CATALOG_SPEC_BYTES: u64 = 1024 * 1024;
 const MAX_CATALOG_PACKAGES: usize = 4096;
 const PLUGIN_METADATA_FILENAME: &str = "plugin.json";
 const LEGACY_LICENSE_FILENAME: &str = "license.dat";
+const RELEASE_SET_MATERIALIZATION_MARKER: &str = ".release-set-materializing.json";
 
 #[derive(Debug, Clone)]
 pub struct PrepareOptions<'a> {
@@ -67,6 +68,14 @@ pub struct CatalogOptions<'a> {
     pub trust_store: &'a Path,
     pub catalog: &'a Path,
     pub now: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct MaterializeReleaseSetOptions<'a> {
+    pub spec: &'a Path,
+    pub trust_store: &'a Path,
+    pub matrix: &'a Path,
+    pub plugin_root: &'a Path,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -156,6 +165,25 @@ pub struct ReleaseSetCheckReport {
     pub matrix_verified: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaterializeReleaseSetReport {
+    pub schema_version: u8,
+    pub spec_sha256: String,
+    pub package_set_sha256: String,
+    pub trust_store_sha256: String,
+    pub matrix_sha256: String,
+    pub plugin_count: usize,
+    pub service_count: usize,
+    pub method_count: usize,
+    pub case_count: usize,
+    pub enabled_case_count: usize,
+    pub packages_verified: bool,
+    pub matrix_verified: bool,
+    pub root_verified: bool,
+    pub materialized: bool,
+}
+
 struct CheckedReleasePackages {
     packages: Vec<ReleasePackageReport>,
     package_set_sha256: String,
@@ -191,6 +219,12 @@ struct SigningRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReleaseSetSpec {
     schema_version: u8,
+    packages: Vec<PathBuf>,
+}
+
+struct ReleaseSetInputs {
+    spec: PathBuf,
+    spec_sha256: String,
     packages: Vec<PathBuf>,
 }
 
@@ -522,6 +556,11 @@ pub fn check_release_set(
     trust_store: &Path,
     matrix: &Path,
 ) -> Result<ReleaseSetCheckReport, ToolError> {
+    let inputs = load_release_set_inputs(spec)?;
+    check_release_set_inputs(&inputs, trust_store, matrix)
+}
+
+fn load_release_set_inputs(spec: &Path) -> Result<ReleaseSetInputs, ToolError> {
     let spec = canonical_real_file(spec, MAX_RELEASE_SET_SPEC_BYTES)?;
     let spec_sha256 = sha256_file_bounded(&spec, MAX_RELEASE_SET_SPEC_BYTES)?;
     let document: ReleaseSetSpec = read_bounded_json(&spec, MAX_RELEASE_SET_SPEC_BYTES)?;
@@ -547,15 +586,27 @@ pub fn check_release_set(
             }
         })
         .collect::<Vec<_>>();
-    let checked = check_release_packages(&package_paths, trust_store, matrix)?;
-    if spec_sha256 != sha256_file_bounded(&spec, MAX_RELEASE_SET_SPEC_BYTES)? {
+    Ok(ReleaseSetInputs {
+        spec,
+        spec_sha256,
+        packages: package_paths,
+    })
+}
+
+fn check_release_set_inputs(
+    inputs: &ReleaseSetInputs,
+    trust_store: &Path,
+    matrix: &Path,
+) -> Result<ReleaseSetCheckReport, ToolError> {
+    let checked = check_release_packages(&inputs.packages, trust_store, matrix)?;
+    if inputs.spec_sha256 != sha256_file_bounded(&inputs.spec, MAX_RELEASE_SET_SPEC_BYTES)? {
         return Err(ToolError::Invalid(
             "release set spec changed while it was checked".into(),
         ));
     }
     Ok(ReleaseSetCheckReport {
         schema_version: 1,
-        spec_sha256,
+        spec_sha256: inputs.spec_sha256.clone(),
         package_set_sha256: checked.package_set_sha256,
         trust_store_sha256: checked.trust_store_sha256,
         matrix_sha256: checked.matrix_sha256,
@@ -567,6 +618,75 @@ pub fn check_release_set(
         packages: checked.packages,
         packages_verified: true,
         matrix_verified: true,
+    })
+}
+
+pub fn materialize_release_set(
+    options: &MaterializeReleaseSetOptions<'_>,
+) -> Result<MaterializeReleaseSetReport, ToolError> {
+    let plugin_root = normalized_new_path(options.plugin_root)?;
+    let inputs = load_release_set_inputs(options.spec)?;
+    let approved = check_release_set_inputs(&inputs, options.trust_store, options.matrix)?;
+    with_fresh_directory(&plugin_root, "materialized plugin root", |plugin_root| {
+        materialize_release_set_into(
+            plugin_root,
+            &inputs,
+            &approved,
+            options.trust_store,
+            options.matrix,
+        )
+    })
+}
+
+fn materialize_release_set_into(
+    plugin_root: &Path,
+    inputs: &ReleaseSetInputs,
+    approved: &ReleaseSetCheckReport,
+    trust_store: &Path,
+    matrix: &Path,
+) -> Result<MaterializeReleaseSetReport, ToolError> {
+    write_new_json(
+        plugin_root.join(RELEASE_SET_MATERIALIZATION_MARKER),
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "specSha256": approved.spec_sha256,
+            "packageSetSha256": approved.package_set_sha256
+        }),
+    )?;
+    let trust = TrustStore::load(trust_store)?;
+    for package in &inputs.packages {
+        let prepared = PreparedPlugin::prepare(package, plugin_root, &trust)?;
+        trust.verify_for_issuance(prepared.manifest())?;
+        prepared.activate()?.commit()?;
+    }
+    fs::remove_file(plugin_root.join(RELEASE_SET_MATERIALIZATION_MARKER)).map_err(|source| {
+        ToolError::Io {
+            path: plugin_root.join(RELEASE_SET_MATERIALIZATION_MARKER),
+            source,
+        }
+    })?;
+
+    let verified = check_release_root_against_set(plugin_root, &inputs.spec, trust_store, matrix)?;
+    if &verified != approved {
+        return Err(ToolError::Invalid(
+            "materialized plugin root no longer matches the approved release set".into(),
+        ));
+    }
+    Ok(MaterializeReleaseSetReport {
+        schema_version: 1,
+        spec_sha256: verified.spec_sha256,
+        package_set_sha256: verified.package_set_sha256,
+        trust_store_sha256: verified.trust_store_sha256,
+        matrix_sha256: verified.matrix_sha256,
+        plugin_count: verified.plugin_count,
+        service_count: verified.service_count,
+        method_count: verified.method_count,
+        case_count: verified.case_count,
+        enabled_case_count: verified.enabled_case_count,
+        packages_verified: verified.packages_verified,
+        matrix_verified: verified.matrix_verified,
+        root_verified: true,
+        materialized: true,
     })
 }
 
@@ -1231,6 +1351,20 @@ pub fn check_executable_matrix_root(
 
 fn discover_clean_plugin_root(plugin_root: &Path) -> Result<Vec<PluginManifest>, ToolError> {
     let plugin_root = canonical_real_directory(plugin_root)?;
+    match fs::symlink_metadata(plugin_root.join(RELEASE_SET_MATERIALIZATION_MARKER)) {
+        Ok(_) => {
+            return Err(ToolError::Invalid(
+                "plugin root contains an incomplete release set materialization marker".into(),
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ToolError::Io {
+                path: plugin_root.join(RELEASE_SET_MATERIALIZATION_MARKER),
+                source,
+            })
+        }
+    }
     let discovery = discover_plugins(&plugin_root)?;
     if !discovery.failures.is_empty() {
         let first = &discovery.failures[0];
@@ -1618,6 +1752,27 @@ fn ensure_fresh_output(path: &Path, role: &str) -> Result<(), ToolError> {
             source,
         }),
     }
+}
+
+fn with_fresh_directory<T>(
+    path: &Path,
+    role: &str,
+    operation: impl FnOnce(&Path) -> Result<T, ToolError>,
+) -> Result<T, ToolError> {
+    ensure_fresh_output(path, role)?;
+    fs::create_dir(path).map_err(|source| ToolError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let result = operation(path);
+    if result.is_err() {
+        if let Err(source) = fs::remove_dir_all(path) {
+            return Err(ToolError::Invalid(format!(
+                "{role} operation failed and its incomplete directory could not be removed: {source}"
+            )));
+        }
+    }
+    result
 }
 
 fn output_parent(path: &Path) -> &Path {
@@ -2083,17 +2238,40 @@ mod tests {
         assert_eq!(reversed.packages, report.packages);
 
         let plugin_root = root.path().join("tested-plugin-root");
-        let trust_store = TrustStore::load(&trust).unwrap();
-        for package in [&reader_package, &printer_package] {
-            PreparedPlugin::prepare(package, &plugin_root, &trust_store)
-                .unwrap()
-                .activate()
-                .unwrap()
-                .commit()
-                .unwrap();
-        }
+        let materialized = materialize_release_set(&MaterializeReleaseSetOptions {
+            spec: &spec,
+            trust_store: &trust,
+            matrix: &matrix,
+            plugin_root: &plugin_root,
+        })
+        .unwrap();
+        assert!(materialized.materialized);
+        assert!(materialized.root_verified);
+        assert_eq!(materialized.plugin_count, 2);
+        assert_eq!(materialized.package_set_sha256, report.package_set_sha256);
         let rooted = check_release_root_against_set(&plugin_root, &spec, &trust, &matrix).unwrap();
         assert_eq!(rooted.package_set_sha256, report.package_set_sha256);
+
+        let error = materialize_release_set(&MaterializeReleaseSetOptions {
+            spec: &spec,
+            trust_store: &trust,
+            matrix: &matrix,
+            plugin_root: &plugin_root,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        check_release_root_against_set(&plugin_root, &spec, &trust, &matrix).unwrap();
+
+        fs::write(
+            plugin_root.join(RELEASE_SET_MATERIALIZATION_MARKER),
+            b"incomplete",
+        )
+        .unwrap();
+        let error =
+            check_release_root_against_set(&plugin_root, &spec, &trust, &matrix).unwrap_err();
+        assert!(error.to_string().contains("incomplete release set"));
+        fs::remove_file(plugin_root.join(RELEASE_SET_MATERIALIZATION_MARKER)).unwrap();
+
         fs::write(plugin_root.join("reader-plugin/reader.dll"), b"tampered").unwrap();
         let error =
             check_release_root_against_set(&plugin_root, &spec, &trust, &matrix).unwrap_err();
@@ -2112,6 +2290,15 @@ mod tests {
         );
         let error = check_release_set(&duplicate_spec, &trust, &matrix).unwrap_err();
         assert!(error.to_string().contains("same package path"));
+        let rejected_root = root.path().join("rejected-plugin-root");
+        materialize_release_set(&MaterializeReleaseSetOptions {
+            spec: &duplicate_spec,
+            trust_store: &trust,
+            matrix: &matrix,
+            plugin_root: &rejected_root,
+        })
+        .unwrap_err();
+        assert!(!rejected_root.exists());
 
         let copied_package = root.path().join("reader-copy.ssdev-plugin");
         fs::copy(&reader_package, &copied_package).unwrap();
@@ -2620,6 +2807,20 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn failed_fresh_directory_operation_removes_partial_output() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("candidate-root");
+        let result: Result<(), ToolError> =
+            with_fresh_directory(&output, "candidate root", |candidate| {
+                fs::write(candidate.join("partial"), b"partial").unwrap();
+                Err(ToolError::Invalid("injected failure".into()))
+            });
+
+        assert!(result.unwrap_err().to_string().contains("injected failure"));
+        assert!(!output.exists());
     }
 
     #[test]

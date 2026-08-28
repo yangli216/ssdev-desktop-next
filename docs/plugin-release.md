@@ -119,6 +119,18 @@ cargo run --locked -p ssdev-plugin-tool -- release-set-check `
 
 集合门禁逐包安全解压、验签并要求 active 发布键，拒绝重复包、忽略大小写后重复插件 ID、跨插件 `serviceId` 冲突、矩阵目标缺失/多余/错版以及任一方法未覆盖。成功报告按插件 ID 稳定排序，给出每个包的身份、版本、keyId 和摘要，以及域分隔的 `packageSetSha256`、规范/信任库/矩阵摘要和联合覆盖计数；规范、任一包、信任库或矩阵在检查过程中变化都会失败。这样多插件项目不再依赖人工拼接多份单包报告。
 
+离线审批通过后，不要手工把多个包逐个解压或复制到验收目录。用同一规范一次生成全新的插件根目录：
+
+```powershell
+cargo run --locked -p ssdev-plugin-tool -- release-set-materialize `
+  --spec C:\secure-release\hospital-a-release-set.json `
+  --trust-store C:\secure-build-inputs\plugin-trust.json `
+  --matrix C:\secure-release\hospital-a-matrix.json `
+  --plugin-root C:\secure-test-inputs\hospital-a-plugins
+```
+
+`plugin-root` 的父目录必须已存在，目标自身必须不存在。工具先完成整个发布集合门禁，再通过桌面安装器同源的安全解包与事务激活路径逐包安装；全部安装后把每个插件重新确定性封包，逐项核对身份、版本、active keyId 和包 SHA-256，并再次检查规范、信任库和矩阵。普通失败会删除新建的半成品目录，已有路径永不覆盖；若进程崩溃或断电，目录会保留 `.release-set-materializing.json`，任何 `matrix-check` 或正式实机运行都会失败关闭。检查原因后删除该候选目录并重新物化，不能手工移除标记后继续使用。
+
 多个已签名包进入插件仓库时，不要手工维护版本、大小和摘要。使用 [签名插件仓库协议](plugin-repository.md) 中的 `ssdev-plugin-tool catalog` 从这些包生成确定性目录，再通过统一发布签名工具签目录。
 
 ## 4. 实机门禁
@@ -135,7 +147,7 @@ powershell -ExecutionPolicy Bypass -File scripts/test-plugin-matrix.ps1 `
   -EvidenceEnvironment hospital-a-reader-lab
 ```
 
-`PluginRoot` 必须是 `ReleaseSetSpec` 所批准包的精确安装结果，不能是另行复制或重新签名的暂存目录。运行器会逐项校验身份、版本、active 签名 keyId，并把根目录中的每个插件重新确定性封包；只有重建包 SHA-256 与发布集合完全相同才会接触硬件。因此，多包离线审批、现场安装内容和最终实机结论属于同一条可追溯链路。
+`PluginRoot` 应直接使用上一节 `release-set-materialize` 生成的目录，并且必须是 `ReleaseSetSpec` 所批准包的精确安装结果，不能是另行复制或重新签名的暂存目录。运行器会逐项校验身份、版本、active 签名 keyId，并把根目录中的每个插件重新确定性封包；只有重建包 SHA-256 与发布集合完全相同才会接触硬件。因此，多包离线审批、现场安装内容和最终实机结论属于同一条可追溯链路。
 
 矩阵必须由启用用例覆盖插件集合声明的每个方法；alias 会归一到对应真实方法。每个启用用例的输入字段必须与该方法声明的非 `$` 输入完全一致，未知字段、缺失字段和生成器保留占位符都会在宿主启动前失败。工具只在全部用例通过后生成 schema 2 证据，并绑定源码提交、发布集合规范与包集合、插件签名载荷集合、信任库、矩阵、x86/x64 宿主摘要及目标环境标签。任一输入在运行期间变化都会失败，已有证据文件不会被覆盖；旧 schema 1 插件矩阵证据不能人工升级，必须用批准的发布集合重新执行。
 
