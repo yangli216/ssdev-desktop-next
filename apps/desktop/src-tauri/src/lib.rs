@@ -242,10 +242,46 @@ async fn run_deployment_check(
     diagnostics: State<'_, DiagnosticsRuntime>,
 ) -> Result<deployment_check::DeploymentCheckReport, String> {
     desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    recover_plugin_store(&state)?;
     let config = desktop_state.config.snapshot();
     let config_error = config.validate().err().map(|error| error.to_string());
     let business_origin_count = config.business_origins().map_or(0, |origins| origins.len());
     let origin = desktop_state.origin_policy_summary();
+    let origin_policy_error = desktop_state.origin_policy_error();
+    let inspected = inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+    );
+    let (manifests, plugin_load_failures, plugin_inventory_error) = match inspected {
+        Ok(inspected) => (inspected.manifests, inspected.failures.len(), None),
+        Err(error) => (Vec::new(), 0, Some(error)),
+    };
+    let plugin_count = manifests.len();
+    let service_count = manifests
+        .iter()
+        .map(|manifest| manifest.services.len())
+        .sum();
+    let route_coverage = desktop_state.plugin_route_policy_coverage(&config, &manifests);
+    let (
+        plugin_route_count,
+        evaluated_policy_grants,
+        authorized_policy_grants,
+        uncovered_business_origins,
+        uncovered_plugin_routes,
+        route_policy_error,
+    ) = match route_coverage {
+        Ok(coverage) => (
+            coverage.route_count,
+            coverage.evaluated_grant_count,
+            coverage.authorized_grant_count,
+            coverage.uncovered_origin_count,
+            coverage.uncovered_route_count,
+            None,
+        ),
+        Err(error) => (0, 0, 0, 0, 0, Some(error)),
+    };
     let trust_keys = state
         .trust_store
         .as_deref()
@@ -259,13 +295,21 @@ async fn run_deployment_check(
         is_windows: cfg!(windows),
         config_error,
         business_origin_count,
-        origin_policy_error: desktop_state.origin_policy_error(),
+        origin_policy_error,
         allow_insecure_http: origin.allow_insecure_http,
         plugin_trust_mode: state.plugin_trust_mode,
         active_trust_keys: trust_keys.active,
-        plugin_count: state.plugin_count.load(Ordering::Acquire),
-        service_count: state.controller.service_count().await,
-        plugin_load_failures: state.plugin_load_failures.load(Ordering::Acquire),
+        plugin_count,
+        service_count,
+        active_service_count: state.controller.service_count().await,
+        plugin_route_count,
+        evaluated_policy_grants,
+        authorized_policy_grants,
+        uncovered_business_origins,
+        uncovered_plugin_routes,
+        route_policy_error,
+        plugin_inventory_error,
+        plugin_load_failures,
         plugin_preflight_failures: state.plugin_preflight_failures.load(Ordering::Acquire),
         x86_host_available: state.x86_host.is_file(),
         x64_host_available: state.x64_host.is_file(),

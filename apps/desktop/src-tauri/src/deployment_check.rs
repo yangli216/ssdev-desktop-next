@@ -11,6 +11,14 @@ pub(crate) struct DeploymentCheckFacts {
     pub(crate) active_trust_keys: usize,
     pub(crate) plugin_count: usize,
     pub(crate) service_count: usize,
+    pub(crate) active_service_count: usize,
+    pub(crate) plugin_route_count: usize,
+    pub(crate) evaluated_policy_grants: usize,
+    pub(crate) authorized_policy_grants: usize,
+    pub(crate) uncovered_business_origins: usize,
+    pub(crate) uncovered_plugin_routes: usize,
+    pub(crate) route_policy_error: Option<String>,
+    pub(crate) plugin_inventory_error: Option<String>,
     pub(crate) plugin_load_failures: usize,
     pub(crate) plugin_preflight_failures: usize,
     pub(crate) x86_host_available: bool,
@@ -53,7 +61,7 @@ pub(crate) enum DeploymentCheckStatus {
 }
 
 pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
-    let mut items = Vec::with_capacity(10);
+    let mut items = Vec::with_capacity(12);
 
     items.push(item(
         "webview-runtime",
@@ -64,11 +72,11 @@ pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
     ));
 
     match (&facts.config_error, facts.business_origin_count) {
-        (Some(error), _) => items.push(item(
+        (Some(_), _) => items.push(item(
             "project-config",
             "项目配置",
             DeploymentCheckStatus::Fail,
-            format!("当前配置未通过校验：{error}"),
+            "当前配置未通过校验。",
             Some("进入“项目配置”修正地址或重复项，然后保存配置。"),
         )),
         (None, 0) => items.push(item(
@@ -87,12 +95,12 @@ pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
         )),
     }
 
-    if let Some(error) = &facts.origin_policy_error {
+    if facts.origin_policy_error.is_some() {
         items.push(item(
             "origin-policy",
             "业务来源策略",
             DeploymentCheckStatus::Fail,
-            format!("当前项目配置未获部署策略授权：{error}"),
+            "当前项目配置未获部署策略授权。",
             Some("核对项目地址和签名来源策略；普通内网 HTTP 地址应来自当前项目配置。"),
         ));
     } else {
@@ -170,13 +178,32 @@ pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
         ));
     }
 
-    if facts.plugin_load_failures > 0 {
+    if facts.plugin_inventory_error.is_some() {
+        items.push(item(
+            "plugin-inventory",
+            "插件与服务",
+            DeploymentCheckStatus::Fail,
+            "无法读取当前插件清单。",
+            Some("检查插件数据目录权限和磁盘状态，然后重新启动客户端。"),
+        ));
+    } else if facts.plugin_load_failures > 0 {
         items.push(item(
             "plugin-inventory",
             "插件与服务",
             DeploymentCheckStatus::Fail,
             format!("有 {} 个插件加载失败或被隔离。", facts.plugin_load_failures),
             Some("进入“插件管理”查看隔离原因，修复依赖、架构或签名问题。"),
+        ));
+    } else if facts.service_count != facts.active_service_count {
+        items.push(item(
+            "plugin-inventory",
+            "插件与服务",
+            DeploymentCheckStatus::Fail,
+            format!(
+                "磁盘插件声明 {} 个服务，但控制器当前只有 {} 个活动服务。",
+                facts.service_count, facts.active_service_count
+            ),
+            Some("进入“插件管理”重新加载插件；若仍不一致，请导出诊断包后重启客户端。"),
         ));
     } else if facts.service_count == 0 {
         items.push(item(
@@ -194,6 +221,46 @@ pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
             format!(
                 "{} 个插件提供 {} 个原生服务。",
                 facts.plugin_count, facts.service_count
+            ),
+            None,
+        ));
+    }
+
+    if facts.route_policy_error.is_some() {
+        items.push(item(
+            "plugin-route-policy",
+            "业务与原生能力授权",
+            DeploymentCheckStatus::Fail,
+            "无法核对业务来源与插件方法授权。",
+            Some("修正项目配置或签名来源策略，再重新执行部署自检。"),
+        ));
+    } else if facts.plugin_route_count == 0 {
+        items.push(item(
+            "plugin-route-policy",
+            "业务与原生能力授权",
+            DeploymentCheckStatus::Info,
+            "当前没有需要核对授权的插件调用路由。",
+            None,
+        ));
+    } else if facts.uncovered_business_origins > 0 || facts.uncovered_plugin_routes > 0 {
+        items.push(item(
+            "plugin-route-policy",
+            "业务与原生能力授权",
+            DeploymentCheckStatus::Fail,
+            format!(
+                "有 {} 个业务来源无法调用任何已安装能力，另有 {} 条插件调用路由未被任何当前业务来源授权。",
+                facts.uncovered_business_origins, facts.uncovered_plugin_routes
+            ),
+            Some("按项目实际调用范围更新并重新签署来源策略；不要用通配授权绕过漏项。"),
+        ));
+    } else {
+        items.push(item(
+            "plugin-route-policy",
+            "业务与原生能力授权",
+            DeploymentCheckStatus::Pass,
+            format!(
+                "已核对 {} 条来源/插件授权组合，其中 {} 条获得授权；每个业务来源和插件路由均有有效覆盖。",
+                facts.evaluated_policy_grants, facts.authorized_policy_grants
             ),
             None,
         ));
@@ -357,6 +424,14 @@ mod tests {
             active_trust_keys: 1,
             plugin_count: 2,
             service_count: 4,
+            active_service_count: 4,
+            plugin_route_count: 6,
+            evaluated_policy_grants: 12,
+            authorized_policy_grants: 6,
+            uncovered_business_origins: 0,
+            uncovered_plugin_routes: 0,
+            route_policy_error: None,
+            plugin_inventory_error: None,
             plugin_load_failures: 0,
             plugin_preflight_failures: 0,
             x86_host_available: true,
@@ -398,6 +473,8 @@ mod tests {
     fn optional_operational_gaps_are_warnings_not_false_failures() {
         let mut facts = healthy_facts();
         facts.service_count = 0;
+        facts.active_service_count = 0;
+        facts.plugin_route_count = 0;
         facts.plugin_count = 0;
         facts.plugin_preflight_failures = 2;
         facts.diagnostics_available = false;
@@ -420,5 +497,39 @@ mod tests {
         assert!(report.items.iter().any(|item| {
             item.id == "plugin-hosts" && item.status == DeploymentCheckStatus::Info
         }));
+    }
+
+    #[test]
+    fn route_drift_and_policy_gaps_block_false_delivery_readiness() {
+        let mut route_drift = healthy_facts();
+        route_drift.active_service_count = 3;
+        let report = evaluate(&route_drift);
+        assert!(!report.ready);
+        assert!(report.items.iter().any(|item| {
+            item.id == "plugin-inventory" && item.status == DeploymentCheckStatus::Fail
+        }));
+
+        let mut policy_gap = healthy_facts();
+        policy_gap.uncovered_business_origins = 1;
+        policy_gap.uncovered_plugin_routes = 2;
+        let report = evaluate(&policy_gap);
+        assert!(!report.ready);
+        assert!(report.items.iter().any(|item| {
+            item.id == "plugin-route-policy" && item.status == DeploymentCheckStatus::Fail
+        }));
+    }
+
+    #[test]
+    fn report_does_not_return_sensitive_error_details() {
+        let mut facts = healthy_facts();
+        facts.config_error = Some("invalid http://private.example/app".to_owned());
+        facts.origin_policy_error = Some("unauthorized http://private.example".to_owned());
+        facts.plugin_inventory_error = Some("failed at C:\\private\\plugins".to_owned());
+        facts.route_policy_error = Some("reader.secretMethod is unauthorized".to_owned());
+
+        let encoded = serde_json::to_string(&evaluate(&facts)).unwrap();
+        assert!(!encoded.contains("private.example"));
+        assert!(!encoded.contains("private\\\\plugins"));
+        assert!(!encoded.contains("secretMethod"));
     }
 }

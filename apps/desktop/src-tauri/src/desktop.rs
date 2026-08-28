@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ssdev_config::{ConfigStore, DesktopConfig};
-use ssdev_origin_policy::{OriginPolicy, OriginPolicySummary};
+use ssdev_origin_policy::{InvocationPolicyCoverage, OriginPolicy, OriginPolicySummary};
 use tauri::ipc::CapabilityBuilder;
 use tauri::menu::{Menu, MenuBuilder, SubmenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -19,6 +19,7 @@ use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_opener::OpenerExt;
 use url::Url;
+use webplus_plugin_config::PluginManifest;
 
 pub(crate) const BUSINESS_LABEL_PREFIX: &str = "business-";
 const FLOATING_LABEL_PREFIX: &str = "floating-";
@@ -70,6 +71,31 @@ impl DesktopState {
     pub(crate) fn authorize_config(&self, config: &DesktopConfig) -> Result<(), String> {
         self.origin_policy
             .authorize(config)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn plugin_route_policy_coverage(
+        &self,
+        config: &DesktopConfig,
+        manifests: &[PluginManifest],
+    ) -> Result<InvocationPolicyCoverage, String> {
+        self.authorize_config(config)?;
+        let origins = config
+            .business_origins()
+            .map_err(|error| error.to_string())?;
+        let mut routes = BTreeSet::new();
+        for manifest in manifests {
+            for service in &manifest.services {
+                for method in &service.methods {
+                    routes.insert((service.service_id.clone(), method.name.clone()));
+                    if let Some(alias) = &method.alias {
+                        routes.insert((service.service_id.clone(), alias.clone()));
+                    }
+                }
+            }
+        }
+        self.origin_policy
+            .invocation_coverage(&origins, &routes)
             .map_err(|error| error.to_string())
     }
 
@@ -1839,5 +1865,49 @@ mod tests {
         .build()
         .unwrap();
         assert!(require_plugin_invocation(&attacker, &state, "ci.health", "probe").is_err());
+    }
+
+    #[test]
+    fn deployment_coverage_includes_canonical_and_alias_plugin_routes() {
+        let policy = OriginPolicy::from_unsigned_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "businessGrants": [{
+                    "origin": "https://business.example.test",
+                    "services": [{"serviceId": "reader", "methods": ["read"]}]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.json");
+        let config = DesktopConfig {
+            website: Some("https://business.example.test/app".into()),
+            ..DesktopConfig::default()
+        };
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let store = ConfigStore::open(&config_path, Vec::<PathBuf>::new()).unwrap();
+        let state = DesktopState::new(store, policy);
+        let plugin = directory.path().join("reader-plugin");
+        fs::create_dir(&plugin).unwrap();
+        fs::write(
+            plugin.join("api.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "serviceId": "reader",
+                "mainClass": "reader.dll",
+                "methods": [{"name": "read", "alias": "readCard"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("reader-plugin", &plugin).unwrap();
+
+        let coverage = state
+            .plugin_route_policy_coverage(&config, &[manifest])
+            .unwrap();
+        assert_eq!(coverage.route_count, 2);
+        assert_eq!(coverage.authorized_grant_count, 1);
+        assert_eq!(coverage.uncovered_route_count, 1);
     }
 }

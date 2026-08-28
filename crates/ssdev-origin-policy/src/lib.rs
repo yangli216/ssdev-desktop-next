@@ -74,6 +74,16 @@ pub struct OriginPolicySummary {
     pub allow_insecure_http: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvocationPolicyCoverage {
+    pub origin_count: usize,
+    pub route_count: usize,
+    pub evaluated_grant_count: usize,
+    pub authorized_grant_count: usize,
+    pub uncovered_origin_count: usize,
+    pub uncovered_route_count: usize,
+}
+
 impl OriginPolicy {
     pub fn load(
         policy_path: &Path,
@@ -194,6 +204,43 @@ impl OriginPolicy {
                 method: method.to_owned(),
             })
         }
+    }
+
+    pub fn invocation_coverage(
+        &self,
+        origins: &BTreeSet<String>,
+        routes: &BTreeSet<(String, String)>,
+    ) -> Result<InvocationPolicyCoverage, OriginPolicyError> {
+        let mut covered_origins = BTreeSet::new();
+        let mut covered_routes = BTreeSet::new();
+        let mut evaluated_grant_count = 0_usize;
+        let mut authorized_grant_count = 0_usize;
+        for origin in origins {
+            for (service_id, method) in routes {
+                evaluated_grant_count = evaluated_grant_count.saturating_add(1);
+                match self.authorize_plugin_invocation(origin, service_id, method) {
+                    Ok(()) => {
+                        authorized_grant_count = authorized_grant_count.saturating_add(1);
+                        covered_origins.insert(origin.clone());
+                        covered_routes.insert((service_id.clone(), method.clone()));
+                    }
+                    Err(
+                        OriginPolicyError::Unauthorized { .. }
+                        | OriginPolicyError::UnauthorizedService { .. }
+                        | OriginPolicyError::UnauthorizedMethod { .. },
+                    ) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(InvocationPolicyCoverage {
+            origin_count: origins.len(),
+            route_count: routes.len(),
+            evaluated_grant_count,
+            authorized_grant_count,
+            uncovered_origin_count: origins.len().saturating_sub(covered_origins.len()),
+            uncovered_route_count: routes.len().saturating_sub(covered_routes.len()),
+        })
     }
 
     pub fn summary(&self) -> OriginPolicySummary {
@@ -587,6 +634,28 @@ mod tests {
     }
 
     #[test]
+    fn invocation_coverage_detects_unreachable_origins_and_plugin_routes() {
+        let policy = load_signed(policy_document()).unwrap();
+        let origins = BTreeSet::from([
+            "https://business.example.test".to_owned(),
+            "https://unconfigured.example.test".to_owned(),
+        ]);
+        let routes = BTreeSet::from([
+            ("reader".to_owned(), "read".to_owned()),
+            ("reader".to_owned(), "delete".to_owned()),
+            ("printer".to_owned(), "print".to_owned()),
+        ]);
+
+        let coverage = policy.invocation_coverage(&origins, &routes).unwrap();
+        assert_eq!(coverage.origin_count, 2);
+        assert_eq!(coverage.route_count, 3);
+        assert_eq!(coverage.evaluated_grant_count, 6);
+        assert_eq!(coverage.authorized_grant_count, 2);
+        assert_eq!(coverage.uncovered_origin_count, 1);
+        assert_eq!(coverage.uncovered_route_count, 1);
+    }
+
+    #[test]
     fn http_requires_an_explicit_signed_policy_exception() {
         let mut denied = policy_document();
         denied["businessGrants"][0]["origin"] = json!("http://legacy.example.test");
@@ -626,6 +695,18 @@ mod tests {
             .unwrap();
         assert!(policy.summary().allow_configured_business_origins);
         assert!(policy.summary().allow_insecure_http);
+        let coverage = policy
+            .invocation_coverage(
+                &BTreeSet::from(["http://10.17.5.57".to_owned()]),
+                &BTreeSet::from([
+                    ("project.reader".to_owned(), "read".to_owned()),
+                    ("project.printer".to_owned(), "print".to_owned()),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(coverage.authorized_grant_count, 2);
+        assert_eq!(coverage.uncovered_origin_count, 0);
+        assert_eq!(coverage.uncovered_route_count, 0);
     }
 
     #[test]
