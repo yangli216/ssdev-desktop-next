@@ -91,6 +91,8 @@ type DeploymentCheckReport = {
 type ProjectBundlePreview = {
   schemaVersion: number
   createdByVersion: string
+  signatureVerified: boolean
+  signatureKeyId?: string
   businessOrigins: number
   signedPlugins: number
   localMappings: number
@@ -342,7 +344,7 @@ async function exportProjectBundle() {
     result = await invoke<{ bytes: number; signedPlugins: number; localMappings: number }>('export_project_bundle', { destination })
   }, '')
   if (result) {
-    notice.value = `项目部署包已导出（${(result.bytes / 1024 / 1024).toFixed(1)} MiB）：${result.signedPlugins} 个签名插件，${result.localMappings} 个本地映射。`
+    notice.value = `项目部署包草稿已导出（${(result.bytes / 1024 / 1024).toFixed(1)} MiB）：${result.signedPlugins} 个签名插件，${result.localMappings} 个本地映射。正式交付前请使用组织签名工具生成同目录旁签文件。`
   }
 }
 
@@ -358,7 +360,7 @@ async function inspectProjectBundle() {
     selectedProjectBundle.value = ''
     projectBundlePreview.value = await invoke<ProjectBundlePreview>('inspect_project_bundle', { source })
     selectedProjectBundle.value = source
-  }, '项目包完整性、插件签名、来源授权覆盖、联合路由和宿主架构预检均已通过。')
+  }, '项目包预检已完成；组织签名状态、组件、来源授权、联合路由和宿主结果见下方预览。')
 }
 
 async function importSelectedProjectBundle() {
@@ -685,10 +687,10 @@ async function runDeploymentCheck() {
       <section v-show="activeSection === 'configuration'" class="page" aria-labelledby="configuration-title">
         <header class="section-header"><div><p class="eyebrow">PROJECT CONFIGURATION</p><h1 id="configuration-title">项目配置</h1><p>管理业务环境、来源边界和桌面启动行为。</p></div><div class="header-actions"><button type="button" :disabled="busy" @click="importConfig">导入配置</button><button type="button" :disabled="busy" @click="exportConfig">导出配置</button></div></header>
         <section class="project-bundle-panel">
-          <div class="project-bundle-copy"><p class="eyebrow">PROJECT DELIVERY</p><h2>项目部署包</h2><p>将当前配置、签名插件和本地映射作为一个交付单元迁移到目标 Windows 机器。</p></div>
+          <div class="project-bundle-copy"><p class="eyebrow">PROJECT DELIVERY</p><h2>项目部署包</h2><p>将当前配置、签名插件和本地映射作为一个交付单元迁移到目标 Windows 机器；正式导入要求同目录组织签名旁签。</p></div>
           <div class="project-bundle-actions"><button type="button" :disabled="busy" @click="exportProjectBundle">导出当前项目</button><button class="primary" type="button" :disabled="busy" @click="inspectProjectBundle">选择项目包并预检</button></div>
           <div v-if="projectBundlePreview" class="project-bundle-preview">
-            <header><div><strong>预检通过，可以导入</strong><small>由客户端 {{ projectBundlePreview.createdByVersion }} 创建 · schema {{ projectBundlePreview.schemaVersion }}</small></div><button class="primary" type="button" :disabled="busy" @click="importSelectedProjectBundle">确认导入并切换项目</button></header>
+            <header><div><strong>预检通过，可以导入</strong><small>由客户端 {{ projectBundlePreview.createdByVersion }} 创建 · schema {{ projectBundlePreview.schemaVersion }} · {{ projectBundlePreview.signatureVerified ? `组织签名 ${projectBundlePreview.signatureKeyId}` : '调试态未签名' }}</small></div><button class="primary" type="button" :disabled="busy" @click="importSelectedProjectBundle">确认导入并切换项目</button></header>
             <div class="bundle-summary"><span><strong>{{ projectBundlePreview.businessOrigins }}</strong>业务来源</span><span><strong>{{ projectBundlePreview.signedPlugins }}</strong>签名插件</span><span><strong>{{ projectBundlePreview.localMappings }}</strong>本地映射</span><span><strong>{{ projectBundlePreview.serviceCount }}</strong>原生服务</span><span><strong>{{ projectBundlePreview.preflightedHosts }}</strong>宿主预检</span></div>
             <ul><li v-for="component in projectBundlePreview.components" :key="component.pluginId"><span><strong>{{ component.pluginId }}</strong><small>{{ component.source === 'signed-package' ? `签名插件 ${component.version ?? ''}` : '本地动态映射' }}</small></span><em>{{ component.serviceCount }} 个服务</em></li></ul>
           </div>

@@ -63,6 +63,7 @@ pub enum TrustPurpose {
     CutoverEvidence,
     Plugin,
     PluginCatalog,
+    ProjectBundle,
     OriginPolicy,
     ProcessPolicy,
 }
@@ -74,6 +75,7 @@ impl TrustPurpose {
             Self::CutoverEvidence => "cutover-evidence",
             Self::Plugin => "plugin",
             Self::PluginCatalog => "plugin-catalog",
+            Self::ProjectBundle => "project-bundle",
             Self::OriginPolicy => "origin-policy",
             Self::ProcessPolicy => "process-policy",
         }

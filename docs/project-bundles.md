@@ -5,8 +5,8 @@
 ## 控制台流程
 
 1. 在配置机完成项目地址、签名插件和本地映射配置，并确保部署自检没有阻塞项。
-2. 在“项目配置 → 项目部署包”导出当前项目。
-3. 在目标机器选择项目包。此时只执行读取、验签、路由检查和宿主预检，不修改当前项目。
+2. 在“项目配置 → 项目部署包”导出当前项目草稿，并由组织发布系统生成同目录 detached 签名封套。
+3. 将 `.ssdev-project` 和对应的 `.ssdev-project.sig.json` 一起交付，在目标机器选择项目包。此时只执行读取、组织签名、组件验签、路由检查和宿主预检，不修改当前项目。
 4. 查看业务来源、插件、映射、服务和宿主预检数量后，确认导入。
 5. 导入完成后重新执行部署自检并打开真实业务环境。
 
@@ -21,13 +21,36 @@
 
 项目包最多包含 128 个组件，单组件最大 1 GiB，容器及解压内容最大 4 GiB。读取过程拒绝覆盖、重复条目、未声明文件、路径穿越、符号链接、特殊文件、摘要不一致和非规范插件 ID。
 
-项目包清单本身不是新的发布签名格式。签名插件仍必须逐个通过组织 Ed25519 信任链；本地映射和项目配置仍属于本机管理员能力，与控制台原有的 JSON 配置导入和映射导入权限一致。不要从不可信渠道接收项目包。正式分发如需审批签名，应在后续版本复用组织外部签名流程对项目清单增加独立用途，不能把私钥放进客户端。
+项目包使用独立的 `project-bundle` 信任用途，签名 payload 为 ASCII `SSDEV-PROJECT-BUNDLE`、一个 `0x00` 字节，再拼接整个 `.ssdev-project` 原始文件的 SHA-256（二进制 32 字节）。因此配置、本地映射、内部签名插件、清单、ZIP 元数据或重新封包中的任意变化都会使旁签失效；内部签名插件仍会逐个执行自身的组织签名和完整文件清单验证，两层信任不能相互替代。
+
+控制台只导出未签名草稿，不持有生产私钥。正式交付使用 [统一发布文档签名](release-signing.md) 的外部 KMS/HSM 流程：
+
+```powershell
+cargo run --locked -p ssdev-release-signing -- prepare `
+  --kind project-bundle `
+  --document C:\secure-release\clinic.ssdev-project `
+  --key-id project-delivery-2026-01 `
+  --trust-store C:\secure-build-inputs\plugin-trust.json `
+  --request C:\secure-release\clinic.project.signing-request.json
+
+# KMS/HSM 对请求中的 payloadBase64 解码结果签名后：
+cargo run --locked -p ssdev-release-signing -- finalize `
+  --kind project-bundle `
+  --document C:\secure-release\clinic.ssdev-project `
+  --request C:\secure-release\clinic.project.signing-request.json `
+  --signature C:\secure-signing-output\clinic.project.sig.base64 `
+  --trust-store C:\secure-build-inputs\plugin-trust.json `
+  --envelope C:\secure-release\clinic.ssdev-project.sig.json
+```
+
+正式客户端按固定规则在项目包同目录查找 `<完整项目包文件名>.sig.json`，例如 `clinic.ssdev-project.sig.json`。缺少封套、用途不匹配、签名无效、密钥已吊销或项目包在读取期间变化时，预检会失败关闭；运行时为计划轮换继续接受 `retired` 有效签名。只有显式启用未签名插件的 Debug 模式可预检未签名项目包，不能用于正式交付。
 
 ## 预检与导入语义
 
 只读预检在修改目标机器前完成以下工作：
 
 - 校验项目配置和当前来源策略；
+- 验证覆盖整个项目包的 `project-bundle` 组织签名；
 - 核对组件清单、大小和 SHA-256；
 - 验证每个发布插件的身份、版本、完整文件清单和签名密钥状态；
 - 拒绝默认插件降级；

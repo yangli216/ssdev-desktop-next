@@ -4430,6 +4430,7 @@ dependencies = [
  "ssdev-origin-policy",
  "ssdev-plugin-tool",
  "ssdev-process-policy",
+ "ssdev-project-bundle",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -4546,6 +4547,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssdev-project-bundle"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "sha2",
+ "ssdev-config",
+ "tempfile",
+ "webplus-plugin-trust",
+ "zip 8.6.0",
+]
+
+[[package]]
 name = "ssdev-release-manifest"
 version = "0.1.0"
 dependencies = [
@@ -4565,9 +4581,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "ssdev-config",
  "ssdev-cutover-evidence",
  "ssdev-origin-policy",
  "ssdev-process-policy",
+ "ssdev-project-bundle",
  "tempfile",
  "thiserror 2.0.20",
  "webplus-plugin-repository",

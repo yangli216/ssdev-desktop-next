@@ -152,6 +152,7 @@ fn required_purposes(options: &HashMap<String, String>) -> Result<Vec<TrustPurpo
             "cutover-evidence" => TrustPurpose::CutoverEvidence,
             "plugin" => TrustPurpose::Plugin,
             "plugin-catalog" => TrustPurpose::PluginCatalog,
+            "project-bundle" => TrustPurpose::ProjectBundle,
             "origin-policy" => TrustPurpose::OriginPolicy,
             "process-policy" => TrustPurpose::ProcessPolicy,
             _ => return Err(format!("不支持的信任用途 [{value}]")),
@@ -168,7 +169,7 @@ fn required_purposes(options: &HashMap<String, String>) -> Result<Vec<TrustPurpo
 }
 
 fn usage() -> &'static str {
-    "用法:\n  ssdev-release-signing prepare --kind <cutover-decision|plugin-matrix-evidence|migration-audit-evidence|windows-package-evidence|origin-policy|process-policy|plugin-catalog> --document FILE --key-id ID --trust-store FILE --request FILE\n  ssdev-release-signing finalize --kind KIND --document FILE --request FILE --signature FILE --trust-store FILE --envelope FILE\n  ssdev-release-signing verify --kind KIND --document FILE --envelope FILE --trust-store FILE\n  ssdev-release-signing verify-trust-store --trust-store FILE --required-purposes plugin,origin-policy"
+    "用法:\n  ssdev-release-signing prepare --kind <cutover-decision|plugin-matrix-evidence|migration-audit-evidence|windows-package-evidence|origin-policy|process-policy|plugin-catalog|project-bundle> --document FILE --key-id ID --trust-store FILE --request FILE\n  ssdev-release-signing finalize --kind KIND --document FILE --request FILE --signature FILE --trust-store FILE --envelope FILE\n  ssdev-release-signing verify --kind KIND --document FILE --envelope FILE --trust-store FILE\n  ssdev-release-signing verify-trust-store --trust-store FILE --required-purposes plugin,origin-policy,project-bundle"
 }
 
 #[cfg(test)]

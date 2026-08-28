@@ -24,6 +24,7 @@ ssdev-diagnostics.workspace = true
 ssdev-invocation-ledger.workspace = true
 ssdev-origin-policy.workspace = true
 ssdev-process-policy.workspace = true
+ssdev-project-bundle.workspace = true
 tauri = { workspace = true, features = ["tray-icon"] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-dialog.workspace = true

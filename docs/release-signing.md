@@ -1,12 +1,13 @@
 # 统一发布文档签名
 
-`ssdev-release-signing` 为七类 detached Ed25519 发布文档提供同一条受控流水线：
+`ssdev-release-signing` 为八类 detached Ed25519 发布制品提供同一条受控流水线：
 
 | `--kind` | 信任用途 | 文档 |
 | --- | --- | --- |
 | `origin-policy` | `origin-policy` | `origin-policy.json` |
 | `process-policy` | `process-policy` | `process-policy.json` |
 | `plugin-catalog` | `plugin-catalog` | 插件仓库 `catalog.json` |
+| `project-bundle` | `project-bundle` | 项目交付 `.ssdev-project` |
 | `cutover-decision` | `cutover-decision` | 生产切换 `cutover-decision.json` |
 | `plugin-matrix-evidence` | `cutover-evidence` | 真实插件黄金矩阵证据 |
 | `migration-audit-evidence` | `cutover-evidence` | 生产流程迁移审计证据 |
@@ -19,7 +20,7 @@
 ```powershell
 cargo run --locked -p ssdev-release-signing -- verify-trust-store `
   --trust-store C:\secure-build-inputs\plugin-trust.json `
-  --required-purposes plugin,origin-policy
+  --required-purposes plugin,origin-policy,project-bundle
 ```
 
 该入口使用运行时相同的严格 schema 解析，并要求列出的用途和信任库中其他已声明用途都至少有一把 `active` 密钥。Windows 构建与安装包验收直接复用它，不在 PowerShell 中复制状态判断。
@@ -42,10 +43,11 @@ cargo run --locked -p ssdev-release-signing -- prepare `
 - 来源策略检查 schema 2、精确 origin/service/method、重复项、通配符和 HTTP 例外；
 - 进程策略检查固定绝对路径、参数上限、SHA-256 格式、重复 ID 和条目上限；
 - 插件目录检查 schema、SemVer、HTTPS URL、包大小/摘要、重复版本，以及当前签发/过期时间和最长 31 天有效期。目录本身应先由 `ssdev-plugin-tool catalog` 从已验签包生成，避免人工录入包字段。
+- 项目包先通过与客户端相同的受限 ZIP、配置、组件清单、大小和摘要校验，再对整个原始 `.ssdev-project` 文件建立独立域签名；审核摘要只公开创建版本、组件分类计数、包大小和 SHA-256。
 - 切换决策检查严格 schema、源码提交、应用版本、策略/信任库/三份证据/三个封套摘要和阻塞码一致性；只有 `eligible: true` 的 `GO` 决策可以进入签名请求，且请求、封套和独立验证的 keyId 都必须等于策略选定的 `approvalSignerKeyId`。`NO-GO` 决策只能归档，不能获准发布。
 - 三类执行证据分别检查自身严格 schema、来源提交、执行环境、输入摘要、覆盖与结果一致性，并使用不同域分隔 payload；插件矩阵 schema 2 的审核摘要额外公开 `packageSetSha256`，把硬件结论绑定到批准的确定性包集合。它们共享 `cutover-evidence` 用途，但生产策略可为每类证据指定不同 `keyId` 以隔离 QA 职责。
 
-请求文件明确记录 `artifactKind`、对应 `trustPurpose`、`keyId`、文档摘要、待签字节及其摘要，并给出不含敏感内容的审核摘要。来源策略摘要包含授权来源/服务/方法数量和 HTTP 例外状态；进程策略包含条目数；插件目录包含签发时间、过期时间和条目数；执行证据包含源码提交与关键覆盖/结果计数；切换决策包含源码提交、应用版本和判定时间。
+请求文件明确记录 `artifactKind`、对应 `trustPurpose`、`keyId`、文档摘要、待签字节及其摘要，并给出不含敏感内容的审核摘要。来源策略摘要包含授权来源/服务/方法数量和 HTTP 例外状态；进程策略包含条目数；插件目录包含签发时间、过期时间和条目数；项目包包含创建版本、组件分类计数、包大小和摘要；执行证据包含源码提交与关键覆盖/结果计数；切换决策包含源码提交、应用版本和判定时间。
 
 所有输出必须是尚不存在的新文件，父目录必须预先存在且不能是符号链接。工具不会覆盖旧请求或封套。
 
@@ -91,5 +93,6 @@ cargo run --locked -p ssdev-release-signing -- verify `
 
 - 进程策略签名只证明策略语义和固定摘要未被篡改。目标机器仍会在每次启动前读取实际可执行文件并重新计算 SHA-256；部署门禁必须验证目标绝对路径、权限和工作目录。
 - 插件目录签名只证明索引本身。客户端仍会校验 HTTPS、下载字节数/摘要、插件内部签名、候选宿主预检和真实硬件黄金矩阵。
+- 项目包签名绑定整个交付容器和发布者身份，但不会把本地映射提升为通用组织插件。客户端仍会验证每个签名插件、当前来源授权、联合路由、目标架构宿主，并在确认前保持目标机器不变。
 - 应用更新与 bundle 产物使用 Tauri Minisign/Authenticode，不复用本工具的 Ed25519 封套或密钥。
 - `cutover-decision` 签名证明具备独立用途的审批密钥批准了某一精确 `GO` 文档；验证方仍应保留并按文档中的 SHA-256 复核原始策略与三份证据。

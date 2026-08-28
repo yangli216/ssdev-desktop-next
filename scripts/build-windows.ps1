@@ -252,9 +252,9 @@ try {
   try {
     cargo run --locked -p ssdev-release-signing -- verify-trust-store `
       --trust-store $bundledTrustStore `
-      --required-purposes plugin,origin-policy
+      --required-purposes plugin,origin-policy,project-bundle
     if ($LASTEXITCODE -ne 0) {
-      throw "Production trust store is not ready for plugin and origin-policy issuance."
+      throw "Production trust store is not ready for plugin, origin-policy, and project-bundle issuance."
     }
   } finally {
     Pop-Location

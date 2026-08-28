@@ -13,7 +13,6 @@ mod desktop;
 mod invocations;
 mod local_mappings;
 mod project_activation;
-mod project_bundle;
 mod shortcuts;
 mod sso;
 
@@ -40,6 +39,7 @@ use ssdev_invocation_ledger::{
 };
 use ssdev_origin_policy::{OriginPolicy, OriginPolicySummary};
 use ssdev_process_policy::ProcessPolicy;
+use ssdev_project_bundle as project_bundle;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_global_shortcut::Builder as ShortcutBuilder;
@@ -353,6 +353,8 @@ struct ProjectBundleExportResult {
 struct ProjectBundlePreview {
     schema_version: u8,
     created_by_version: String,
+    signature_verified: bool,
+    signature_key_id: Option<String>,
     business_origins: usize,
     signed_plugins: usize,
     local_mappings: usize,
@@ -837,15 +839,20 @@ async fn prepare_project_bundle(
     state: &BridgeState,
     desktop_state: &desktop::DesktopState,
 ) -> Result<PreparedProjectBundle, String> {
-    let opened = tokio::task::spawn_blocking(move || project_bundle::open(&source))
-        .await
-        .map_err(|_| "项目包读取任务异常终止".to_owned())??;
+    let strict_signature = state.plugin_trust_mode != "debug-unsigned";
+    let trust_store = state.trust_store.clone();
+    let (opened, signature_verified, signature_key_id) = tokio::task::spawn_blocking(move || {
+        open_project_bundle_for_mode(&source, trust_store.as_deref(), strict_signature)
+    })
+    .await
+    .map_err(|_| "项目包读取任务异常终止".to_owned())??;
     desktop_state.authorize_config(&opened.config)?;
     let business_origins = opened
         .config
         .business_origins()
         .map_err(|error| error.to_string())?
         .len();
+    let schema_version = opened.schema_version();
     let created_by_version = opened.created_by_version().to_owned();
     let specifications = opened
         .components()
@@ -1007,8 +1014,10 @@ async fn prepare_project_bundle(
         config: opened.config,
         components,
         preview: ProjectBundlePreview {
-            schema_version: 1,
+            schema_version,
             created_by_version,
+            signature_verified,
+            signature_key_id,
             business_origins,
             signed_plugins,
             local_mappings,
@@ -1017,6 +1026,21 @@ async fn prepare_project_bundle(
             components: previews,
         },
     })
+}
+
+fn open_project_bundle_for_mode(
+    source: &std::path::Path,
+    trust_store: Option<&TrustStore>,
+    strict_signature: bool,
+) -> Result<(project_bundle::OpenedProjectBundle, bool, Option<String>), String> {
+    if strict_signature {
+        let trust_store = trust_store.ok_or_else(|| "正式项目包要求启用组织签名信任".to_owned())?;
+        let signature = project_bundle::signature_path(source)?;
+        project_bundle::open_verified(source, &signature, trust_store)
+            .map(|(opened, verified)| (opened, true, Some(verified.key_id)))
+    } else {
+        project_bundle::open(source).map(|opened| (opened, false, None))
+    }
 }
 
 #[derive(Serialize)]
@@ -2771,11 +2795,12 @@ fn select_runtime_path(
 mod tests {
     use super::{
         ensure_upgrade_allowed, is_plugin_update_available, legacy_config_candidates,
-        select_runtime_path, service_inventory_item,
+        open_project_bundle_for_mode, project_bundle, select_runtime_path, service_inventory_item,
     };
     use semver::Version;
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
     use webplus_plugin_config::ServiceDefinition;
+    use webplus_plugin_trust::TrustStore;
 
     #[test]
     fn plugin_install_rejects_downgrade_but_allows_repair() {
@@ -2887,5 +2912,29 @@ mod tests {
         assert!(candidates.contains(&PathBuf::from(
             r"C:\dir\bsoft\rbmh-desktop-config\config.json"
         )));
+    }
+
+    #[test]
+    fn formal_project_import_requires_the_fixed_signature_sidecar() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("clinic.ssdev-project");
+        project_bundle::create(
+            &project,
+            &ssdev_config::DesktopConfig::default(),
+            "1.2.3",
+            Vec::new(),
+        )
+        .unwrap();
+        let trust_path = root.path().join("trust.json");
+        fs::write(&trust_path, br#"{"schemaVersion":2,"keys":[]}"#).unwrap();
+        let trust = TrustStore::load(&trust_path).unwrap();
+
+        let error = open_project_bundle_for_mode(&project, Some(&trust), true)
+            .err()
+            .unwrap();
+        assert!(error.contains("签名封套"));
+        let (_, verified, key_id) = open_project_bundle_for_mode(&project, None, false).unwrap();
+        assert!(!verified);
+        assert!(key_id.is_none());
     }
 }

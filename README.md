@@ -30,7 +30,7 @@ business webview -> narrow Tauri command -> Rust controller
 无需重新编译客户端的 DLL/COM 可视化配置、热加载、现场调试和本地映射包迁移见 [docs/local-mapping-studio.md](docs/local-mapping-studio.md)。
 从 Rust 封装 Win32 API、x86/x64 映射、网页调用到外部签名封包和更新发布的完整示例见 [examples/windows-system-plugin](examples/windows-system-plugin/README.md)。
 旧插件从安全暂存、外部签名、确定性封包到黄金矩阵草稿的发布流程见 [docs/plugin-release.md](docs/plugin-release.md)。
-业务来源策略、受控进程策略和插件目录共用的外部 Ed25519 发布签名流程见 [docs/release-signing.md](docs/release-signing.md)。
+业务来源策略、受控进程策略、插件目录和项目部署包共用的外部 Ed25519 发布签名流程见 [docs/release-signing.md](docs/release-signing.md)。
 签名插件仓库协议见 [docs/plugin-repository.md](docs/plugin-repository.md)。
 声明式快捷键与签名进程策略见 [docs/desktop-policies.md](docs/desktop-policies.md)。
 业务 WebView 的发布方签名来源边界见 [docs/origin-policy.md](docs/origin-policy.md)：正式策略使用 schema 2，把权限精确收敛到 origin、service 和 method，拒绝无范围或通配授权。
@@ -45,7 +45,7 @@ Go WebPlus 的逐项替代决策见 [docs/webplus-parity.md](docs/webplus-parity
 Windows 安装包与源码提交、锁文件和工具链的签名绑定见 [docs/release-provenance.md](docs/release-provenance.md)。
 有界结构化日志、隐私契约和本地诊断包导出见 [docs/diagnostics.md](docs/diagnostics.md)。
 项目交付前的一键环境检查、阻塞条件和处理建议见 [docs/deployment-check.md](docs/deployment-check.md)。
-将项目配置、签名插件、本地映射和联合路由作为一个可崩溃恢复的原子单元迁移到目标机器，见 [docs/project-bundles.md](docs/project-bundles.md)。
+将项目配置、签名插件、本地映射和联合路由作为一个有组织旁签、可崩溃恢复的原子单元迁移到目标机器，见 [docs/project-bundles.md](docs/project-bundles.md)。
 锁文件、官方 npm 源、固定 GitHub Action 提交和定期漏洞审计要求见 [docs/supply-chain-security.md](docs/supply-chain-security.md)。
 
 仓库内的 `plugin-trust.json` 默认没有任何公钥，因此生产接入真实插件前必须由发布流水线注入组织公钥。每把公钥除用途外还具有 `active`、`retired` 或 `revoked` 生命周期；新发布只接受 active，retired 用于计划轮换并停止官方新签发，revoked 用于泄露后让运行时立即拒绝。旧版把 RSA 私钥放进客户端的 `license.dat` 校验方式不会沿用。

@@ -100,7 +100,7 @@ reader-plugin.ssdev-plugin
 }
 ```
 
-允许的用途只有 `plugin`、`plugin-catalog`、`origin-policy`、`process-policy`、`cutover-evidence` 和 `cutover-decision`。生产环境应为运行时信任、仓库发布、QA 执行证明和切换审批使用不同密钥；确需合并时必须在 `purposes` 中显式列出，不能因为公钥存在就跨用途验签。
+允许的用途只有 `plugin`、`plugin-catalog`、`project-bundle`、`origin-policy`、`process-policy`、`cutover-evidence` 和 `cutover-decision`。生产环境应为插件运行时、仓库发布、项目交付、QA 执行证明和切换审批使用不同密钥；确需合并时必须在 `purposes` 中显式列出，不能因为公钥存在就跨用途验签。
 
 `status` 用于管理密钥生命周期：
 

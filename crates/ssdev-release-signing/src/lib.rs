@@ -33,6 +33,7 @@ pub enum ArtifactKind {
     PluginMatrixEvidence,
     ProcessPolicy,
     PluginCatalog,
+    ProjectBundle,
     WindowsPackageEvidence,
 }
 
@@ -46,6 +47,7 @@ impl ArtifactKind {
             Self::OriginPolicy => TrustPurpose::OriginPolicy,
             Self::ProcessPolicy => TrustPurpose::ProcessPolicy,
             Self::PluginCatalog => TrustPurpose::PluginCatalog,
+            Self::ProjectBundle => TrustPurpose::ProjectBundle,
         }
     }
 
@@ -57,6 +59,7 @@ impl ArtifactKind {
             Self::PluginMatrixEvidence => "plugin-matrix-evidence",
             Self::ProcessPolicy => "process-policy",
             Self::PluginCatalog => "plugin-catalog",
+            Self::ProjectBundle => "project-bundle",
             Self::WindowsPackageEvidence => "windows-package-evidence",
         }
     }
@@ -73,6 +76,7 @@ impl std::str::FromStr for ArtifactKind {
             "plugin-matrix-evidence" => Ok(Self::PluginMatrixEvidence),
             "process-policy" => Ok(Self::ProcessPolicy),
             "plugin-catalog" => Ok(Self::PluginCatalog),
+            "project-bundle" => Ok(Self::ProjectBundle),
             "windows-package-evidence" => Ok(Self::WindowsPackageEvidence),
             _ => Err(SigningError::Invalid(format!(
                 "unsupported artifact kind [{value}]"
@@ -118,6 +122,13 @@ pub enum ArtifactSummary {
         issued_at: u64,
         expires_at: u64,
         entry_count: usize,
+    },
+    ProjectBundle {
+        created_by_version: String,
+        component_count: usize,
+        signed_plugin_count: usize,
+        local_mapping_count: usize,
+        bundle_bytes: u64,
     },
     PluginMatrixEvidence {
         source_revision: String,
@@ -198,8 +209,7 @@ pub fn prepare(options: &PrepareOptions<'_>) -> Result<SigningReport, SigningErr
     validate_signing_key_id(options.key_id)?;
     TrustStore::load(options.trust_store)?
         .ensure_key_can_issue(options.kind.trust_purpose(), options.key_id)?;
-    let document = read_bounded(options.document, MAX_DOCUMENT_BYTES)?;
-    let material = prepare_material(options.kind, &document, options.now)?;
+    let material = prepare_material_from_path(options.kind, options.document, options.now)?;
     ensure_expected_signer(&material.summary, options.key_id)?;
     let request = SigningRequest {
         schema_version: 1,
@@ -227,10 +237,9 @@ pub fn verify_trust_store(
 
 pub fn finalize(options: &FinalizeOptions<'_>) -> Result<SigningReport, SigningError> {
     ensure_fresh_output(options.envelope, "signature envelope")?;
-    let document = read_bounded(options.document, MAX_DOCUMENT_BYTES)?;
     let request: SigningRequest =
         serde_json::from_slice(&read_bounded(options.request, MAX_REQUEST_BYTES)?)?;
-    validate_request(options.kind, &document, &request, options.now)?;
+    validate_request(options.kind, options.document, &request, options.now)?;
     let signature = read_signature(options.signature)?;
     let envelope = DetachedSignatureDocument::new(&request.key_id, &signature)?;
     let trust_store = TrustStore::load(options.trust_store)?;
@@ -262,11 +271,10 @@ pub fn verify(
     trust_store_path: &Path,
     now: SystemTime,
 ) -> Result<SigningReport, SigningError> {
-    let document = read_bounded(document_path, MAX_DOCUMENT_BYTES)?;
     let envelope_bytes = read_bounded(envelope_path, MAX_REQUEST_BYTES)?;
     let envelope: DetachedSignatureDocument = serde_json::from_slice(&envelope_bytes)?;
     envelope.validate()?;
-    let material = prepare_material(kind, &document, now)?;
+    let material = prepare_material_from_path(kind, document_path, now)?;
     ensure_expected_signer(&material.summary, &envelope.key_id)?;
     let trust_store = TrustStore::load(trust_store_path)?;
     trust_store.verify_detached_for_issuance(
@@ -289,7 +297,7 @@ pub fn verify(
 
 fn validate_request(
     kind: ArtifactKind,
-    document: &[u8],
+    document: &Path,
     request: &SigningRequest,
     now: SystemTime,
 ) -> Result<(), SigningError> {
@@ -302,7 +310,7 @@ fn validate_request(
         ));
     }
     validate_signing_key_id(&request.key_id)?;
-    let material = prepare_material(kind, document, now)?;
+    let material = prepare_material_from_path(kind, document, now)?;
     ensure_expected_signer(&material.summary, &request.key_id)?;
     if request.document_sha256 != material.document_sha256
         || request.payload_base64 != BASE64.encode(&material.payload)
@@ -314,6 +322,32 @@ fn validate_request(
         ));
     }
     Ok(())
+}
+
+fn prepare_material_from_path(
+    kind: ArtifactKind,
+    document: &Path,
+    now: SystemTime,
+) -> Result<Material, SigningError> {
+    if kind == ArtifactKind::ProjectBundle {
+        let material = ssdev_project_bundle::signing_material(document)
+            .map_err(SigningError::ProjectBundle)?;
+        let summary = material.summary;
+        return Ok(Material {
+            document_sha256: summary.bundle_sha256.clone(),
+            payload_sha256: sha256_hex(&material.payload),
+            payload: material.payload,
+            summary: ArtifactSummary::ProjectBundle {
+                created_by_version: summary.created_by_version,
+                component_count: summary.component_count,
+                signed_plugin_count: summary.signed_plugin_count,
+                local_mapping_count: summary.local_mapping_count,
+                bundle_bytes: summary.bundle_bytes,
+            },
+        });
+    }
+    let document = read_bounded(document, MAX_DOCUMENT_BYTES)?;
+    prepare_material(kind, &document, now)
 }
 
 fn prepare_material(
@@ -387,6 +421,11 @@ fn prepare_material(
                     entry_count: catalog.entries().len(),
                 },
             )
+        }
+        ArtifactKind::ProjectBundle => {
+            return Err(SigningError::Invalid(
+                "project bundles must be prepared from their bounded file path".into(),
+            ));
         }
         ArtifactKind::PluginMatrixEvidence => {
             let evidence: PluginMatrixEvidence = serde_json::from_slice(document)?;
@@ -591,6 +630,8 @@ pub enum SigningError {
     ProcessPolicy(#[from] ssdev_process_policy::PolicyError),
     #[error("plugin catalog validation failed: {0}")]
     PluginCatalog(#[from] webplus_plugin_repository::RepositoryError),
+    #[error("project bundle validation failed: {0}")]
+    ProjectBundle(String),
     #[error("cutover decision failed validation: {0}")]
     CutoverDecision(#[from] ssdev_cutover_evidence::EvidenceError),
     #[error("signature trust validation failed: {0}")]
@@ -758,14 +799,26 @@ mod tests {
                 }),
             ),
         ];
-        values
+        let mut documents = values
             .into_iter()
             .map(|(kind, value)| {
                 let path = root.join(format!("{}.json", kind.as_str()));
                 fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
                 (kind, path)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        let cutover = documents.pop().unwrap();
+        let project = root.join("delivery.ssdev-project");
+        ssdev_project_bundle::create(
+            &project,
+            &ssdev_config::DesktopConfig::default(),
+            "1.2.3",
+            Vec::new(),
+        )
+        .unwrap();
+        documents.push((ArtifactKind::ProjectBundle, project));
+        documents.push(cutover);
+        documents
     }
 
     fn trust_store(root: &Path, signing_key: &SigningKey) -> PathBuf {
@@ -782,7 +835,7 @@ mod tests {
             "keyId": "release-key",
             "algorithm": "ed25519",
             "publicKey": BASE64.encode(signing_key.verifying_key().to_bytes()),
-            "purposes": ["cutover-decision", "cutover-evidence", "origin-policy", "process-policy", "plugin-catalog"]
+            "purposes": ["cutover-decision", "cutover-evidence", "origin-policy", "process-policy", "plugin-catalog", "project-bundle"]
         });
         if let Some(status) = status {
             key["status"] = serde_json::Value::String(status.to_owned());
@@ -811,6 +864,7 @@ mod tests {
                 TrustPurpose::OriginPolicy,
                 TrustPurpose::ProcessPolicy,
                 TrustPurpose::PluginCatalog,
+                TrustPurpose::ProjectBundle,
                 TrustPurpose::CutoverDecision,
                 TrustPurpose::CutoverEvidence,
             ],
@@ -970,6 +1024,64 @@ mod tests {
 
         let error = finalize(&FinalizeOptions {
             kind,
+            document: &document,
+            request: &request,
+            signature: &signature,
+            trust_store: &trust,
+            envelope: &envelope,
+            now,
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("document changed"));
+        assert!(!envelope.exists());
+    }
+
+    #[test]
+    fn repacked_project_bundle_is_rejected_before_an_envelope_is_written() {
+        let root = tempfile::tempdir().unwrap();
+        let signing_key = SigningKey::from_bytes(&[61_u8; 32]);
+        let trust = trust_store(root.path(), &signing_key);
+        let now = unix_time(NOW).unwrap();
+        let document = root.path().join("delivery.ssdev-project");
+        ssdev_project_bundle::create(
+            &document,
+            &ssdev_config::DesktopConfig::default(),
+            "1.2.3",
+            Vec::new(),
+        )
+        .unwrap();
+        let request = root.path().join("project.request.json");
+        prepare(&PrepareOptions {
+            kind: ArtifactKind::ProjectBundle,
+            document: &document,
+            key_id: "release-key",
+            trust_store: &trust,
+            request: &request,
+            now,
+        })
+        .unwrap();
+        let request_document: SigningRequest =
+            serde_json::from_slice(&fs::read(&request).unwrap()).unwrap();
+        let payload = BASE64.decode(request_document.payload_base64).unwrap();
+        let signature = root.path().join("project.signature");
+        fs::write(
+            &signature,
+            BASE64.encode(signing_key.sign(&payload).to_bytes()),
+        )
+        .unwrap();
+
+        fs::remove_file(&document).unwrap();
+        ssdev_project_bundle::create(
+            &document,
+            &ssdev_config::DesktopConfig::default(),
+            "1.2.4",
+            Vec::new(),
+        )
+        .unwrap();
+        let envelope = root.path().join("delivery.ssdev-project.sig.json");
+        let error = finalize(&FinalizeOptions {
+            kind: ArtifactKind::ProjectBundle,
             document: &document,
             request: &request,
             signature: &signature,

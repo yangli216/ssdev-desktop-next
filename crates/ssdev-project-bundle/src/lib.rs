@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ssdev_config::DesktopConfig;
 use tempfile::{Builder as TempBuilder, TempDir};
+use webplus_plugin_trust::{DetachedSignatureDocument, TrustPurpose, TrustStore};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
@@ -18,28 +19,34 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_COMPONENT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_COMPONENTS: usize = 128;
 const MAX_ENTRIES: usize = MAX_COMPONENTS + 2;
+const MAX_SIGNATURE_BYTES: u64 = 64 * 1024;
+const PROJECT_BUNDLE_DOMAIN: &[u8] = b"SSDEV-PROJECT-BUNDLE\0";
 
 #[derive(Debug, Clone)]
-pub(crate) struct ProjectBundleInput {
-    pub(crate) plugin_id: String,
-    pub(crate) version: Option<String>,
-    pub(crate) kind: ProjectComponentKind,
-    pub(crate) path: PathBuf,
+pub struct ProjectBundleInput {
+    pub plugin_id: String,
+    pub version: Option<String>,
+    pub kind: ProjectComponentKind,
+    pub path: PathBuf,
 }
 
 #[derive(Debug)]
-pub(crate) struct OpenedProjectBundle {
+pub struct OpenedProjectBundle {
     staging: TempDir,
     manifest: ProjectManifest,
-    pub(crate) config: DesktopConfig,
+    pub config: DesktopConfig,
 }
 
 impl OpenedProjectBundle {
-    pub(crate) fn created_by_version(&self) -> &str {
+    pub fn schema_version(&self) -> u8 {
+        self.manifest.schema_version
+    }
+
+    pub fn created_by_version(&self) -> &str {
         &self.manifest.created_by_version
     }
 
-    pub(crate) fn components(&self) -> impl Iterator<Item = OpenedProjectComponent<'_>> {
+    pub fn components(&self) -> impl Iterator<Item = OpenedProjectComponent<'_>> {
         self.manifest
             .components
             .iter()
@@ -52,18 +59,43 @@ impl OpenedProjectBundle {
     }
 }
 
-pub(crate) struct OpenedProjectComponent<'a> {
-    pub(crate) plugin_id: &'a str,
-    pub(crate) version: Option<&'a str>,
-    pub(crate) kind: ProjectComponentKind,
-    pub(crate) path: PathBuf,
+pub struct OpenedProjectComponent<'a> {
+    pub plugin_id: &'a str,
+    pub version: Option<&'a str>,
+    pub kind: ProjectComponentKind,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum ProjectComponentKind {
+pub enum ProjectComponentKind {
     SignedPlugin,
     LocalMapping,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectBundleSummary {
+    pub schema_version: u8,
+    pub created_by_version: String,
+    pub component_count: usize,
+    pub signed_plugin_count: usize,
+    pub local_mapping_count: usize,
+    pub bundle_bytes: u64,
+    pub bundle_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectBundleSigningMaterial {
+    pub payload: Vec<u8>,
+    pub summary: ProjectBundleSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectBundleSignature {
+    pub key_id: String,
+    pub summary: ProjectBundleSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,7 +119,7 @@ struct ProjectComponentManifest {
     bytes: u64,
 }
 
-pub(crate) fn create(
+pub fn create(
     destination: &Path,
     config: &DesktopConfig,
     created_by_version: &str,
@@ -212,7 +244,7 @@ pub(crate) fn create(
     Ok(())
 }
 
-pub(crate) fn open(source: &Path) -> Result<OpenedProjectBundle, String> {
+pub fn open(source: &Path) -> Result<OpenedProjectBundle, String> {
     require_extension(source)?;
     let metadata =
         fs::symlink_metadata(source).map_err(|error| format!("无法读取项目包: {error}"))?;
@@ -318,6 +350,123 @@ pub(crate) fn open(source: &Path) -> Result<OpenedProjectBundle, String> {
     })
 }
 
+pub fn signature_path(source: &Path) -> Result<PathBuf, String> {
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("项目包文件名无效")?;
+    Ok(source.with_file_name(format!("{name}.sig.json")))
+}
+
+pub fn signing_material(source: &Path) -> Result<ProjectBundleSigningMaterial, String> {
+    let before = bundle_fingerprint(source)?;
+    let opened = open(source)?;
+    let material = signing_material_from_opened(source, &opened)?;
+    ensure_unchanged(&before, &material.summary)?;
+    Ok(material)
+}
+
+pub fn open_verified(
+    source: &Path,
+    envelope_path: &Path,
+    trust_store: &TrustStore,
+) -> Result<(OpenedProjectBundle, ProjectBundleSignature), String> {
+    let before = bundle_fingerprint(source)?;
+    let opened = open(source)?;
+    let material = signing_material_from_opened(source, &opened)?;
+    ensure_unchanged(&before, &material.summary)?;
+    let envelope = read_signature_envelope(envelope_path)?;
+    trust_store
+        .verify_detached(
+            TrustPurpose::ProjectBundle,
+            &envelope.key_id,
+            &material.payload,
+            &envelope.signature,
+        )
+        .map_err(|error| format!("项目包签名验证失败: {error}"))?;
+    Ok((
+        opened,
+        ProjectBundleSignature {
+            key_id: envelope.key_id,
+            summary: material.summary,
+        },
+    ))
+}
+
+fn bundle_fingerprint(source: &Path) -> Result<(u64, String), String> {
+    let metadata =
+        fs::symlink_metadata(source).map_err(|error| format!("无法读取项目包: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > MAX_BUNDLE_BYTES
+    {
+        return Err("项目包必须是大小受限的安全普通文件".into());
+    }
+    Ok((metadata.len(), sha256_file(source)?))
+}
+
+fn ensure_unchanged(before: &(u64, String), summary: &ProjectBundleSummary) -> Result<(), String> {
+    if before.0 != summary.bundle_bytes || before.1 != summary.bundle_sha256 {
+        return Err("项目包在读取期间发生变化，请重新选择稳定文件".into());
+    }
+    Ok(())
+}
+
+fn signing_material_from_opened(
+    source: &Path,
+    opened: &OpenedProjectBundle,
+) -> Result<ProjectBundleSigningMaterial, String> {
+    let metadata =
+        fs::symlink_metadata(source).map_err(|error| format!("无法读取项目包: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > MAX_BUNDLE_BYTES
+    {
+        return Err("项目包必须是大小受限的安全普通文件".into());
+    }
+    let digest = sha256_file_digest(source)?;
+    let mut payload = Vec::with_capacity(PROJECT_BUNDLE_DOMAIN.len() + digest.len());
+    payload.extend_from_slice(PROJECT_BUNDLE_DOMAIN);
+    payload.extend_from_slice(&digest);
+    let signed_plugin_count = opened
+        .manifest
+        .components
+        .iter()
+        .filter(|component| component.kind == ProjectComponentKind::SignedPlugin)
+        .count();
+    let local_mapping_count = opened
+        .manifest
+        .components
+        .len()
+        .saturating_sub(signed_plugin_count);
+    Ok(ProjectBundleSigningMaterial {
+        payload,
+        summary: ProjectBundleSummary {
+            schema_version: opened.manifest.schema_version,
+            created_by_version: opened.manifest.created_by_version.clone(),
+            component_count: opened.manifest.components.len(),
+            signed_plugin_count,
+            local_mapping_count,
+            bundle_bytes: metadata.len(),
+            bundle_sha256: hex_digest(&digest),
+        },
+    })
+}
+
+fn read_signature_envelope(path: &Path) -> Result<DetachedSignatureDocument, String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("无法读取项目包签名封套: {error}"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_SIGNATURE_BYTES
+    {
+        return Err("项目包签名封套必须是大小受限的安全普通文件".into());
+    }
+    let bytes = fs::read(path).map_err(|error| format!("无法读取项目包签名封套: {error}"))?;
+    let envelope: DetachedSignatureDocument =
+        serde_json::from_slice(&bytes).map_err(|error| format!("项目包签名封套无效: {error}"))?;
+    envelope
+        .validate()
+        .map_err(|error| format!("项目包签名封套无效: {error}"))?;
+    Ok(envelope)
+}
+
 fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
     if manifest.schema_version != SCHEMA_VERSION {
         return Err(format!("不支持项目包 schema {}", manifest.schema_version));
@@ -414,6 +563,10 @@ fn is_symlink_mode(mode: u32) -> bool {
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
+    sha256_file_digest(path).map(|digest| hex_digest(&digest))
+}
+
+fn sha256_file_digest(path: &Path) -> Result<[u8; 32], String> {
     let mut file = File::open(path).map_err(|error| format!("无法读取摘要输入: {error}"))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -426,7 +579,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hex_digest(hasher.finalize().as_slice()))
+    Ok(hasher.finalize().into())
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -444,6 +597,9 @@ fn is_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    use ed25519_dalek::{Signer, SigningKey};
 
     fn config() -> DesktopConfig {
         DesktopConfig {
@@ -571,5 +727,53 @@ mod tests {
         destination.finish().unwrap();
 
         assert!(open(&tampered).unwrap_err().contains("摘要或大小不匹配"));
+    }
+
+    #[test]
+    fn detached_signature_binds_the_complete_project_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("clinic.ssdev-project");
+        create(&project, &config(), "1.2.3", Vec::new()).unwrap();
+        let signing_key = SigningKey::from_bytes(&[71; 32]);
+        let material = signing_material(&project).unwrap();
+        let signature = BASE64.encode(signing_key.sign(&material.payload).to_bytes());
+        let envelope = signature_path(&project).unwrap();
+        fs::write(
+            &envelope,
+            DetachedSignatureDocument::new("project-release", &signature)
+                .unwrap()
+                .to_pretty_json()
+                .unwrap(),
+        )
+        .unwrap();
+        let trust_path = root.path().join("trust.json");
+        fs::write(
+            &trust_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "keys": [{
+                    "keyId": "project-release",
+                    "algorithm": "ed25519",
+                    "publicKey": BASE64.encode(signing_key.verifying_key().to_bytes()),
+                    "purposes": ["project-bundle"],
+                    "status": "active"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let trust = TrustStore::load(&trust_path).unwrap();
+
+        let (_, verified) = open_verified(&project, &envelope, &trust).unwrap();
+        assert_eq!(verified.key_id, "project-release");
+        assert_eq!(
+            verified.summary.bundle_sha256,
+            material.summary.bundle_sha256
+        );
+
+        let repacked = root.path().join("repacked.ssdev-project");
+        create(&repacked, &config(), "1.2.4", Vec::new()).unwrap();
+        assert!(open(&repacked).is_ok());
+        assert!(open_verified(&repacked, &envelope, &trust).is_err());
     }
 }

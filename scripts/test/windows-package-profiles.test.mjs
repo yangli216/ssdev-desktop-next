@@ -55,6 +55,20 @@ test("Windows package smoke verifies the selected package profile", async () => 
   );
 });
 
+test("Windows production bundles require project delivery signing trust", async () => {
+  const [buildScript, packageTest] = await Promise.all([
+    readFile(buildScriptUrl, "utf8"),
+    readFile(packageTestUrl, "utf8"),
+  ]);
+
+  for (const script of [buildScript, packageTest]) {
+    assert.match(
+      script,
+      /--required-purposes plugin,origin-policy,project-bundle/,
+    );
+  }
+});
+
 test("CI publishes separate offline and online-light NSIS packages", async () => {
   const workflow = await readFile(workflowUrl, "utf8");
   const offlineUpload = workflow.indexOf(
