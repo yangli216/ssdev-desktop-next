@@ -599,6 +599,50 @@ function Get-ApplicationDataPaths {
     LocalDataRoot = $localDataRoot
     PluginRoot = (Join-Path $localDataRoot "plugins")
     DiagnosticLog = (Join-Path $localDataRoot "logs/ssdev.log")
+    StartupFailure = (Join-Path $localDataRoot "logs/startup-failure.json")
+  }
+}
+
+function Write-UnresolvedStartupFailureMarker {
+  param([Parameter(Mandatory = $true)]$Paths)
+  $logDirectory = Split-Path -Parent $Paths.StartupFailure
+  New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
+  $generatedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  $document = [ordered]@{
+    schemaVersion = 1
+    generatedAtUnixMs = $generatedAt
+    eventCode = "desktop-startup-failed"
+    errorCode = "startup-desktop-shell"
+    summary = "Synthetic unresolved startup failure for package smoke."
+    action = "The installed frontend must mark this record as recovered."
+  }
+  [System.IO.File]::WriteAllText(
+    $Paths.StartupFailure,
+    ($document | ConvertTo-Json -Compress),
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  return $generatedAt
+}
+
+function Assert-StartupFailureResolved {
+  param(
+    [Parameter(Mandatory = $true)]$Paths,
+    [Parameter(Mandatory = $true)][string]$ExpectedVersion,
+    [Parameter(Mandatory = $true)][long]$GeneratedAt
+  )
+  if (-not (Test-Path -LiteralPath $Paths.StartupFailure -PathType Leaf)) {
+    throw "Installed application removed the startup failure record instead of resolving it."
+  }
+  $document = Get-Content -Raw -LiteralPath $Paths.StartupFailure | ConvertFrom-Json
+  $resolvedAt = Get-OptionalProperty $document "resolvedAtUnixMs"
+  if (
+    $document.schemaVersion -ne 2 -or
+    $document.errorCode -ne "startup-desktop-shell" -or
+    -not $resolvedAt -or
+    [long]$resolvedAt -lt $GeneratedAt -or
+    (Get-OptionalProperty $document "resolvedByAppVersion") -ne $ExpectedVersion
+  ) {
+    throw "Installed frontend reached native IPC, but startup-failure.json was not marked as recovered by the running version."
   }
 }
 
@@ -644,6 +688,7 @@ function Invoke-ApplicationSmoke {
   try {
     $diagnosticLog = $dataPaths.DiagnosticLog
     $frontendEventsBefore = Get-DiagnosticEventCount $diagnosticLog $ExpectedVersion "frontend-ready"
+    $startupFailureGeneratedAt = Write-UnresolvedStartupFailureMarker $dataPaths
     $application = Start-Process -FilePath $Executable -PassThru
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     $frontendReadyObserved = $false
@@ -662,6 +707,7 @@ function Invoke-ApplicationSmoke {
     if (-not $frontendReadyObserved) {
       throw "Installed application stayed alive, but the control frontend did not mount and reach native IPC."
     }
+    Assert-StartupFailureResolved $dataPaths $ExpectedVersion $startupFailureGeneratedAt
   } finally {
     if ($application -and -not $application.HasExited) {
       Stop-Process -Id $application.Id -Force

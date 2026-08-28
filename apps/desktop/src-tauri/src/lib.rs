@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ssdev_config::ConfigStore;
 use ssdev_diagnostics::{DiagnosticContext, DiagnosticsState, DiagnosticsStats};
@@ -66,6 +66,8 @@ use invocations::{
 
 const FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_FAILURE_FILE_NAME: &str = "startup-failure.json";
+const STARTUP_FAILURE_SCHEMA_VERSION: u8 = 2;
+const MAX_STARTUP_FAILURE_BYTES: u64 = 4 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -103,41 +105,49 @@ impl StartupStage {
     fn failure(self) -> StartupFailure {
         match self {
             Self::RuntimePaths => StartupFailure {
+                event_code: "desktop-startup-failed",
                 code: "startup-runtime-paths",
                 summary: "无法确定当前用户的应用数据目录。",
                 action: "请确认 Windows 用户配置文件可用，并尝试重新登录系统。",
             },
             Self::Diagnostics => StartupFailure {
+                event_code: "desktop-startup-failed",
                 code: "startup-diagnostics",
                 summary: "无法初始化本地诊断记录。",
                 action: "请检查用户应用数据目录的写入权限和剩余磁盘空间。",
             },
             Self::LocalStorage => StartupFailure {
+                event_code: "desktop-startup-failed",
                 code: "startup-local-storage",
                 summary: "无法读取或恢复桌面配置及本地组件数据。",
                 action: "请先保留应用数据目录，再检查目录权限、磁盘空间或联系实施人员。",
             },
             Self::TrustPolicy => StartupFailure {
+                event_code: "desktop-startup-failed",
                 code: "startup-trust-policy",
                 summary: "安装包中的签名信任或业务来源策略无效。",
                 action: "请使用组织正式发布的完整安装包修复安装，不要手工替换策略文件。",
             },
             Self::PluginRuntime => StartupFailure {
+                event_code: "desktop-startup-failed",
                 code: "startup-plugin-runtime",
                 summary: "原生插件运行环境初始化失败。",
                 action: "请修复 SSDEV Desktop 安装，并确认 x86/x64 插件宿主文件未被安全软件隔离。",
             },
             Self::CoreServices => StartupFailure {
+                event_code: "desktop-startup-failed",
                 code: "startup-core-services",
                 summary: "桌面核心服务初始化失败。",
                 action: "请查看启动日志中的稳定错误码，并将诊断文件交给实施人员。",
             },
             Self::DesktopShell => StartupFailure {
+                event_code: "desktop-startup-failed",
                 code: "startup-desktop-shell",
                 summary: "控制窗口或系统桌面集成初始化失败。",
                 action: "请修复 Microsoft Edge WebView2 Runtime 后重试；仍失败时修复 SSDEV Desktop 安装。",
             },
             Self::SetupComplete | Self::Bootstrap => StartupFailure {
+                event_code: "desktop-startup-failed",
                 code: "startup-framework",
                 summary: "桌面运行框架初始化失败。",
                 action: "请重新启动；仍失败时修复 SSDEV Desktop 安装并查看启动日志。",
@@ -148,20 +158,25 @@ impl StartupStage {
 
 #[derive(Clone, Copy)]
 struct StartupFailure {
+    event_code: &'static str,
     code: &'static str,
     summary: &'static str,
     action: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StartupFailureDocument {
     schema_version: u8,
     generated_at_unix_ms: u128,
-    event_code: &'static str,
-    error_code: &'static str,
-    summary: &'static str,
-    action: &'static str,
+    event_code: String,
+    error_code: String,
+    summary: String,
+    action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolved_at_unix_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolved_by_app_version: Option<String>,
 }
 
 static STARTUP_STAGE: AtomicU8 = AtomicU8::new(StartupStage::Bootstrap as u8);
@@ -199,10 +214,68 @@ struct DiagnosticsRuntime {
     log_dir: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FrontendStartupState {
+    #[default]
+    Waiting,
+    Ready,
+    TimedOut,
+    Recovered,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrontendReadyTransition {
+    recovered_after_timeout: bool,
+    duplicate_signal: bool,
+}
+
 #[derive(Default)]
 struct FrontendRuntime {
-    ready: AtomicBool,
-    timeout_reported: AtomicBool,
+    startup_state: std::sync::Mutex<FrontendStartupState>,
+}
+
+impl FrontendRuntime {
+    fn mark_ready(&self) -> FrontendReadyTransition {
+        let mut state = self
+            .startup_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match *state {
+            FrontendStartupState::Waiting => {
+                *state = FrontendStartupState::Ready;
+                FrontendReadyTransition {
+                    recovered_after_timeout: false,
+                    duplicate_signal: false,
+                }
+            }
+            FrontendStartupState::TimedOut => {
+                *state = FrontendStartupState::Recovered;
+                FrontendReadyTransition {
+                    recovered_after_timeout: true,
+                    duplicate_signal: false,
+                }
+            }
+            FrontendStartupState::Ready | FrontendStartupState::Recovered => {
+                FrontendReadyTransition {
+                    recovered_after_timeout: *state == FrontendStartupState::Recovered,
+                    duplicate_signal: true,
+                }
+            }
+        }
+    }
+
+    fn report_timeout(&self, report: impl FnOnce()) -> bool {
+        let mut state = self
+            .startup_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *state != FrontendStartupState::Waiting {
+            return false;
+        }
+        report();
+        *state = FrontendStartupState::TimedOut;
+        true
+    }
 }
 
 #[tauri::command]
@@ -212,12 +285,30 @@ fn frontend_ready(
     frontend: State<'_, FrontendRuntime>,
 ) -> Result<(), String> {
     desktop::require_control(&caller)?;
-    let was_ready = frontend.ready.swap(true, Ordering::AcqRel);
+    let transition = frontend.mark_ready();
+    let mut previous_failure_resolved = false;
+    if !transition.duplicate_signal {
+        if let Some(log_dir) = STARTUP_LOG_DIR.get() {
+            match resolve_startup_failure_document(
+                log_dir,
+                &app.package_info().version.to_string(),
+                unix_time_ms(),
+            ) {
+                Ok(resolved) => previous_failure_resolved = resolved,
+                Err(_) => tracing::warn!(
+                    event_code = "startup-failure-resolution-failed",
+                    error_code = "startup-failure-marker-io",
+                    "the previous startup failure marker could not be marked as recovered"
+                ),
+            }
+        }
+    }
     tracing::info!(
         event_code = "frontend-ready",
         app_version = %app.package_info().version,
-        recovered_after_timeout = frontend.timeout_reported.load(Ordering::Acquire),
-        duplicate_signal = was_ready,
+        recovered_after_timeout = transition.recovered_after_timeout,
+        previous_failure_resolved,
+        duplicate_signal = transition.duplicate_signal,
         "control frontend mounted and reached native IPC"
     );
     Ok(())
@@ -3768,26 +3859,23 @@ fn start_frontend_watchdog(app: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(FRONTEND_READY_TIMEOUT).await;
         let frontend = app.state::<FrontendRuntime>();
-        if frontend.ready.load(Ordering::Acquire)
-            || frontend
-                .timeout_reported
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
-            return;
-        }
         let failure = StartupFailure {
+            event_code: "frontend-startup-timeout",
             code: "frontend-startup-timeout",
             summary: "控制窗口已经创建，但页面未能连接桌面核心服务。",
             action: "请修复 Microsoft Edge WebView2 Runtime 或 SSDEV Desktop 安装；随后查看日志并重新启动。",
         };
-        tracing::error!(
-            event_code = "frontend-startup-timeout",
-            error_code = failure.code,
-            timeout_seconds = FRONTEND_READY_TIMEOUT.as_secs(),
-            "control frontend did not reach native IPC before the startup deadline"
-        );
-        write_startup_failure_document(failure);
+        if !frontend.report_timeout(|| {
+            tracing::error!(
+                event_code = "frontend-startup-timeout",
+                error_code = failure.code,
+                timeout_seconds = FRONTEND_READY_TIMEOUT.as_secs(),
+                "control frontend did not reach native IPC before the startup deadline"
+            );
+            write_startup_failure_document(failure);
+        }) {
+            return;
+        }
         app.dialog()
             .message(startup_failure_message(failure))
             .title("SSDEV Desktop 启动异常")
@@ -3814,20 +3902,19 @@ fn write_startup_failure_document(failure: StartupFailure) {
         return;
     };
     let document = StartupFailureDocument {
-        schema_version: 1,
-        generated_at_unix_ms: SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-        event_code: "desktop-startup-failed",
-        error_code: failure.code,
-        summary: failure.summary,
-        action: failure.action,
+        schema_version: STARTUP_FAILURE_SCHEMA_VERSION,
+        generated_at_unix_ms: unix_time_ms(),
+        event_code: failure.event_code.to_owned(),
+        error_code: failure.code.to_owned(),
+        summary: failure.summary.to_owned(),
+        action: failure.action.to_owned(),
+        resolved_at_unix_ms: None,
+        resolved_by_app_version: None,
     };
     let Ok(bytes) = serde_json::to_vec(&document) else {
         return;
     };
-    if bytes.len() > 4 * 1024 {
+    if bytes.len() as u64 > MAX_STARTUP_FAILURE_BYTES {
         return;
     }
     let _ = persist_startup_failure_document(log_dir, &bytes);
@@ -3857,6 +3944,78 @@ fn persist_startup_failure_document(
         .persist(destination)
         .map_err(|error| error.error)?;
     Ok(())
+}
+
+fn resolve_startup_failure_document(
+    log_dir: &std::path::Path,
+    app_version: &str,
+    resolved_at_unix_ms: u128,
+) -> std::io::Result<bool> {
+    let destination = log_dir.join(STARTUP_FAILURE_FILE_NAME);
+    let metadata = match fs::symlink_metadata(&destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_STARTUP_FAILURE_BYTES
+    {
+        return Err(std::io::Error::other("startup failure marker is unsafe"));
+    }
+    let bytes = fs::read(&destination)?;
+    let mut document = serde_json::from_slice::<StartupFailureDocument>(&bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if !matches!(document.schema_version, 1 | STARTUP_FAILURE_SCHEMA_VERSION)
+        || !is_known_startup_failure_code(&document.error_code)
+        || !matches!(
+            document.event_code.as_str(),
+            "desktop-startup-failed" | "frontend-startup-timeout"
+        )
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "startup failure marker is unsupported",
+        ));
+    }
+    if document.resolved_at_unix_ms.is_some() {
+        return Ok(false);
+    }
+    document.schema_version = STARTUP_FAILURE_SCHEMA_VERSION;
+    document.resolved_at_unix_ms = Some(resolved_at_unix_ms);
+    document.resolved_by_app_version = Some(app_version.to_owned());
+    let bytes = serde_json::to_vec(&document)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if bytes.len() as u64 > MAX_STARTUP_FAILURE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "resolved startup failure marker is too large",
+        ));
+    }
+    persist_startup_failure_document(log_dir, &bytes)?;
+    Ok(true)
+}
+
+fn is_known_startup_failure_code(code: &str) -> bool {
+    matches!(
+        code,
+        "startup-framework"
+            | "startup-runtime-paths"
+            | "startup-diagnostics"
+            | "startup-local-storage"
+            | "startup-trust-policy"
+            | "startup-plugin-runtime"
+            | "startup-core-services"
+            | "startup-desktop-shell"
+            | "frontend-startup-timeout"
+    )
+}
+
+fn unix_time_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn startup_failure_message(failure: StartupFailure) -> String {
@@ -4075,9 +4234,10 @@ mod tests {
         ensure_upgrade_allowed, is_lowercase_sha256, is_plugin_update_available,
         legacy_config_candidates, open_project_bundle_for_mode, persist_startup_failure_document,
         plugin_update_installed_state_digest, plugin_update_plan_id, project_bundle,
-        project_import_plan_id, project_import_state_digest, select_runtime_path,
-        service_inventory_item, startup_failure_message, CatalogWithdrawalReason, FrontendRuntime,
-        ProjectBundlePreview, StartupFailureDocument, StartupStage, FRONTEND_READY_TIMEOUT,
+        project_import_plan_id, project_import_state_digest, resolve_startup_failure_document,
+        select_runtime_path, service_inventory_item, startup_failure_message,
+        CatalogWithdrawalReason, FrontendRuntime, ProjectBundlePreview, StartupFailureDocument,
+        StartupStage, FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -4108,6 +4268,7 @@ mod tests {
             (StartupStage::SetupComplete, "startup-framework"),
         ] {
             let failure = stage.failure();
+            assert_eq!(failure.event_code, "desktop-startup-failed");
             assert_eq!(failure.code, expected_code);
             assert!(!failure.summary.is_empty());
             assert!(!failure.action.is_empty());
@@ -4122,12 +4283,14 @@ mod tests {
     fn startup_failure_document_is_bounded_and_contains_no_raw_error() {
         let failure = StartupStage::DesktopShell.failure();
         let document = StartupFailureDocument {
-            schema_version: 1,
+            schema_version: 2,
             generated_at_unix_ms: 1,
-            event_code: "desktop-startup-failed",
-            error_code: failure.code,
-            summary: failure.summary,
-            action: failure.action,
+            event_code: failure.event_code.into(),
+            error_code: failure.code.into(),
+            summary: failure.summary.into(),
+            action: failure.action.into(),
+            resolved_at_unix_ms: None,
+            resolved_by_app_version: None,
         };
         let encoded = serde_json::to_vec(&document).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -4141,29 +4304,58 @@ mod tests {
 
     #[test]
     fn frontend_readiness_timeout_is_bounded_and_reported_once() {
-        let frontend = FrontendRuntime::default();
-
         assert!(FRONTEND_READY_TIMEOUT >= Duration::from_secs(5));
         assert!(FRONTEND_READY_TIMEOUT <= Duration::from_secs(60));
-        assert!(!frontend.ready.load(std::sync::atomic::Ordering::Acquire));
-        assert!(frontend
-            .timeout_reported
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_ok());
-        assert!(frontend
-            .timeout_reported
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_err());
+
+        let ready_first = FrontendRuntime::default();
+        let transition = ready_first.mark_ready();
+        assert!(!transition.recovered_after_timeout);
+        assert!(!transition.duplicate_signal);
+        assert!(!ready_first.report_timeout(|| panic!("ready frontend cannot time out")));
+        assert!(ready_first.mark_ready().duplicate_signal);
+
+        let timed_out_first = FrontendRuntime::default();
+        let mut reports = 0;
+        assert!(timed_out_first.report_timeout(|| reports += 1));
+        assert!(!timed_out_first.report_timeout(|| reports += 1));
+        assert_eq!(reports, 1);
+        let transition = timed_out_first.mark_ready();
+        assert!(transition.recovered_after_timeout);
+        assert!(!transition.duplicate_signal);
+        let duplicate = timed_out_first.mark_ready();
+        assert!(duplicate.recovered_after_timeout);
+        assert!(duplicate.duplicate_signal);
+    }
+
+    #[test]
+    fn successful_frontend_marks_a_previous_startup_failure_as_resolved() {
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("logs");
+        let failure = StartupStage::DesktopShell.failure();
+        let document = StartupFailureDocument {
+            schema_version: 1,
+            generated_at_unix_ms: 10,
+            event_code: failure.event_code.into(),
+            error_code: failure.code.into(),
+            summary: failure.summary.into(),
+            action: failure.action.into(),
+            resolved_at_unix_ms: None,
+            resolved_by_app_version: None,
+        };
+        persist_startup_failure_document(&log_dir, &serde_json::to_vec(&document).unwrap())
+            .unwrap();
+
+        assert!(resolve_startup_failure_document(&log_dir, "0.2.0", 20).unwrap());
+        let resolved: StartupFailureDocument = serde_json::from_slice(
+            &fs::read(log_dir.join(super::STARTUP_FAILURE_FILE_NAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(resolved.schema_version, 2);
+        assert_eq!(resolved.generated_at_unix_ms, 10);
+        assert_eq!(resolved.error_code, "startup-desktop-shell");
+        assert_eq!(resolved.resolved_at_unix_ms, Some(20));
+        assert_eq!(resolved.resolved_by_app_version.as_deref(), Some("0.2.0"));
+        assert!(!resolve_startup_failure_document(&log_dir, "0.2.0", 30).unwrap());
     }
 
     #[test]
@@ -4193,6 +4385,7 @@ mod tests {
         symlink(&private, log_dir.join(super::STARTUP_FAILURE_FILE_NAME)).unwrap();
 
         assert!(persist_startup_failure_document(&log_dir, b"replacement").is_err());
+        assert!(resolve_startup_failure_document(&log_dir, "0.2.0", 20).is_err());
         assert_eq!(fs::read(private).unwrap(), b"keep");
     }
 

@@ -118,6 +118,10 @@ test("Windows package smoke requires a rendered frontend IPC signal", async () =
   ]);
 
   assert.match(packageTest, /"frontend-ready"/);
+  assert.match(packageTest, /Write-UnresolvedStartupFailureMarker/);
+  assert.match(packageTest, /Assert-StartupFailureResolved/);
+  assert.match(packageTest, /resolvedAtUnixMs/);
+  assert.match(packageTest, /resolvedByAppVersion/);
   assert.doesNotMatch(packageTest, /Get-StartupEventCount/);
   assert.match(controlHtml, /SSDEV Desktop 正在启动/);
 });
