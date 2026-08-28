@@ -202,6 +202,24 @@ type PluginInstallResult = {
   preflightedHosts: number
 }
 
+type PluginPackagePreview = {
+  planId: string
+  pluginId: string
+  displayName: string
+  pluginVersion: string
+  desktopVersionRequirement: string
+  currentVersion?: string
+  action: 'install' | 'upgrade' | 'reinstall'
+  serviceCount: number
+  methodCount: number
+  services: Array<{
+    serviceId: string
+    architecture: 'x86' | 'x64'
+    methodCount: number
+  }>
+  preflightedHosts: number
+}
+
 type PluginInventory = {
   plugins: Array<{
     pluginId: string
@@ -280,6 +298,8 @@ const configImportPreview = ref<ConfigImportPreview | null>(null)
 const selectedConfigImport = ref('')
 const snapshot = ref<ConfigSnapshot | null>(null)
 const inventory = ref<PluginInventory | null>(null)
+const pluginPackagePreview = ref<PluginPackagePreview | null>(null)
+const selectedPluginPackage = ref('')
 const catalogPluginId = ref('')
 const pluginUpdates = ref<PluginUpdateCheck | null>(null)
 const appUpdate = ref<AppUpdateCheck | null>(null)
@@ -536,7 +556,7 @@ async function reloadBusiness() {
   await run(() => invoke('reload_business_windows'), '业务窗口已刷新。')
 }
 
-async function installPlugin() {
+async function selectPluginPackage() {
   const selected = await open({
     multiple: false,
     directory: false,
@@ -544,9 +564,33 @@ async function installPlugin() {
   })
   if (typeof selected !== 'string') return
 
+  await run(async () => {
+    pluginPackagePreview.value = null
+    selectedPluginPackage.value = ''
+    pluginPackagePreview.value = await invoke<PluginPackagePreview>('inspect_plugin_package', {
+      packagePath: selected,
+    })
+    selectedPluginPackage.value = selected
+    status.value = await invoke<BridgeStatus>('bridge_status')
+  }, '插件包验签和候选宿主预检已通过；请核对变更后确认安装。')
+}
+
+async function confirmPluginPackageInstall() {
+  if (!pluginPackagePreview.value || !selectedPluginPackage.value) {
+    error.value = '请先选择并预检签名插件包。'
+    return
+  }
+  const packagePath = selectedPluginPackage.value
+  const preview = pluginPackagePreview.value
+
   let result: PluginInstallResult | undefined
   await run(async () => {
-    result = await invoke<PluginInstallResult>('install_plugin_package', { packagePath: selected })
+    result = await invoke<PluginInstallResult>('install_plugin_package', {
+      packagePath,
+      expectedPlanId: preview.planId,
+    })
+    pluginPackagePreview.value = null
+    selectedPluginPackage.value = ''
     ;[status.value, inventory.value, deploymentCheck.value] = await Promise.all([
       invoke<BridgeStatus>('bridge_status'),
       invoke<PluginInventory>('plugin_inventory'),
@@ -555,9 +599,15 @@ async function installPlugin() {
   }, '')
 
   if (result) {
-    const action = result.replacedExisting ? '升级' : '安装'
+    const action = projectActionLabels[preview.action]
     notice.value = `${result.pluginId} ${result.pluginVersion} 已${action}，${result.preflightedHosts} 个架构宿主预检通过，当前共 ${result.serviceCount} 个服务已热加载。`
   }
+}
+
+function cancelPluginPackageInstall() {
+  pluginPackagePreview.value = null
+  selectedPluginPackage.value = ''
+  notice.value = '已取消签名插件安装。'
 }
 
 async function uninstallSignedPlugin(pluginId: string, displayName: string) {
@@ -944,7 +994,16 @@ async function exportDeploymentCheck() {
       </section>
 
       <section v-show="activeSection === 'plugins'" class="page" aria-labelledby="plugins-title">
-        <header class="section-header"><div><p class="eyebrow">PLUGIN MANAGEMENT</p><h1 id="plugins-title">插件管理</h1><p>管理签名插件包、本机动态映射和仓库更新。</p></div><div class="header-actions"><button type="button" :disabled="busy" @click="installPlugin">安装签名插件</button><button type="button" :disabled="busy" @click="reloadPlugins">重新扫描</button></div></header>
+        <header class="section-header"><div><p class="eyebrow">PLUGIN MANAGEMENT</p><h1 id="plugins-title">插件管理</h1><p>管理签名插件包、本机动态映射和仓库更新。</p></div><div class="header-actions"><button type="button" :disabled="busy" @click="selectPluginPackage">选择签名插件</button><button type="button" :disabled="busy" @click="reloadPlugins">重新扫描</button></div></header>
+        <section v-if="pluginPackagePreview" class="plugin-package-preview" aria-label="签名插件安装预览">
+          <header>
+            <div><p class="eyebrow">SIGNED PLUGIN PLAN</p><h2>核对{{ projectActionLabels[pluginPackagePreview.action] }}计划</h2><p>确认时会重新读取和验签安装包，并复核当前插件状态；任一变化都会停止安装。</p></div>
+            <div class="plugin-package-actions"><button type="button" :disabled="busy" @click="cancelPluginPackageInstall">取消</button><button class="primary" type="button" :disabled="busy" @click="confirmPluginPackageInstall">确认并{{ projectActionLabels[pluginPackagePreview.action] }}</button></div>
+          </header>
+          <div class="plugin-package-identity"><span><small>插件</small><strong>{{ pluginPackagePreview.displayName }}</strong><code>{{ pluginPackagePreview.pluginId }}</code></span><span><small>版本变化</small><strong>{{ pluginPackagePreview.currentVersion ?? '未安装' }} → {{ pluginPackagePreview.pluginVersion }}</strong><b :class="`plan-action ${pluginPackagePreview.action}`">{{ projectActionLabels[pluginPackagePreview.action] }}</b></span><span><small>Desktop 兼容范围</small><strong>{{ pluginPackagePreview.desktopVersionRequirement }}</strong></span></div>
+          <div class="plugin-package-summary"><span><strong>{{ pluginPackagePreview.serviceCount }}</strong>个服务</span><span><strong>{{ pluginPackagePreview.methodCount }}</strong>个方法</span><span><strong>{{ pluginPackagePreview.preflightedHosts }}</strong>个宿主已预检</span></div>
+          <ul><li v-for="service in pluginPackagePreview.services" :key="service.serviceId"><code>{{ service.serviceId }}</code><span>{{ service.architecture }} · {{ service.methodCount }} 个方法</span></li></ul>
+        </section>
         <section class="plugin-inventory" aria-label="已安装插件">
           <div><p class="eyebrow">VERIFIED INVENTORY</p><h2>已验证插件</h2><p>无效项不会进入服务路由；动态映射始终与主进程隔离。</p><div class="inventory-count"><strong>{{ inventory?.plugins.length ?? '—' }}</strong><span>个可用插件</span></div></div>
           <div class="plugin-list">

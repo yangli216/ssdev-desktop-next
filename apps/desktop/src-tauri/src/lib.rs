@@ -1850,6 +1850,36 @@ struct PluginInstallResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct PluginPackagePreview {
+    plan_id: String,
+    plugin_id: String,
+    display_name: String,
+    plugin_version: String,
+    desktop_version_requirement: String,
+    current_version: Option<String>,
+    action: &'static str,
+    service_count: usize,
+    method_count: usize,
+    services: Vec<PluginPackageServicePreview>,
+    preflighted_hosts: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginPackageServicePreview {
+    service_id: String,
+    architecture: PluginArchitecture,
+    method_count: usize,
+}
+
+struct LocalPluginInstallContext {
+    current_state_sha256: String,
+    current_version: Option<semver::Version>,
+    action: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PluginReloadResult {
     service_count: usize,
     quarantined_plugins: usize,
@@ -1961,11 +1991,11 @@ struct PluginUpdateItem {
 }
 
 #[tauri::command]
-async fn install_plugin_package(
+async fn inspect_plugin_package(
     caller: WebviewWindow,
     state: State<'_, BridgeState>,
     package_path: PathBuf,
-) -> Result<PluginInstallResult, String> {
+) -> Result<PluginPackagePreview, String> {
     desktop::require_control(&caller)?;
     let _install = state.install_lock.lock().await;
     recover_plugin_store(&state)?;
@@ -1980,7 +2010,117 @@ async fn install_plugin_package(
         Arc::clone(&trust_store),
     )
     .await?;
-    activate_prepared_plugin(&state, &trust_store, prepared, None).await
+    let context = local_plugin_install_context(&state, &trust_store, &prepared).await?;
+    let candidate_payload = prepared_plugin_signing_payload(&prepared)?;
+    let plan_id = local_plugin_install_plan_id(
+        &candidate_payload,
+        &context.current_state_sha256,
+        &state.desktop_version,
+    );
+    let preflight = match state
+        .controller
+        .preflight_candidate_manifest(prepared.manifest())
+        .await
+    {
+        Ok(preflight) => preflight,
+        Err(error) => {
+            state
+                .plugin_preflight_failures
+                .fetch_add(1, Ordering::AcqRel);
+            return Err(format!(
+                "候选插件宿主预检失败 ({})，未修改当前插件",
+                error.diagnostic_code()
+            ));
+        }
+    };
+    state
+        .preflighted_plugin_hosts
+        .fetch_add(preflight.hosts_started, Ordering::AcqRel);
+
+    let metadata = prepared.metadata();
+    let services = prepared
+        .manifest()
+        .services
+        .iter()
+        .map(|service| PluginPackageServicePreview {
+            service_id: service.service_id.clone(),
+            architecture: service.architecture,
+            method_count: service.methods.len(),
+        })
+        .collect::<Vec<_>>();
+    let method_count = services.iter().map(|service| service.method_count).sum();
+    tracing::info!(
+        event_code = "plugin-package-inspected",
+        plugin_id = prepared.identity().plugin_id,
+        plugin_version = %metadata.version,
+        action = context.action,
+        service_count = services.len(),
+        method_count,
+        preflighted_hosts = preflight.hosts_started,
+        "signed plugin package inspected without activation"
+    );
+    Ok(PluginPackagePreview {
+        plan_id,
+        plugin_id: prepared.identity().plugin_id.clone(),
+        display_name: if metadata.display_name.trim().is_empty() {
+            prepared.identity().plugin_id.clone()
+        } else {
+            metadata.display_name.clone()
+        },
+        plugin_version: metadata.version.to_string(),
+        desktop_version_requirement: metadata
+            .desktop_version_requirement
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "未声明".to_owned()),
+        current_version: context.current_version.map(|version| version.to_string()),
+        action: context.action,
+        service_count: services.len(),
+        method_count,
+        services,
+        preflighted_hosts: preflight.hosts_started,
+    })
+}
+
+#[tauri::command]
+async fn install_plugin_package(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    package_path: PathBuf,
+    expected_plan_id: String,
+) -> Result<PluginInstallResult, String> {
+    desktop::require_control(&caller)?;
+    if !is_lowercase_sha256(&expected_plan_id) {
+        return Err("插件安装确认标识无效，请重新选择安装包并预检".to_owned());
+    }
+    let _install = state.install_lock.lock().await;
+    recover_plugin_store(&state)?;
+    let trust_store = state
+        .trust_store
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "开发态未签名模式不允许使用插件安装器".to_owned())?;
+    let prepared = prepare_local_package(
+        package_path,
+        state.plugin_root.clone(),
+        Arc::clone(&trust_store),
+    )
+    .await?;
+    let context = local_plugin_install_context(&state, &trust_store, &prepared).await?;
+    let candidate_payload = prepared_plugin_signing_payload(&prepared)?;
+    let actual_plan_id = local_plugin_install_plan_id(
+        &candidate_payload,
+        &context.current_state_sha256,
+        &state.desktop_version,
+    );
+    ensure_local_plugin_install_plan_matches(&expected_plan_id, &actual_plan_id)?;
+    activate_prepared_plugin(
+        &state,
+        &trust_store,
+        prepared,
+        Some(&context.current_state_sha256),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2291,6 +2431,110 @@ fn ensure_plugin_update_plan_matches(expected: &str, actual: &str) -> Result<(),
         );
     }
     Ok(())
+}
+
+fn local_plugin_install_plan_id(
+    candidate_payload: &[u8],
+    current_state_sha256: &str,
+    desktop_version: &semver::Version,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-LOCAL-PLUGIN-INSTALL-PLAN\0");
+    hash_plan_field(&mut hasher, candidate_payload);
+    hash_plan_field(&mut hasher, current_state_sha256.as_bytes());
+    hash_plan_field(&mut hasher, desktop_version.to_string().as_bytes());
+    lowercase_hex(&hasher.finalize())
+}
+
+fn ensure_local_plugin_install_plan_matches(expected: &str, actual: &str) -> Result<(), String> {
+    if expected != actual {
+        return Err("安装包或当前插件状态在确认后发生变化，请重新选择安装包并预检".to_owned());
+    }
+    Ok(())
+}
+
+fn classify_local_plugin_install_action(
+    current: Option<&semver::Version>,
+    candidate: &semver::Version,
+) -> &'static str {
+    match current {
+        None => "install",
+        Some(current) if candidate > current => "upgrade",
+        Some(_) => "reinstall",
+    }
+}
+
+fn prepared_plugin_signing_payload(prepared: &PreparedPlugin) -> Result<Vec<u8>, String> {
+    prepare_signing_material(
+        &prepared.manifest().plugin_dir,
+        &prepared.identity().plugin_id,
+        &prepared.identity().key_id,
+    )
+    .map(|material| material.payload)
+    .map_err(|error| format!("无法生成插件安装确认标识: {error}"))
+}
+
+async fn local_plugin_install_context(
+    state: &BridgeState,
+    trust_store: &TrustStore,
+    prepared: &PreparedPlugin,
+) -> Result<LocalPluginInstallContext, String> {
+    ensure_signed_plugin_compatible(prepared.manifest(), &state.desktop_version)?;
+    let plugin_id = &prepared.identity().plugin_id;
+    let before = inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        Some(trust_store),
+        &state.desktop_version,
+    )?;
+    let active_matches = state
+        .controller
+        .manifests_match_active_routes(&before.manifests)
+        .await
+        .map_err(|error| format!("无法核对当前插件运行状态 ({})", error.diagnostic_code()))?;
+    if !active_matches {
+        return Err("插件目录与当前运行路由不一致，请先重新扫描并处理隔离项后再安装".to_owned());
+    }
+    if before.manifests.iter().any(|manifest| {
+        manifest.plugin_id == *plugin_id && is_local_manifest(manifest, &state.local_mapping_root)
+    }) {
+        return Err(format!(
+            "签名插件 ID [{plugin_id}] 与现有本地映射冲突，请先删除或重命名本地映射"
+        ));
+    }
+    let previous_manifest = before
+        .manifests
+        .iter()
+        .find(|manifest| {
+            manifest.plugin_id == *plugin_id
+                && !is_local_manifest(manifest, &state.local_mapping_root)
+        })
+        .cloned();
+    let current_version = previous_manifest
+        .as_ref()
+        .and_then(|manifest| manifest.metadata.as_ref())
+        .map(|metadata| metadata.version.clone());
+    ensure_upgrade_allowed(current_version.as_ref(), &prepared.metadata().version)?;
+
+    let current_state_sha256 = plugin_update_installed_state_digest(
+        &state.plugin_root,
+        plugin_id,
+        previous_manifest.as_ref(),
+    )?;
+    let mut candidates = before.manifests;
+    candidates.retain(|manifest| manifest.plugin_id != *plugin_id);
+    candidates.push(prepared.manifest().clone());
+    PluginController::validate_manifests(&candidates).map_err(|error| error.to_string())?;
+
+    let action = classify_local_plugin_install_action(
+        current_version.as_ref(),
+        &prepared.metadata().version,
+    );
+    Ok(LocalPluginInstallContext {
+        current_state_sha256,
+        current_version,
+        action,
+    })
 }
 
 async fn prepare_local_package(
@@ -3586,6 +3830,7 @@ pub fn run() {
             import_project_bundle,
             frontend_ready,
             open_diagnostics_directory,
+            inspect_plugin_package,
             install_plugin_package,
             install_plugin_from_catalog,
             uninstall_signed_plugin,
@@ -4228,16 +4473,18 @@ fn select_runtime_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_project_component_action, collect_plugin_updates, desktop,
+        classify_local_plugin_install_action, classify_project_component_action,
+        collect_plugin_updates, desktop, ensure_local_plugin_install_plan_matches,
         ensure_plugin_update_plan_matches, ensure_project_export_active_manifests_match,
         ensure_project_export_runtime_matches, ensure_signed_plugin_compatible,
         ensure_upgrade_allowed, is_lowercase_sha256, is_plugin_update_available,
-        legacy_config_candidates, open_project_bundle_for_mode, persist_startup_failure_document,
-        plugin_update_installed_state_digest, plugin_update_plan_id, project_bundle,
-        project_import_plan_id, project_import_state_digest, resolve_startup_failure_document,
-        select_runtime_path, service_inventory_item, startup_failure_message,
-        CatalogWithdrawalReason, FrontendRuntime, ProjectBundlePreview, StartupFailureDocument,
-        StartupStage, FRONTEND_READY_TIMEOUT,
+        legacy_config_candidates, local_plugin_install_plan_id, open_project_bundle_for_mode,
+        persist_startup_failure_document, plugin_update_installed_state_digest,
+        plugin_update_plan_id, project_bundle, project_import_plan_id, project_import_state_digest,
+        resolve_startup_failure_document, select_runtime_path, service_inventory_item,
+        startup_failure_message, CatalogWithdrawalReason, FrontendRuntime, PluginPackagePreview,
+        PluginPackageServicePreview, ProjectBundlePreview, StartupFailureDocument, StartupStage,
+        FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -4253,6 +4500,7 @@ mod tests {
     use webplus_plugin_trust::{
         encode_signature_document, prepare_signing_material, TrustStore, SIGNATURE_FILENAME,
     };
+    use webplus_protocol::PluginArchitecture;
 
     #[test]
     fn startup_stages_have_stable_actionable_failure_codes() {
@@ -4736,6 +4984,71 @@ mod tests {
         );
         assert!(ensure_plugin_update_plan_matches(&base, &base).is_ok());
         assert!(ensure_plugin_update_plan_matches(&base, &"55".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn local_plugin_install_plan_binds_candidate_state_and_desktop_version() {
+        let desktop = Version::new(0, 1, 5);
+        let state = "22".repeat(32);
+        let base = local_plugin_install_plan_id(b"signed candidate", &state, &desktop);
+        assert!(is_lowercase_sha256(&base));
+        assert_ne!(
+            base,
+            local_plugin_install_plan_id(b"changed candidate", &state, &desktop)
+        );
+        assert_ne!(
+            base,
+            local_plugin_install_plan_id(b"signed candidate", &"33".repeat(32), &desktop)
+        );
+        assert_ne!(
+            base,
+            local_plugin_install_plan_id(b"signed candidate", &state, &Version::new(0, 2, 0))
+        );
+        assert!(ensure_local_plugin_install_plan_matches(&base, &base).is_ok());
+        assert!(ensure_local_plugin_install_plan_matches(&base, &"44".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn local_plugin_install_action_distinguishes_install_upgrade_and_repair() {
+        let one = Version::new(1, 0, 0);
+        let two = Version::new(2, 0, 0);
+        assert_eq!(classify_local_plugin_install_action(None, &one), "install");
+        assert_eq!(
+            classify_local_plugin_install_action(Some(&one), &two),
+            "upgrade"
+        );
+        assert_eq!(
+            classify_local_plugin_install_action(Some(&one), &one),
+            "reinstall"
+        );
+    }
+
+    #[test]
+    fn local_plugin_install_preview_omits_path_and_signing_key() {
+        let preview = PluginPackagePreview {
+            plan_id: "11".repeat(32),
+            plugin_id: "reader".to_owned(),
+            display_name: "Reader".to_owned(),
+            plugin_version: "1.1.0".to_owned(),
+            desktop_version_requirement: ">=0.1.0, <0.2.0".to_owned(),
+            current_version: Some("1.0.0".to_owned()),
+            action: "upgrade",
+            service_count: 1,
+            method_count: 2,
+            services: vec![PluginPackageServicePreview {
+                service_id: "card.reader".to_owned(),
+                architecture: PluginArchitecture::X86,
+                method_count: 2,
+            }],
+            preflighted_hosts: 1,
+        };
+        let value = serde_json::to_value(preview).unwrap();
+        let object = value.as_object().unwrap();
+        assert!(!object.contains_key("packagePath"));
+        assert!(!object.contains_key("pluginRoot"));
+        assert!(!object.contains_key("keyId"));
+        assert_eq!(value["action"], "upgrade");
+        assert_eq!(value["services"][0]["architecture"], "x86");
     }
 
     #[test]

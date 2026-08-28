@@ -49,6 +49,7 @@ Release 启动失败和控制页面空白由原生错误提示覆盖；正常控
 项目交付前的一键环境检查、阻塞条件和处理建议见 [docs/deployment-check.md](docs/deployment-check.md)。
 将项目配置、签名插件、本地映射和联合路由作为一个有组织旁签、带导入差异计划且可崩溃恢复的原子单元迁移到目标机器，见 [docs/project-bundles.md](docs/project-bundles.md)。
 单独导入普通桌面配置同样采用只读变更预检和确认标识，确认时重新绑定候选文件与当前已保存状态，不再在选择文件后立即覆盖。
+本地 `.ssdev-plugin` 也采用相同的人机确认边界：选择文件只执行验签、兼容/路由检查和候选宿主预检；确认安装时重新读取候选并绑定目标插件当前状态，包或本机状态漂移会要求重新预检。
 锁文件、官方 npm 源、固定 GitHub Action 提交和定期漏洞审计要求见 [docs/supply-chain-security.md](docs/supply-chain-security.md)。
 
 仓库内的 `plugin-trust.json` 默认没有任何公钥，因此生产接入真实插件前必须由发布流水线注入组织公钥。每把公钥除用途外还具有 `active`、`retired` 或 `revoked` 生命周期；新发布只接受 active，retired 用于计划轮换并停止官方新签发，revoked 用于泄露后让运行时立即拒绝。旧版把 RSA 私钥放进客户端的 `license.dat` 校验方式不会沿用。

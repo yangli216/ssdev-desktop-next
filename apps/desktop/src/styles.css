@@ -167,6 +167,28 @@ button:disabled { cursor: wait !important; opacity: .5; }
 .compact-panel p { margin: 7px 0 0; color: #728078; font-size: 12px; }
 
 .page-native .mapping-studio { margin-top: 32px; }
+.plugin-package-preview { margin-top: 32px; overflow: hidden; border: 1px solid #b9d1c0; border-radius: 16px; background: rgba(247,252,248,.94); box-shadow: 0 18px 45px rgba(36,63,48,.05); }
+.plugin-package-preview > header { display: flex; justify-content: space-between; gap: 28px; align-items: center; padding: 24px 28px; border-bottom: 1px solid #d5e3d8; }
+.plugin-package-preview h2 { margin: 0; color: #214a35; font: 500 27px Georgia, "Songti SC", serif; }
+.plugin-package-preview header p:last-child { margin: 8px 0 0; color: #68766e; font-size: 12px; }
+.plugin-package-actions { display: flex; flex: 0 0 auto; gap: 9px; }
+.plugin-package-actions button { padding: 10px 14px; border: 1px solid #9eaaa2; border-radius: 9px; background: rgba(255,255,255,.8); color: #274735; cursor: pointer; }
+.plugin-package-identity { display: grid; grid-template-columns: 1.1fr .9fr 1fr; border-bottom: 1px solid #dbe6dd; }
+.plugin-package-identity > span { display: grid; min-width: 0; gap: 5px; padding: 17px 20px; border-right: 1px solid #dbe6dd; }
+.plugin-package-identity > span:last-child { border-right: 0; }
+.plugin-package-identity small { color: #78857d; font-size: 10px; }
+.plugin-package-identity strong { overflow: hidden; color: #2f493a; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.plugin-package-identity code { overflow: hidden; color: #708078; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.plugin-package-identity .plan-action { justify-self: start; }
+.plugin-package-summary { display: grid; grid-template-columns: repeat(3, 1fr); border-bottom: 1px solid #dbe6dd; background: rgba(242,247,243,.7); }
+.plugin-package-summary span { padding: 13px 20px; border-right: 1px solid #dbe6dd; color: #6e7c73; font-size: 10px; }
+.plugin-package-summary span:last-child { border-right: 0; }
+.plugin-package-summary strong { margin-right: 5px; color: #245338; font: 19px Georgia, serif; }
+.plugin-package-preview ul { margin: 0; padding: 0; list-style: none; }
+.plugin-package-preview li { display: flex; justify-content: space-between; gap: 20px; padding: 11px 20px; border-bottom: 1px solid #edf1ed; }
+.plugin-package-preview li:last-child { border-bottom: 0; }
+.plugin-package-preview li code { color: #1e4934; font-size: 11px; overflow-wrap: anywhere; }
+.plugin-package-preview li span { color: #718078; font-size: 10px; white-space: nowrap; }
 .inventory-count { display: grid; margin-top: 34px; }
 .inventory-count strong { color: #1d4a34; font: 40px Georgia, serif; }
 .inventory-count span { color: #758078; font-size: 11px; }
@@ -273,6 +295,10 @@ button:disabled { cursor: wait !important; opacity: .5; }
   .attention-panel, .boundary { grid-template-columns: 1fr; gap: 24px; }
   .form-columns { grid-template-columns: 1fr; }
   .config-import-preview > header { align-items: flex-start; flex-direction: column; }
+  .plugin-package-preview > header { align-items: flex-start; flex-direction: column; }
+  .plugin-package-identity { grid-template-columns: 1fr; }
+  .plugin-package-identity > span { border-right: 0; border-bottom: 1px solid #dbe6dd; }
+  .plugin-package-identity > span:last-child { border-bottom: 0; }
   .config-import-counts { grid-template-columns: repeat(3, 1fr); }
   .bundle-summary { grid-template-columns: repeat(3, 1fr); }
   .environment-row { grid-template-columns: auto 1fr auto auto; }
