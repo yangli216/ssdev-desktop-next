@@ -11,6 +11,7 @@ mod deployment_check;
 mod desktop;
 mod invocations;
 mod local_mappings;
+mod project_bundle;
 mod shortcuts;
 mod sso;
 
@@ -22,6 +23,7 @@ const DESKTOP_CAPABILITIES_SCHEMA_VERSION: u16 = 1;
 #[doc(hidden)]
 pub use app_update::verify_update_artifact_files;
 
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -290,6 +292,65 @@ struct DiagnosticsExportResult {
     bytes: u64,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectBundleExportResult {
+    bytes: u64,
+    signed_plugins: usize,
+    local_mappings: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectBundlePreview {
+    schema_version: u8,
+    created_by_version: String,
+    business_origins: usize,
+    signed_plugins: usize,
+    local_mappings: usize,
+    service_count: usize,
+    preflighted_hosts: usize,
+    components: Vec<ProjectBundleComponentPreview>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectBundleComponentPreview {
+    plugin_id: String,
+    version: Option<String>,
+    source: &'static str,
+    service_count: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectBundleImportResult {
+    signed_plugins: usize,
+    local_mappings: usize,
+    service_count: usize,
+    preflighted_hosts: usize,
+}
+
+enum PreparedProjectComponent {
+    Signed(PreparedPlugin),
+    Local(local_mappings::PreparedLocalMapping),
+}
+
+impl PreparedProjectComponent {
+    fn manifest(&self) -> &PluginManifest {
+        match self {
+            Self::Signed(prepared) => prepared.manifest(),
+            Self::Local(prepared) => prepared.manifest(),
+        }
+    }
+}
+
+struct PreparedProjectBundle {
+    config: ssdev_config::DesktopConfig,
+    components: Vec<PreparedProjectComponent>,
+    preview: ProjectBundlePreview,
+}
+
 #[tauri::command]
 async fn export_diagnostics(
     caller: WebviewWindow,
@@ -386,6 +447,353 @@ async fn export_diagnostics(
         "diagnostics exported"
     );
     Ok(DiagnosticsExportResult { bytes })
+}
+
+#[tauri::command]
+async fn export_project_bundle(
+    caller: WebviewWindow,
+    app: AppHandle,
+    destination: PathBuf,
+    state: State<'_, BridgeState>,
+    desktop_state: State<'_, desktop::DesktopState>,
+) -> Result<ProjectBundleExportResult, String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    recover_plugin_store(&state)?;
+    let config = desktop_state.config.snapshot();
+    desktop_state.authorize_config(&config)?;
+    let inspected = inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+    )?;
+    if !inspected.failures.is_empty() {
+        return Err(format!(
+            "当前有 {} 个插件或映射未通过校验，请先处理后再导出项目包",
+            inspected.failures.len()
+        ));
+    }
+    let trust_store = state.trust_store.clone();
+    let local_mapping_root = state.local_mapping_root.clone();
+    let version = app.package_info().version.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let temporary =
+            tempfile::tempdir().map_err(|error| format!("无法创建项目包组件暂存目录: {error}"))?;
+        let mut inputs = Vec::with_capacity(inspected.manifests.len());
+        let mut signed_plugins = 0_usize;
+        let mut local_mappings = 0_usize;
+        for manifest in inspected.manifests {
+            let plugin_id = manifest.plugin_id.clone();
+            if is_local_manifest(&manifest, &local_mapping_root) {
+                let path = temporary.path().join(format!("{plugin_id}.ssdev-mapping"));
+                local_mappings::export_bundle(&local_mapping_root, &plugin_id, &path)?;
+                inputs.push(project_bundle::ProjectBundleInput {
+                    plugin_id,
+                    version: None,
+                    kind: project_bundle::ProjectComponentKind::LocalMapping,
+                    path,
+                });
+                local_mappings += 1;
+            } else {
+                let trust_store = trust_store.as_deref().ok_or_else(|| {
+                    "开发态未签名插件不能进入项目部署包，请使用本地映射或正式签名插件".to_owned()
+                })?;
+                let metadata = manifest
+                    .metadata
+                    .as_ref()
+                    .ok_or_else(|| format!("签名插件 [{plugin_id}] 缺少版本元数据"))?;
+                let path = temporary.path().join(format!("{plugin_id}.ssdev-plugin"));
+                webplus_plugin_package::create_deterministic_package(
+                    &manifest.plugin_dir,
+                    &path,
+                    trust_store,
+                )
+                .map_err(|error| format!("无法导出签名插件 [{plugin_id}]: {error}"))?;
+                inputs.push(project_bundle::ProjectBundleInput {
+                    plugin_id,
+                    version: Some(metadata.version.to_string()),
+                    kind: project_bundle::ProjectComponentKind::SignedPlugin,
+                    path,
+                });
+                signed_plugins += 1;
+            }
+        }
+        project_bundle::create(&destination, &config, &version, inputs)?;
+        let bytes = fs::metadata(&destination)
+            .map_err(|error| format!("无法读取已导出项目包: {error}"))?
+            .len();
+        Ok::<_, String>(ProjectBundleExportResult {
+            bytes,
+            signed_plugins,
+            local_mappings,
+        })
+    })
+    .await
+    .map_err(|_| "项目包导出任务异常终止".to_owned())??;
+    tracing::info!(
+        event_code = "project-bundle-exported",
+        bytes = result.bytes,
+        signed_plugins = result.signed_plugins,
+        local_mappings = result.local_mappings,
+        "project deployment bundle exported"
+    );
+    Ok(result)
+}
+
+#[tauri::command]
+async fn inspect_project_bundle(
+    caller: WebviewWindow,
+    source: PathBuf,
+    state: State<'_, BridgeState>,
+    desktop_state: State<'_, desktop::DesktopState>,
+) -> Result<ProjectBundlePreview, String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    recover_plugin_store(&state)?;
+    let prepared = prepare_project_bundle(source, &state, &desktop_state).await?;
+    tracing::info!(
+        event_code = "project-bundle-inspected",
+        signed_plugins = prepared.preview.signed_plugins,
+        local_mappings = prepared.preview.local_mappings,
+        service_count = prepared.preview.service_count,
+        preflighted_hosts = prepared.preview.preflighted_hosts,
+        "project deployment bundle inspected"
+    );
+    Ok(prepared.preview)
+}
+
+#[tauri::command]
+async fn import_project_bundle(
+    caller: WebviewWindow,
+    app: AppHandle,
+    source: PathBuf,
+    state: State<'_, BridgeState>,
+    desktop_state: State<'_, desktop::DesktopState>,
+) -> Result<ProjectBundleImportResult, String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    recover_plugin_store(&state)?;
+    let prepared = prepare_project_bundle(source, &state, &desktop_state).await?;
+    let signed_plugins = prepared.preview.signed_plugins;
+    let local_mappings = prepared.preview.local_mappings;
+    let mut preflighted_hosts = 0_usize;
+    for component in prepared.components {
+        match component {
+            PreparedProjectComponent::Signed(plugin) => {
+                let trust_store = state
+                    .trust_store
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| "正式项目包要求启用插件签名信任".to_owned())?;
+                let result = activate_prepared_plugin(&state, &trust_store, plugin).await?;
+                preflighted_hosts = preflighted_hosts.saturating_add(result.preflighted_hosts);
+            }
+            PreparedProjectComponent::Local(mapping) => {
+                let result = activate_prepared_local_mapping(&state, mapping).await?;
+                preflighted_hosts = preflighted_hosts.saturating_add(result.preflighted_hosts);
+            }
+        }
+    }
+    if let Err(error) = desktop::replace_desktop_config(&app, &desktop_state, prepared.config) {
+        return Err(format!(
+            "项目组件已安全安装，但项目配置切换失败且保持原配置：{error}"
+        ));
+    }
+    let service_count = state.controller.service_count().await;
+    tracing::info!(
+        event_code = "project-bundle-imported",
+        signed_plugins,
+        local_mappings,
+        service_count,
+        preflighted_hosts,
+        "project deployment bundle imported"
+    );
+    Ok(ProjectBundleImportResult {
+        signed_plugins,
+        local_mappings,
+        service_count,
+        preflighted_hosts,
+    })
+}
+
+async fn prepare_project_bundle(
+    source: PathBuf,
+    state: &BridgeState,
+    desktop_state: &desktop::DesktopState,
+) -> Result<PreparedProjectBundle, String> {
+    let opened = tokio::task::spawn_blocking(move || project_bundle::open(&source))
+        .await
+        .map_err(|_| "项目包读取任务异常终止".to_owned())??;
+    desktop_state.authorize_config(&opened.config)?;
+    let business_origins = opened
+        .config
+        .business_origins()
+        .map_err(|error| error.to_string())?
+        .len();
+    let created_by_version = opened.created_by_version().to_owned();
+    let specifications = opened
+        .components()
+        .map(|component| {
+            (
+                component.plugin_id.to_owned(),
+                component.version.map(str::to_owned),
+                component.kind,
+                component.path,
+            )
+        })
+        .collect::<Vec<_>>();
+    let current = inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+    )?;
+    if !current.failures.is_empty() {
+        return Err(format!(
+            "目标机器当前有 {} 个无效插件或映射，请先处理后再导入项目包",
+            current.failures.len()
+        ));
+    }
+    let mut components = Vec::with_capacity(specifications.len());
+    let mut previews = Vec::with_capacity(specifications.len());
+    for (declared_id, declared_version, kind, path) in specifications {
+        match kind {
+            project_bundle::ProjectComponentKind::SignedPlugin => {
+                if current.manifests.iter().any(|manifest| {
+                    manifest.plugin_id == declared_id
+                        && is_local_manifest(manifest, &state.local_mapping_root)
+                }) {
+                    return Err(format!(
+                        "项目签名插件 [{declared_id}] 与目标机器的同名本地映射冲突，请先删除本地映射"
+                    ));
+                }
+                let trust_store = state
+                    .trust_store
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| "正式项目包要求启用插件签名信任".to_owned())?;
+                let plugin_root = state.plugin_root.clone();
+                let prepared = tokio::task::spawn_blocking(move || {
+                    PreparedPlugin::prepare(&path, &plugin_root, &trust_store)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|_| "签名插件准备任务异常终止".to_owned())??;
+                let metadata = prepared.metadata();
+                let actual_version = metadata.version.to_string();
+                if prepared.identity().plugin_id != declared_id
+                    || declared_version.as_deref() != Some(actual_version.as_str())
+                {
+                    return Err(format!("项目组件 [{declared_id}] 身份或版本与清单不一致"));
+                }
+                let current_version = current
+                    .manifests
+                    .iter()
+                    .find(|manifest| {
+                        manifest.plugin_id == declared_id
+                            && !is_local_manifest(manifest, &state.local_mapping_root)
+                    })
+                    .and_then(|manifest| manifest.metadata.as_ref())
+                    .map(|metadata| &metadata.version);
+                ensure_upgrade_allowed(current_version, &metadata.version)?;
+                previews.push(ProjectBundleComponentPreview {
+                    plugin_id: declared_id,
+                    version: Some(actual_version),
+                    source: "signed-package",
+                    service_count: prepared.manifest().services.len(),
+                });
+                components.push(PreparedProjectComponent::Signed(prepared));
+            }
+            project_bundle::ProjectComponentKind::LocalMapping => {
+                if current.manifests.iter().any(|manifest| {
+                    manifest.plugin_id == declared_id
+                        && !is_local_manifest(manifest, &state.local_mapping_root)
+                }) {
+                    return Err(format!(
+                        "项目本地映射 [{declared_id}] 与目标机器的同名签名插件冲突，请先调整映射 ID"
+                    ));
+                }
+                if declared_version.is_some() {
+                    return Err(format!("本地映射 [{declared_id}] 不应声明发布版本"));
+                }
+                let local_root = state.local_mapping_root.clone();
+                let prepared = tokio::task::spawn_blocking(move || {
+                    local_mappings::prepare_import(&local_root, &path)
+                })
+                .await
+                .map_err(|_| "本地映射准备任务异常终止".to_owned())??;
+                if prepared.plugin_id() != declared_id {
+                    return Err(format!("本地映射 [{declared_id}] 身份与清单不一致"));
+                }
+                previews.push(ProjectBundleComponentPreview {
+                    plugin_id: declared_id,
+                    version: None,
+                    source: "local-mapping",
+                    service_count: prepared.manifest().services.len(),
+                });
+                components.push(PreparedProjectComponent::Local(prepared));
+            }
+        }
+    }
+
+    let imported_ids = components
+        .iter()
+        .map(|component| component.manifest().plugin_id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut candidates = current
+        .manifests
+        .into_iter()
+        .filter(|manifest| !imported_ids.contains(&manifest.plugin_id))
+        .collect::<Vec<_>>();
+    candidates.extend(
+        components
+            .iter()
+            .map(|component| component.manifest().clone()),
+    );
+    PluginController::validate_manifests(&candidates).map_err(|error| error.to_string())?;
+    let mut preflighted_hosts = 0_usize;
+    for component in &components {
+        let report = state
+            .controller
+            .preflight_candidate_manifest(component.manifest())
+            .await
+            .map_err(|error| {
+                state
+                    .plugin_preflight_failures
+                    .fetch_add(1, Ordering::AcqRel);
+                format!(
+                    "项目组件 [{}] 宿主预检失败 ({})：{error}",
+                    component.manifest().plugin_id,
+                    error.diagnostic_code()
+                )
+            })?;
+        preflighted_hosts = preflighted_hosts.saturating_add(report.hosts_started);
+    }
+    state
+        .preflighted_plugin_hosts
+        .fetch_add(preflighted_hosts, Ordering::AcqRel);
+    let signed_plugins = previews
+        .iter()
+        .filter(|component| component.source == "signed-package")
+        .count();
+    let local_mappings = previews.len().saturating_sub(signed_plugins);
+    let service_count = previews
+        .iter()
+        .map(|component| component.service_count)
+        .sum();
+    Ok(PreparedProjectBundle {
+        config: opened.config,
+        components,
+        preview: ProjectBundlePreview {
+            schema_version: 1,
+            created_by_version,
+            business_origins,
+            signed_plugins,
+            local_mappings,
+            service_count,
+            preflighted_hosts,
+            components: previews,
+        },
+    })
 }
 
 #[derive(Serialize)]
@@ -1592,6 +2000,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             bridge_status,
             run_deployment_check,
+            export_project_bundle,
+            inspect_project_bundle,
+            import_project_bundle,
             frontend_ready,
             install_plugin_package,
             install_plugin_from_catalog,

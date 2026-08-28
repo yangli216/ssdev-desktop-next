@@ -4422,6 +4422,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "ssdev-config",
  "ssdev-diagnostics",
  "ssdev-invocation-ledger",

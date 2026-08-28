@@ -67,7 +67,7 @@ impl DesktopState {
             .map(|error| error.to_string())
     }
 
-    fn authorize_config(&self, config: &DesktopConfig) -> Result<(), String> {
+    pub(crate) fn authorize_config(&self, config: &DesktopConfig) -> Result<(), String> {
         self.origin_policy
             .authorize(config)
             .map_err(|error| error.to_string())
@@ -230,7 +230,7 @@ pub(crate) fn save_desktop_config(
     replace_desktop_config(&app, &state, config)
 }
 
-fn replace_desktop_config(
+pub(crate) fn replace_desktop_config(
     app: &AppHandle,
     state: &DesktopState,
     config: DesktopConfig,

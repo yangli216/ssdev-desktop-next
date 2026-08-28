@@ -88,6 +88,29 @@ type DeploymentCheckReport = {
   }>
 }
 
+type ProjectBundlePreview = {
+  schemaVersion: number
+  createdByVersion: string
+  businessOrigins: number
+  signedPlugins: number
+  localMappings: number
+  serviceCount: number
+  preflightedHosts: number
+  components: Array<{
+    pluginId: string
+    version?: string
+    source: 'signed-package' | 'local-mapping'
+    serviceCount: number
+  }>
+}
+
+type ProjectBundleImportResult = {
+  signedPlugins: number
+  localMappings: number
+  serviceCount: number
+  preflightedHosts: number
+}
+
 type EnvironmentConfig = {
   name: string
   url: string
@@ -191,6 +214,8 @@ type SsoStatusEvent = {
 
 const status = ref<BridgeStatus | null>(null)
 const deploymentCheck = ref<DeploymentCheckReport | null>(null)
+const projectBundlePreview = ref<ProjectBundlePreview | null>(null)
+const selectedProjectBundle = ref('')
 const snapshot = ref<ConfigSnapshot | null>(null)
 const inventory = ref<PluginInventory | null>(null)
 const catalogPluginId = ref('')
@@ -304,6 +329,60 @@ async function exportConfig() {
     () => invoke('export_desktop_config', { destination }),
     '当前有效配置已原子导出。',
   )
+}
+
+async function exportProjectBundle() {
+  const destination = await save({
+    defaultPath: 'ssdev-project.ssdev-project',
+    filters: [{ name: 'SSDEV 项目部署包', extensions: ['ssdev-project'] }],
+  })
+  if (typeof destination !== 'string') return
+  let result: { bytes: number; signedPlugins: number; localMappings: number } | undefined
+  await run(async () => {
+    result = await invoke<{ bytes: number; signedPlugins: number; localMappings: number }>('export_project_bundle', { destination })
+  }, '')
+  if (result) {
+    notice.value = `项目部署包已导出（${(result.bytes / 1024 / 1024).toFixed(1)} MiB）：${result.signedPlugins} 个签名插件，${result.localMappings} 个本地映射。`
+  }
+}
+
+async function inspectProjectBundle() {
+  const source = await open({
+    multiple: false,
+    directory: false,
+    filters: [{ name: 'SSDEV 项目部署包', extensions: ['ssdev-project'] }],
+  })
+  if (typeof source !== 'string') return
+  await run(async () => {
+    projectBundlePreview.value = null
+    selectedProjectBundle.value = ''
+    projectBundlePreview.value = await invoke<ProjectBundlePreview>('inspect_project_bundle', { source })
+    selectedProjectBundle.value = source
+  }, '项目包完整性、插件签名、路由冲突和宿主架构预检均已通过。')
+}
+
+async function importSelectedProjectBundle() {
+  if (!selectedProjectBundle.value || !projectBundlePreview.value) {
+    error.value = '请先选择并预检项目部署包。'
+    return
+  }
+  let result: ProjectBundleImportResult | undefined
+  await run(async () => {
+    result = await invoke<ProjectBundleImportResult>('import_project_bundle', {
+      source: selectedProjectBundle.value,
+    })
+    ;[status.value, snapshot.value, inventory.value, deploymentCheck.value] = await Promise.all([
+      invoke<BridgeStatus>('bridge_status'),
+      invoke<ConfigSnapshot>('desktop_config'),
+      invoke<PluginInventory>('plugin_inventory'),
+      invoke<DeploymentCheckReport>('run_deployment_check'),
+    ])
+    selectedProjectBundle.value = ''
+    projectBundlePreview.value = null
+  }, '')
+  if (result) {
+    notice.value = `项目已导入：${result.signedPlugins} 个签名插件、${result.localMappings} 个本地映射、${result.serviceCount} 个原生服务；已有业务窗口已关闭。`
+  }
 }
 
 async function openBusiness() {
@@ -604,7 +683,16 @@ async function runDeploymentCheck() {
       </section>
 
       <section v-show="activeSection === 'configuration'" class="page" aria-labelledby="configuration-title">
-        <header class="section-header"><div><p class="eyebrow">PROJECT CONFIGURATION</p><h1 id="configuration-title">项目配置</h1><p>管理业务环境、来源边界和桌面启动行为。</p></div><div class="header-actions"><button type="button" :disabled="busy" @click="importConfig">导入</button><button type="button" :disabled="busy" @click="exportConfig">导出</button></div></header>
+        <header class="section-header"><div><p class="eyebrow">PROJECT CONFIGURATION</p><h1 id="configuration-title">项目配置</h1><p>管理业务环境、来源边界和桌面启动行为。</p></div><div class="header-actions"><button type="button" :disabled="busy" @click="importConfig">导入配置</button><button type="button" :disabled="busy" @click="exportConfig">导出配置</button></div></header>
+        <section class="project-bundle-panel">
+          <div class="project-bundle-copy"><p class="eyebrow">PROJECT DELIVERY</p><h2>项目部署包</h2><p>将当前配置、签名插件和本地映射作为一个交付单元迁移到目标 Windows 机器。</p></div>
+          <div class="project-bundle-actions"><button type="button" :disabled="busy" @click="exportProjectBundle">导出当前项目</button><button class="primary" type="button" :disabled="busy" @click="inspectProjectBundle">选择项目包并预检</button></div>
+          <div v-if="projectBundlePreview" class="project-bundle-preview">
+            <header><div><strong>预检通过，可以导入</strong><small>由客户端 {{ projectBundlePreview.createdByVersion }} 创建 · schema {{ projectBundlePreview.schemaVersion }}</small></div><button class="primary" type="button" :disabled="busy" @click="importSelectedProjectBundle">确认导入并切换项目</button></header>
+            <div class="bundle-summary"><span><strong>{{ projectBundlePreview.businessOrigins }}</strong>业务来源</span><span><strong>{{ projectBundlePreview.signedPlugins }}</strong>签名插件</span><span><strong>{{ projectBundlePreview.localMappings }}</strong>本地映射</span><span><strong>{{ projectBundlePreview.serviceCount }}</strong>原生服务</span><span><strong>{{ projectBundlePreview.preflightedHosts }}</strong>宿主预检</span></div>
+            <ul><li v-for="component in projectBundlePreview.components" :key="component.pluginId"><span><strong>{{ component.pluginId }}</strong><small>{{ component.source === 'signed-package' ? `签名插件 ${component.version ?? ''}` : '本地动态映射' }}</small></span><em>{{ component.serviceCount }} 个服务</em></li></ul>
+          </div>
+        </section>
         <section class="operations" aria-label="桌面配置">
           <div class="operation-copy">
             <p class="eyebrow">BUSINESS ENTRY</p><h2>受控业务入口</h2>

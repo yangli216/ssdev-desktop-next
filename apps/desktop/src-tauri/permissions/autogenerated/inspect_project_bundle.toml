@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-inspect-project-bundle"
+description = "Enables the inspect_project_bundle command without any pre-configured scope."
+commands.allow = ["inspect_project_bundle"]
+
+[[permission]]
+identifier = "deny-inspect-project-bundle"
+description = "Denies the inspect_project_bundle command without any pre-configured scope."
+commands.deny = ["inspect_project_bundle"]
