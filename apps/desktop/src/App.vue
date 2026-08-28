@@ -89,6 +89,7 @@ type DeploymentCheckReport = {
 }
 
 type ProjectBundlePreview = {
+  planId: string
   schemaVersion: number
   createdByVersion: string
   signatureVerified: boolean
@@ -98,11 +99,25 @@ type ProjectBundlePreview = {
   localMappings: number
   serviceCount: number
   preflightedHosts: number
+  configChanged: boolean
+  installCount: number
+  upgradeCount: number
+  replaceCount: number
+  retainedCount: number
   components: Array<{
     pluginId: string
     version?: string
     desktopVersionRequirement?: string
     source: 'signed-package' | 'local-mapping'
+    action: 'install' | 'upgrade' | 'reinstall' | 'replace'
+    serviceCount: number
+  }>
+  retainedComponents: Array<{
+    pluginId: string
+    version?: string
+    desktopVersionRequirement?: string
+    source: 'signed-package' | 'local-mapping'
+    action: 'retain'
     serviceCount: number
   }>
 }
@@ -244,6 +259,13 @@ const sections: Array<{ id: ConsoleSection; label: string; description: string }
   { id: 'plugins', label: '插件管理', description: '安装、签名与更新' },
   { id: 'security', label: '安全与诊断', description: '策略、运行指标与日志' },
 ]
+const projectActionLabels = {
+  install: '新增',
+  upgrade: '升级',
+  reinstall: '同版本修复',
+  replace: '替换映射',
+  retain: '保留',
+} as const
 let unlistenSsoStatus: UnlistenFn | undefined
 let ssoStatusEventSeen = false
 
@@ -366,7 +388,7 @@ async function inspectProjectBundle() {
     selectedProjectBundle.value = ''
     projectBundlePreview.value = await invoke<ProjectBundlePreview>('inspect_project_bundle', { source })
     selectedProjectBundle.value = source
-  }, '项目包预检已完成；组织签名状态、组件、来源授权、联合路由和宿主结果见下方预览。')
+  }, '项目包预检已完成；导入计划已绑定项目包和当前机器状态，请核对变更后确认。')
 }
 
 async function importSelectedProjectBundle() {
@@ -374,10 +396,13 @@ async function importSelectedProjectBundle() {
     error.value = '请先选择并预检项目部署包。'
     return
   }
+  const source = selectedProjectBundle.value
+  const expectedPlanId = projectBundlePreview.value.planId
   let result: ProjectBundleImportResult | undefined
   await run(async () => {
     result = await invoke<ProjectBundleImportResult>('import_project_bundle', {
-      source: selectedProjectBundle.value,
+      source,
+      expectedPlanId,
     })
     ;[status.value, snapshot.value, inventory.value, deploymentCheck.value] = await Promise.all([
       invoke<BridgeStatus>('bridge_status'),
@@ -713,9 +738,12 @@ async function runDeploymentCheck() {
           <div class="project-bundle-copy"><p class="eyebrow">PROJECT DELIVERY</p><h2>项目部署包</h2><p>将当前配置、签名插件和本地映射作为一个交付单元迁移到目标 Windows 机器；正式导入要求同目录组织签名旁签。</p></div>
           <div class="project-bundle-actions"><button type="button" :disabled="busy" @click="exportProjectBundle">导出当前项目</button><button class="primary" type="button" :disabled="busy" @click="inspectProjectBundle">选择项目包并预检</button></div>
           <div v-if="projectBundlePreview" class="project-bundle-preview">
-            <header><div><strong>预检通过，可以导入</strong><small>由客户端 {{ projectBundlePreview.createdByVersion }} 创建 · schema {{ projectBundlePreview.schemaVersion }} · {{ projectBundlePreview.signatureVerified ? `组织签名 ${projectBundlePreview.signatureKeyId}` : '调试态未签名' }}</small></div><button class="primary" type="button" :disabled="busy" @click="importSelectedProjectBundle">确认导入并切换项目</button></header>
+            <header><div><strong>变更计划已验证，可以导入</strong><small>由客户端 {{ projectBundlePreview.createdByVersion }} 创建 · schema {{ projectBundlePreview.schemaVersion }} · {{ projectBundlePreview.signatureVerified ? `组织签名 ${projectBundlePreview.signatureKeyId}` : '调试态未签名' }}</small></div><button class="primary" type="button" :disabled="busy" @click="importSelectedProjectBundle">确认计划并切换项目</button></header>
             <div class="bundle-summary"><span><strong>{{ projectBundlePreview.businessOrigins }}</strong>业务来源</span><span><strong>{{ projectBundlePreview.signedPlugins }}</strong>签名插件</span><span><strong>{{ projectBundlePreview.localMappings }}</strong>本地映射</span><span><strong>{{ projectBundlePreview.serviceCount }}</strong>原生服务</span><span><strong>{{ projectBundlePreview.preflightedHosts }}</strong>宿主预检</span></div>
-            <ul><li v-for="component in projectBundlePreview.components" :key="component.pluginId"><span><strong>{{ component.pluginId }}</strong><small>{{ component.source === 'signed-package' ? `签名插件 ${component.version ?? ''} · Desktop ${component.desktopVersionRequirement ?? '未声明'}` : '本地动态映射' }}</small></span><em>{{ component.serviceCount }} 个服务</em></li></ul>
+            <div class="project-change-summary"><span :class="{ changed: projectBundlePreview.configChanged }">配置{{ projectBundlePreview.configChanged ? '更新' : '不变' }}</span><span>新增 {{ projectBundlePreview.installCount }}</span><span>升级 {{ projectBundlePreview.upgradeCount }}</span><span>修复/替换 {{ projectBundlePreview.replaceCount }}</span><span>保留本机 {{ projectBundlePreview.retainedCount }}</span></div>
+            <h3>项目包变更</h3>
+            <ul><li v-for="component in projectBundlePreview.components" :key="component.pluginId"><span><strong>{{ component.pluginId }}</strong><small>{{ component.source === 'signed-package' ? `签名插件 ${component.version ?? ''} · Desktop ${component.desktopVersionRequirement ?? '未声明'}` : '本地动态映射' }}</small></span><em><b :class="`plan-action ${component.action}`">{{ projectActionLabels[component.action] }}</b>{{ component.serviceCount }} 个服务</em></li></ul>
+            <details v-if="projectBundlePreview.retainedComponents.length" class="retained-components"><summary>不会删除的本机现有能力（{{ projectBundlePreview.retainedCount }}）</summary><ul><li v-for="component in projectBundlePreview.retainedComponents" :key="component.pluginId"><span><strong>{{ component.pluginId }}</strong><small>{{ component.source === 'signed-package' ? `签名插件 ${component.version ?? ''}` : '本地动态映射' }}</small></span><em><b class="plan-action retain">保留</b>{{ component.serviceCount }} 个服务</em></li></ul></details>
           </div>
         </section>
         <section class="operations" aria-label="桌面配置">

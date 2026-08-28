@@ -25,12 +25,14 @@ const DESKTOP_CAPABILITIES_SCHEMA_VERSION: u16 = 1;
 pub use app_update::verify_update_artifact_files;
 
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use ssdev_config::ConfigStore;
 use ssdev_diagnostics::{DiagnosticContext, DiagnosticsState, DiagnosticsStats};
 use ssdev_invocation_ledger::{
@@ -51,7 +53,7 @@ use webplus_plugin_package::{prepare_plugin_removal, PluginActivation, PreparedP
 use webplus_plugin_repository::{
     download_package, fetch_catalog, secure_http_client, CatalogEntry, PluginCatalog,
 };
-use webplus_plugin_trust::TrustStore;
+use webplus_plugin_trust::{prepare_signing_material, read_identity, TrustStore};
 use webplus_protocol::{InvokeRequest, InvokeResponse, PluginArchitecture, HOST_PROTOCOL_VERSION};
 
 use invocations::{
@@ -353,6 +355,7 @@ struct ProjectBundleExportResult {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectBundlePreview {
+    plan_id: String,
     schema_version: u8,
     created_by_version: String,
     signature_verified: bool,
@@ -362,7 +365,13 @@ struct ProjectBundlePreview {
     local_mappings: usize,
     service_count: usize,
     preflighted_hosts: usize,
+    config_changed: bool,
+    install_count: usize,
+    upgrade_count: usize,
+    replace_count: usize,
+    retained_count: usize,
     components: Vec<ProjectBundleComponentPreview>,
+    retained_components: Vec<ProjectBundleComponentPreview>,
 }
 
 #[derive(Clone, Serialize)]
@@ -372,6 +381,7 @@ struct ProjectBundleComponentPreview {
     version: Option<String>,
     desktop_version_requirement: Option<String>,
     source: &'static str,
+    action: &'static str,
     service_count: usize,
 }
 
@@ -668,6 +678,11 @@ async fn inspect_project_bundle(
         local_mappings = prepared.preview.local_mappings,
         service_count = prepared.preview.service_count,
         preflighted_hosts = prepared.preview.preflighted_hosts,
+        config_changed = prepared.preview.config_changed,
+        installs = prepared.preview.install_count,
+        upgrades = prepared.preview.upgrade_count,
+        replacements = prepared.preview.replace_count,
+        retained = prepared.preview.retained_count,
         "project deployment bundle inspected"
     );
     Ok(prepared.preview)
@@ -678,13 +693,20 @@ async fn import_project_bundle(
     caller: WebviewWindow,
     app: AppHandle,
     source: PathBuf,
+    expected_plan_id: String,
     state: State<'_, BridgeState>,
     desktop_state: State<'_, desktop::DesktopState>,
 ) -> Result<ProjectBundleImportResult, String> {
     desktop::require_control(&caller)?;
     let _install = state.install_lock.lock().await;
     recover_plugin_store(&state)?;
+    if !is_lowercase_sha256(&expected_plan_id) {
+        return Err("项目导入计划标识无效，请重新预检".into());
+    }
     let prepared = prepare_project_bundle(source, &state, &desktop_state).await?;
+    if prepared.preview.plan_id != expected_plan_id {
+        return Err("项目包或当前机器状态已在预检后变化，请重新预检后确认导入".into());
+    }
     let signed_plugins = prepared.preview.signed_plugins;
     let local_mappings = prepared.preview.local_mappings;
     let preflighted_hosts = prepared.preview.preflighted_hosts;
@@ -847,11 +869,12 @@ async fn prepare_project_bundle(
 ) -> Result<PreparedProjectBundle, String> {
     let strict_signature = state.plugin_trust_mode != "debug-unsigned";
     let trust_store = state.trust_store.clone();
-    let (opened, signature_verified, signature_key_id) = tokio::task::spawn_blocking(move || {
-        open_project_bundle_for_mode(&source, trust_store.as_deref(), strict_signature)
-    })
-    .await
-    .map_err(|_| "项目包读取任务异常终止".to_owned())??;
+    let (opened, signature_verified, signature_key_id, bundle_sha256) =
+        tokio::task::spawn_blocking(move || {
+            open_project_bundle_for_mode(&source, trust_store.as_deref(), strict_signature)
+        })
+        .await
+        .map_err(|_| "项目包读取任务异常终止".to_owned())??;
     desktop_state.authorize_config(&opened.config)?;
     let business_origins = opened
         .config
@@ -883,6 +906,24 @@ async fn prepare_project_bundle(
             current.failures.len()
         ));
     }
+    let current_config = desktop_state.config.snapshot();
+    let config_changed = current_config != opened.config;
+    let current_state_manifests = current.manifests.clone();
+    let current_state_local_root = state.local_mapping_root.clone();
+    let current_state_digest = tokio::task::spawn_blocking(move || {
+        project_import_state_digest(
+            &current_config,
+            &current_state_manifests,
+            &current_state_local_root,
+        )
+    })
+    .await
+    .map_err(|_| "项目导入基线摘要任务异常终止".to_owned())??;
+    let plan_id = project_import_plan_id(
+        &bundle_sha256,
+        &current_state_digest,
+        &state.desktop_version,
+    );
     let mut components = Vec::with_capacity(specifications.len());
     let mut previews = Vec::with_capacity(specifications.len());
     for (declared_id, declared_version, kind, path) in specifications {
@@ -916,16 +957,20 @@ async fn prepare_project_bundle(
                 {
                     return Err(format!("项目组件 [{declared_id}] 身份或版本与清单不一致"));
                 }
-                let current_version = current
-                    .manifests
-                    .iter()
-                    .find(|manifest| {
-                        manifest.plugin_id == declared_id
-                            && !is_local_manifest(manifest, &state.local_mapping_root)
-                    })
+                let current_manifest = current.manifests.iter().find(|manifest| {
+                    manifest.plugin_id == declared_id
+                        && !is_local_manifest(manifest, &state.local_mapping_root)
+                });
+                let current_version = current_manifest
                     .and_then(|manifest| manifest.metadata.as_ref())
                     .map(|metadata| &metadata.version);
                 ensure_upgrade_allowed(current_version, &metadata.version)?;
+                let action = classify_project_component_action(
+                    project_bundle::ProjectComponentKind::SignedPlugin,
+                    current_manifest.is_some(),
+                    current_version,
+                    Some(&metadata.version),
+                );
                 previews.push(ProjectBundleComponentPreview {
                     plugin_id: declared_id,
                     version: Some(actual_version),
@@ -934,11 +979,16 @@ async fn prepare_project_bundle(
                         .as_ref()
                         .map(ToString::to_string),
                     source: "signed-package",
+                    action,
                     service_count: prepared.manifest().services.len(),
                 });
                 components.push(PreparedProjectComponent::Signed(prepared));
             }
             project_bundle::ProjectComponentKind::LocalMapping => {
+                let current_mapping_exists = current.manifests.iter().any(|manifest| {
+                    manifest.plugin_id == declared_id
+                        && is_local_manifest(manifest, &state.local_mapping_root)
+                });
                 if current.manifests.iter().any(|manifest| {
                     manifest.plugin_id == declared_id
                         && !is_local_manifest(manifest, &state.local_mapping_root)
@@ -964,6 +1014,12 @@ async fn prepare_project_bundle(
                     version: None,
                     desktop_version_requirement: None,
                     source: "local-mapping",
+                    action: classify_project_component_action(
+                        project_bundle::ProjectComponentKind::LocalMapping,
+                        current_mapping_exists,
+                        None,
+                        None,
+                    ),
                     service_count: prepared.manifest().services.len(),
                 });
                 components.push(PreparedProjectComponent::Local(prepared));
@@ -975,6 +1031,37 @@ async fn prepare_project_bundle(
         .iter()
         .map(|component| component.manifest().plugin_id.clone())
         .collect::<std::collections::HashSet<_>>();
+    let retained_components = current
+        .manifests
+        .iter()
+        .filter(|manifest| !imported_ids.contains(&manifest.plugin_id))
+        .map(|manifest| {
+            let local = is_local_manifest(manifest, &state.local_mapping_root);
+            ProjectBundleComponentPreview {
+                plugin_id: manifest.plugin_id.clone(),
+                version: manifest
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.version.to_string()),
+                desktop_version_requirement: if local {
+                    None
+                } else {
+                    manifest
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.desktop_version_requirement.as_ref())
+                        .map(ToString::to_string)
+                },
+                source: if local {
+                    "local-mapping"
+                } else {
+                    "signed-package"
+                },
+                action: "retain",
+                service_count: manifest.services.len(),
+            }
+        })
+        .collect::<Vec<_>>();
     let mut candidates = current
         .manifests
         .into_iter()
@@ -1023,10 +1110,24 @@ async fn prepare_project_bundle(
         .iter()
         .map(|component| component.service_count)
         .sum();
+    let install_count = previews
+        .iter()
+        .filter(|component| component.action == "install")
+        .count();
+    let upgrade_count = previews
+        .iter()
+        .filter(|component| component.action == "upgrade")
+        .count();
+    let replace_count = previews
+        .iter()
+        .filter(|component| matches!(component.action, "reinstall" | "replace"))
+        .count();
+    let retained_count = retained_components.len();
     Ok(PreparedProjectBundle {
         config: opened.config,
         components,
         preview: ProjectBundlePreview {
+            plan_id,
             schema_version,
             created_by_version,
             signature_verified,
@@ -1036,23 +1137,154 @@ async fn prepare_project_bundle(
             local_mappings,
             service_count,
             preflighted_hosts,
+            config_changed,
+            install_count,
+            upgrade_count,
+            replace_count,
+            retained_count,
             components: previews,
+            retained_components,
         },
     })
+}
+
+fn classify_project_component_action(
+    kind: project_bundle::ProjectComponentKind,
+    current_exists: bool,
+    current_version: Option<&semver::Version>,
+    candidate_version: Option<&semver::Version>,
+) -> &'static str {
+    if !current_exists {
+        return "install";
+    }
+    match kind {
+        project_bundle::ProjectComponentKind::LocalMapping => "replace",
+        project_bundle::ProjectComponentKind::SignedPlugin => {
+            if current_version
+                .zip(candidate_version)
+                .is_some_and(|(current, candidate)| candidate > current)
+            {
+                "upgrade"
+            } else {
+                "reinstall"
+            }
+        }
+    }
+}
+
+fn project_import_state_digest(
+    config: &ssdev_config::DesktopConfig,
+    manifests: &[PluginManifest],
+    local_mapping_root: &std::path::Path,
+) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-PROJECT-IMPORT-STATE\0");
+    let config = serde_json::to_vec(config).map_err(|error| error.to_string())?;
+    hash_plan_field(&mut hasher, &config);
+
+    let mut manifests = manifests.iter().collect::<Vec<_>>();
+    manifests.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    let temporary =
+        tempfile::tempdir().map_err(|error| format!("无法创建项目导入基线暂存目录: {error}"))?;
+    for (index, manifest) in manifests.into_iter().enumerate() {
+        hash_plan_field(&mut hasher, manifest.plugin_id.as_bytes());
+        if is_local_manifest(manifest, local_mapping_root) {
+            hash_plan_field(&mut hasher, b"local-mapping");
+            let package = temporary
+                .path()
+                .join(format!("mapping-{index}.ssdev-mapping"));
+            local_mappings::export_bundle(local_mapping_root, &manifest.plugin_id, &package)?;
+            hash_plan_file(&mut hasher, &package)?;
+        } else {
+            hash_plan_field(&mut hasher, b"signed-package");
+            let key_id = match read_identity(&manifest.plugin_dir) {
+                Ok(identity) => identity.key_id,
+                Err(_) if allow_unsigned_plugins() => "debug-unsigned".to_owned(),
+                Err(error) => return Err(error.to_string()),
+            };
+            let material =
+                prepare_signing_material(&manifest.plugin_dir, &manifest.plugin_id, &key_id)
+                    .map_err(|error| error.to_string())?;
+            hash_plan_field(&mut hasher, &material.payload);
+        }
+    }
+    Ok(lowercase_hex(&hasher.finalize()))
+}
+
+fn project_import_plan_id(
+    bundle_sha256: &str,
+    current_state_sha256: &str,
+    desktop_version: &semver::Version,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-PROJECT-IMPORT-PLAN\0");
+    hash_plan_field(&mut hasher, bundle_sha256.as_bytes());
+    hash_plan_field(&mut hasher, current_state_sha256.as_bytes());
+    hash_plan_field(&mut hasher, desktop_version.to_string().as_bytes());
+    lowercase_hex(&hasher.finalize())
+}
+
+fn hash_plan_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_plan_file(hasher: &mut Sha256, path: &std::path::Path) -> Result<(), String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("无法读取项目导入基线文件: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("项目导入基线文件不是安全普通文件".into());
+    }
+    hasher.update(metadata.len().to_be_bytes());
+    let mut file =
+        fs::File::open(path).map_err(|error| format!("无法打开项目导入基线文件: {error}"))?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("无法计算项目导入基线摘要: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(())
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn open_project_bundle_for_mode(
     source: &std::path::Path,
     trust_store: Option<&TrustStore>,
     strict_signature: bool,
-) -> Result<(project_bundle::OpenedProjectBundle, bool, Option<String>), String> {
+) -> Result<
+    (
+        project_bundle::OpenedProjectBundle,
+        bool,
+        Option<String>,
+        String,
+    ),
+    String,
+> {
     if strict_signature {
         let trust_store = trust_store.ok_or_else(|| "正式项目包要求启用组织签名信任".to_owned())?;
         let signature = project_bundle::signature_path(source)?;
-        project_bundle::open_verified(source, &signature, trust_store)
-            .map(|(opened, verified)| (opened, true, Some(verified.key_id)))
+        project_bundle::open_verified(source, &signature, trust_store).map(|(opened, verified)| {
+            let bundle_sha256 = verified.summary.bundle_sha256;
+            (opened, true, Some(verified.key_id), bundle_sha256)
+        })
     } else {
-        project_bundle::open(source).map(|opened| (opened, false, None))
+        project_bundle::open_with_signing_material(source)
+            .map(|(opened, material)| (opened, false, None, material.summary.bundle_sha256))
     }
 }
 
@@ -3079,10 +3311,15 @@ fn select_runtime_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_plugin_updates, ensure_signed_plugin_compatible, ensure_upgrade_allowed,
-        is_plugin_update_available, legacy_config_candidates, open_project_bundle_for_mode,
-        project_bundle, select_runtime_path, service_inventory_item,
+        classify_project_component_action, collect_plugin_updates, ensure_signed_plugin_compatible,
+        ensure_upgrade_allowed, is_lowercase_sha256, is_plugin_update_available,
+        legacy_config_candidates, open_project_bundle_for_mode, project_bundle,
+        project_import_plan_id, project_import_state_digest, select_runtime_path,
+        service_inventory_item,
     };
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    use ed25519_dalek::{Signer, SigningKey};
     use semver::Version;
     use std::{
         fs,
@@ -3091,7 +3328,9 @@ mod tests {
     };
     use webplus_plugin_config::{PluginManifest, ServiceDefinition, API_FILENAME};
     use webplus_plugin_repository::PluginCatalog;
-    use webplus_plugin_trust::TrustStore;
+    use webplus_plugin_trust::{
+        encode_signature_document, prepare_signing_material, TrustStore, SIGNATURE_FILENAME,
+    };
 
     #[test]
     fn plugin_install_rejects_downgrade_but_allows_repair() {
@@ -3100,6 +3339,114 @@ mod tests {
         assert!(ensure_upgrade_allowed(Some(&current), &Version::new(2, 4, 0)).is_ok());
         assert!(ensure_upgrade_allowed(Some(&current), &Version::new(3, 0, 0)).is_ok());
         assert!(ensure_upgrade_allowed(None, &Version::new(1, 0, 0)).is_ok());
+    }
+
+    #[test]
+    fn project_import_plan_classifies_only_actions_the_import_actually_performs() {
+        use project_bundle::ProjectComponentKind::{LocalMapping, SignedPlugin};
+
+        assert_eq!(
+            classify_project_component_action(
+                SignedPlugin,
+                false,
+                None,
+                Some(&Version::new(1, 0, 0)),
+            ),
+            "install"
+        );
+        assert_eq!(
+            classify_project_component_action(
+                SignedPlugin,
+                true,
+                Some(&Version::new(1, 0, 0)),
+                Some(&Version::new(1, 1, 0)),
+            ),
+            "upgrade"
+        );
+        assert_eq!(
+            classify_project_component_action(
+                SignedPlugin,
+                true,
+                Some(&Version::new(1, 0, 0)),
+                Some(&Version::new(1, 0, 0)),
+            ),
+            "reinstall"
+        );
+        assert_eq!(
+            classify_project_component_action(LocalMapping, true, None, None),
+            "replace"
+        );
+    }
+
+    #[test]
+    fn project_import_plan_id_binds_bundle_state_and_desktop_version() {
+        let base =
+            project_import_plan_id(&"11".repeat(32), &"22".repeat(32), &Version::new(0, 1, 0));
+        assert!(is_lowercase_sha256(&base));
+        assert_ne!(
+            base,
+            project_import_plan_id(&"33".repeat(32), &"22".repeat(32), &Version::new(0, 1, 0),)
+        );
+        assert_ne!(
+            base,
+            project_import_plan_id(&"11".repeat(32), &"44".repeat(32), &Version::new(0, 1, 0),)
+        );
+        assert_ne!(
+            base,
+            project_import_plan_id(&"11".repeat(32), &"22".repeat(32), &Version::new(0, 2, 0),)
+        );
+    }
+
+    #[test]
+    fn project_import_state_digest_changes_with_the_saved_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let baseline = ssdev_config::DesktopConfig::default();
+        let mut changed = baseline.clone();
+        changed.website = Some("http://project.internal".into());
+
+        let baseline_digest = project_import_state_digest(&baseline, &[], root.path()).unwrap();
+        let changed_digest = project_import_state_digest(&changed, &[], root.path()).unwrap();
+        assert!(is_lowercase_sha256(&baseline_digest));
+        assert_ne!(baseline_digest, changed_digest);
+    }
+
+    #[test]
+    fn project_import_state_digest_binds_signed_plugin_file_content() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin = root.path().join("reader");
+        fs::create_dir(&plugin).unwrap();
+        fs::write(
+            plugin.join(API_FILENAME),
+            r#"{"serviceId":"reader","mainClass":"reader.dll"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin.join("plugin.json"),
+            r#"{"schemaVersion":1,"pluginId":"reader","version":"1.0.0","desktopVersionRequirement":">=0.1.0, <0.2.0"}"#,
+        )
+        .unwrap();
+        fs::write(plugin.join("reader.dll"), b"first signed payload").unwrap();
+        let signing_key = SigningKey::from_bytes(&[73_u8; 32]);
+        let material = prepare_signing_material(&plugin, "reader", "test-key").unwrap();
+        let signature = BASE64.encode(signing_key.sign(&material.payload).to_bytes());
+        fs::write(
+            plugin.join(SIGNATURE_FILENAME),
+            encode_signature_document(&material, &signature).unwrap(),
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("reader", &plugin).unwrap();
+        let config = ssdev_config::DesktopConfig::default();
+        let local_root = root.path().join("local-mappings");
+        fs::create_dir(&local_root).unwrap();
+
+        let before =
+            project_import_state_digest(&config, std::slice::from_ref(&manifest), &local_root)
+                .unwrap();
+        fs::write(plugin.join("reader.dll"), b"changed signed payload").unwrap();
+        let after =
+            project_import_state_digest(&config, std::slice::from_ref(&manifest), &local_root)
+                .unwrap();
+        assert_ne!(before, after);
     }
 
     #[test]
@@ -3299,8 +3646,10 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.contains("签名封套"));
-        let (_, verified, key_id) = open_project_bundle_for_mode(&project, None, false).unwrap();
+        let (_, verified, key_id, bundle_sha256) =
+            open_project_bundle_for_mode(&project, None, false).unwrap();
         assert!(!verified);
         assert!(key_id.is_none());
+        assert!(is_lowercase_sha256(&bundle_sha256));
     }
 }

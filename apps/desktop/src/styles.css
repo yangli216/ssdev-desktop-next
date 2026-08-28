@@ -97,12 +97,24 @@ button:disabled { cursor: wait !important; opacity: .5; }
 .bundle-summary span { display: grid; gap: 4px; padding: 14px 18px; border-right: 1px solid #dbe6dd; color: #748078; font-size: 10px; }
 .bundle-summary span:last-child { border-right: 0; }
 .bundle-summary strong { color: #244a36; font: 22px Georgia, serif; }
+.project-change-summary { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 18px; border-bottom: 1px solid #dbe6dd; background: rgba(242,247,243,.7); }
+.project-change-summary span { padding: 5px 9px; border: 1px solid #d4dfd7; border-radius: 999px; color: #617068; font-size: 10px; }
+.project-change-summary span.changed { border-color: #b8d3bf; background: #e7f3e9; color: #28583a; }
+.project-bundle-preview h3 { margin: 0; padding: 12px 18px 4px; color: #53645a; font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
 .project-bundle-preview ul { margin: 0; padding: 0; list-style: none; }
 .project-bundle-preview li { display: flex; justify-content: space-between; gap: 20px; align-items: center; padding: 11px 18px; border-bottom: 1px solid #edf1ed; }
 .project-bundle-preview li:last-child { border-bottom: 0; }
 .project-bundle-preview li span { display: grid; gap: 3px; }
 .project-bundle-preview li strong { color: #34483d; font-size: 12px; }
 .project-bundle-preview li small, .project-bundle-preview li em { color: #77837b; font-size: 10px; font-style: normal; }
+.project-bundle-preview li em { display: flex; gap: 8px; align-items: center; }
+.plan-action { padding: 3px 7px; border-radius: 999px; background: #edf2ee; color: #56645b; font-size: 9px; font-weight: 700; white-space: nowrap; }
+.plan-action.install { background: #e7f3e9; color: #28583a; }
+.plan-action.upgrade { background: #e7eff8; color: #285176; }
+.plan-action.reinstall, .plan-action.replace { background: #fff1d8; color: #79551c; }
+.plan-action.retain { background: #f0f1f0; color: #6a746e; }
+.retained-components { border-top: 1px solid #dbe6dd; }
+.retained-components summary { padding: 12px 18px; color: #5e6b63; font-size: 11px; cursor: pointer; }
 .operation-copy > p:not(.eyebrow), .plugin-inventory > div > p:not(.eyebrow) { color: #66736b; line-height: 1.7; }
 .migration { padding: 12px; overflow-wrap: anywhere; border-radius: 9px; background: #edf1e7; font-size: 12px; }
 .warning { color: #7c4d2b !important; background: #fff2df !important; }

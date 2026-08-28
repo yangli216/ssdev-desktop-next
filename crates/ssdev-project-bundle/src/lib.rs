@@ -359,11 +359,20 @@ pub fn signature_path(source: &Path) -> Result<PathBuf, String> {
 }
 
 pub fn signing_material(source: &Path) -> Result<ProjectBundleSigningMaterial, String> {
+    open_with_signing_material(source).map(|(_, material)| material)
+}
+
+/// Opens and fingerprints one stable project bundle as one bounded operation.
+/// Debug tooling can use this to bind an unsigned preview to the exact bytes
+/// that were inspected without duplicating the archive parsing rules.
+pub fn open_with_signing_material(
+    source: &Path,
+) -> Result<(OpenedProjectBundle, ProjectBundleSigningMaterial), String> {
     let before = bundle_fingerprint(source)?;
     let opened = open(source)?;
     let material = signing_material_from_opened(source, &opened)?;
     ensure_unchanged(&before, &material.summary)?;
-    Ok(material)
+    Ok((opened, material))
 }
 
 pub fn open_verified(
@@ -371,10 +380,7 @@ pub fn open_verified(
     envelope_path: &Path,
     trust_store: &TrustStore,
 ) -> Result<(OpenedProjectBundle, ProjectBundleSignature), String> {
-    let before = bundle_fingerprint(source)?;
-    let opened = open(source)?;
-    let material = signing_material_from_opened(source, &opened)?;
-    ensure_unchanged(&before, &material.summary)?;
+    let (opened, material) = open_with_signing_material(source)?;
     let envelope = read_signature_envelope(envelope_path)?;
     trust_store
         .verify_detached(
