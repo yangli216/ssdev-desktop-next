@@ -312,10 +312,15 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
         .transpose()?
         .map(|path| canonical_regular_file(&path, "previous release metadata"))
         .transpose()?;
+    let previous_bundle_root = previous_metadata_path
+        .as_deref()
+        .map(release_bundle_root_from_metadata)
+        .transpose()?;
     if let Some(path) = &previous_metadata_path {
         require_file_name(path, "release.json")?;
-        let previous_bundle_root = release_bundle_root_from_metadata(path)?;
-        if output.starts_with(previous_bundle_root) {
+        if output.starts_with(
+            previous_bundle_root.expect("previous metadata has a resolved bundle root"),
+        ) {
             return Err(invalid_input(
                 "evidence output must stay outside the previous release bundle",
             ));
@@ -332,6 +337,10 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
         .transpose()?;
 
     let source_before = capture_source_identity(&workspace)?;
+    verify_manifest(bundle_root, "metadata/artifacts.json")?;
+    if let Some(previous_bundle_root) = previous_bundle_root {
+        verify_manifest(previous_bundle_root, "metadata/artifacts.json")?;
+    }
     let release_metadata_before = sha256_file(&release_metadata_path)?;
     let artifact_manifest_before = sha256_file(&artifact_manifest_path)?;
     let current = verify_release_metadata(&release_metadata_path, Some(&workspace))?;
@@ -354,6 +363,10 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
         .transpose()?;
     validate_previous_version(&current, previous.as_ref())?;
 
+    verify_manifest(bundle_root, "metadata/artifacts.json")?;
+    if let Some(previous_bundle_root) = previous_bundle_root {
+        verify_manifest(previous_bundle_root, "metadata/artifacts.json")?;
+    }
     let source_after = capture_source_identity(&workspace)?;
     let release_metadata_after = sha256_file(&release_metadata_path)?;
     let artifact_manifest_after = sha256_file(&artifact_manifest_path)?;

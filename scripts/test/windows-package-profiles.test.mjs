@@ -25,6 +25,10 @@ const controllerUrl = new URL(
   "../../crates/webplus-controller/src/lib.rs",
   import.meta.url,
 );
+const cutoverEvidenceMainUrl = new URL(
+  "../../crates/ssdev-cutover-evidence/src/main.rs",
+  import.meta.url,
+);
 const controlHtmlUrl = new URL("../../apps/desktop/index.html", import.meta.url);
 
 test("Windows build exposes only the supported installer and WebView2 profiles", async () => {
@@ -175,9 +179,10 @@ test("Windows upgrade gate reinstalls and launches the exact previous release", 
 });
 
 test("production evidence binds delivery hosts, trust store, and origin policy", async () => {
-  const [matrixTest, packageTest] = await Promise.all([
+  const [matrixTest, packageTest, cutoverEvidenceMain] = await Promise.all([
     readFile(pluginMatrixTestUrl, "utf8"),
     readFile(packageTestUrl, "utf8"),
+    readFile(cutoverEvidenceMainUrl, "utf8"),
   ]);
 
   assert.match(matrixTest, /\[string\]\$X86Host/);
@@ -200,6 +205,22 @@ test("production evidence binds delivery hosts, trust store, and origin policy",
   assert.match(packageTest, /\$script:CandidateOriginPolicySha256/);
   assert.match(packageTest, /\$script:CandidateX86HostSha256/);
   assert.match(packageTest, /\$script:CandidateX64HostSha256/);
+  assert.equal(
+    (
+      cutoverEvidenceMain.match(
+        /verify_manifest\(bundle_root, "metadata\/artifacts\.json"\)/g,
+      ) ?? []
+    ).length,
+    2,
+  );
+  assert.equal(
+    (
+      cutoverEvidenceMain.match(
+        /verify_manifest\(previous_bundle_root, "metadata\/artifacts\.json"\)/g,
+      ) ?? []
+    ).length,
+    2,
+  );
   assert.match(packageTest, /\[string\]\$DeploymentCheckRecord/);
   assert.match(packageTest, /DeploymentCheckRecord.*deep deployment-check JSON file/);
   assert.match(packageTest, /else \{ "none" \}/);

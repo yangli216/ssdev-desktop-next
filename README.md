@@ -183,7 +183,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
   -ExpectedSignerSubject "<完整证书主题 DN>"
 ```
 
-该门禁先要求包内更新公钥与独立输入的组织公钥逐字节一致，再验证签名的全产物 SHA-256 清单、源码提交/锁文件/工具链溯源、Rust/npm CycloneDX SBOM、updater Minisign、信任密钥生命周期以及来源/可选进程策略的 active 密钥签名；随后安装 NSIS，验证 x64 主程序、x86/x64 宿主、注入策略及 Authenticode 发布者，启动到 `app-started` 诊断事件，最后静默卸载并确认程序与注册项清理完成。只有全部请求项成功后，才会以不覆盖方式在源码和 bundle 之外写出绑定发布元数据、产物清单、版本、实际安装插件信任库、来源策略与双宿主摘要、安装器覆盖、启动、升级、回退和签名结果的 schema 6 Windows 包证据；使用上一生产 bundle 时还绑定其版本、`release.json` 和 `artifacts.json` 摘要。正式验收另传 `-DeploymentCheckRecord`，把一小时内由同版本客户端导出的 Windows 深度检查摘要写入证据；普通 CI 不伪造真实业务页面结果，因此该字段为空且不能用于生产 GO。
+该门禁先要求包内更新公钥与独立输入的组织公钥逐字节一致，再验证签名的全产物 SHA-256 清单、源码提交/锁文件/工具链溯源、Rust/npm CycloneDX SBOM、updater Minisign、信任密钥生命周期以及来源/可选进程策略的 active 密钥签名；随后安装 NSIS，验证 x64 主程序、x86/x64 宿主、注入策略及 Authenticode 发布者，启动到 `app-started` 诊断事件，最后静默卸载并确认程序与注册项清理完成。机器证据生成器还会在自身读取前后重新按 `artifacts.json` 扫描候选及上一版本的完整 bundle；安装器、updater、策略、宿主、SBOM 或其他清单文件发生漂移时不写证据。只有全部请求项成功后，才会以不覆盖方式在源码和 bundle 之外写出绑定发布元数据、产物清单、版本、实际安装插件信任库、来源策略与双宿主摘要、安装器覆盖、启动、升级、回退和签名结果的 schema 6 Windows 包证据；使用上一生产 bundle 时还绑定其版本、`release.json` 和 `artifacts.json` 摘要。正式验收另传 `-DeploymentCheckRecord`，把一小时内由同版本客户端导出的 Windows 深度检查摘要写入证据；普通 CI 不伪造真实业务页面结果，因此该字段为空且不能用于生产 GO。
 
 若要验证覆盖升级，将上一正式版本解包目录作为额外输入：
 
