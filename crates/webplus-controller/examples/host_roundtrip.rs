@@ -48,10 +48,12 @@ async fn main() {
     let broken_manifest = PluginManifest::load("broken-smoke-plugin", broken_plugin_dir.path())
         .expect("failed to load broken smoke manifest");
     let broken = controller
-        .preflight_candidate_manifest(&broken_manifest)
+        .preflight_candidate_manifest_detailed(&broken_manifest)
         .await
         .expect_err("missing native component unexpectedly passed preflight");
-    assert_eq!(broken.diagnostic_code(), "native-component-missing");
+    assert_eq!(broken.plugin_id, "broken-smoke-plugin");
+    assert_eq!(broken.architecture, Some(architecture));
+    assert_eq!(broken.diagnostic_code, "native-component-missing");
 
     let plugin_dir = tempfile::tempdir().expect("failed to create smoke plugin directory");
     fs::copy(fixture, plugin_dir.path().join("fixture.dll"))

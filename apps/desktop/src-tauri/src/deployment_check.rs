@@ -12,7 +12,7 @@ pub(crate) struct DeploymentCheckFacts {
     pub(crate) is_windows: bool,
     pub(crate) deep_preflight: bool,
     pub(crate) deep_preflighted_hosts: usize,
-    pub(crate) deep_preflight_failed: bool,
+    pub(crate) deep_preflight_failure: Option<DeploymentPreflightFailure>,
     pub(crate) config_error: Option<String>,
     pub(crate) business_origin_count: usize,
     pub(crate) origin_policy_error: Option<String>,
@@ -40,6 +40,13 @@ pub(crate) struct DeploymentCheckFacts {
     pub(crate) diagnostics_available: bool,
     pub(crate) managed_process_failures: usize,
     pub(crate) app_update_configured: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DeploymentPreflightFailure {
+    pub(crate) plugin_id: Option<String>,
+    pub(crate) architecture: Option<&'static str>,
+    pub(crate) diagnostic_code: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -391,13 +398,31 @@ pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
         ));
     }
 
-    if facts.deep_preflight && facts.deep_preflight_failed {
+    if facts.deep_preflight && facts.deep_preflight_failure.is_some() {
+        let failure = facts
+            .deep_preflight_failure
+            .as_ref()
+            .expect("deep preflight failure was checked");
+        let summary = match &failure.plugin_id {
+            Some(plugin_id) => format!(
+                "插件 [{}]{} 未能通过隔离宿主 Health 预检 ({})。",
+                plugin_id,
+                failure
+                    .architecture
+                    .map_or_else(String::new, |architecture| format!(" {architecture}")),
+                failure.diagnostic_code
+            ),
+            None => format!(
+                "当前插件未能通过隔离宿主 Health 预检 ({})。",
+                failure.diagnostic_code
+            ),
+        };
         items.push(item(
             "plugin-preflight",
             "当前插件宿主深度预检",
             DeploymentCheckStatus::Fail,
-            "当前插件未能通过隔离宿主 Health 预检。",
-            Some("进入“插件管理”核对目标插件架构、依赖和入口定义；修复后重新执行深度自检。"),
+            summary,
+            Some(preflight_failure_action(failure.diagnostic_code)),
         ));
     } else if facts.deep_preflight {
         items.push(item(
@@ -524,6 +549,32 @@ fn item(
     }
 }
 
+fn preflight_failure_action(code: &str) -> &'static str {
+    match code {
+        "native-component-missing" => "重新验签或安装目标插件，并确认入口及依赖文件完整。",
+        "native-path-escape" => "修正越过插件目录的原生路径或重新打包；重复重试不会修复。",
+        "native-dll-preflight-failed" => {
+            "核对 DLL 位数、依赖文件和声明导出；修复后重新执行深度自检。"
+        }
+        "native-com-preflight-failed" => {
+            "核对对应位数的 COM/OCX 注册、类和成员声明；修复后重新执行深度自检。"
+        }
+        "native-process-preflight-failed" => "核对 EXE/BAT 入口完整性，文件变化时重新打包或安装。",
+        "native-operation-unsupported" | "host-architecture-mismatch" => {
+            "检查组件类型、x86/x64 架构和静态 ABI 声明。"
+        }
+        "host-spawn-failed" => "确认客户端安装完整，并检查终端防护是否阻止插件宿主启动。",
+        "host-protocol-version-mismatch" | "protocol-version-mismatch" => {
+            "修复或重新安装当前 Desktop，确保主程序与插件宿主版本一致。"
+        }
+        "plugin-state-drifted-during-preflight" => {
+            "插件在检查期间发生变化；重新扫描插件后再次执行深度自检。"
+        }
+        "plugin-inventory-unavailable" => "先修复插件目录或验签错误，再重新执行深度自检。",
+        _ => "进入“插件管理”核对目标插件架构、依赖和入口定义；修复后重新执行深度自检。",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,7 +584,7 @@ mod tests {
             is_windows: true,
             deep_preflight: true,
             deep_preflighted_hosts: 3,
-            deep_preflight_failed: false,
+            deep_preflight_failure: None,
             config_error: None,
             business_origin_count: 2,
             origin_policy_error: None,
@@ -641,7 +692,11 @@ mod tests {
     #[test]
     fn failed_deep_host_preflight_blocks_delivery() {
         let mut facts = healthy_facts();
-        facts.deep_preflight_failed = true;
+        facts.deep_preflight_failure = Some(DeploymentPreflightFailure {
+            plugin_id: Some("reader-plugin".into()),
+            architecture: Some("x86"),
+            diagnostic_code: "native-dll-preflight-failed",
+        });
         facts.deep_preflighted_hosts = 0;
 
         let report = evaluate(&facts);
@@ -649,7 +704,12 @@ mod tests {
         assert!(report.deep);
         assert!(!report.ready);
         assert!(report.items.iter().any(|item| {
-            item.id == "plugin-preflight" && item.status == DeploymentCheckStatus::Fail
+            item.id == "plugin-preflight"
+                && item.status == DeploymentCheckStatus::Fail
+                && item.summary.contains("reader-plugin")
+                && item.summary.contains("x86")
+                && item.summary.contains("native-dll-preflight-failed")
+                && item.action.is_some_and(|action| action.contains("DLL"))
         }));
     }
 

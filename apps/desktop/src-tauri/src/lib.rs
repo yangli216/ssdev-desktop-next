@@ -48,7 +48,8 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_global_shortcut::Builder as ShortcutBuilder;
 use tauri_plugin_opener::OpenerExt;
 use webplus_controller::{
-    PluginController, PluginTrust, SupervisorConfig, DEFAULT_MAX_IN_FLIGHT_INVOCATIONS,
+    PluginController, PluginPreflightFailure, PluginTrust, SupervisorConfig,
+    DEFAULT_MAX_IN_FLIGHT_INVOCATIONS,
 };
 use webplus_plugin_config::{discover_plugins, PluginManifest, ServiceDefinition};
 use webplus_plugin_package::{prepare_plugin_removal, PluginActivation, PreparedPlugin};
@@ -578,12 +579,19 @@ async fn run_deployment_check(
         .iter()
         .map(|manifest| manifest.services.len())
         .sum();
-    let (deep_preflighted_hosts, deep_preflight_failed) = if !deep {
-        (0, false)
+    let (deep_preflighted_hosts, deep_preflight_failure) = if !deep {
+        (0, None)
     } else if plugin_inventory_error.is_some() {
-        (0, true)
+        (
+            0,
+            Some(deployment_check::DeploymentPreflightFailure {
+                plugin_id: None,
+                architecture: None,
+                diagnostic_code: "plugin-inventory-unavailable",
+            }),
+        )
     } else {
-        match preflight_manifests(&state, &manifests, "部署深度自检插件").await {
+        match preflight_manifests_detailed(&state, &manifests).await {
             Ok(hosts) => match inspect_all_plugins(
                 &state.plugin_root,
                 &state.local_mapping_root,
@@ -594,7 +602,7 @@ async fn run_deployment_check(
                     if after.manifests == manifests
                         && same_plugin_failures(&plugin_failures, &after.failures) =>
                 {
-                    (hosts, false)
+                    (hosts, None)
                 }
                 Ok(_) | Err(_) => {
                     tracing::warn!(
@@ -602,16 +610,30 @@ async fn run_deployment_check(
                         error_code = "plugin-state-drifted-during-preflight",
                         "plugin state changed while the deep deployment check was running"
                     );
-                    (hosts, true)
+                    (
+                        hosts,
+                        Some(deployment_check::DeploymentPreflightFailure {
+                            plugin_id: None,
+                            architecture: None,
+                            diagnostic_code: "plugin-state-drifted-during-preflight",
+                        }),
+                    )
                 }
             },
-            Err(_error) => {
+            Err(failure) => {
                 tracing::warn!(
                     event_code = "deployment-check-host-preflight-failed",
-                    error_code = "plugin-host-preflight-failed",
+                    error_code = failure.diagnostic_code,
                     "deep deployment check could not preflight the current plugin hosts"
                 );
-                (0, true)
+                (
+                    0,
+                    Some(deployment_check::DeploymentPreflightFailure {
+                        plugin_id: Some(failure.plugin_id),
+                        architecture: failure.architecture.map(plugin_architecture_name),
+                        diagnostic_code: failure.diagnostic_code,
+                    }),
+                )
             }
         }
     };
@@ -647,7 +669,7 @@ async fn run_deployment_check(
         is_windows: cfg!(windows),
         deep_preflight: deep,
         deep_preflighted_hosts,
-        deep_preflight_failed,
+        deep_preflight_failure,
         config_error,
         business_origin_count,
         origin_policy_error,
@@ -1830,21 +1852,25 @@ async fn preflight_manifests(
     manifests: &[PluginManifest],
     subject: &str,
 ) -> Result<usize, String> {
+    preflight_manifests_detailed(state, manifests)
+        .await
+        .map_err(|failure| preflight_failure_message(subject, &failure))
+}
+
+async fn preflight_manifests_detailed(
+    state: &BridgeState,
+    manifests: &[PluginManifest],
+) -> Result<usize, PluginPreflightFailure> {
     let mut preflighted_hosts = 0_usize;
     for manifest in manifests {
         let report = state
             .controller
-            .preflight_candidate_manifest(manifest)
+            .preflight_candidate_manifest_detailed(manifest)
             .await
-            .map_err(|error| {
+            .inspect_err(|_| {
                 state
                     .plugin_preflight_failures
                     .fetch_add(1, Ordering::AcqRel);
-                format!(
-                    "{subject} [{}] 宿主预检失败 ({})：{error}",
-                    manifest.plugin_id,
-                    error.diagnostic_code()
-                )
             })?;
         preflighted_hosts = preflighted_hosts.saturating_add(report.hosts_started);
     }
@@ -1852,6 +1878,18 @@ async fn preflight_manifests(
         .preflighted_plugin_hosts
         .fetch_add(preflighted_hosts, Ordering::AcqRel);
     Ok(preflighted_hosts)
+}
+
+fn preflight_failure_message(subject: &str, failure: &PluginPreflightFailure) -> String {
+    let architecture = failure
+        .architecture
+        .map_or_else(String::new, |architecture| {
+            format!(" {}", plugin_architecture_name(architecture))
+        });
+    format!(
+        "{subject} [{}]{architecture} 宿主预检失败 ({})",
+        failure.plugin_id, failure.diagnostic_code
+    )
 }
 
 fn classify_project_component_action(
@@ -2247,17 +2285,17 @@ async fn inspect_plugin_package(
     );
     let preflight = match state
         .controller
-        .preflight_candidate_manifest(prepared.manifest())
+        .preflight_candidate_manifest_detailed(prepared.manifest())
         .await
     {
         Ok(preflight) => preflight,
-        Err(error) => {
+        Err(failure) => {
             state
                 .plugin_preflight_failures
                 .fetch_add(1, Ordering::AcqRel);
             return Err(format!(
-                "候选插件宿主预检失败 ({})，未修改当前插件",
-                error.diagnostic_code()
+                "{}，未修改当前插件",
+                preflight_failure_message("候选插件", &failure)
             ));
         }
     };
@@ -3044,17 +3082,17 @@ async fn activate_prepared_plugin(
 
     let preflight = match state
         .controller
-        .preflight_candidate_manifest(prepared.manifest())
+        .preflight_candidate_manifest_detailed(prepared.manifest())
         .await
     {
         Ok(preflight) => preflight,
-        Err(error) => {
+        Err(failure) => {
             state
                 .plugin_preflight_failures
                 .fetch_add(1, Ordering::AcqRel);
-            let diagnostic_code = error.diagnostic_code();
             return Err(format!(
-                "候选插件宿主预检失败 ({diagnostic_code})，未修改当前插件"
+                "{}，未修改当前插件",
+                preflight_failure_message("候选插件", &failure)
             ));
         }
     };
@@ -3701,15 +3739,15 @@ async fn activate_prepared_local_mapping(
     PluginController::validate_manifests(&candidates).map_err(|error| error.to_string())?;
     let preflight = state
         .controller
-        .preflight_candidate_manifest(prepared.manifest())
+        .preflight_candidate_manifest_detailed(prepared.manifest())
         .await
-        .map_err(|error| {
+        .map_err(|failure| {
             state
                 .plugin_preflight_failures
                 .fetch_add(1, Ordering::AcqRel);
             format!(
-                "本地映射宿主预检失败 ({})，未修改当前映射: {error}",
-                error.diagnostic_code(),
+                "{}，未修改当前映射",
+                preflight_failure_message("本地映射", &failure)
             )
         })?;
     if let Some(expected) = expected_current_state_sha256 {
@@ -5235,10 +5273,10 @@ mod tests {
         is_plugin_update_available, legacy_config_candidates, local_mapping_import_plan_id,
         local_mapping_import_state_digest, local_plugin_install_plan_id,
         open_project_bundle_for_mode, persist_startup_failure_document,
-        plugin_update_installed_state_digest, plugin_update_plan_id, project_bundle,
-        project_import_plan_id, project_import_state_digest, resolve_startup_failure_document,
-        same_manifest_contracts, select_runtime_path, service_inventory_item,
-        signed_plugin_route_policy_coverage, startup_failure_message,
+        plugin_update_installed_state_digest, plugin_update_plan_id, preflight_failure_message,
+        project_bundle, project_import_plan_id, project_import_state_digest,
+        resolve_startup_failure_document, same_manifest_contracts, select_runtime_path,
+        service_inventory_item, signed_plugin_route_policy_coverage, startup_failure_message,
         validate_signed_plugin_activation_routes, BridgePluginHostHealth, CatalogWithdrawalReason,
         FrontendRuntime, InspectedPlugins, LocalMappingImportPreview,
         LocalMappingImportServicePreview, PluginInstallBlocker, PluginInstallSource,
@@ -5257,6 +5295,7 @@ mod tests {
         path::PathBuf,
         time::{Duration, UNIX_EPOCH},
     };
+    use webplus_controller::PluginPreflightFailure;
     use webplus_plugin_config::{PluginManifest, ServiceDefinition, API_FILENAME};
     use webplus_plugin_repository::PluginCatalog;
     use webplus_plugin_trust::{
@@ -5303,6 +5342,24 @@ mod tests {
             assert!(message.contains("处理建议"));
             assert!(message.contains("日志目录"));
         }
+    }
+
+    #[test]
+    fn preflight_failure_message_exposes_only_safe_structured_context() {
+        let failure = PluginPreflightFailure {
+            plugin_id: "reader-plugin".to_owned(),
+            architecture: Some(PluginArchitecture::X86),
+            diagnostic_code: "native-dll-preflight-failed",
+        };
+
+        let message = preflight_failure_message("候选插件", &failure);
+
+        assert_eq!(
+            message,
+            "候选插件 [reader-plugin] x86 宿主预检失败 (native-dll-preflight-failed)"
+        );
+        assert!(!message.contains("C:\\vendor\\reader.dll"));
+        assert!(!message.contains("LoadLibrary"));
     }
 
     #[test]

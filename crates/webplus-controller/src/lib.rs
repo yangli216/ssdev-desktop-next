@@ -114,6 +114,18 @@ pub struct PluginPreflightReport {
     pub hosts_started: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginPreflightFailure {
+    pub plugin_id: String,
+    pub architecture: Option<PluginArchitecture>,
+    pub diagnostic_code: &'static str,
+}
+
+struct CandidatePreflightFailure {
+    public: PluginPreflightFailure,
+    source: ControllerError,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PluginHostStats {
     pub active_hosts: usize,
@@ -408,6 +420,26 @@ impl PluginController {
         &self,
         manifest: &PluginManifest,
     ) -> Result<PluginPreflightReport, ControllerError> {
+        self.preflight_candidate_manifest_internal(manifest)
+            .await
+            .map_err(|failure| failure.source)
+    }
+
+    /// Performs candidate Health preflight while retaining only the plugin,
+    /// architecture, and stable failure category for local operator workflows.
+    pub async fn preflight_candidate_manifest_detailed(
+        &self,
+        manifest: &PluginManifest,
+    ) -> Result<PluginPreflightReport, PluginPreflightFailure> {
+        self.preflight_candidate_manifest_internal(manifest)
+            .await
+            .map_err(|failure| failure.public)
+    }
+
+    async fn preflight_candidate_manifest_internal(
+        &self,
+        manifest: &PluginManifest,
+    ) -> Result<PluginPreflightReport, CandidatePreflightFailure> {
         let plugin_lifecycle = self.plugin_lifecycle(&manifest.plugin_id).await;
         let lifecycle_epoch = self.lifecycle_epoch.load(Ordering::Acquire);
         let plugin_epoch = plugin_lifecycle.epoch.load(Ordering::Acquire);
@@ -415,7 +447,11 @@ impl PluginController {
             || self.global_maintenance_active.load(Ordering::Acquire)
             || plugin_lifecycle.maintenance_active.load(Ordering::Acquire)
         {
-            return Err(ControllerError::PreflightUnavailable);
+            return Err(candidate_preflight_failure(
+                manifest,
+                None,
+                ControllerError::PreflightUnavailable,
+            ));
         }
         let _lifecycle = self.lifecycle.read().await;
         let _plugin_lifecycle = plugin_lifecycle.lifecycle.read().await;
@@ -425,9 +461,13 @@ impl PluginController {
             || self.lifecycle_epoch.load(Ordering::Acquire) != lifecycle_epoch
             || plugin_lifecycle.epoch.load(Ordering::Acquire) != plugin_epoch
         {
-            return Err(ControllerError::PreflightUnavailable);
+            return Err(candidate_preflight_failure(
+                manifest,
+                None,
+                ControllerError::PreflightUnavailable,
+            ));
         }
-        self.preflight_manifest_hosts(manifest).await
+        self.preflight_manifest_hosts_detailed(manifest).await
     }
 
     pub async fn begin_maintenance(&self) -> PluginMaintenance<'_> {
@@ -637,36 +677,58 @@ impl PluginController {
         &self,
         manifest: &PluginManifest,
     ) -> Result<PluginPreflightReport, ControllerError> {
+        self.preflight_manifest_hosts_detailed(manifest)
+            .await
+            .map_err(|failure| failure.source)
+    }
+
+    async fn preflight_manifest_hosts_detailed(
+        &self,
+        manifest: &PluginManifest,
+    ) -> Result<PluginPreflightReport, CandidatePreflightFailure> {
         let descriptors = preflight_descriptors(manifest);
         let result = match descriptors.as_slice() {
             [] => Ok(()),
-            [descriptor] => self.supervisor.preflight(descriptor).await,
-            [first, second] => {
-                let (first, second) = tokio::join!(
-                    self.supervisor.preflight(first),
-                    self.supervisor.preflight(second)
+            [descriptor] => self
+                .supervisor
+                .preflight(descriptor)
+                .await
+                .map_err(|error| (descriptor.architecture, error)),
+            [first_descriptor, second_descriptor] => {
+                let (first_result, second_result) = tokio::join!(
+                    self.supervisor.preflight(first_descriptor),
+                    self.supervisor.preflight(second_descriptor)
                 );
-                first.and(second)
+                match (first_result, second_result) {
+                    (Err(error), _) => Err((first_descriptor.architecture, error)),
+                    (Ok(()), Err(error)) => Err((second_descriptor.architecture, error)),
+                    (Ok(()), Ok(())) => Ok(()),
+                }
             }
             descriptors => {
                 let mut result = Ok(());
                 for descriptor in descriptors {
                     if let Err(failure) = self.supervisor.preflight(descriptor).await {
-                        result = Err(failure);
+                        result = Err((descriptor.architecture, failure));
                         break;
                     }
                 }
                 result
             }
         };
-        if let Err(failure) = result {
+        if let Err((architecture, failure)) = result {
             warn!(
                 event_code = "plugin-host-preflight-failed",
                 plugin_id = manifest.plugin_id,
+                architecture = ?architecture,
                 error_code = failure.diagnostic_code(),
                 "plugin host preflight failed"
             );
-            return Err(failure);
+            return Err(candidate_preflight_failure(
+                manifest,
+                Some(architecture),
+                failure,
+            ));
         }
         info!(
             event_code = "plugin-host-preflight-succeeded",
@@ -879,6 +941,21 @@ impl ScopedPluginMaintenance<'_> {
         routes.retain(|_, route| route.descriptor.plugin_id != self.plugin_id);
         routes.extend(replacement);
         Ok(())
+    }
+}
+
+fn candidate_preflight_failure(
+    manifest: &PluginManifest,
+    architecture: Option<PluginArchitecture>,
+    source: ControllerError,
+) -> CandidatePreflightFailure {
+    CandidatePreflightFailure {
+        public: PluginPreflightFailure {
+            plugin_id: manifest.plugin_id.clone(),
+            architecture,
+            diagnostic_code: source.diagnostic_code(),
+        },
+        source,
     }
 }
 
@@ -2462,6 +2539,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detailed_candidate_preflight_identifies_plugin_architecture_and_stable_failure() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("api.json"),
+            r#"{"serviceId":"candidate","mainClass":"reader.dll","architecture":"x64"}"#,
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("candidate-plugin", root.path()).unwrap();
+        let controller = PluginController::new(config()).unwrap();
+
+        let failure = controller
+            .preflight_candidate_manifest_detailed(&manifest)
+            .await
+            .unwrap_err();
+
+        assert_eq!(failure.plugin_id, "candidate-plugin");
+        assert_eq!(failure.architecture, Some(PluginArchitecture::X64));
+        assert_eq!(failure.diagnostic_code, "host-spawn-failed");
+        assert_eq!(controller.service_count().await, 0);
+    }
+
+    #[tokio::test]
     async fn candidate_preflight_cannot_cross_an_active_maintenance_boundary() {
         let root = tempdir().unwrap();
         fs::write(
@@ -2479,6 +2578,30 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(failure, ControllerError::PreflightUnavailable));
+        assert_eq!(controller.plugin_host_stats().failed_starts, 0);
+        drop(maintenance);
+    }
+
+    #[tokio::test]
+    async fn detailed_candidate_preflight_omits_architecture_at_lifecycle_boundary() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("api.json"),
+            r#"{"serviceId":"candidate","mainClass":"reader.dll","architecture":"x86"}"#,
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("candidate-plugin", root.path()).unwrap();
+        let controller = PluginController::new(config()).unwrap();
+        let maintenance = controller.begin_maintenance().await;
+
+        let failure = controller
+            .preflight_candidate_manifest_detailed(&manifest)
+            .await
+            .unwrap_err();
+
+        assert_eq!(failure.plugin_id, "candidate-plugin");
+        assert_eq!(failure.architecture, None);
+        assert_eq!(failure.diagnostic_code, "preflight-unavailable");
         assert_eq!(controller.plugin_host_stats().failed_starts, 0);
         drop(maintenance);
     }
