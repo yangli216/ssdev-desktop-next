@@ -383,6 +383,12 @@ type BusinessDataClearResult = {
   failedWindowClosures: number
 }
 
+type BusinessWindowReloadResult = {
+  requestedWindows: number
+  reloadedWindows: number
+  failedWindows: number
+}
+
 type ControlRefreshField = 'status' | 'config' | 'inventory' | 'deployment'
 type PrimaryActionOutcome = {
   succeeded: boolean
@@ -1145,7 +1151,21 @@ async function confirmBusinessDataClear() {
 }
 
 async function reloadBusiness() {
-  await run(() => invoke('reload_business_windows'), '业务窗口已刷新。')
+  let result: BusinessWindowReloadResult | undefined
+  const outcome = await runPrimaryThenRefresh(async () => {
+    result = await invoke<BusinessWindowReloadResult>('reload_business_windows')
+  }, ['status'])
+  if (!outcome.succeeded || !result) return
+  if (result.requestedWindows === 0) {
+    showPrimaryActionSuccess('当前没有打开的业务窗口，无需刷新。', outcome.refreshed)
+  } else if (result.failedWindows > 0) {
+    showPrimaryActionSuccess(
+      `已刷新 ${result.reloadedWindows} / ${result.requestedWindows} 个业务窗口；${result.failedWindows} 个窗口无法刷新，请关闭后重新进入。`,
+      outcome.refreshed,
+    )
+  } else {
+    showPrimaryActionSuccess(`已刷新 ${result.reloadedWindows} 个业务窗口。`, outcome.refreshed)
+  }
 }
 
 async function retryTimedOutBusinessWindows() {

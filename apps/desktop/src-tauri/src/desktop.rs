@@ -81,6 +81,14 @@ pub(crate) struct BusinessDataClearResult {
     failed_window_closures: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BusinessWindowReloadResult {
+    requested_windows: usize,
+    reloaded_windows: usize,
+    failed_windows: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BusinessReadyTransition {
     recovered_after_timeout: bool,
@@ -1207,9 +1215,12 @@ pub(crate) fn clear_business_data(
 }
 
 #[tauri::command]
-pub(crate) fn reload_business_windows(caller: WebviewWindow, app: AppHandle) -> Result<(), String> {
+pub(crate) fn reload_business_windows(
+    caller: WebviewWindow,
+    app: AppHandle,
+) -> Result<BusinessWindowReloadResult, String> {
     require_control(&caller)?;
-    reload_business_windows_internal(&app)
+    Ok(reload_business_windows_internal(&app))
 }
 
 #[tauri::command]
@@ -1243,11 +1254,16 @@ pub(crate) fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                     }
                 }
                 "reload-business" => {
-                    if reload_business_windows_internal(app).is_err() {
+                    let result = reload_business_windows_internal(app);
+                    if result.failed_windows > 0 {
                         tracing::warn!(
                             event_code = "tray-reload-business-failed",
+                            requested_windows = result.requested_windows,
+                            reloaded_windows = result.reloaded_windows,
+                            failed_windows = result.failed_windows,
                             "tray reload action failed"
                         );
+                        show_control(app);
                     }
                 }
                 "quit" => request_graceful_exit(app, 0),
@@ -1980,13 +1996,19 @@ fn business_data_clear_plan_id(
     crate::lowercase_hex(&hasher.finalize())
 }
 
-fn reload_business_windows_internal(app: &AppHandle) -> Result<(), String> {
+fn reload_business_windows_internal(app: &AppHandle) -> BusinessWindowReloadResult {
+    let mut result = BusinessWindowReloadResult::default();
     for (label, window) in app.webview_windows() {
         if label.starts_with(BUSINESS_LABEL_PREFIX) {
-            window.reload().map_err(|error| error.to_string())?;
+            result.requested_windows += 1;
+            if window.reload().is_ok() {
+                result.reloaded_windows += 1;
+            } else {
+                result.failed_windows += 1;
+            }
         }
     }
-    Ok(())
+    result
 }
 
 fn retry_timed_out_business_windows_internal(
@@ -2097,6 +2119,25 @@ mod tests {
             })
         );
         assert!(!value.to_string().contains("example.test"));
+    }
+
+    #[test]
+    fn business_window_reload_result_exposes_only_aggregate_counts() {
+        let value = serde_json::to_value(BusinessWindowReloadResult {
+            requested_windows: 3,
+            reloaded_windows: 2,
+            failed_windows: 1,
+        })
+        .unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "requestedWindows": 3,
+                "reloadedWindows": 2,
+                "failedWindows": 1,
+            })
+        );
     }
 
     #[test]
