@@ -14,7 +14,7 @@ test('committed control actions are not reported as failed by follow-up reads', 
   assert.match(source, /@click="retryControlStateRefresh"/)
   assert.match(source, /controlRefreshMissing\.value = \[\.\.\.new Set\(/)
   assert.match(source, /pendingControlRefreshFields/)
-  assert.match(source, /runPrimaryThenRefresh\([\s\S]+invoke\('save_desktop_config'/)
+  assert.match(source, /runPrimaryThenRefresh\([\s\S]+invoke<BusinessSurfaceCloseResult>\('save_desktop_config'/)
   assert.match(source, /runPrimaryThenRefresh\([\s\S]+invoke<ProjectBundleImportResult>\('import_project_bundle'/)
   assert.match(source, /runPrimaryThenRefresh\([\s\S]+invoke<PluginInstallResult>\('install_plugin_package'/)
   assert.match(source, /runPrimaryThenRefresh\([\s\S]+invoke\('uninstall_signed_plugin'/)

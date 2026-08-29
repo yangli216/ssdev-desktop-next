@@ -76,17 +76,18 @@ pub(crate) struct BusinessDataClearPreview {
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct BusinessDataClearResult {
-    close_requested_windows: usize,
-    failed_window_closures: usize,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct BusinessWindowReloadResult {
     requested_windows: usize,
     reloaded_windows: usize,
     failed_windows: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BusinessSurfaceCloseResult {
+    pub(crate) requested_windows: usize,
+    pub(crate) closed_windows: usize,
+    pub(crate) failed_windows: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +198,13 @@ impl DesktopState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(label);
+    }
+
+    fn release_floating_window_label(&self, label: &str) {
+        self.floating_windows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|_, entry| entry.window_label != label);
     }
 
     fn mark_business_navigation(&self, label: &str, business_origin: bool) -> Option<u64> {
@@ -495,6 +503,15 @@ pub(crate) struct ConfigImportPreview {
     change: ConfigChangePreview,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfigImportResult {
+    #[serde(flatten)]
+    snapshot: ConfigSnapshot,
+    #[serde(flatten)]
+    closed_surfaces: BusinessSurfaceCloseResult,
+}
+
 #[tauri::command]
 pub(crate) fn desktop_config<R: tauri::Runtime>(
     caller: WebviewWindow<R>,
@@ -521,11 +538,12 @@ pub(crate) async fn save_desktop_config(
     state: State<'_, DesktopState>,
     bridge_state: State<'_, crate::BridgeState>,
     config: DesktopConfig,
-) -> Result<(), String> {
+) -> Result<BusinessSurfaceCloseResult, String> {
     require_control(&caller)?;
     let _install = bridge_state.install_lock.lock().await;
     crate::validate_config_signed_plugin_route_change(&state, &bridge_state, &config).await?;
-    replace_desktop_config(&app, &state, config)
+    replace_desktop_config(&app, &state, config)?;
+    Ok(force_close_business_surfaces(&app))
 }
 
 #[tauri::command]
@@ -593,7 +611,6 @@ pub(crate) fn replace_desktop_config(
             "tray menu refresh failed after desktop config replacement"
         );
     }
-    close_business_windows(app);
     Ok(())
 }
 
@@ -605,7 +622,7 @@ pub(crate) async fn import_desktop_config(
     bridge_state: State<'_, crate::BridgeState>,
     source: PathBuf,
     expected_plan_id: String,
-) -> Result<ConfigSnapshot, String> {
+) -> Result<ConfigImportResult, String> {
     require_control(&caller)?;
     let _install = bridge_state.install_lock.lock().await;
     if !crate::is_lowercase_sha256(&expected_plan_id) {
@@ -622,9 +639,13 @@ pub(crate) async fn import_desktop_config(
             event_code = "desktop-config-import-unchanged",
             "desktop config import skipped because configuration is unchanged"
         );
-        return Ok(config_snapshot(&state));
+        return Ok(ConfigImportResult {
+            snapshot: config_snapshot(&state),
+            closed_surfaces: BusinessSurfaceCloseResult::default(),
+        });
     }
     replace_desktop_config(&app, &state, candidate)?;
+    let closed_surfaces = force_close_business_surfaces(&app);
     tracing::info!(
         event_code = "desktop-config-imported",
         config_changed = preview.change.config_changed,
@@ -634,7 +655,10 @@ pub(crate) async fn import_desktop_config(
         enabled_shortcuts = preview.change.candidate_enabled_shortcut_count,
         "desktop config imported"
     );
-    Ok(config_snapshot(&state))
+    Ok(ConfigImportResult {
+        snapshot: config_snapshot(&state),
+        closed_surfaces,
+    })
 }
 
 fn build_config_import_preview(
@@ -1174,7 +1198,7 @@ pub(crate) fn clear_business_data(
     app: AppHandle,
     state: State<'_, DesktopState>,
     expected_plan_id: String,
-) -> Result<BusinessDataClearResult, String> {
+) -> Result<BusinessSurfaceCloseResult, String> {
     require_control(&caller)?;
     if !crate::is_lowercase_sha256(&expected_plan_id) {
         return Err("站点数据清理计划标识无效，请重新检查影响".into());
@@ -1193,22 +1217,15 @@ pub(crate) fn clear_business_data(
         "无法提交站点数据清理请求，请关闭业务窗口后重试；错误码：webview-data-clear".to_owned()
     })?;
 
-    let mut result = BusinessDataClearResult::default();
-    for (label, window) in app.webview_windows() {
-        if label.starts_with(BUSINESS_LABEL_PREFIX) || label.starts_with(FLOATING_LABEL_PREFIX) {
-            result.close_requested_windows += 1;
-            if window.close().is_err() {
-                result.failed_window_closures += 1;
-            }
-        }
-    }
+    let result = force_close_business_surfaces(&app);
     tracing::info!(
         event_code = "business-data-clear-requested",
         configured_business_origins = preview.configured_business_origins,
         business_windows = preview.business_windows,
         floating_windows = preview.floating_windows,
-        close_requested_windows = result.close_requested_windows,
-        failed_window_closures = result.failed_window_closures,
+        close_requested_windows = result.requested_windows,
+        closed_windows = result.closed_windows,
+        failed_window_closures = result.failed_windows,
         "business browsing data clear request accepted"
     );
     Ok(result)
@@ -1373,7 +1390,16 @@ fn request_graceful_exit(app: &AppHandle, exit_code: i32) {
         return;
     }
 
-    close_business_windows(app);
+    let closed = force_close_business_surfaces(app);
+    if closed.failed_windows > 0 {
+        tracing::warn!(
+            event_code = "app-exit-business-close-failed",
+            requested_windows = closed.requested_windows,
+            closed_windows = closed.closed_windows,
+            failed_windows = closed.failed_windows,
+            "application exit could not destroy every business surface before drain"
+        );
+    }
     let app = app.clone();
     let (controller, invocation_coordinator) = {
         let bridge = app.state::<crate::BridgeState>();
@@ -1934,12 +1960,30 @@ fn bridge_initialization_script(
     ))
 }
 
-pub(crate) fn close_business_windows(app: &AppHandle) {
+pub(crate) fn force_close_business_surfaces<R: Runtime>(
+    app: &AppHandle<R>,
+) -> BusinessSurfaceCloseResult {
+    let state = app.state::<DesktopState>();
+    let mut result = BusinessSurfaceCloseResult::default();
     for (label, window) in app.webview_windows() {
-        if label.starts_with(BUSINESS_LABEL_PREFIX) {
-            let _ = window.close();
+        let business = label.starts_with(BUSINESS_LABEL_PREFIX);
+        let floating = label.starts_with(FLOATING_LABEL_PREFIX);
+        if !business && !floating {
+            continue;
+        }
+        result.requested_windows += 1;
+        if window.destroy().is_ok() {
+            result.closed_windows += 1;
+            if business {
+                state.release_business_window_label(&label);
+            } else {
+                state.release_floating_window_label(&label);
+            }
+        } else {
+            result.failed_windows += 1;
         }
     }
+    result
 }
 
 fn build_business_data_clear_preview(
@@ -2138,6 +2182,63 @@ mod tests {
                 "failedWindows": 1,
             })
         );
+    }
+
+    #[test]
+    fn programmatic_project_close_destroys_business_and_floating_surfaces_without_stale_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            ConfigStore::open(directory.path().join("config.json"), Vec::<PathBuf>::new()).unwrap();
+        let state = DesktopState::new(store, OriginPolicy::development_unrestricted());
+        let business_label = state.reserve_business_window_label().unwrap();
+        let floating_label = state.take_floating_label();
+        state
+            .floating_windows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                "notice-1".into(),
+                FloatingEntry {
+                    window_label: floating_label.clone(),
+                    parent_label: business_label.clone(),
+                },
+            );
+        let app = tauri::test::mock_builder()
+            .manage(state)
+            .build(crate::app_context())
+            .unwrap();
+        WebviewWindowBuilder::new(
+            &app,
+            &business_label,
+            WebviewUrl::External(Url::parse("https://business.example.test/app").unwrap()),
+        )
+        .build()
+        .unwrap();
+        WebviewWindowBuilder::new(
+            &app,
+            &floating_label,
+            WebviewUrl::External(Url::parse("https://business.example.test/notice").unwrap()),
+        )
+        .build()
+        .unwrap();
+
+        let closed = force_close_business_surfaces(app.handle());
+
+        assert_eq!(closed.requested_windows, 2);
+        assert_eq!(closed.closed_windows, 2);
+        assert_eq!(closed.failed_windows, 0);
+        assert_eq!(
+            app.state::<DesktopState>()
+                .business_frontend_health()
+                .active_windows,
+            0
+        );
+        assert!(app
+            .state::<DesktopState>()
+            .floating_windows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
     }
 
     #[test]

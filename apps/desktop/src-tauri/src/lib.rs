@@ -880,6 +880,9 @@ struct ProjectBundleImportResult {
     local_mappings: usize,
     service_count: usize,
     preflighted_hosts: usize,
+    requested_windows: usize,
+    closed_windows: usize,
+    failed_windows: usize,
 }
 
 enum PreparedProjectComponent {
@@ -1367,6 +1370,7 @@ async fn import_project_bundle(
         ));
     }
     baseline_transition.commit();
+    let closed_surfaces = desktop::force_close_business_surfaces(&app);
 
     let mut deferred_cleanup = 0_usize;
     for component in activated {
@@ -1395,6 +1399,9 @@ async fn import_project_bundle(
         service_count,
         preflighted_hosts,
         deferred_cleanup,
+        requested_windows = closed_surfaces.requested_windows,
+        closed_windows = closed_surfaces.closed_windows,
+        failed_windows = closed_surfaces.failed_windows,
         "project deployment bundle imported"
     );
     Ok(ProjectBundleImportResult {
@@ -1402,6 +1409,9 @@ async fn import_project_bundle(
         local_mappings,
         service_count,
         preflighted_hosts,
+        requested_windows: closed_surfaces.requested_windows,
+        closed_windows: closed_surfaces.closed_windows,
+        failed_windows: closed_surfaces.failed_windows,
     })
 }
 

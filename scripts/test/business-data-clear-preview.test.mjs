@@ -18,7 +18,7 @@ test('business data clear requires a bound local preview before mutation', async
   ])
   const capability = JSON.parse(capabilityDocument)
   const inspect = app.indexOf("invoke<BusinessDataClearPreview>('inspect_business_data_clear')")
-  const confirm = app.indexOf("invoke<BusinessDataClearResult>('clear_business_data'")
+  const confirm = app.indexOf("invoke<BusinessSurfaceCloseResult>('clear_business_data'")
 
   assert.ok(inspect >= 0 && confirm > inspect)
   assert.match(app, /expectedPlanId: preview\.planId/)
@@ -26,7 +26,7 @@ test('business data clear requires a bound local preview before mutation', async
   assert.match(desktop, /SSDEV-BUSINESS-DATA-CLEAR-PLAN/)
   assert.match(desktop, /preview\.plan_id != expected_plan_id/)
   assert.match(desktop, /caller\.clear_all_browsing_data\(\)/)
-  assert.match(desktop, /label\.starts_with\(BUSINESS_LABEL_PREFIX\) \|\| label\.starts_with\(FLOATING_LABEL_PREFIX\)/)
+  assert.match(desktop, /force_close_business_surfaces\(&app\)/)
   assert.doesNotMatch(desktop, /"clear-business-data"\s*=>/)
   assert.doesNotMatch(desktop, /\.text\("clear-business-data"/)
   assert.match(commands, /"inspect_business_data_clear"/)

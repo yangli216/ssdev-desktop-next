@@ -164,6 +164,9 @@ type ProjectBundleImportResult = {
   localMappings: number
   serviceCount: number
   preflightedHosts: number
+  requestedWindows: number
+  closedWindows: number
+  failedWindows: number
 }
 
 type EnvironmentConfig = {
@@ -196,6 +199,14 @@ type ConfigSnapshot = {
   migrationSources: string[]
   migrationWarnings: string[]
 }
+
+type BusinessSurfaceCloseResult = {
+  requestedWindows: number
+  closedWindows: number
+  failedWindows: number
+}
+
+type ConfigImportResult = ConfigSnapshot & BusinessSurfaceCloseResult
 
 type ConfigChangePreview = {
   configChanged: boolean
@@ -376,11 +387,6 @@ type BusinessDataClearPreview = {
   configuredBusinessOrigins: number
   businessWindows: number
   floatingWindows: number
-}
-
-type BusinessDataClearResult = {
-  closeRequestedWindows: number
-  failedWindowClosures: number
 }
 
 type BusinessWindowReloadResult = {
@@ -711,6 +717,14 @@ function requireCleanProjectDrafts(action: string): boolean {
   return requireVerifiedControlState(action) && requireSavedConfig(action) && requireSavedMapping(action)
 }
 
+function businessSurfaceCloseSummary(result: BusinessSurfaceCloseResult): string {
+  if (result.requestedWindows === 0) return '当前没有打开的业务或悬浮页面。'
+  if (result.failedWindows > 0) {
+    return `已关闭 ${result.closedWindows} / ${result.requestedWindows} 个业务或悬浮页面；${result.failedWindows} 个页面未能自动关闭，请手动关闭后再继续。`
+  }
+  return `已关闭 ${result.closedWindows} 个业务或悬浮页面。`
+}
+
 function preventConfigDraftUnload(event: BeforeUnloadEvent) {
   if (!configDraftDirty.value) return
   event.preventDefault()
@@ -942,17 +956,18 @@ async function discardConfigChanges() {
 async function saveConfig() {
   if (!snapshot.value) return
   const candidate = cloneConfig(snapshot.value.config)
+  let closedSurfaces: BusinessSurfaceCloseResult | undefined
   const outcome = await runPrimaryThenRefresh(
     async () => {
-      await invoke('save_desktop_config', { config: candidate })
+      closedSurfaces = await invoke<BusinessSurfaceCloseResult>('save_desktop_config', { config: candidate })
       savedConfigFingerprint.value = configFingerprint(candidate)
       configImportPreview.value = null
       selectedConfigImport.value = ''
     },
     ['status', 'config', 'deployment'],
   )
-  if (outcome.succeeded) {
-    showPrimaryActionSuccess('配置已安全保存；已有业务窗口已关闭，请重新进入。', outcome.refreshed)
+  if (outcome.succeeded && closedSurfaces) {
+    showPrimaryActionSuccess(`配置已安全保存；${businessSurfaceCloseSummary(closedSurfaces)}`, outcome.refreshed)
   }
 }
 
@@ -980,8 +995,9 @@ async function confirmConfigImport() {
   const source = selectedConfigImport.value
   const expectedPlanId = configImportPreview.value.planId
   const changed = configImportPreview.value.configChanged
+  let imported: ConfigImportResult | undefined
   const outcome = await runPrimaryThenRefresh(async () => {
-    const imported = await invoke<ConfigSnapshot>('import_desktop_config', {
+    imported = await invoke<ConfigImportResult>('import_desktop_config', {
       source,
       expectedPlanId,
     })
@@ -991,7 +1007,9 @@ async function confirmConfigImport() {
   }, ['status', 'config', 'deployment'])
   if (outcome.succeeded) {
     showPrimaryActionSuccess(
-      changed ? '配置已按确认计划导入；已有业务窗口已关闭。' : '导入配置与当前配置一致，未执行替换。',
+      changed && imported
+        ? `配置已按确认计划导入；${businessSurfaceCloseSummary(imported)}`
+        : '导入配置与当前配置一致，未执行替换。',
       outcome.refreshed,
     )
   }
@@ -1075,7 +1093,7 @@ async function importSelectedProjectBundle() {
   }, ALL_CONTROL_REFRESH_FIELDS)
   if (result) {
     showPrimaryActionSuccess(
-      `项目已导入：${result.signedPlugins} 个签名插件、${result.localMappings} 个本地映射、${result.serviceCount} 个原生服务；已有业务窗口已关闭。`,
+      `项目已导入：${result.signedPlugins} 个签名插件、${result.localMappings} 个本地映射、${result.serviceCount} 个原生服务；${businessSurfaceCloseSummary(result)}`,
       outcome.refreshed,
     )
   }
@@ -1130,9 +1148,9 @@ function cancelBusinessDataClear() {
 async function confirmBusinessDataClear() {
   const preview = businessDataClearPreview.value
   if (!preview) return
-  let result: BusinessDataClearResult | undefined
+  let result: BusinessSurfaceCloseResult | undefined
   const outcome = await runPrimaryThenRefresh(async () => {
-    result = await invoke<BusinessDataClearResult>('clear_business_data', {
+    result = await invoke<BusinessSurfaceCloseResult>('clear_business_data', {
       expectedPlanId: preview.planId,
     })
     businessDataClearPreview.value = null
@@ -1141,11 +1159,8 @@ async function confirmBusinessDataClear() {
     businessDataClearPreview.value = null
     return
   }
-  const closeSummary = result.failedWindowClosures > 0
-    ? `${result.failedWindowClosures} 个页面未能自动关闭，请手动关闭后再重新进入。`
-    : `${result.closeRequestedWindows} 个受影响页面已请求关闭。`
   showPrimaryActionSuccess(
-    `站点数据清理已提交，Cookie、登录状态、缓存和本地存储不可恢复；${closeSummary}`,
+    `站点数据清理已提交，Cookie、登录状态、缓存和本地存储不可恢复；${businessSurfaceCloseSummary(result)}`,
     outcome.refreshed,
   )
 }
