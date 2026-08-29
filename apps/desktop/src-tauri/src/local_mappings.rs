@@ -960,7 +960,7 @@ fn release_matrix_seed(
             let name = unique_matrix_case_name(
                 &format!("{}.{} release draft", service.service_id, method.name),
                 &mut names,
-            );
+            )?;
             let parameters = method
                 .parameters
                 .iter()
@@ -1015,17 +1015,17 @@ fn release_case_has_draft_placeholder(case: &ReleaseMatrixCase) -> bool {
         || contains_draft_placeholder(&case.expected.res_data)
 }
 
-fn unique_matrix_case_name(preferred: &str, names: &mut HashSet<String>) -> String {
+fn unique_matrix_case_name(preferred: &str, names: &mut HashSet<String>) -> Result<String, String> {
     if names.insert(preferred.to_owned()) {
-        return preferred.to_owned();
+        return Ok(preferred.to_owned());
     }
-    for suffix in 2_u16..=u16::MAX {
+    for suffix in 2..=MAX_RELEASE_MATRIX_CASES + 1 {
         let candidate = format!("{preferred} ({suffix})");
         if names.insert(candidate.clone()) {
-            return candidate;
+            return Ok(candidate);
         }
     }
-    unreachable!("matrix case count is bounded well below u16::MAX")
+    Err("黄金矩阵种子无法生成唯一用例名称".to_owned())
 }
 
 fn release_parameter_placeholder(_: &ParameterDefinition) -> serde_json::Value {

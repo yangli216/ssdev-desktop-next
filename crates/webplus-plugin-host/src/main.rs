@@ -125,22 +125,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 HostCommand::Invoke {
                     plugin_id: requested_plugin,
                     request,
-                } if requested_plugin == arguments.plugin_id && native_worker.is_some() => {
-                    let response = native_worker
-                        .as_ref()
-                        .expect("worker availability was checked")
-                        .invoke(request)
-                        .await?;
-                    HostResponse::ok(request_id, HostPayload::Invoke { response })
-                }
-                HostCommand::Invoke {
-                    plugin_id: requested_plugin,
-                    ..
-                } if requested_plugin == arguments.plugin_id => HostResponse::error(
-                    request_id,
-                    native_preflight_code.unwrap_or("native_preflight"),
-                    "native component preflight failed",
-                ),
+                } if requested_plugin == arguments.plugin_id => match native_worker.as_ref() {
+                    Some(worker) => {
+                        let response = worker.invoke(request).await?;
+                        HostResponse::ok(request_id, HostPayload::Invoke { response })
+                    }
+                    None => HostResponse::error(
+                        request_id,
+                        native_preflight_code.unwrap_or("native_preflight"),
+                        "native component preflight failed",
+                    ),
+                },
                 HostCommand::Invoke {
                     plugin_id: requested_plugin,
                     ..

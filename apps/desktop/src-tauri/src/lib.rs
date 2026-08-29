@@ -2252,7 +2252,7 @@ fn hash_complete_plugin_state(
             hash_plan_field(hasher, b"local-mapping");
             let package = temporary
                 .as_ref()
-                .expect("local mapping state requires a temporary directory")
+                .ok_or_else(|| "无法建立本地映射状态暂存目录".to_owned())?
                 .path()
                 .join(format!("mapping-{index}.ssdev-mapping"));
             local_mappings::export_bundle(local_mapping_root, &manifest.plugin_id, &package)?;
@@ -2964,65 +2964,68 @@ fn collect_plugin_updates(
                         Vec::new(),
                     )
                 } else {
-                match plugin_update_installed_state_digest(
-                    plugin_root,
-                    &plugin_id,
-                    installed_manifest,
-                ) {
-                    Ok(current_state_sha256) => {
-                        let install_plan_id = available_entry
-                            .filter(|_| has_install_candidate)
-                            .map(|entry| {
-                                plugin_update_plan_id(
-                                    entry,
-                                    catalog_signing_key_id,
-                                    &current_state_sha256,
-                                    desktop_version,
-                                )
-                            })
-                            .transpose()?;
-                        let rollback_versions = rollback_entries
-                            .into_iter()
-                            .map(|entry| {
-                                Ok(PluginRollbackOption {
-                                    version: entry.version.to_string(),
-                                    desktop_version_requirement: entry
-                                        .desktop_version_requirement
-                                        .as_ref()
-                                        .expect("rollback candidates require compatibility metadata")
-                                        .to_string(),
-                                    install_plan_id: plugin_update_plan_id(
+                    match plugin_update_installed_state_digest(
+                        plugin_root,
+                        &plugin_id,
+                        installed_manifest,
+                    ) {
+                        Ok(current_state_sha256) => {
+                            let install_plan_id = available_entry
+                                .filter(|_| has_install_candidate)
+                                .map(|entry| {
+                                    plugin_update_plan_id(
                                         entry,
                                         catalog_signing_key_id,
                                         &current_state_sha256,
                                         desktop_version,
-                                    )?,
+                                    )
                                 })
-                            })
-                            .collect::<Result<Vec<_>, String>>()?;
-                        (
-                            has_install_candidate,
-                            install_plan_id,
-                            None,
-                            rollback_versions,
-                        )
+                                .transpose()?;
+                            let rollback_versions = rollback_entries
+                                .into_iter()
+                                .map(|entry| {
+                                    let desktop_version_requirement = entry
+                                        .desktop_version_requirement
+                                        .as_ref()
+                                        .ok_or_else(|| {
+                                            "签名插件仓库的回退版本缺少 Desktop 兼容范围".to_owned()
+                                        })?
+                                        .to_string();
+                                    Ok(PluginRollbackOption {
+                                        version: entry.version.to_string(),
+                                        desktop_version_requirement,
+                                        install_plan_id: plugin_update_plan_id(
+                                            entry,
+                                            catalog_signing_key_id,
+                                            &current_state_sha256,
+                                            desktop_version,
+                                        )?,
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, String>>()?;
+                            (
+                                has_install_candidate,
+                                install_plan_id,
+                                None,
+                                rollback_versions,
+                            )
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                event_code = "plugin-catalog-target-blocked",
+                                error_code = "plugin-update-target-state-invalid",
+                                plugin_id,
+                                "catalog candidate blocked by invalid local target state"
+                            );
+                            (
+                                false,
+                                None,
+                                Some(PluginInstallBlocker::InvalidTargetState),
+                                Vec::new(),
+                            )
+                        }
                     }
-                    Err(_) => {
-                        tracing::warn!(
-                            event_code = "plugin-catalog-target-blocked",
-                            error_code = "plugin-update-target-state-invalid",
-                            plugin_id,
-                            "catalog candidate blocked by invalid local target state"
-                        );
-                        (
-                            false,
-                            None,
-                            Some(PluginInstallBlocker::InvalidTargetState),
-                            Vec::new(),
-                        )
-                    }
-                }
-            };
+                };
             Ok(PluginUpdateItem {
                 plugin_id,
                 installed_version: installed_version.map(ToString::to_string),

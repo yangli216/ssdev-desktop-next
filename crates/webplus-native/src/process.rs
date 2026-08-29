@@ -35,6 +35,13 @@ struct PinnedProcess {
 }
 
 impl ProcessAdapter {
+    pub(crate) fn unverified() -> Self {
+        Self {
+            verified_files: None,
+            pinned: HashMap::new(),
+        }
+    }
+
     pub(crate) fn new(
         verified_files: Option<BTreeMap<String, String>>,
     ) -> Result<Self, NativeError> {

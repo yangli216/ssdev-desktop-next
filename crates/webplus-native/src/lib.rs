@@ -23,8 +23,7 @@ impl NativePlugin {
             manifest,
             com: com::ComAdapter::new(),
             dll: dll::DllAdapter::new(),
-            process: process::ProcessAdapter::new(None)
-                .expect("an unverified process adapter has no inventory to validate"),
+            process: process::ProcessAdapter::unverified(),
         }
     }
 

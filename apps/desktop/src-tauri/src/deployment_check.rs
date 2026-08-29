@@ -318,11 +318,12 @@ pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
             None,
         ));
     } else {
-        let missing = match (facts.x86_host_available, facts.x64_host_available) {
-            (false, false) => "x86、x64",
-            (false, true) => "x86",
-            (true, false) => "x64",
-            (true, true) => unreachable!(),
+        let missing = if !facts.x86_host_available && !facts.x64_host_available {
+            "x86、x64"
+        } else if !facts.x86_host_available {
+            "x86"
+        } else {
+            "x64"
         };
         items.push(item(
             "plugin-hosts",
@@ -463,11 +464,7 @@ pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
         ));
     }
 
-    if facts.deep_preflight && facts.deep_preflight_failure.is_some() {
-        let failure = facts
-            .deep_preflight_failure
-            .as_ref()
-            .expect("deep preflight failure was checked");
+    if let (true, Some(failure)) = (facts.deep_preflight, facts.deep_preflight_failure.as_ref()) {
         let summary = match &failure.plugin_id {
             Some(plugin_id) => format!(
                 "插件 [{}]{} 未能通过隔离宿主 Health 预检 ({})。",
