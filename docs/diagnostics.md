@@ -17,6 +17,8 @@ SSDEV Desktop 的诊断目标是定位客户端边界故障，而不是复刻业
 
 下一次更新尝试清理下载中崩溃遗留的固定前缀普通文件时记录 `app-update-stale-downloads-cleaned` 和清理数量，不记录临时目录、文件名或更新时间。
 
+更新检查、下载连接、下载中断及非成功 HTTP 状态分别使用 `app-update-check-failed`、`app-update-download-failed`、`app-update-download-interrupted` 和 `app-update-server-error`。控制台只显示稳定错误码、网络/代理/证书/服务等处理方向及可选 HTTP 状态，不显示 updater/HTTP 原始错误、端点、下载地址或安装器路径。
+
 ## 有界存储
 
 - 每个 JSON 事件最多 64 KiB；超过上限时用固定的 `diagnostic-event-oversized` 事件替代。

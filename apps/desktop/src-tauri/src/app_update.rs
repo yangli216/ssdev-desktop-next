@@ -76,14 +76,14 @@ struct AppUpdatePolicy {
 impl AppUpdatePolicy {
     fn load(path: &Path) -> Result<Self, String> {
         let metadata = fs::symlink_metadata(path)
-            .map_err(|error| format!("无法读取应用更新策略 {path:?}: {error}"))?;
+            .map_err(|_| "无法读取应用更新策略文件（app-update-policy-read）".to_owned())?;
         if !metadata.is_file() || metadata.len() > MAX_POLICY_BYTES {
             return Err(format!(
                 "应用更新策略必须是普通文件且不超过 {MAX_POLICY_BYTES} 字节"
             ));
         }
-        let bytes =
-            fs::read(path).map_err(|error| format!("无法读取应用更新策略 {path:?}: {error}"))?;
+        let bytes = fs::read(path)
+            .map_err(|_| "无法读取应用更新策略文件（app-update-policy-read）".to_owned())?;
         let policy: Self = serde_json::from_slice(&bytes)
             .map_err(|error| format!("应用更新策略不是有效 JSON: {error}"))?;
         policy.validate()?;
@@ -217,11 +217,29 @@ pub(crate) async fn check_app_update(
         .updater_builder()
         .pubkey(policy.pubkey.clone())
         .endpoints(policy.endpoints.clone())
-        .map_err(|error| error.to_string())?
+        .map_err(|_| {
+            runtime_update_failure(
+                "app-update-client-init-failed",
+                "updater-client",
+                "应用更新客户端配置无效（app-update-client-init-failed）；请修复或重新安装当前客户端。",
+            )
+        })?
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|error| error.to_string())?;
-    let update = updater.check().await.map_err(|error| error.to_string())?;
+        .map_err(|_| {
+            runtime_update_failure(
+                "app-update-client-init-failed",
+                "updater-client",
+                "应用更新客户端初始化失败（app-update-client-init-failed）；请修复或重新安装当前客户端。",
+            )
+        })?;
+    let update = updater.check().await.map_err(|_| {
+        runtime_update_failure(
+            "app-update-check-failed",
+            "update-check",
+            "无法检查签名更新（app-update-check-failed）；请检查网络、代理、院内证书、更新清单格式和服务状态。",
+        )
+    })?;
     let Some(update) = update else {
         *state
             .pending
@@ -397,7 +415,7 @@ pub(crate) async fn install_app_update(
     if let Some(coordinator) = &bridge.invocation_coordinator {
         coordinator.drain().await;
     }
-    if let Err(error) = update.install(&bytes) {
+    if update.install(&bytes).is_err() {
         bridge.controller.resume_after_shutdown().await;
         if let Some(coordinator) = &bridge.invocation_coordinator {
             coordinator.resume_after_shutdown();
@@ -407,7 +425,10 @@ pub(crate) async fn install_app_update(
             error_code = "updater-install",
             "application update install handoff failed; current runtime resumed"
         );
-        return Err(format!("无法启动系统安装程序，当前版本已恢复可用: {error}"));
+        return Err(
+            "无法启动系统安装程序（app-update-install-handoff-failed）；当前版本与业务窗口已恢复，请检查终端防护、安装权限和磁盘空间后重新检查更新。"
+                .to_owned(),
+        );
     }
     crate::desktop::mark_exit_ready(&app);
     app.restart();
@@ -441,6 +462,19 @@ fn ensure_app_update_plan_matches(expected: &str, actual: &str) -> Result<(), St
         return Err("待安装应用版本或当前插件集合在确认后发生变化，请重新检查应用更新".to_owned());
     }
     Ok(())
+}
+
+fn runtime_update_failure(
+    event_code: &'static str,
+    error_code: &'static str,
+    message: &str,
+) -> String {
+    tracing::warn!(
+        event_code,
+        error_code,
+        "application update operation failed"
+    );
+    message.to_owned()
 }
 
 async fn read_verified_package(
@@ -504,9 +538,25 @@ async fn download_and_verify(
         .get(update.download_url.clone())
         .send()
         .await
-        .map_err(|error| format!("下载应用更新失败: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("应用更新服务器返回错误: {error}"))?;
+        .map_err(|_| {
+            runtime_update_failure(
+                "app-update-download-failed",
+                "update-network",
+                "无法下载应用更新（app-update-download-failed）；请检查网络、代理、院内证书和更新服务状态。",
+            )
+        })?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        tracing::warn!(
+            event_code = "app-update-server-error",
+            error_code = "update-http-status",
+            http_status = status,
+            "application update server returned an unsuccessful status"
+        );
+        return Err(format!(
+            "应用更新服务暂时不可用（HTTP {status}；app-update-server-error），请稍后重试或联系发布人员。"
+        ));
+    }
     let content_length = response.content_length();
     if content_length.is_some_and(|length| length > policy.max_download_bytes) {
         return Err(format!(
@@ -521,11 +571,13 @@ async fn download_and_verify(
         })
         .map_err(|error| error.to_string())?;
     let mut downloaded = 0_u64;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("读取应用更新数据失败: {error}"))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        runtime_update_failure(
+            "app-update-download-interrupted",
+            "update-network",
+            "应用更新下载中断（app-update-download-interrupted）；请检查网络稳定性后重新检查更新。",
+        )
+    })? {
         downloaded = downloaded.saturating_add(chunk.len() as u64);
         if downloaded > policy.max_download_bytes {
             return Err(format!(

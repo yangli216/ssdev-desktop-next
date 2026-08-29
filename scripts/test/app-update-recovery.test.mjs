@@ -33,7 +33,7 @@ test("failed application update handoff preserves the current business workspace
   assert.ok(installHandoff < resumeCoordinator);
   assert.match(body, /event_code = "app-update-install-handoff-failed"/);
   assert.match(body, /error_code = "updater-install"/);
-  assert.match(body, /当前版本已恢复可用/);
+  assert.match(body, /当前版本与业务窗口已恢复/);
 });
 
 test("control console clears the consumed update plan after a failed handoff", async () => {
@@ -52,4 +52,22 @@ test("control console clears the consumed update plan after a failed handoff", a
   assert.match(body, /appUpdate\.value\.installPlanId = undefined/);
   assert.match(body, /当前版本与业务窗口已恢复，请重新检查更新后重试/);
   assert.match(body, /await refreshRuntimeStatus\(\)/);
+});
+
+test("runtime update failures expose stable guidance without endpoint or path details", async () => {
+  const source = await readFile(appUpdateUrl, "utf8");
+  const runtimeEnd = source.indexOf("\npub fn verify_update_artifact_files(");
+  assert.notEqual(runtimeEnd, -1, "runtime update boundary must remain detectable");
+
+  const runtime = source.slice(0, runtimeEnd);
+  assert.doesNotMatch(runtime, /下载应用更新失败: \{error\}/);
+  assert.doesNotMatch(runtime, /应用更新服务器返回错误: \{error\}/);
+  assert.doesNotMatch(runtime, /当前版本已恢复可用: \{error\}/);
+  assert.doesNotMatch(runtime, /应用更新策略 \{path:\?\}/);
+  assert.match(runtime, /"app-update-check-failed"/);
+  assert.match(runtime, /"app-update-download-failed"/);
+  assert.match(runtime, /"app-update-download-interrupted"/);
+  assert.match(runtime, /error_code = "update-http-status"/);
+  assert.match(runtime, /http_status = status/);
+  assert.match(runtime, /app-update-install-handoff-failed/);
 });
