@@ -37,6 +37,8 @@ const MAX_SIGNATURE_BYTES: u64 = 1024;
 const MAX_MATRIX_CASES: usize = 1024;
 const MAX_MATRIX_PLUGINS: usize = 256;
 const MAX_MATRIX_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_WEB_KIT_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_WEB_KIT_TYPESCRIPT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_TRUST_STORE_BYTES: u64 = 256 * 1024;
 const MAX_RELEASE_SET_SPEC_BYTES: u64 = 256 * 1024;
 const MAX_CATALOG_SPEC_BYTES: u64 = 1024 * 1024;
@@ -317,6 +319,25 @@ pub struct GenerateWebKitReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct WebKitCheckReport {
+    pub schema_version: u8,
+    pub plugin_id: String,
+    pub plugin_version: String,
+    pub service_count: usize,
+    pub method_count: usize,
+    pub fixture_count: usize,
+    pub file_count: usize,
+    pub api_sha256: String,
+    pub plugin_metadata_sha256: String,
+    pub matrix_sha256: String,
+    pub client_sha256: String,
+    pub fixtures_sha256: String,
+    pub manifest_sha256: String,
+    pub verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitDllPluginReport {
     pub schema_version: u8,
     pub plugin_id: String,
@@ -480,34 +501,34 @@ struct GeneratedWebFixture {
     response: InvokeResponse,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WebKitManifest<'a> {
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WebKitManifest {
     schema_version: u8,
-    plugin_id: &'a str,
-    plugin_version: &'a str,
-    display_name: &'a str,
-    api_sha256: &'a str,
-    plugin_metadata_sha256: &'a str,
-    matrix_sha256: &'a str,
+    plugin_id: String,
+    plugin_version: String,
+    display_name: String,
+    api_sha256: String,
+    plugin_metadata_sha256: String,
+    matrix_sha256: String,
     service_count: usize,
     method_count: usize,
     fixture_count: usize,
-    files: WebKitFiles<'a>,
+    files: WebKitFiles,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WebKitFiles<'a> {
-    client: WebKitFile<'a>,
-    fixtures: WebKitFile<'a>,
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WebKitFiles {
+    client: WebKitFile,
+    fixtures: WebKitFile,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WebKitFile<'a> {
-    path: &'a str,
-    sha256: &'a str,
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WebKitFile {
+    path: String,
+    sha256: String,
 }
 
 /// Creates a minimal, buildable Windows DLL plugin workspace for the common
@@ -690,7 +711,7 @@ fn scaffold_readme(
         PluginArchitecture::X64 => "x64",
     };
     format!(
-        "# {display_name}\n\nSSDEV DLL 插件脚手架。插件 ID：`{plugin_id}`；服务：`{service_id}`；架构：`{architecture}`。\n\n## 1. 构建 DLL\n\n在 Windows PowerShell 中运行：\n\n```powershell\n./build.ps1\n```\n\n脚本使用锁定依赖构建 `native` crate，并把 `{native_library}` 复制到 `release-source/bin`。修改导出函数后必须同步评审 `release-source/api.json`。\n\n## 2. 检查和本地调试\n\n先运行 `ssdev-plugin-tool source-check --source release-source --plugin-id {plugin_id}`。该命令不加载 DLL、不执行方法，也不需要签名密钥；它会用正式准备流程的同一规则检查文件边界、PE 位数、声明导出和 ABI。随后在 SSDEV Desktop 的“原生映射”工作台中选择 `release-source/bin/{native_library}`，按照 `release-source/api.json` 配置 `SsdevEcho`，然后使用输入 `SSDEV_TEST` 调用 `echo`。不要把生产账号、患者数据或不可逆设备操作放入调试用例。\n\n## 3. Web 接入\n\n`web/client.ts` 由共享清单生成器产生，依赖 `@bsoft/ssdev-web-bridge`。业务代码创建桌面连接后，把 `connection.bridge` 传给生成的客户端；`api.json` 变化后重新运行 `ssdev-plugin-tool client`，输出到一个新的临时文件，评审差异后替换业务制品。正式矩阵完成脱敏和实机复核后，使用 `ssdev-plugin-tool web-kit --plugin-dir <规范插件目录> --matrix <定稿矩阵> --destination <新目录>` 原子生成客户端、fixture 和摘要清单，再把整个接入包交给业务项目。\n\n## 4. 签名发布\n\n先运行 `ssdev-plugin-tool prepare --source release-source ... --matrix-seed matrix-seed.json`。矩阵种子保持 `draft: true` 和 `reviewRequired: true`；必须在 Windows 测试环境核对完整响应后才可解除这两项门禁。随后由组织 KMS/HSM 签名，并使用 `finalize` 生成 `.ssdev-plugin`。私钥、真实硬件数据和业务 Web 源码都不能放入 `release-source`。\n\n此模板只覆盖 UTF-8 字符串输入和 1 KiB 调用方输出缓冲区。结构体、回调、浮点 ABI、厂商内存释放或线程绑定组件需要单独设计 Rust 适配器，不能通过修改 JSON 猜测。\n"
+        "# {display_name}\n\nSSDEV DLL 插件脚手架。插件 ID：`{plugin_id}`；服务：`{service_id}`；架构：`{architecture}`。\n\n## 1. 构建 DLL\n\n在 Windows PowerShell 中运行：\n\n```powershell\n./build.ps1\n```\n\n脚本使用锁定依赖构建 `native` crate，并把 `{native_library}` 复制到 `release-source/bin`。修改导出函数后必须同步评审 `release-source/api.json`。\n\n## 2. 检查和本地调试\n\n先运行 `ssdev-plugin-tool source-check --source release-source --plugin-id {plugin_id}`。该命令不加载 DLL、不执行方法，也不需要签名密钥；它会用正式准备流程的同一规则检查文件边界、PE 位数、声明导出和 ABI。随后在 SSDEV Desktop 的“原生映射”工作台中选择 `release-source/bin/{native_library}`，按照 `release-source/api.json` 配置 `SsdevEcho`，然后使用输入 `SSDEV_TEST` 调用 `echo`。不要把生产账号、患者数据或不可逆设备操作放入调试用例。\n\n## 3. Web 接入\n\n`web/client.ts` 由共享清单生成器产生，依赖 `@bsoft/ssdev-web-bridge`。业务代码创建桌面连接后，把 `connection.bridge` 传给生成的客户端；`api.json` 变化后重新运行 `ssdev-plugin-tool client`，输出到一个新的临时文件，评审差异后替换业务制品。正式矩阵完成脱敏和实机复核后，使用 `ssdev-plugin-tool web-kit --plugin-dir <规范插件目录> --matrix <定稿矩阵> --destination <新目录>` 原子生成客户端、fixture 和摘要清单，再把整个接入包交给业务项目；业务 CI 使用 `ssdev-plugin-tool web-kit-check --kit <接入包目录>` 拒绝文件集或摘要漂移。\n\n## 4. 签名发布\n\n先运行 `ssdev-plugin-tool prepare --source release-source ... --matrix-seed matrix-seed.json`。矩阵种子保持 `draft: true` 和 `reviewRequired: true`；必须在 Windows 测试环境核对完整响应后才可解除这两项门禁。随后由组织 KMS/HSM 签名，并使用 `finalize` 生成 `.ssdev-plugin`。私钥、真实硬件数据和业务 Web 源码都不能放入 `release-source`。\n\n此模板只覆盖 UTF-8 字符串输入和 1 KiB 调用方输出缓冲区。结构体、回调、浮点 ABI、厂商内存释放或线程绑定组件需要单独设计 Rust 适配器，不能通过修改 JSON 猜测。\n"
     )
 }
 
@@ -1122,23 +1143,23 @@ pub fn generate_web_kit(
         let fixtures_sha256 = fixtures.output_sha256;
         let kit_manifest = WebKitManifest {
             schema_version: 1,
-            plugin_id: &plugin_id,
-            plugin_version: &plugin_version,
-            display_name: &display_name,
-            api_sha256: &api_sha256,
-            plugin_metadata_sha256: &plugin_metadata_sha256,
-            matrix_sha256: &matrix_sha256,
+            plugin_id: plugin_id.clone(),
+            plugin_version: plugin_version.clone(),
+            display_name: display_name.clone(),
+            api_sha256: api_sha256.clone(),
+            plugin_metadata_sha256: plugin_metadata_sha256.clone(),
+            matrix_sha256: matrix_sha256.clone(),
             service_count,
             method_count,
             fixture_count: fixtures.fixture_count,
             files: WebKitFiles {
                 client: WebKitFile {
-                    path: WEB_KIT_CLIENT_FILENAME,
-                    sha256: &client_sha256,
+                    path: WEB_KIT_CLIENT_FILENAME.into(),
+                    sha256: client_sha256.clone(),
                 },
                 fixtures: WebKitFile {
-                    path: WEB_KIT_FIXTURES_FILENAME,
-                    sha256: &fixtures_sha256,
+                    path: WEB_KIT_FIXTURES_FILENAME.into(),
+                    sha256: fixtures_sha256.clone(),
                 },
             },
         };
@@ -1172,6 +1193,144 @@ pub fn generate_web_kit(
             manifest_sha256,
             destination: destination.to_path_buf(),
         })
+    })
+}
+
+/// Verifies the fixed Web handoff file set without needing native components,
+/// signing keys, or the original matrix. This detects accidental or unreviewed
+/// drift after generation; it does not authenticate the publisher or prove the
+/// source plugin and hardware evidence.
+pub fn check_web_kit(kit: &Path) -> Result<WebKitCheckReport, ToolError> {
+    let kit = canonical_real_directory(kit)?;
+    let actual_files = fs::read_dir(&kit)
+        .map_err(|source| ToolError::Io {
+            path: kit.clone(),
+            source,
+        })?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .map_err(|source| ToolError::Io {
+                    path: kit.clone(),
+                    source,
+                })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let expected_files = BTreeSet::from([
+        WEB_KIT_CLIENT_FILENAME.to_owned(),
+        WEB_KIT_FIXTURES_FILENAME.to_owned(),
+        WEB_KIT_MANIFEST_FILENAME.to_owned(),
+    ]);
+    if actual_files != expected_files {
+        return Err(ToolError::Invalid(
+            "Web kit must contain exactly client.ts, fixtures.ts, and ssdev-web-kit.json".into(),
+        ));
+    }
+
+    let manifest_path = kit.join(WEB_KIT_MANIFEST_FILENAME);
+    let manifest: WebKitManifest = read_bounded_json(&manifest_path, MAX_WEB_KIT_MANIFEST_BYTES)?;
+    let version = Version::parse(&manifest.plugin_version).map_err(|error| {
+        ToolError::Invalid(format!("Web kit plugin version is not SemVer: {error}"))
+    })?;
+    if manifest.schema_version != 1
+        || manifest.plugin_id.trim() != manifest.plugin_id
+        || Path::new(&manifest.plugin_id).components().count() != 1
+        || portable_plugin_path(Path::new(&manifest.plugin_id))? != manifest.plugin_id
+        || version.to_string() != manifest.plugin_version
+    {
+        return Err(ToolError::Invalid(
+            "Web kit identity must use schema 1, a canonical portable plugin ID, and SemVer".into(),
+        ));
+    }
+    if manifest.display_name.trim() != manifest.display_name
+        || manifest.display_name.is_empty()
+        || manifest.display_name.chars().count() > 128
+        || manifest.display_name.chars().any(char::is_control)
+    {
+        return Err(ToolError::Invalid(
+            "Web kit display name must be trimmed, non-empty, and at most 128 safe characters"
+                .into(),
+        ));
+    }
+    if manifest.service_count == 0
+        || manifest.service_count > manifest.method_count
+        || manifest.method_count > manifest.fixture_count
+        || manifest.fixture_count > MAX_MATRIX_CASES
+    {
+        return Err(ToolError::Invalid(
+            "Web kit coverage counts are inconsistent or exceed the matrix limit".into(),
+        ));
+    }
+    if manifest.files.client.path != WEB_KIT_CLIENT_FILENAME
+        || manifest.files.fixtures.path != WEB_KIT_FIXTURES_FILENAME
+    {
+        return Err(ToolError::Invalid(
+            "Web kit manifest must reference the fixed TypeScript filenames".into(),
+        ));
+    }
+    for digest in [
+        &manifest.api_sha256,
+        &manifest.plugin_metadata_sha256,
+        &manifest.matrix_sha256,
+        &manifest.files.client.sha256,
+        &manifest.files.fixtures.sha256,
+    ] {
+        if !is_lowercase_sha256(digest) {
+            return Err(ToolError::Invalid(
+                "Web kit manifest digests must use 64 lowercase hexadecimal characters".into(),
+            ));
+        }
+    }
+
+    let client_path = kit.join(WEB_KIT_CLIENT_FILENAME);
+    let fixtures_path = kit.join(WEB_KIT_FIXTURES_FILENAME);
+    let client_bytes = read_bounded_file(&client_path, MAX_WEB_KIT_TYPESCRIPT_BYTES)?;
+    let fixtures_bytes = read_bounded_file(&fixtures_path, MAX_WEB_KIT_TYPESCRIPT_BYTES)?;
+    let client_sha256 = sha256_hex(&client_bytes);
+    let fixtures_sha256 = sha256_hex(&fixtures_bytes);
+    if client_sha256 != manifest.files.client.sha256
+        || fixtures_sha256 != manifest.files.fixtures.sha256
+    {
+        return Err(ToolError::Invalid(
+            "Web kit TypeScript content does not match its manifest digests".into(),
+        ));
+    }
+    let client = std::str::from_utf8(&client_bytes)
+        .map_err(|_| ToolError::Invalid("Web kit client.ts must be UTF-8".into()))?;
+    let fixtures = std::str::from_utf8(&fixtures_bytes)
+        .map_err(|_| ToolError::Invalid("Web kit fixtures.ts must be UTF-8".into()))?;
+    let expected_client_header = format!(
+        "// Web kit plugin: {}@{}\n// API SHA-256: {}\n",
+        manifest.plugin_id, manifest.plugin_version, manifest.api_sha256
+    );
+    let expected_fixtures_header = format!(
+        "// Generated from a structurally valid SSDEV executable matrix.\n// Matrix SHA-256: {}\n",
+        manifest.matrix_sha256
+    );
+    if !client.starts_with(&expected_client_header)
+        || !fixtures.starts_with(&expected_fixtures_header)
+    {
+        return Err(ToolError::Invalid(
+            "Web kit TypeScript headers do not match the manifest identity and source digests"
+                .into(),
+        ));
+    }
+
+    Ok(WebKitCheckReport {
+        schema_version: 1,
+        plugin_id: manifest.plugin_id,
+        plugin_version: manifest.plugin_version,
+        service_count: manifest.service_count,
+        method_count: manifest.method_count,
+        fixture_count: manifest.fixture_count,
+        file_count: 3,
+        api_sha256: manifest.api_sha256,
+        plugin_metadata_sha256: manifest.plugin_metadata_sha256,
+        matrix_sha256: manifest.matrix_sha256,
+        client_sha256,
+        fixtures_sha256,
+        manifest_sha256: sha256_file_bounded(&manifest_path, MAX_WEB_KIT_MANIFEST_BYTES)?,
+        verified: true,
     })
 }
 
@@ -3112,6 +3271,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
     digest_hex(Sha256::digest(bytes))
 }
 
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn sha256_file(path: &Path) -> Result<String, ToolError> {
     sha256_file_bounded(path, MAX_PLUGIN_BYTES)
 }
@@ -4088,9 +4254,9 @@ mod tests {
         assert_eq!(report.client_sha256, sha256_hex(client.as_bytes()));
         assert_eq!(report.fixtures_sha256, sha256_hex(fixtures.as_bytes()));
 
-        let kit_manifest: Value =
-            serde_json::from_slice(&fs::read(destination.join(WEB_KIT_MANIFEST_FILENAME)).unwrap())
-                .unwrap();
+        let kit_manifest_path = destination.join(WEB_KIT_MANIFEST_FILENAME);
+        let kit_manifest_bytes = fs::read(&kit_manifest_path).unwrap();
+        let kit_manifest: Value = serde_json::from_slice(&kit_manifest_bytes).unwrap();
         assert_eq!(kit_manifest["pluginId"], "reader-plugin");
         assert_eq!(kit_manifest["pluginVersion"], "2.3.1");
         assert_eq!(kit_manifest["matrixSha256"], report.matrix_sha256);
@@ -4117,6 +4283,26 @@ mod tests {
             .unwrap()
             .contains(plugin_dir.to_string_lossy().as_ref()));
 
+        let checked = check_web_kit(&destination).unwrap();
+        assert!(checked.verified);
+        assert_eq!(checked.plugin_id, report.plugin_id);
+        assert_eq!(checked.plugin_version, report.plugin_version);
+        assert_eq!(checked.service_count, report.service_count);
+        assert_eq!(checked.method_count, report.method_count);
+        assert_eq!(checked.fixture_count, report.fixture_count);
+        assert_eq!(checked.api_sha256, report.api_sha256);
+        assert_eq!(
+            checked.plugin_metadata_sha256,
+            report.plugin_metadata_sha256
+        );
+        assert_eq!(checked.matrix_sha256, report.matrix_sha256);
+        assert_eq!(checked.client_sha256, report.client_sha256);
+        assert_eq!(checked.fixtures_sha256, report.fixtures_sha256);
+        assert_eq!(checked.manifest_sha256, report.manifest_sha256);
+        assert!(!serde_json::to_string(&checked)
+            .unwrap()
+            .contains(root.path().to_string_lossy().as_ref()));
+
         let error = generate_web_kit(&GenerateWebKitOptions {
             plugin_dir: &plugin_dir,
             matrix: &matrix,
@@ -4136,6 +4322,56 @@ mod tests {
             .to_string()
             .contains("outside the verified plugin input"));
         assert!(!inside_destination.exists());
+
+        let client_path = destination.join(WEB_KIT_CLIENT_FILENAME);
+        fs::write(&client_path, format!("{client}// drift\n")).unwrap();
+        assert!(check_web_kit(&destination)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match its manifest digests"));
+        fs::write(&client_path, &client).unwrap();
+
+        let extra = destination.join("notes.txt");
+        fs::write(&extra, "unreviewed").unwrap();
+        assert!(check_web_kit(&destination)
+            .unwrap_err()
+            .to_string()
+            .contains("must contain exactly"));
+        fs::remove_file(extra).unwrap();
+
+        let mut unknown_field_manifest = kit_manifest.clone();
+        unknown_field_manifest["unreviewed"] = Value::Bool(true);
+        fs::write(
+            &kit_manifest_path,
+            serde_json::to_vec_pretty(&unknown_field_manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(check_web_kit(&destination).is_err());
+        fs::write(&kit_manifest_path, &kit_manifest_bytes).unwrap();
+
+        let mut uppercase_digest_manifest = kit_manifest.clone();
+        uppercase_digest_manifest["apiSha256"] =
+            Value::String(report.api_sha256.to_ascii_uppercase());
+        fs::write(
+            &kit_manifest_path,
+            serde_json::to_vec_pretty(&uppercase_digest_manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(check_web_kit(&destination)
+            .unwrap_err()
+            .to_string()
+            .contains("lowercase hexadecimal"));
+        fs::write(&kit_manifest_path, &kit_manifest_bytes).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let fixtures_path = destination.join(WEB_KIT_FIXTURES_FILENAME);
+            fs::remove_file(&fixtures_path).unwrap();
+            symlink(&client_path, &fixtures_path).unwrap();
+            assert!(check_web_kit(&destination).is_err());
+        }
     }
 
     #[test]
