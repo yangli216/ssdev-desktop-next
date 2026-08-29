@@ -276,6 +276,18 @@ impl TrustStore {
 
     pub fn verify(&self, manifest: &PluginManifest) -> Result<(), TrustError> {
         self.verify_plugin(manifest, KeyUse::RuntimeVerification)
+            .map(|_| ())
+    }
+
+    /// Verifies a plugin for runtime use and returns the signed file inventory.
+    ///
+    /// Native hosts use this inventory to bind process preflight and later
+    /// launches to the exact bytes covered by the publisher signature.
+    pub fn verify_with_file_inventory(
+        &self,
+        manifest: &PluginManifest,
+    ) -> Result<BTreeMap<String, String>, TrustError> {
+        self.verify_plugin(manifest, KeyUse::RuntimeVerification)
     }
 
     /// Verifies a plugin signature while also requiring an active issuance key.
@@ -283,9 +295,14 @@ impl TrustStore {
     /// planned rotation remain usable under a retired key.
     pub fn verify_for_issuance(&self, manifest: &PluginManifest) -> Result<(), TrustError> {
         self.verify_plugin(manifest, KeyUse::NewSignature)
+            .map(|_| ())
     }
 
-    fn verify_plugin(&self, manifest: &PluginManifest, key_use: KeyUse) -> Result<(), TrustError> {
+    fn verify_plugin(
+        &self,
+        manifest: &PluginManifest,
+        key_use: KeyUse,
+    ) -> Result<BTreeMap<String, String>, TrustError> {
         let document = read_signature_document(&manifest.plugin_dir)?;
 
         if document.schema_version != 1 {
@@ -342,7 +359,8 @@ impl TrustStore {
                 "plugin [{}] signature verification failed",
                 manifest.plugin_id
             ))
-        })
+        })?;
+        Ok(actual_files)
     }
 
     pub fn verify_detached(
@@ -874,6 +892,12 @@ mod tests {
         let (_root, trust, manifest) = signed_plugin();
         trust.verify(&manifest).unwrap();
         trust.verify_for_issuance(&manifest).unwrap();
+        let files = trust.verify_with_file_inventory(&manifest).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            files.get("reader.dll"),
+            Some(&sha256_file(&manifest.plugin_dir.join("reader.dll")).unwrap())
+        );
     }
 
     #[test]

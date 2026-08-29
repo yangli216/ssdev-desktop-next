@@ -8,6 +8,7 @@ version.workspace = true
 [dependencies]
 encoding_rs = "0.8"
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 webplus-plugin-config.workspace = true
 webplus-protocol.workspace = true

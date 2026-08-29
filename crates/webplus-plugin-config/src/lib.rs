@@ -164,6 +164,24 @@ pub fn verify_local_mapping_integrity(
     plugin_dir: &Path,
     services: &[ServiceDefinition],
 ) -> Result<String, ConfigError> {
+    verify_local_mapping_integrity_with_files(plugin_dir, services)
+        .map(|verified| verified.document_sha256)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedLocalMappingIntegrity {
+    pub document_sha256: String,
+    /// Portable relative path to the SHA-256 approved by the local mapping
+    /// integrity document.
+    pub files: BTreeMap<String, String>,
+}
+
+/// Verifies a local mapping and returns both its pinned document identity and
+/// the file digests needed by the isolated native host.
+pub fn verify_local_mapping_integrity_with_files(
+    plugin_dir: &Path,
+    services: &[ServiceDefinition],
+) -> Result<VerifiedLocalMappingIntegrity, ConfigError> {
     let integrity_path = plugin_dir.join(LOCAL_MAPPING_INTEGRITY_FILENAME);
     let bytes = fs::read(&integrity_path).map_err(|source| ConfigError::Read {
         path: integrity_path.clone(),
@@ -209,6 +227,7 @@ pub fn verify_local_mapping_integrity(
         ));
     }
     let mut total = 0_u64;
+    let mut verified_files = BTreeMap::new();
     for (key, expected_path) in expected {
         let (relative, entry) = actual.remove(&key).expect("sets were compared");
         if relative != expected_path {
@@ -254,8 +273,12 @@ pub fn verify_local_mapping_integrity(
                 entry.path
             )));
         }
+        verified_files.insert(entry.path, entry.sha256.to_ascii_lowercase());
     }
-    Ok(hex_sha256(&bytes))
+    Ok(VerifiedLocalMappingIntegrity {
+        document_sha256: hex_sha256(&bytes),
+        files: verified_files,
+    })
 }
 
 fn local_mapping_protected_paths(
@@ -862,6 +885,13 @@ mod tests {
 
         let digest = verify_local_mapping_integrity(root.path(), &services).unwrap();
         assert_eq!(digest.len(), 64);
+        let verified = verify_local_mapping_integrity_with_files(root.path(), &services).unwrap();
+        assert_eq!(verified.document_sha256, digest);
+        assert_eq!(verified.files.len(), 3);
+        assert_eq!(
+            verified.files.get("components/reader.dll"),
+            Some(&hash_regular_file(&root.path().join("components/reader.dll")).unwrap())
+        );
         let manifest = PluginManifest::load("reader", root.path()).unwrap();
         assert_eq!(
             manifest.local_mapping_integrity_sha256.as_deref(),

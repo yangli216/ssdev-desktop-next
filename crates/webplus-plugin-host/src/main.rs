@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
 use webplus_ipc::{read_frame_async, write_frame_async};
 use webplus_native::NativePlugin;
-use webplus_plugin_config::PluginManifest;
+use webplus_plugin_config::{verify_local_mapping_integrity_with_files, PluginManifest};
 use webplus_plugin_trust::TrustStore;
 use webplus_protocol::{
     HostCommand, HostPayload, HostRequest, HostResponse, InvokeRequest, InvokeResponse,
@@ -39,10 +39,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let (mut input, mut output) = open_transport(&arguments).await?;
     let manifest = PluginManifest::load(&arguments.plugin_id, &arguments.plugin_dir)?;
-    if arguments.allow_unsigned {
+    let verified_files = if arguments.allow_unsigned {
         if !cfg!(debug_assertions) {
             return Err("release plugin hosts refuse --allow-unsigned".into());
         }
+        None
     } else if let Some(local_mapping_root) = arguments.local_mapping_root.as_deref() {
         require_local_mapping_path(
             Path::new(&arguments.plugin_dir),
@@ -59,21 +60,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         if actual != expected {
             return Err("local mapping integrity identity changed after route approval".into());
         }
+        let verified =
+            verify_local_mapping_integrity_with_files(&manifest.plugin_dir, &manifest.services)?;
+        if verified.document_sha256 != expected {
+            return Err("local mapping integrity identity changed during host startup".into());
+        }
+        Some(verified.files)
     } else {
         let trust_store_path = arguments
             .trust_store
             .as_deref()
             .ok_or("signed plugin hosts require --trust-store")?;
         let trust_store = TrustStore::load(std::path::Path::new(&trust_store_path))?;
-        trust_store.verify(&manifest)?;
-    }
+        Some(trust_store.verify_with_file_inventory(&manifest)?)
+    };
     let allowed_services = manifest
         .services
         .iter()
         .filter(|service| service.architecture == arguments.architecture)
         .map(|service| service.service_id.clone())
         .collect::<HashSet<_>>();
-    let mut native_worker = NativeWorker::spawn(manifest, arguments.architecture).ok();
+    let mut native_worker =
+        NativeWorker::spawn(manifest, arguments.architecture, verified_files).ok();
 
     while let Some(request) = read_frame_async::<_, HostRequest>(&mut input).await? {
         let request_id = request.request_id;
@@ -380,13 +388,27 @@ struct NativeWorker {
 }
 
 impl NativeWorker {
-    fn spawn(manifest: PluginManifest, architecture: PluginArchitecture) -> Result<Self, String> {
+    fn spawn(
+        manifest: PluginManifest,
+        architecture: PluginArchitecture,
+        verified_files: Option<std::collections::BTreeMap<String, String>>,
+    ) -> Result<Self, String> {
         let (sender, receiver) = mpsc::channel();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name(format!("webplus-native-{}", manifest.plugin_id))
             .spawn(move || {
-                let mut plugin = NativePlugin::new(manifest);
+                let plugin = match verified_files {
+                    Some(files) => NativePlugin::new_verified(manifest, files),
+                    None => Ok(NativePlugin::new(manifest)),
+                };
+                let mut plugin = match plugin {
+                    Ok(plugin) => plugin,
+                    Err(error) => {
+                        let _ = ready_sender.send(Err(error));
+                        return;
+                    }
+                };
                 if let Err(error) = plugin.preflight(architecture) {
                     let _ = ready_sender.send(Err(error));
                     return;
@@ -580,11 +602,20 @@ mod tests {
         )
         .unwrap();
         let manifest = PluginManifest::load("process-probe", root.path()).unwrap();
-        let mut worker = NativeWorker::spawn(manifest.clone(), PluginArchitecture::X86).unwrap();
+        let mut mismatched_inventory = std::collections::BTreeMap::new();
+        mismatched_inventory.insert("probe.exe".into(), "0".repeat(64));
+        assert!(NativeWorker::spawn(
+            manifest.clone(),
+            PluginArchitecture::X86,
+            Some(mismatched_inventory),
+        )
+        .is_err());
+        let mut worker =
+            NativeWorker::spawn(manifest.clone(), PluginArchitecture::X86, None).unwrap();
         worker.shutdown().unwrap();
 
         std::fs::remove_file(root.path().join("probe.exe")).unwrap();
-        assert!(NativeWorker::spawn(manifest, PluginArchitecture::X86).is_err());
+        assert!(NativeWorker::spawn(manifest, PluginArchitecture::X86, None).is_err());
     }
 
     #[test]

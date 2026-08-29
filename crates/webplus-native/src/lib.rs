@@ -4,6 +4,8 @@ mod com;
 mod dll;
 mod process;
 
+use std::collections::BTreeMap;
+
 use thiserror::Error;
 use webplus_plugin_config::PluginManifest;
 use webplus_protocol::{InvokeRequest, InvokeResponse, PluginArchitecture};
@@ -12,6 +14,7 @@ pub struct NativePlugin {
     manifest: PluginManifest,
     com: com::ComAdapter,
     dll: dll::DllAdapter,
+    process: process::ProcessAdapter,
 }
 
 impl NativePlugin {
@@ -20,7 +23,23 @@ impl NativePlugin {
             manifest,
             com: com::ComAdapter::new(),
             dll: dll::DllAdapter::new(),
+            process: process::ProcessAdapter::new(None)
+                .expect("an unverified process adapter has no inventory to validate"),
         }
+    }
+
+    /// Constructs a native adapter whose process entries must match a file
+    /// inventory already authenticated by the caller.
+    pub fn new_verified(
+        manifest: PluginManifest,
+        verified_files: BTreeMap<String, String>,
+    ) -> Result<Self, NativeError> {
+        Ok(Self {
+            manifest,
+            com: com::ComAdapter::new(),
+            dll: dll::DllAdapter::new(),
+            process: process::ProcessAdapter::new(Some(verified_files))?,
+        })
     }
 
     /// Pumps pending messages for apartment-threaded COM components.
@@ -52,7 +71,7 @@ impl NativePlugin {
         for service in &services {
             match service.resolved_main_type().to_ascii_lowercase().as_str() {
                 "dll" => self.dll.preflight(&self.manifest.plugin_dir, service)?,
-                "exe" | "bat" => process::preflight(&self.manifest.plugin_dir, service)?,
+                "exe" | "bat" => self.process.preflight(&self.manifest.plugin_dir, service)?,
                 "ocx" | "com" => self.com.preflight(service)?,
                 other => {
                     return Err(NativeError::Unsupported(format!(
@@ -94,7 +113,7 @@ impl NativePlugin {
                 method,
                 &request.parameters,
             ),
-            "exe" | "bat" => process::invoke(
+            "exe" | "bat" => self.process.invoke(
                 &self.manifest.plugin_dir,
                 service,
                 method,
