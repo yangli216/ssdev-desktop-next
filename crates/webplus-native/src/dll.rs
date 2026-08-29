@@ -1,5 +1,5 @@
 use serde_json::{Map, Value};
-use webplus_plugin_config::{MethodDefinition, ServiceDefinition};
+use webplus_plugin_config::{MethodDefinition, ParameterDefinition, ServiceDefinition};
 use webplus_protocol::InvokeResponse;
 
 use crate::NativeError;
@@ -22,9 +22,93 @@ impl DllAdapter {
         method: &MethodDefinition,
         parameters: &Map<String, Value>,
     ) -> Result<InvokeResponse, NativeError> {
+        validate_dll_declaration(service)?;
         self.platform
             .invoke(plugin_dir, service, method, parameters)
     }
+
+    pub(crate) fn preflight(
+        &mut self,
+        plugin_dir: &std::path::Path,
+        service: &ServiceDefinition,
+    ) -> Result<(), NativeError> {
+        validate_dll_declaration(service)?;
+        self.platform.preflight(plugin_dir, service)
+    }
+}
+
+fn validate_dll_declaration(service: &ServiceDefinition) -> Result<(), NativeError> {
+    match service
+        .calling_convention
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "c" | "cdecl" | "system" | "stdcall" | "winapi" => {}
+        other => {
+            return Err(NativeError::Dll(format!(
+                "unsupported calling convention [{other}]"
+            )))
+        }
+    }
+    for method in &service.methods {
+        if method.parameters.len() > 12 {
+            return Err(NativeError::Dll(format!(
+                "method [{}] has {} arguments; maximum is 12",
+                method.name,
+                method.parameters.len()
+            )));
+        }
+        match method.return_type.trim().to_ascii_lowercase().as_str() {
+            "" | "void" | "string" | "char*" | "pointer_string" | "bool" | "boolean" | "int"
+            | "int32" | "long" | "uint" | "uint32" | "dword" | "pointer" | "uintptr" | "usize" => {}
+            "float" | "double" => {
+                return Err(NativeError::Dll(format!(
+                    "method [{}] uses a floating-point return that requires a typed ABI",
+                    method.name
+                )))
+            }
+            other => {
+                return Err(NativeError::Dll(format!(
+                    "method [{}] has unsupported return type [{other}]",
+                    method.name
+                )))
+            }
+        }
+        for parameter in &method.parameters {
+            let ParameterDefinition::Detailed(detail) = parameter else {
+                continue;
+            };
+            let output = detail.name.starts_with('$');
+            let kind = detail.parameter_type.trim().to_ascii_lowercase();
+            let supported = if output {
+                matches!(
+                    kind.as_str(),
+                    "" | "inferred" | "string" | "buffer" | "int" | "int32" | "long"
+                ) && (!matches!(kind.as_str(), "" | "inferred" | "string" | "buffer")
+                    || (1..=1024 * 1024).contains(&detail.len))
+            } else {
+                matches!(
+                    kind.as_str(),
+                    "" | "inferred"
+                        | "string"
+                        | "bool"
+                        | "int"
+                        | "int32"
+                        | "long"
+                        | "uint"
+                        | "uint32"
+                )
+            };
+            if !supported {
+                return Err(NativeError::Dll(format!(
+                    "method [{}] parameter [{}] has an unsupported ABI declaration",
+                    method.name, detail.name
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -49,6 +133,43 @@ mod platform {
                 "DLL invocation is only available on Windows".into(),
             ))
         }
+
+        pub fn preflight(
+            &mut self,
+            _plugin_dir: &std::path::Path,
+            _service: &ServiceDefinition,
+        ) -> Result<(), NativeError> {
+            Err(NativeError::Unsupported(
+                "DLL preflight is only available on Windows".into(),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preflight_rejects_abi_shapes_the_runtime_cannot_call() {
+        let float_return: ServiceDefinition = serde_json::from_value(serde_json::json!({
+            "serviceId": "fixture",
+            "mainClass": "fixture.dll",
+            "methods": [{"name": "Read", "returnType": "double"}]
+        }))
+        .unwrap();
+        assert!(validate_dll_declaration(&float_return).is_err());
+
+        let too_many: ServiceDefinition = serde_json::from_value(serde_json::json!({
+            "serviceId": "fixture",
+            "mainClass": "fixture.dll",
+            "methods": [{
+                "name": "Read",
+                "parameters": ["a","b","c","d","e","f","g","h","i","j","k","l","m"]
+            }]
+        }))
+        .unwrap();
+        assert!(validate_dll_declaration(&too_many).is_err());
     }
 }
 
@@ -127,13 +248,31 @@ mod platform {
 
     pub struct DllAdapter {
         dependencies: HashMap<PathBuf, Library>,
+        libraries: HashMap<PathBuf, Library>,
     }
 
     impl DllAdapter {
         pub fn new() -> Self {
             Self {
                 dependencies: HashMap::new(),
+                libraries: HashMap::new(),
             }
+        }
+
+        pub fn preflight(
+            &mut self,
+            plugin_dir: &Path,
+            service: &ServiceDefinition,
+        ) -> Result<(), NativeError> {
+            let library = self.library_for(plugin_dir, service)?;
+            for method in &service.methods {
+                let _: Symbol<*const ()> = unsafe {
+                    library
+                        .get(method.name.as_bytes())
+                        .map_err(|error| NativeError::Dll(error.to_string()))?
+                };
+            }
+            Ok(())
         }
 
         pub fn invoke(
@@ -143,14 +282,7 @@ mod platform {
             method: &MethodDefinition,
             parameters: &Map<String, Value>,
         ) -> Result<InvokeResponse, NativeError> {
-            self.preload_dependencies(plugin_dir, service)?;
-
-            let component =
-                resolve_component_with_extension(plugin_dir, &service.main_class, "dll")?;
-            let library = unsafe {
-                Library::load_with_flags(&component, LOAD_WITH_ALTERED_SEARCH_PATH)
-                    .map_err(|error| NativeError::Dll(error.to_string()))?
-            };
+            let library = self.library_for(plugin_dir, service)?;
             let prepared = PreparedArguments::build(service, method, parameters)?;
             let convention = service.calling_convention.trim().to_ascii_lowercase();
             let return_word = match convention.as_str() {
@@ -172,6 +304,27 @@ mod platform {
                 return_value,
                 prepared.collect_outputs(),
             )))
+        }
+
+        fn library_for(
+            &mut self,
+            plugin_dir: &Path,
+            service: &ServiceDefinition,
+        ) -> Result<&Library, NativeError> {
+            self.preload_dependencies(plugin_dir, service)?;
+            let component =
+                resolve_component_with_extension(plugin_dir, &service.main_class, "dll")?;
+            if !self.libraries.contains_key(&component) {
+                let library = unsafe {
+                    Library::load_with_flags(&component, LOAD_WITH_ALTERED_SEARCH_PATH)
+                        .map_err(|error| NativeError::Dll(error.to_string()))?
+                };
+                self.libraries.insert(component.clone(), library);
+            }
+            Ok(self
+                .libraries
+                .get(&component)
+                .expect("library was inserted before lookup"))
         }
 
         fn preload_dependencies(

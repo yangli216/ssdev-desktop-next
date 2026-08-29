@@ -5,7 +5,7 @@ fn main() {
     use serde_json::{json, Map, Value};
     use webplus_native::NativePlugin;
     use webplus_plugin_config::PluginManifest;
-    use webplus_protocol::InvokeRequest;
+    use webplus_protocol::{InvokeRequest, PluginArchitecture};
 
     let mut arguments = std::env::args_os().skip(1);
     let dll = arguments
@@ -28,6 +28,12 @@ fn main() {
     let manifest = PluginManifest::load("windows-system-example", plugin_dir.path())
         .expect("failed to load Windows system example");
     let mut plugin = NativePlugin::new(manifest);
+    let architecture = if cfg!(target_arch = "x86") {
+        PluginArchitecture::X86
+    } else {
+        PluginArchitecture::X64
+    };
+    assert_eq!(plugin.preflight(architecture).unwrap(), 1);
 
     let invoke = |plugin: &mut NativePlugin, method: &str, parameters: Map<String, Value>| {
         let response = plugin.invoke(&InvokeRequest {

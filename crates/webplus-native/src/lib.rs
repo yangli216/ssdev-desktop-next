@@ -6,7 +6,7 @@ mod process;
 
 use thiserror::Error;
 use webplus_plugin_config::PluginManifest;
-use webplus_protocol::{InvokeRequest, InvokeResponse};
+use webplus_protocol::{InvokeRequest, InvokeResponse, PluginArchitecture};
 
 pub struct NativePlugin {
     manifest: PluginManifest,
@@ -28,6 +28,40 @@ impl NativePlugin {
     /// The plugin host calls this while its dedicated native thread is idle.
     pub fn pump_messages(&mut self) {
         self.com.pump_messages();
+    }
+
+    /// Initializes every service assigned to one native host architecture
+    /// without executing a declared business method.
+    ///
+    /// DLLs and dependencies are loaded and every export is resolved; COM/OCX
+    /// classes are instantiated and their declared members are resolved; EXE
+    /// and BAT entries are path-checked but never launched.
+    pub fn preflight(&mut self, architecture: PluginArchitecture) -> Result<usize, NativeError> {
+        let services = self
+            .manifest
+            .services
+            .iter()
+            .filter(|service| service.architecture == architecture)
+            .cloned()
+            .collect::<Vec<_>>();
+        if services.is_empty() {
+            return Err(NativeError::Unsupported(format!(
+                "plugin does not declare services for {architecture:?}"
+            )));
+        }
+        for service in &services {
+            match service.resolved_main_type().to_ascii_lowercase().as_str() {
+                "dll" => self.dll.preflight(&self.manifest.plugin_dir, service)?,
+                "exe" | "bat" => process::preflight(&self.manifest.plugin_dir, service)?,
+                "ocx" | "com" => self.com.preflight(service)?,
+                other => {
+                    return Err(NativeError::Unsupported(format!(
+                        "mainClass type [{other}] is not supported"
+                    )))
+                }
+            }
+        }
+        Ok(services.len())
     }
 
     pub fn invoke(&mut self, request: &InvokeRequest) -> InvokeResponse {
@@ -161,5 +195,24 @@ mod tests {
             resolve_component_with_extension(directory.path(), "reader", "dll").unwrap();
 
         assert!(component.ends_with("reader.dll"));
+    }
+
+    #[test]
+    fn process_preflight_checks_files_without_executing_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("executed");
+        let component = directory.path().join("probe.exe");
+        fs::write(&component, format!("touch {}", marker.display())).unwrap();
+        fs::write(
+            directory.path().join("api.json"),
+            r#"{"serviceId":"process.probe","mainClass":"probe.exe","mainType":"exe","architecture":"x64","methods":[{"name":"run"}]}"#,
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("process-probe", directory.path()).unwrap();
+        let mut plugin = NativePlugin::new(manifest);
+
+        assert_eq!(plugin.preflight(PluginArchitecture::X64).unwrap(), 1);
+        assert!(!marker.exists());
+        assert!(plugin.preflight(PluginArchitecture::X86).is_err());
     }
 }

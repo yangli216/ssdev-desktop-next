@@ -1128,7 +1128,12 @@ impl PluginWorker {
             .arg("--plugin-id")
             .arg(&descriptor.plugin_id)
             .arg("--plugin-dir")
-            .arg(&descriptor.plugin_dir);
+            .arg(&descriptor.plugin_dir)
+            .arg("--architecture")
+            .arg(match descriptor.architecture {
+                PluginArchitecture::X86 => "x86",
+                PluginArchitecture::X64 => "x64",
+            });
         match plugin_trust {
             PluginTrust::Strict { trust_store } => {
                 command.arg("--trust-store").arg(trust_store);

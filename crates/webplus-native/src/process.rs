@@ -15,6 +15,22 @@ const MAX_PROCESS_OUTPUT_BYTES: usize = 1024 * 1024;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+pub(crate) fn preflight(
+    plugin_dir: &std::path::Path,
+    service: &ServiceDefinition,
+) -> Result<(), NativeError> {
+    let main_type = service.resolved_main_type().to_ascii_lowercase();
+    let component = resolve_component_with_extension(plugin_dir, &service.main_class, &main_type)?;
+    let metadata = std::fs::symlink_metadata(&component)
+        .map_err(|_| NativeError::MissingComponent(component.clone()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(NativeError::Process(
+            "native process entry must be a regular non-symlink file".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn invoke(
     plugin_dir: &std::path::Path,
     service: &ServiceDefinition,

@@ -36,6 +36,20 @@ impl ComAdapter {
         }
     }
 
+    pub(crate) fn preflight(&mut self, service: &ServiceDefinition) -> Result<(), NativeError> {
+        #[cfg(windows)]
+        {
+            self.platform.preflight(service)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = service;
+            Err(NativeError::Unsupported(
+                "COM/OCX preflight is only available on Windows".into(),
+            ))
+        }
+    }
+
     pub(crate) fn pump_messages(&mut self) {
         #[cfg(windows)]
         self.platform.pump_messages();
@@ -106,6 +120,18 @@ mod platform {
                 data.insert(property.clone(), variant_to_json(&value)?);
             }
             Ok(InvokeResponse::success(Value::Object(data)))
+        }
+
+        pub(super) fn preflight(&mut self, service: &ServiceDefinition) -> Result<(), NativeError> {
+            self.ensure_sta()?;
+            let dispatch = self.dispatch_for(service)?;
+            for method in &service.methods {
+                resolve_member(&dispatch, &method.name)?;
+                for property in &method.props {
+                    resolve_member(&dispatch, property)?;
+                }
+            }
+            Ok(())
         }
 
         pub(super) fn pump_messages(&mut self) {
@@ -335,14 +361,8 @@ mod platform {
         flags: windows::Win32::System::Com::DISPATCH_FLAGS,
         arguments: &mut [VARIANT],
     ) -> Result<VARIANT, NativeError> {
-        let member_name = wide_nul(member)?;
-        let name = PCWSTR(member_name.as_ptr());
-        let mut dispatch_id = 0;
+        let dispatch_id = resolve_member(dispatch, member)?;
         let iid_null = GUID::zeroed();
-        unsafe {
-            dispatch.GetIDsOfNames(&iid_null, &name, 1, LOCALE_USER_DEFAULT, &mut dispatch_id)
-        }
-        .map_err(|error| NativeError::Com(format!("resolve member [{member}]: {error}")))?;
 
         let parameters = DISPPARAMS {
             rgvarg: arguments.as_mut_ptr(),
@@ -373,6 +393,18 @@ mod platform {
             ))
         })?;
         Ok(result)
+    }
+
+    fn resolve_member(dispatch: &IDispatch, member: &str) -> Result<i32, NativeError> {
+        let member_name = wide_nul(member)?;
+        let name = PCWSTR(member_name.as_ptr());
+        let mut dispatch_id = 0;
+        let iid_null = GUID::zeroed();
+        unsafe {
+            dispatch.GetIDsOfNames(&iid_null, &name, 1, LOCALE_USER_DEFAULT, &mut dispatch_id)
+        }
+        .map_err(|error| NativeError::Com(format!("resolve member [{member}]: {error}")))?;
+        Ok(dispatch_id)
     }
 
     fn take_exception_text(exception: &mut EXCEPINFO) -> Option<String> {

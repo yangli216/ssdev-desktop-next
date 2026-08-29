@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+use std::collections::HashSet;
 use std::env;
 use std::path::{Component, Path};
 use std::process::ExitCode;
@@ -17,7 +18,7 @@ use webplus_plugin_config::PluginManifest;
 use webplus_plugin_trust::TrustStore;
 use webplus_protocol::{
     HostCommand, HostPayload, HostRequest, HostResponse, InvokeRequest, InvokeResponse,
-    HOST_PROTOCOL_VERSION,
+    PluginArchitecture, HOST_PROTOCOL_VERSION,
 };
 
 #[tokio::main(flavor = "current_thread")]
@@ -33,6 +34,9 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = HostArguments::parse(env::args().skip(1))?;
+    if arguments.architecture != compiled_architecture() {
+        return Err("plugin host binary architecture does not match the requested route".into());
+    }
     let (mut input, mut output) = open_transport(&arguments).await?;
     let manifest = PluginManifest::load(&arguments.plugin_id, &arguments.plugin_dir)?;
     if arguments.allow_unsigned {
@@ -63,7 +67,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let trust_store = TrustStore::load(std::path::Path::new(&trust_store_path))?;
         trust_store.verify(&manifest)?;
     }
-    let mut native_worker = NativeWorker::spawn(manifest)?;
+    let allowed_services = manifest
+        .services
+        .iter()
+        .filter(|service| service.architecture == arguments.architecture)
+        .map(|service| service.service_id.clone())
+        .collect::<HashSet<_>>();
+    let mut native_worker = NativeWorker::spawn(manifest, arguments.architecture).ok();
 
     while let Some(request) = read_frame_async::<_, HostRequest>(&mut input).await? {
         let request_id = request.request_id;
@@ -78,19 +88,48 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
         } else {
             match request.command {
-                HostCommand::Health => HostResponse::ok(
+                HostCommand::Health if native_worker.is_some() => HostResponse::ok(
                     request_id,
                     HostPayload::Health {
                         plugin_id: arguments.plugin_id.clone(),
                     },
                 ),
+                HostCommand::Health => HostResponse::error(
+                    request_id,
+                    "native_preflight",
+                    "native component preflight failed",
+                ),
                 HostCommand::Invoke {
                     plugin_id: requested_plugin,
                     request,
-                } if requested_plugin == arguments.plugin_id => {
-                    let response = native_worker.invoke(request).await?;
+                } if requested_plugin == arguments.plugin_id
+                    && !allowed_services.contains(&request.service_id) =>
+                {
+                    HostResponse::error(
+                        request_id,
+                        "architecture_mismatch",
+                        "service is not assigned to this native host architecture",
+                    )
+                }
+                HostCommand::Invoke {
+                    plugin_id: requested_plugin,
+                    request,
+                } if requested_plugin == arguments.plugin_id && native_worker.is_some() => {
+                    let response = native_worker
+                        .as_ref()
+                        .expect("worker availability was checked")
+                        .invoke(request)
+                        .await?;
                     HostResponse::ok(request_id, HostPayload::Invoke { response })
                 }
+                HostCommand::Invoke {
+                    plugin_id: requested_plugin,
+                    ..
+                } if requested_plugin == arguments.plugin_id => HostResponse::error(
+                    request_id,
+                    "native_preflight",
+                    "native component preflight failed",
+                ),
                 HostCommand::Invoke {
                     plugin_id: requested_plugin,
                     ..
@@ -103,7 +142,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                 ),
                 HostCommand::Shutdown => {
-                    native_worker.shutdown()?;
+                    if let Some(worker) = native_worker.as_mut() {
+                        worker.shutdown()?;
+                    }
                     write_frame_async(
                         &mut output,
                         &HostResponse::ok(request_id, HostPayload::Shutdown),
@@ -116,6 +157,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         write_frame_async(&mut output, &response).await?;
     }
     Ok(())
+}
+
+fn compiled_architecture() -> PluginArchitecture {
+    if cfg!(target_pointer_width = "32") {
+        PluginArchitecture::X86
+    } else {
+        PluginArchitecture::X64
+    }
 }
 
 type HostReader = Box<dyn AsyncRead + Unpin + Send>;
@@ -152,6 +201,7 @@ async fn open_transport(
 struct HostArguments {
     plugin_id: String,
     plugin_dir: String,
+    architecture: PluginArchitecture,
     trust_store: Option<String>,
     allow_unsigned: bool,
     local_mapping_root: Option<String>,
@@ -167,6 +217,7 @@ impl HostArguments {
         let mut arguments = arguments.into_iter();
         let mut plugin_id = None;
         let mut plugin_dir = None;
+        let mut architecture = None;
         let mut trust_store = None;
         let mut allow_unsigned = false;
         let mut allow_local_mapping = false;
@@ -188,6 +239,11 @@ impl HostArguments {
                     &mut plugin_dir,
                     "--plugin-dir",
                     take_value(&mut arguments, "--plugin-dir")?,
+                )?,
+                "--architecture" => set_once(
+                    &mut architecture,
+                    "--architecture",
+                    take_value(&mut arguments, "--architecture")?,
                 )?,
                 "--trust-store" => set_once(
                     &mut trust_store,
@@ -256,6 +312,14 @@ impl HostArguments {
         Ok(Self {
             plugin_id: plugin_id.ok_or("missing required argument --plugin-id")?,
             plugin_dir: plugin_dir.ok_or("missing required argument --plugin-dir")?,
+            architecture: match architecture
+                .ok_or("missing required argument --architecture")?
+                .as_str()
+            {
+                "x86" => PluginArchitecture::X86,
+                "x64" => PluginArchitecture::X64,
+                _ => return Err("--architecture must be x86 or x64".into()),
+            },
             trust_store,
             allow_unsigned,
             local_mapping_root,
@@ -316,12 +380,20 @@ struct NativeWorker {
 }
 
 impl NativeWorker {
-    fn spawn(manifest: PluginManifest) -> Result<Self, std::io::Error> {
+    fn spawn(manifest: PluginManifest, architecture: PluginArchitecture) -> Result<Self, String> {
         let (sender, receiver) = mpsc::channel();
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name(format!("webplus-native-{}", manifest.plugin_id))
             .spawn(move || {
                 let mut plugin = NativePlugin::new(manifest);
+                if let Err(error) = plugin.preflight(architecture) {
+                    let _ = ready_sender.send(Err(error));
+                    return;
+                }
+                if ready_sender.send(Ok(())).is_err() {
+                    return;
+                }
                 loop {
                     match receiver.recv_timeout(Duration::from_millis(16)) {
                         Ok(NativeCommand::Invoke { request, reply }) => {
@@ -331,7 +403,19 @@ impl NativeWorker {
                         Err(RecvTimeoutError::Timeout) => plugin.pump_messages(),
                     }
                 }
-            })?;
+            })
+            .map_err(|_| "failed to start native worker thread".to_owned())?;
+        match ready_receiver.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                let _ = thread.join();
+                return Err("native component preflight failed".into());
+            }
+            Err(_) => {
+                let _ = thread.join();
+                return Err("native worker stopped during preflight".into());
+            }
+        }
         Ok(Self {
             sender: Some(sender),
             thread: Some(thread),
@@ -377,16 +461,18 @@ mod tests {
     fn required_platform_arguments() -> Vec<String> {
         #[cfg(windows)]
         {
-            vec![
+            let mut arguments = vec!["--architecture".into(), "x86".into()];
+            arguments.extend([
                 "--ipc-pipe".into(),
                 r"\\.\pipe\fixture".into(),
                 "--controller-pid".into(),
                 "42".into(),
-            ]
+            ]);
+            arguments
         }
         #[cfg(not(windows))]
         {
-            Vec::new()
+            vec!["--architecture".into(), "x86".into()]
         }
     }
 
@@ -445,6 +531,7 @@ mod tests {
         valid.extend(required_platform_arguments());
         let parsed = HostArguments::parse(valid).unwrap();
         assert_eq!(parsed.local_mapping_root.as_deref(), Some("mappings"));
+        assert_eq!(parsed.architecture, PluginArchitecture::X86);
 
         let missing_root = vec![
             "--plugin-id".into(),
@@ -481,5 +568,34 @@ mod tests {
 
         let outside = tempfile::tempdir().unwrap();
         assert!(require_local_mapping_path(outside.path(), root.path()).is_err());
+    }
+
+    #[test]
+    fn native_worker_reports_component_preflight_before_serving_health() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("probe.exe"), b"not executed").unwrap();
+        std::fs::write(
+            root.path().join("api.json"),
+            r#"{"serviceId":"process.probe","mainClass":"probe.exe","mainType":"exe","architecture":"x86","methods":[{"name":"run"}]}"#,
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("process-probe", root.path()).unwrap();
+        let mut worker = NativeWorker::spawn(manifest.clone(), PluginArchitecture::X86).unwrap();
+        worker.shutdown().unwrap();
+
+        std::fs::remove_file(root.path().join("probe.exe")).unwrap();
+        assert!(NativeWorker::spawn(manifest, PluginArchitecture::X86).is_err());
+    }
+
+    #[test]
+    fn compiled_architecture_matches_the_binary_pointer_width() {
+        assert_eq!(
+            compiled_architecture(),
+            if cfg!(target_pointer_width = "32") {
+                PluginArchitecture::X86
+            } else {
+                PluginArchitecture::X64
+            }
+        );
     }
 }

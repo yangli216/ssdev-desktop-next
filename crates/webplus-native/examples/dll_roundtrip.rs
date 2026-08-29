@@ -5,7 +5,7 @@ fn main() {
     use serde_json::{json, Map};
     use webplus_native::NativePlugin;
     use webplus_plugin_config::PluginManifest;
-    use webplus_protocol::InvokeRequest;
+    use webplus_protocol::{InvokeRequest, PluginArchitecture};
 
     let source = std::env::args_os()
         .nth(1)
@@ -45,6 +45,12 @@ fn main() {
     let manifest = PluginManifest::load("native-fixture", plugin_dir.path())
         .expect("failed to load fixture manifest");
     let mut plugin = NativePlugin::new(manifest);
+    let architecture = if cfg!(target_arch = "x86") {
+        PluginArchitecture::X86
+    } else {
+        PluginArchitecture::X64
+    };
+    assert_eq!(plugin.preflight(architecture).unwrap(), 1);
     let add = plugin.invoke(&InvokeRequest {
         service_id: "fixture.math".into(),
         method: "Add".into(),
@@ -60,6 +66,21 @@ fn main() {
     });
     assert_eq!(fill.res_code, 0);
     assert_eq!(fill.res_data["value"], "fixture-ok");
+
+    fs::write(
+        plugin_dir.path().join("api.json"),
+        serde_json::to_vec_pretty(&json!({
+            "serviceId": "fixture.invalid",
+            "mainClass": "fixture.dll",
+            "mainType": "dll",
+            "arch": if cfg!(target_arch = "x86") { "x86" } else { "x64" },
+            "methods": [{"name": "MissingExport"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let invalid = PluginManifest::load("native-fixture", plugin_dir.path()).unwrap();
+    assert!(NativePlugin::new(invalid).preflight(architecture).is_err());
     println!("native DLL round-trip succeeded: {add:?}; {fill:?}");
 }
 

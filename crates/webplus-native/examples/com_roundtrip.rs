@@ -6,7 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use tempfile::tempdir;
     use webplus_native::NativePlugin;
     use webplus_plugin_config::PluginManifest;
-    use webplus_protocol::InvokeRequest;
+    use webplus_protocol::{InvokeRequest, PluginArchitecture};
 
     let plugin_dir = tempdir()?;
     fs::write(
@@ -15,6 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "serviceId": "fixture.dictionary",
             "mainClass": "Scripting.Dictionary",
             "mainType": "com",
+            "arch": if cfg!(target_arch = "x86") { "x86" } else { "x64" },
             "cacheable": true,
             "methods": [
                 {
@@ -34,6 +35,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let manifest = PluginManifest::load("com-fixture", plugin_dir.path())?;
     let mut plugin = NativePlugin::new(manifest);
+    let architecture = if cfg!(target_arch = "x86") {
+        PluginArchitecture::X86
+    } else {
+        PluginArchitecture::X64
+    };
+    assert_eq!(plugin.preflight(architecture)?, 1);
 
     let add = plugin.invoke(&InvokeRequest {
         service_id: "fixture.dictionary".into(),
