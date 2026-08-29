@@ -67,6 +67,7 @@ type BridgeStatus = {
   pluginRoot: string
   processPolicyEntries: number
   managedProcessFailures: number
+  managedProcessRestartRequired: boolean
   autoStartEnabled?: boolean
   autoStartError?: string
   appUpdateConfigured: boolean
@@ -452,6 +453,9 @@ const controlStateUnverified = computed(() => (
 const projectStateUnverified = computed(() => (
   controlStateUnverified.value || mappingWorkspaceUnverified.value
 ))
+const managedProcessRestartRequired = computed(() => (
+  status.value?.managedProcessRestartRequired ?? false
+))
 const deploymentReadiness = computed(() => {
   if (controlLoadFailed.value) {
     return {
@@ -487,6 +491,12 @@ const deploymentReadiness = computed(() => {
     return {
       label: '状态未知',
       detail: '桌面核心通信中断，部署状态无法确认',
+    }
+  }
+  if (managedProcessRestartRequired.value) {
+    return {
+      label: '需要重启',
+      detail: '受控辅助进程配置已变更，重启客户端后才能继续业务和交付检查',
     }
   }
   const report = deploymentCheck.value
@@ -534,6 +544,7 @@ const businessFrontendReadiness = computed(() => {
   if (controlLoadFailed.value) return { label: '状态未知', detail: '控制台初始化失败，无法确认业务页面状态' }
   if (controlRefreshIncomplete.value) return { label: '状态未知', detail: '操作后的页面状态尚未完整刷新' }
   if (runtimeStatusStale.value) return { label: '状态未知', detail: '桌面核心通信中断，无法确认业务页面状态' }
+  if (managedProcessRestartRequired.value) return { label: '等待重启', detail: '受控辅助进程配置已变更，当前实例不再启动新业务页面' }
   const current = status.value
   if (!current) return { label: '检查中', detail: '正在读取业务窗口状态' }
   if (current.businessTimedOutWindows > 0) {
@@ -693,6 +704,14 @@ function requireSavedConfig(action: string): boolean {
   notice.value = ''
   error.value = `项目配置有未保存更改。请先保存或放弃更改，再${action}。`
   activeSection.value = 'configuration'
+  return false
+}
+
+function requireCurrentManagedProcesses(action: string): boolean {
+  if (!managedProcessRestartRequired.value) return true
+  notice.value = ''
+  error.value = `受控辅助进程配置已变更。请退出并重新启动客户端后再${action}。`
+  activeSection.value = 'overview'
   return false
 }
 
@@ -1105,11 +1124,13 @@ async function importSelectedProjectBundle() {
 
 async function openBusiness() {
   if (!requireSavedConfig('启动业务系统')) return
+  if (!requireCurrentManagedProcesses('启动业务系统')) return
   await run(() => invoke('open_business_window'), '业务窗口已创建；页面完成加载后首页将显示“已连接”。')
 }
 
 async function openEnvironment(environment: EnvironmentConfig) {
   if (!requireSavedConfig(`打开环境「${environment.name}」`)) return
+  if (!requireCurrentManagedProcesses(`打开环境「${environment.name}」`)) return
   await run(
     () => invoke('open_business_window', { environment: environment.name }),
     `环境「${environment.name}」窗口已创建；页面完成加载后首页将显示“已连接”。`,
@@ -1533,18 +1554,19 @@ async function exportDeploymentCheck() {
         </button>
       </nav>
       <div class="sidebar-status">
-        <span :class="['status-dot', { ready: Boolean(status) && !controlLoadFailed && !controlRefreshIncomplete && !runtimeStatusStale && !mappingWorkspaceUnverified, warning: Boolean(controlLoadFailed || controlRefreshIncomplete || error || ssoError || runtimeStatusStale || mappingWorkspaceUnverified) }]" />
-        <span><strong>{{ controlLoadFailed ? '控制台初始化失败' : runtimeStatusStale ? '桌面通信中断' : controlRefreshIncomplete ? '操作已完成，状态待刷新' : mappingWorkspaceUnverified ? '映射清单待复核' : error || ssoError ? '需要处理' : status ? '桌面服务正常' : '正在连接' }}</strong><small>{{ controlLoadFailed ? '请重新加载核心项目状态' : runtimeStatusStale ? `状态连续 ${runtimeStatusHealth.consecutiveFailures} 次刷新失败` : controlRefreshIncomplete ? `${controlRefreshMissing.length} 类状态等待重新读取` : mappingWorkspaceUnverified ? '请在原生映射页重新读取当前清单' : `${status?.serviceCount ?? '—'} 个原生服务可用` }}</small></span>
+        <span :class="['status-dot', { ready: Boolean(status) && !controlLoadFailed && !controlRefreshIncomplete && !runtimeStatusStale && !mappingWorkspaceUnverified && !managedProcessRestartRequired, warning: Boolean(controlLoadFailed || controlRefreshIncomplete || error || ssoError || runtimeStatusStale || mappingWorkspaceUnverified || managedProcessRestartRequired) }]" />
+        <span><strong>{{ controlLoadFailed ? '控制台初始化失败' : runtimeStatusStale ? '桌面通信中断' : controlRefreshIncomplete ? '操作已完成，状态待刷新' : mappingWorkspaceUnverified ? '映射清单待复核' : managedProcessRestartRequired ? '受控进程等待重启' : error || ssoError ? '需要处理' : status ? '桌面服务正常' : '正在连接' }}</strong><small>{{ controlLoadFailed ? '请重新加载核心项目状态' : runtimeStatusStale ? `状态连续 ${runtimeStatusHealth.consecutiveFailures} 次刷新失败` : controlRefreshIncomplete ? `${controlRefreshMissing.length} 类状态等待重新读取` : mappingWorkspaceUnverified ? '请在原生映射页重新读取当前清单' : managedProcessRestartRequired ? '退出并重新启动客户端后继续' : `${status?.serviceCount ?? '—'} 个原生服务可用` }}</small></span>
       </div>
     </aside>
 
     <main class="workspace">
-      <div v-if="notice || ssoError || error || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || runtimeStatusRecovered" class="message-stack" aria-live="polite">
+      <div v-if="notice || ssoError || error || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || runtimeStatusRecovered || managedProcessRestartRequired" class="message-stack" aria-live="polite">
         <p v-if="notice" class="notice" role="status">{{ notice }}</p>
         <p v-if="runtimeStatusRecovered" class="notice" role="status">桌面核心通信已经恢复，运行状态已重新验证。</p>
         <div v-if="controlLoadFailed" class="runtime-status-alert" role="alert"><span>控制台未能读取完整项目状态。请重新加载；仍失败时重启客户端并查看日志。</span><button type="button" :disabled="controlLoadActive" @click="retryControlLoad">{{ controlLoadActive ? '正在加载…' : '重新加载' }}</button></div>
         <div v-if="controlRefreshIncomplete" class="runtime-status-alert" role="alert"><span>上一项操作已经完成，但部分页面状态尚未重新读取。请勿重复执行该操作，刷新状态后再继续。</span><button type="button" :disabled="busy || controlRefreshActive" @click="retryControlStateRefresh">{{ controlRefreshActive ? '正在刷新…' : '刷新状态' }}</button></div>
         <div v-if="runtimeStatusStale" class="runtime-status-alert" role="alert"><span>桌面核心状态连续刷新失败，当前页面显示的数据可能已经过期。请立即重试；仍失败时重启客户端并查看日志。</span><button type="button" :disabled="busy || statusRefreshActive" @click="retryRuntimeStatus">立即重试</button></div>
+        <div v-if="managedProcessRestartRequired" class="runtime-status-alert" role="alert"><span>受控辅助进程配置已变更。当前实例仍对应启动时选择；请退出并重新启动客户端。</span></div>
         <p v-if="ssoError" class="error" role="alert">{{ ssoError }}</p>
         <p v-if="error" class="error" role="alert">操作失败：{{ error }}</p>
       </div>
@@ -1556,7 +1578,7 @@ async function exportDeploymentCheck() {
             <h1 id="overview-title">本地能力控制台</h1>
             <p class="lede">集中查看运行状态，并快速进入当前项目或专业配置工作区。</p>
           </div>
-          <span class="phase">{{ controlLoadFailed ? '初始化失败' : runtimeStatusStale ? '状态不可用' : controlRefreshIncomplete ? '状态待刷新' : mappingWorkspaceUnverified ? '映射待复核' : status?.acceptingPluginInvocations ? '服务就绪' : '正在初始化' }}</span>
+          <span class="phase">{{ controlLoadFailed ? '初始化失败' : runtimeStatusStale ? '状态不可用' : controlRefreshIncomplete ? '状态待刷新' : mappingWorkspaceUnverified ? '映射待复核' : managedProcessRestartRequired ? '等待重启' : status?.acceptingPluginInvocations ? '服务就绪' : '正在初始化' }}</span>
         </header>
 
         <section class="summary-grid" aria-label="关键运行状态">
@@ -1573,13 +1595,13 @@ async function exportDeploymentCheck() {
               <h2>进入业务系统</h2>
               <p>{{ snapshot?.config.website || '尚未配置默认业务地址' }}</p>
             </div>
-            <button class="primary large" type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || configDraftDirty || !snapshot?.config.website" @click="openBusiness">启动默认环境</button>
+            <button class="primary large" type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || managedProcessRestartRequired || configDraftDirty || !snapshot?.config.website" @click="openBusiness">启动默认环境</button>
             <div v-if="snapshot?.config.allowSwitch && snapshot.config.environments.length" class="environment-shortcuts">
               <button
                 v-for="environment in snapshot.config.environments"
                 :key="`${environment.name}:${environment.url}`"
                 type="button"
-                :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || configDraftDirty || !environment.name || !environment.url"
+                :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || managedProcessRestartRequired || configDraftDirty || !environment.name || !environment.url"
                 @click="openEnvironment(environment)"
               >{{ environment.name || '未命名环境' }}</button>
             </div>
@@ -1596,13 +1618,14 @@ async function exportDeploymentCheck() {
           </section>
         </div>
 
-        <section v-if="controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || mappingWorkspaceUnverified || projectDeliveryDraftDirty || needsDeepDeploymentCheck || deploymentCheck?.failures || status?.businessTimedOutWindows || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
+        <section v-if="controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || mappingWorkspaceUnverified || managedProcessRestartRequired || projectDeliveryDraftDirty || needsDeepDeploymentCheck || deploymentCheck?.failures || status?.businessTimedOutWindows || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
           <div><p class="eyebrow">ATTENTION</p><h2>待处理事项</h2></div>
           <ul>
             <li v-if="controlLoadFailed"><strong>控制台初始化未完成，不能确认当前项目和原生能力状态</strong><button type="button" :disabled="controlLoadActive" @click="retryControlLoad">重新加载</button></li>
             <li v-if="controlRefreshIncomplete"><strong>已完成的操作仍有 {{ controlRefreshMissing.length }} 类页面状态待刷新，请勿重复执行</strong><button type="button" :disabled="busy || controlRefreshActive" @click="retryControlStateRefresh">刷新状态</button></li>
             <li v-if="runtimeStatusStale"><strong>桌面核心通信中断，所有运行状态和部署结论均已标记为未知</strong><button type="button" :disabled="busy || statusRefreshActive" @click="retryRuntimeStatus">重新连接</button></li>
             <li v-if="mappingWorkspaceUnverified"><strong>原生映射工作台清单尚未复核，相关项目操作已暂停</strong><button type="button" @click="activeSection = 'native'">重新读取映射</button></li>
+            <li v-if="managedProcessRestartRequired"><strong>受控辅助进程配置已变更；新业务窗口和新原生调用已暂停，请退出并重新启动客户端</strong></li>
             <li v-if="configDraftDirty"><strong>项目配置有未保存更改，业务启动、原生能力变更和项目交付操作已暂停</strong><button type="button" @click="activeSection = 'configuration'">处理配置</button></li>
             <li v-if="mappingDraftDirty"><strong>原生映射工作台有未保存更改，插件变更、应用更新和项目交付操作已暂停</strong><button type="button" @click="activeSection = 'native'">处理映射</button></li>
             <li v-if="needsDeepDeploymentCheck"><strong>快速检查已通过，正式交付前还需验证当前 x86/x64 插件宿主</strong><button type="button" :disabled="busy || projectStateUnverified || projectDeliveryDraftDirty" @click="runDeploymentCheck">立即深度自检</button></li>
@@ -1691,7 +1714,7 @@ async function exportDeploymentCheck() {
                 <label class="environment-default" title="设为默认环境"><input v-model="snapshot.config.website" type="radio" :value="environment.url" /><span>默认</span></label>
                 <input v-model.trim="environment.name" type="text" maxlength="128" placeholder="环境名称" />
                 <input :value="environment.url" type="url" maxlength="4096" placeholder="http://project.internal" @input="changeEnvironmentUrl(environment, ($event.target as HTMLInputElement).value)" />
-                <button type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || configDraftDirty || !snapshot.config.allowSwitch || !environment.name || !environment.url" @click="openEnvironment(environment)">打开</button>
+                <button type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || managedProcessRestartRequired || configDraftDirty || !snapshot.config.allowSwitch || !environment.name || !environment.url" @click="openEnvironment(environment)">打开</button>
                 <button type="button" :disabled="busy" aria-label="删除环境" @click="removeEnvironment(index)">删除</button>
               </div>
               <button class="environment-add" type="button" :disabled="busy || snapshot.config.environments.length >= 32" @click="addEnvironment">新增环境</button>
@@ -1706,7 +1729,7 @@ async function exportDeploymentCheck() {
               <label><span>仓库索引签名</span><input v-model.trim="snapshot.config.pluginCatalogSignatureUrl" type="url" placeholder="https://plugins.example/catalog.sig.json" /></label>
             </details>
             <div class="toggles"><label><input v-model="snapshot.config.allowSwitch" type="checkbox" />允许环境切换</label><label><input v-model="snapshot.config.autoClose" type="checkbox" />关闭前确认</label><label><input v-model="snapshot.config.autoStart" type="checkbox" />开机自动启动</label></div>
-            <div class="actions"><button class="primary" type="submit" :disabled="busy || controlStateUnverified || !configDraftDirty">保存配置</button><button v-if="configDraftDirty" type="button" :disabled="busy || controlStateUnverified" @click="discardConfigChanges">放弃更改</button><button type="button" :disabled="busy || controlStateUnverified || configDraftDirty" @click="openBusiness">进入业务系统</button></div>
+            <div class="actions"><button class="primary" type="submit" :disabled="busy || controlStateUnverified || !configDraftDirty">保存配置</button><button v-if="configDraftDirty" type="button" :disabled="busy || controlStateUnverified" @click="discardConfigChanges">放弃更改</button><button type="button" :disabled="busy || controlStateUnverified || managedProcessRestartRequired || configDraftDirty" @click="openBusiness">进入业务系统</button></div>
             <small class="config-path">配置位置：{{ snapshot.path }}</small>
           </form>
         </section>
@@ -1780,7 +1803,7 @@ async function exportDeploymentCheck() {
           <article><span>插件信任</span><strong>{{ status?.pluginTrustMode === 'ed25519-strict' ? '严格签名' : '开发模式' }}</strong><small :title="status?.pluginRoot">{{ status ? `${status.trustKeyCount} 把密钥 · ${status.pluginApiBaselineCount} 个契约基线 · 基线写入失败 ${status.pluginApiBaselineFailures}` : '完整清单与 SHA-256 校验' }}</small></article>
           <article><span>安装事务</span><strong>{{ status?.recoveredPluginTransactions ? '已自动恢复' : '状态正常' }}</strong><small>已清理或回滚 {{ status?.recoveredPluginTransactions ?? '—' }} 项</small></article>
           <article><span>宿主预检</span><strong>{{ status?.pluginPreflightFailures ? '存在失败' : '状态正常' }}</strong><small>通过 {{ status?.preflightedPluginHosts ?? '—' }} · 失败 {{ status?.pluginPreflightFailures ?? '—' }}</small></article>
-          <article><span>受控进程策略</span><strong>{{ status?.processPolicyEntries ?? '—' }} 项</strong><small>启动失败 {{ status?.managedProcessFailures ?? '—' }} · 不经过 Shell</small></article>
+          <article><span>受控进程策略</span><strong>{{ managedProcessRestartRequired ? '配置等待重启' : `${status?.processPolicyEntries ?? '—'} 项` }}</strong><small>{{ managedProcessRestartRequired ? '当前实例仍使用启动时选择；新业务和原生调用已暂停' : `启动失败 ${status?.managedProcessFailures ?? '—'} · 不经过 Shell` }}</small></article>
           <article><span>开机启动</span><strong>{{ status?.autoStartEnabled == null ? '状态未知' : status.autoStartEnabled ? '已启用' : '未启用' }}</strong><small :title="status?.autoStartError">{{ status?.autoStartError ?? '由本机系统机制管理' }}</small></article>
           <article><span>SSO 传输</span><strong>{{ ssoActive ? '登录处理中' : ssoError ? '最近失败' : 'HTTPS-only' }}</strong><small>禁止重定向 · 请求与响应均有上限</small></article>
           <article><span>业务来源策略</span><strong>{{ status?.originPolicy.allowConfiguredBusinessOrigins ? '项目地址兼容' : status?.originPolicy.enforced ? '发布方签名' : '开发模式' }}</strong><small :title="status?.originPolicyError">{{ status?.originPolicyError ?? `${status?.originPolicy.businessOrigins ?? '—'} 个来源 · HTTP ${status?.originPolicy.allowInsecureHttp ? '允许' : '禁止'}` }}</small></article>

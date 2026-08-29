@@ -100,6 +100,7 @@ struct BusinessReadyTransition {
 pub(crate) struct DesktopState {
     pub(crate) config: Arc<ConfigStore>,
     origin_policy: Arc<OriginPolicy>,
+    started_managed_processes: BTreeSet<String>,
     next_window_id: AtomicU64,
     next_capability_id: AtomicU64,
     next_tray_action_id: AtomicU64,
@@ -114,9 +115,11 @@ pub(crate) struct DesktopState {
 
 impl DesktopState {
     pub(crate) fn new(config: ConfigStore, origin_policy: OriginPolicy) -> Self {
+        let started_managed_processes = config.snapshot().managed_processes.into_iter().collect();
         Self {
             config: Arc::new(config),
             origin_policy: Arc::new(origin_policy),
+            started_managed_processes,
             next_window_id: AtomicU64::new(1),
             next_capability_id: AtomicU64::new(1),
             next_tray_action_id: AtomicU64::new(1),
@@ -145,6 +148,23 @@ impl DesktopState {
         self.origin_policy
             .authorize(config)
             .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn managed_process_restart_required(&self) -> bool {
+        self.config
+            .snapshot()
+            .managed_processes
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            != self.started_managed_processes
+    }
+
+    pub(crate) fn require_current_managed_processes(&self) -> Result<(), String> {
+        if self.managed_process_restart_required() {
+            Err("受控辅助进程配置已变更，请重新启动客户端后继续；错误码：managed-process-restart-required".into())
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn plugin_route_policy_coverage(
@@ -932,6 +952,7 @@ pub(crate) fn open_business_at(
     state: &DesktopState,
     url: Url,
 ) -> Result<String, String> {
+    state.require_current_managed_processes()?;
     let config = state.config.snapshot();
     state.authorize_config(&config)?;
     let business_origins = config
@@ -2404,6 +2425,43 @@ mod tests {
             &current,
             &changed_extension
         ));
+    }
+
+    #[test]
+    fn managed_process_selection_drift_requires_restart_independent_of_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.json");
+        let store = ConfigStore::open(&config_path, Vec::<PathBuf>::new()).unwrap();
+        store
+            .replace(DesktopConfig {
+                managed_processes: vec!["reader-agent".into(), "device-agent".into()],
+                ..DesktopConfig::default()
+            })
+            .unwrap();
+        let state = DesktopState::new(store, OriginPolicy::development_unrestricted());
+
+        assert!(!state.managed_process_restart_required());
+        state
+            .config
+            .replace(DesktopConfig {
+                managed_processes: vec!["device-agent".into(), "reader-agent".into()],
+                ..DesktopConfig::default()
+            })
+            .unwrap();
+        assert!(!state.managed_process_restart_required());
+
+        state
+            .config
+            .replace(DesktopConfig {
+                managed_processes: vec!["replacement-agent".into()],
+                ..DesktopConfig::default()
+            })
+            .unwrap();
+        assert!(state.managed_process_restart_required());
+        assert!(state
+            .require_current_managed_processes()
+            .unwrap_err()
+            .contains("managed-process-restart-required"));
     }
 
     #[test]

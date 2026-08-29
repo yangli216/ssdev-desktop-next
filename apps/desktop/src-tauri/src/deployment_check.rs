@@ -44,6 +44,7 @@ pub(crate) struct DeploymentCheckFacts {
     pub(crate) tracked_persistence_failures: u64,
     pub(crate) diagnostics_available: bool,
     pub(crate) managed_process_failures: usize,
+    pub(crate) managed_process_restart_required: bool,
     pub(crate) app_update_configured: bool,
 }
 
@@ -522,7 +523,15 @@ pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
         ));
     }
 
-    if facts.managed_process_failures > 0 {
+    if facts.managed_process_restart_required {
+        items.push(item(
+            "managed-processes",
+            "项目辅助进程",
+            DeploymentCheckStatus::Fail,
+            "当前配置的受控辅助进程与本次启动已加载的选择不一致。",
+            Some("退出并重新启动客户端，然后重新执行部署自检。"),
+        ));
+    } else if facts.managed_process_failures > 0 {
         items.push(item(
             "managed-processes",
             "项目辅助进程",
@@ -681,6 +690,7 @@ mod tests {
             tracked_persistence_failures: 0,
             diagnostics_available: true,
             managed_process_failures: 0,
+            managed_process_restart_required: false,
             app_update_configured: false,
         }
     }
@@ -710,6 +720,22 @@ mod tests {
         assert_eq!(report.failures, 3);
         assert!(report.items.iter().any(|item| {
             item.id == "plugin-hosts" && item.status == DeploymentCheckStatus::Fail
+        }));
+    }
+
+    #[test]
+    fn changed_managed_process_selection_requires_restart_before_delivery() {
+        let mut facts = healthy_facts();
+        facts.managed_process_restart_required = true;
+
+        let report = evaluate(&facts);
+
+        assert!(!report.ready);
+        assert!(!report.delivery_ready);
+        assert!(report.items.iter().any(|item| {
+            item.id == "managed-processes"
+                && item.status == DeploymentCheckStatus::Fail
+                && item.summary.contains("本次启动")
         }));
     }
 

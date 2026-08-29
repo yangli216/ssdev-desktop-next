@@ -385,6 +385,7 @@ struct BridgeStatus {
     plugin_root: PathBuf,
     process_policy_entries: usize,
     managed_process_failures: usize,
+    managed_process_restart_required: bool,
     auto_start_enabled: Option<bool>,
     auto_start_error: Option<String>,
     app_update_configured: bool,
@@ -520,6 +521,7 @@ async fn bridge_status(
         plugin_root: state.plugin_root.clone(),
         process_policy_entries: state.process_policy_entries,
         managed_process_failures: state.managed_process_failures,
+        managed_process_restart_required: desktop_state.managed_process_restart_required(),
         auto_start_enabled,
         auto_start_error,
         app_update_configured: app_update.configured,
@@ -736,6 +738,7 @@ async fn run_deployment_check(
         tracked_persistence_failures: tracked.map_or(0, |stats| stats.persistence_failures),
         diagnostics_available: diagnostics.state.is_some(),
         managed_process_failures: state.managed_process_failures,
+        managed_process_restart_required: desktop_state.managed_process_restart_required(),
         app_update_configured: update_state.status().configured,
     });
     tracing::info!(
@@ -747,6 +750,7 @@ async fn run_deployment_check(
         passed = report.passed,
         warnings = report.warnings,
         failures = report.failures,
+        managed_process_restart_required = desktop_state.managed_process_restart_required(),
         "deployment self-check completed"
     );
     Ok(report)
@@ -1018,6 +1022,7 @@ async fn export_diagnostics(
         revoked_trust_key_count: trust_keys.revoked,
         process_policy_entries: bridge_state.process_policy_entries,
         managed_process_failures: bridge_state.managed_process_failures,
+        managed_process_restart_required: desktop_state.managed_process_restart_required(),
         origin_policy_enforced: origin.enforced,
         business_origin_count: origin.business_origins,
         business_window_count: business_frontend.active_windows,
@@ -5261,6 +5266,7 @@ async fn plugin_invoke(
         &request.service_id,
         &request.method,
     )?;
+    desktop_state.require_current_managed_processes()?;
     Ok(state.controller.invoke(request).await)
 }
 
@@ -5278,6 +5284,7 @@ async fn plugin_invoke_tracked(
         &request.service_id,
         &request.method,
     )?;
+    desktop_state.require_current_managed_processes()?;
     let coordinator = state.invocation_coordinator.as_ref().ok_or_else(|| {
         format!(
             "持久调用协调不可用 ({})",

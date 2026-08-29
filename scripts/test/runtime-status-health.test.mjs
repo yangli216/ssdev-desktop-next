@@ -51,7 +51,7 @@ test('control console exposes stale status and blocks new business launches', as
   assert.match(source, /runtimeStatusStale[^\n]+桌面通信中断/)
   assert.match(source, /runtimeStatusStale[^\n]+状态不可用/)
   assert.match(source, /runtimeStatusStale[^\n]+部署状态无法确认/)
-  assert.match(source, /busy \|\| controlLoadFailed \|\| controlRefreshIncomplete \|\| runtimeStatusStale \|\| configDraftDirty \|\| !snapshot\?\.config\.website/)
+  assert.match(source, /busy \|\| controlLoadFailed \|\| controlRefreshIncomplete \|\| runtimeStatusStale \|\| managedProcessRestartRequired \|\| configDraftDirty \|\| !snapshot\?\.config\.website/)
   assert.match(source, /桌面核心状态连续刷新失败/)
   assert.match(source, /ready: deploymentCheck\.ready && !controlLoadFailed && !controlRefreshIncomplete && !runtimeStatusStale && !mappingWorkspaceUnverified && !projectDeliveryDraftDirty/)
   assert.match(source, /controlRefreshIncomplete \|\| runtimeStatusStale \|\| mappingWorkspaceUnverified \? 'STATUS UNKNOWN'/)
