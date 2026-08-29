@@ -1646,6 +1646,25 @@ pub fn check_release_set(
     check_release_set_inputs(&inputs, trust_store, matrix)
 }
 
+pub fn check_release_set_with_package_root(
+    spec: &Path,
+    package_root: &Path,
+    trust_store: &Path,
+    matrix: &Path,
+) -> Result<ReleaseSetCheckReport, ToolError> {
+    let mut inputs = load_release_set_inputs(spec)?;
+    let package_root = canonical_real_directory(package_root)?;
+    for package in &mut inputs.packages {
+        *package = canonical_real_file(package, MAX_PLUGIN_BYTES)?;
+        if !package.starts_with(&package_root) {
+            return Err(ToolError::Invalid(
+                "release set package is outside the approved package root".into(),
+            ));
+        }
+    }
+    check_release_set_inputs(&inputs, trust_store, matrix)
+}
+
 fn load_release_set_inputs(spec: &Path) -> Result<ReleaseSetInputs, ToolError> {
     let spec = canonical_real_file(spec, MAX_RELEASE_SET_SPEC_BYTES)?;
     let spec_sha256 = sha256_file_bounded(&spec, MAX_RELEASE_SET_SPEC_BYTES)?;
@@ -4583,6 +4602,21 @@ mod tests {
         assert_eq!(report.package_set_sha256.len(), 64);
         assert!(report.packages_verified);
         assert!(report.matrix_verified);
+        assert_eq!(
+            check_release_set_with_package_root(&spec, root.path(), &trust, &matrix)
+                .unwrap()
+                .package_set_sha256,
+            report.package_set_sha256
+        );
+        let unrelated_package_root = root.path().join("unrelated-packages");
+        fs::create_dir(&unrelated_package_root).unwrap();
+        assert!(check_release_set_with_package_root(
+            &spec,
+            &unrelated_package_root,
+            &trust,
+            &matrix,
+        )
+        .is_err());
 
         let reversed_spec = matrix_file(
             root.path(),

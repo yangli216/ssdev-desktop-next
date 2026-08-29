@@ -10,7 +10,24 @@
 
 ## 1. 准备策略
 
-复制 [cutover-policy.example.json](cutover-policy.example.json)，把 `targetSourceRevision` 替换为待发布 clean commit 的完整小写 Git object ID，把 `expectedAppVersion` 替换为候选 Windows 包内 `release.json` 的版本，并填写已复验试点报告的 `materialSetSha256` 为 `expectedPilotMaterialSetSha256`。从试点材料中的上一生产 bundle 填写 `expectedPreviousAppVersion`、`expectedPreviousReleaseMetadataSha256` 和 `expectedPreviousWindowsArtifactManifestSha256`；上一版本必须低于候选版本，三个值都必须与 schema 4 Windows 证据逐项一致。再从批准候选包填写 `expectedWindowsArtifactManifestSha256` 与 `expectedOriginPolicySha256`；后者必须同时等于正式迁移证据和 Windows 包证据中的来源策略摘要。`expectedPluginReleaseSetSpecSha256`、`expectedPluginPackageSetSha256`、`expectedPluginTrustStoreSha256` 和 `expectedPluginMatrixSha256` 必须来自本次批准的发布集合及矩阵检查结果，不能照抄示例占位值。根据切换前冻结的旧资产清单填写 `migrationCoverageMinimums`；这些是最低覆盖而不是期望结果，某类资产确实不存在时显式填 `0` 并在审批记录中说明。最后填写实际负责三种验证环境及最终发布审批的四个不同签名 `keyId`。策略文件本身也会按原始字节计算 SHA-256 并写入最终决策。
+生产策略不再由人员逐项复制版本和摘要。先复制 [人工批准输入示例](cutover-policy-approval.example.json)，只填写证据有效期、切换前冻结的八类迁移覆盖下限，以及负责三种验证环境和最终审批的四个不同签名 `keyId`。覆盖下限是人工批准的最低覆盖；某类资产确实不存在时显式填 `0` 并在审批记录中说明。
+
+然后从 clean 候选源码、已复验试点三件套、候选 Windows bundle 和人工批准输入生成不可覆盖的 schema 6 策略：
+
+```powershell
+cargo run --locked -p ssdev-cutover-evidence -- prepare-policy `
+  C:\ssdev-source `
+  D:\ssdev-pilot\materials `
+  D:\ssdev-pilot\pilot-materials.json `
+  D:\ssdev-pilot\reports\pilot-readiness.json `
+  D:\candidate\bundle `
+  D:\cutover-inputs\policy-approval-inputs.json `
+  D:\cutover-inputs\production-policy.json
+```
+
+工具会重新验证完整试点材料集合，从固定类别中确定发布集合规范、唯一插件包目录、唯一黄金矩阵和上一生产 bundle；候选与上一 bundle 的 `artifacts.json` 必须逐文件匹配，候选 `release.json` 必须匹配当前 clean 源码，上一版本必须低于候选版本。来源策略必须使用试点信任库中的 active `origin-policy` 密钥有效签名，插件发布集合则必须在批准包目录边界内通过同一信任库和黄金矩阵检查。目标提交、候选/上一版本、两份产物清单、上一版发布元数据、来源策略、试点材料、发布集合、包集合、信任库和矩阵摘要都由这些已验证输入自动写入，人工批准文件不能覆盖它们。
+
+写入前工具会再次检查源码、manifest、报告、材料、两个 bundle 和批准文件没有漂移；输出不得位于源码、材料或任一 bundle 内，且不能覆盖现有文件。[完整策略示例](cutover-policy.example.json) 只用于说明最终 schema 和测试，不应在生产中手工填写摘要。策略原始字节的 SHA-256 会进入最终决策。
 
 ## 2. 签署执行证据
 

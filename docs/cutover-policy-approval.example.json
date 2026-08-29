@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "maximumEvidenceAgeSeconds": 604800,
+  "migrationCoverageMinimums": {
+    "configFiles": 1,
+    "pluginDirectories": 1,
+    "services": 1,
+    "keyBindings": 0,
+    "browserAssetRoots": 1,
+    "browserAssetFilesScanned": 1,
+    "browserHarFiles": 1,
+    "browserHarRequestsScanned": 1
+  },
+  "pluginMatrixSignerKeyId": "plugin-matrix-approver",
+  "migrationAuditSignerKeyId": "migration-audit-approver",
+  "windowsPackageSignerKeyId": "windows-package-approver",
+  "cutoverDecisionSignerKeyId": "cutover-decision-approver"
+}

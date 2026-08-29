@@ -688,6 +688,14 @@ pub fn load_production_cutover_policy(
     Ok(policy)
 }
 
+pub fn write_production_cutover_policy(
+    path: &Path,
+    policy: &ProductionCutoverPolicy,
+) -> Result<(), EvidenceError> {
+    policy.validate()?;
+    write_new_json(path, policy)
+}
+
 #[derive(Debug)]
 pub struct ProductionCutoverInputs<'a> {
     pub policy: &'a ProductionCutoverPolicy,
@@ -1597,6 +1605,17 @@ mod tests {
         invalid_upgrade.expected_previous_app_version =
             invalid_upgrade.expected_app_version.clone();
         assert!(invalid_upgrade.validate().is_err());
+    }
+
+    #[test]
+    fn generated_production_policy_cannot_overwrite_an_existing_record() {
+        let root = test_dir();
+        let path = root.join("policy.json");
+        let policy = valid_policy("d".repeat(40));
+        write_production_cutover_policy(&path, &policy).unwrap();
+        assert_eq!(load_production_cutover_policy(&path).unwrap(), policy);
+        assert!(write_production_cutover_policy(&path, &policy).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

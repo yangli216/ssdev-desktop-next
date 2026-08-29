@@ -402,6 +402,50 @@ pub fn resolve_migration_audit_inputs(
     })
 }
 
+pub fn resolve_material_category_inputs(
+    materials_root: &Path,
+    manifest: &PilotMaterialManifest,
+    category_id: &str,
+) -> Result<Vec<PathBuf>, PilotReadinessError> {
+    if manifest.schema_version != MANIFEST_SCHEMA_VERSION
+        || !CATEGORY_RULES.iter().any(|rule| rule.id == category_id)
+    {
+        return Err(PilotReadinessError::Invalid(
+            "unsupported pilot material manifest or category".into(),
+        ));
+    }
+    let root_metadata = fs::symlink_metadata(materials_root)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(PilotReadinessError::Invalid(
+            "materials root must be a real directory".into(),
+        ));
+    }
+    let root = fs::canonicalize(materials_root)?;
+    let mut matches = manifest
+        .categories
+        .iter()
+        .filter(|category| category.id == category_id);
+    let category = matches
+        .next()
+        .ok_or_else(|| PilotReadinessError::Invalid("pilot material category is missing".into()))?;
+    if matches.next().is_some()
+        || category.status != MaterialStatus::Provided
+        || category.approval_reference.is_some()
+    {
+        return Err(PilotReadinessError::Invalid(
+            "pilot material category is duplicated or not provided".into(),
+        ));
+    }
+    let normalized = normalize_binding_paths(&category.inputs)
+        .map_err(|_| PilotReadinessError::Invalid("material category inputs are invalid".into()))?;
+    if normalized.is_empty() {
+        return Err(PilotReadinessError::Invalid(
+            "material category inputs are empty".into(),
+        ));
+    }
+    resolve_binding_paths(&root, &normalized)
+}
+
 pub fn prepare_new_output(path: &Path) -> Result<PathBuf, PilotReadinessError> {
     match fs::symlink_metadata(path) {
         Ok(_) => return Err(PilotReadinessError::OutputExists),
@@ -1347,6 +1391,12 @@ mod tests {
     fn previous_windows_release_requires_a_complete_bundle_layout() {
         let temp = tempdir().unwrap();
         let manifest = complete_manifest(temp.path());
+        let resolved =
+            resolve_material_category_inputs(temp.path(), &manifest, "previous-windows-release")
+                .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].is_dir());
+        assert!(resolve_material_category_inputs(temp.path(), &manifest, "unknown").is_err());
         let previous = manifest
             .categories
             .iter()

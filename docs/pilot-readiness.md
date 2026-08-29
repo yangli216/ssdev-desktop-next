@@ -55,6 +55,7 @@ cargo run --locked -p ssdev-pilot-readiness -- `
 1. 把材料根目录、同一 manifest 和已复验报告三件套交给正式迁移审计；工具只从 `migrationAuditBindings` 派生输入和签名来源策略，并在审计完成后再次复验全部材料；
 2. 对批准发布集合运行真实 x86/x64 插件黄金矩阵；
 3. 使用上一正式版本和候选 NSIS 运行 Windows 升级、启动、回退与卸载验收；
-4. 对三份独立证据签名并运行生产 Go/No-Go。
+4. 使用 `ssdev-cutover-evidence prepare-policy` 从同一试点三件套、候选 bundle 和少量人工批准项自动生成生产策略，禁止手工复制材料、插件和版本摘要；
+5. 对三份独立证据签名并运行生产 Go/No-Go。
 
 材料报告不能代替以上任一步，也不应进入远程业务 WebView。

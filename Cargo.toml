@@ -69,6 +69,7 @@ ssdev-cutover-evidence = { path = "crates/ssdev-cutover-evidence" }
 ssdev-process-policy = { path = "crates/ssdev-process-policy" }
 ssdev-origin-policy = { path = "crates/ssdev-origin-policy" }
 ssdev-pilot-readiness = { path = "crates/ssdev-pilot-readiness" }
+ssdev-plugin-tool = { path = "crates/ssdev-plugin-tool" }
 ssdev-project-bundle = { path = "crates/ssdev-project-bundle" }
 ssdev-release-signing = { path = "crates/ssdev-release-signing" }
 ssdev-release-manifest = { path = "crates/ssdev-release-manifest" }
