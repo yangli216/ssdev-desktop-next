@@ -386,7 +386,9 @@ pub(crate) async fn install_app_update(
         package_bytes = bytes.len(),
         "application update signature verified"
     );
-    crate::desktop::close_business_windows(&app);
+    on_event
+        .send(AppUpdateEvent::Installing)
+        .map_err(|error| error.to_string())?;
     if let Some(coordinator) = &bridge.invocation_coordinator {
         coordinator.stop_accepting().await;
     }
@@ -394,19 +396,17 @@ pub(crate) async fn install_app_update(
     if let Some(coordinator) = &bridge.invocation_coordinator {
         coordinator.drain().await;
     }
-    if let Err(error) = on_event.send(AppUpdateEvent::Installing) {
-        bridge.controller.resume_after_shutdown().await;
-        if let Some(coordinator) = &bridge.invocation_coordinator {
-            coordinator.resume_after_shutdown();
-        }
-        return Err(error.to_string());
-    }
     if let Err(error) = update.install(&bytes) {
         bridge.controller.resume_after_shutdown().await;
         if let Some(coordinator) = &bridge.invocation_coordinator {
             coordinator.resume_after_shutdown();
         }
-        return Err(error.to_string());
+        tracing::warn!(
+            event_code = "app-update-install-handoff-failed",
+            error_code = "updater-install",
+            "application update install handoff failed; current runtime resumed"
+        );
+        return Err(format!("无法启动系统安装程序，当前版本已恢复可用: {error}"));
     }
     crate::desktop::mark_exit_ready(&app);
     app.restart();
