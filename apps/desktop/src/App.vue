@@ -484,6 +484,9 @@ const projectStateUnverified = computed(() => (
 const managedProcessRestartRequired = computed(() => (
   status.value?.managedProcessRestartRequired ?? false
 ))
+const trackedInvocationsUnavailable = computed(() => (
+  status.value != null && !status.value.trackedInvocationsAvailable
+))
 const managedProcessDraftChanged = computed(() => {
   const selected = [...new Set(snapshot.value?.config.managedProcesses ?? [])].sort()
   const saved = [...new Set(savedManagedProcesses.value)].sort()
@@ -785,6 +788,22 @@ function processPolicyGuidance(code?: string): string {
     return '签名进程策略未通过验证；请由发布人员检查策略、签名和信任库。'
   }
   return ''
+}
+
+function trackedInvocationGuidance(code?: string): string {
+  if (code === 'operation-ledger-path') {
+    return '持久调用数据目录结构不安全。请停止非幂等设备操作，保留现场并由实施人员检查目录权限或异常链接。'
+  }
+  if (code === 'operation-ledger-corrupt' || code === 'operation-ledger-json' || code === 'operation-ledger-size') {
+    return '持久调用记录损坏或超限。请勿重放未对账的设备操作；先导出诊断并备份应用数据，再由实施人员隔离异常账本后重启。'
+  }
+  if (code === 'operation-ledger-capacity' || code === 'operation-ledger-scope-capacity') {
+    return '持久调用保留记录已达上限。请暂停新的非幂等操作，核对业务是否持续创建新操作 ID，并等待过期记录释放。'
+  }
+  if (code === 'operation-ledger-io') {
+    return '持久调用记录无法读写。请停止非幂等设备操作，检查磁盘空间、用户目录权限和安全软件拦截后重启。'
+  }
+  return '持久调用协调当前不可用。普通幂等调用仍可使用；打印、写卡等非幂等操作应暂停并先导出诊断。'
 }
 
 function shortcutActionDetail(action: DesktopAction): string {
@@ -1714,7 +1733,7 @@ async function exportDeploymentCheck() {
           </section>
         </div>
 
-        <section v-if="controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || mappingWorkspaceUnverified || managedProcessRestartRequired || projectDeliveryDraftDirty || needsDeepDeploymentCheck || deploymentCheck?.failures || status?.businessTimedOutWindows || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
+        <section v-if="controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || mappingWorkspaceUnverified || managedProcessRestartRequired || trackedInvocationsUnavailable || projectDeliveryDraftDirty || needsDeepDeploymentCheck || deploymentCheck?.failures || status?.businessTimedOutWindows || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
           <div><p class="eyebrow">ATTENTION</p><h2>待处理事项</h2></div>
           <ul>
             <li v-if="controlLoadFailed"><strong>控制台初始化未完成，不能确认当前项目和原生能力状态</strong><button type="button" :disabled="controlLoadActive" @click="retryControlLoad">重新加载</button></li>
@@ -1722,6 +1741,7 @@ async function exportDeploymentCheck() {
             <li v-if="runtimeStatusStale"><strong>桌面核心通信中断，所有运行状态和部署结论均已标记为未知</strong><button type="button" :disabled="busy || statusRefreshActive" @click="retryRuntimeStatus">重新连接</button></li>
             <li v-if="mappingWorkspaceUnverified"><strong>原生映射工作台清单尚未复核，相关项目操作已暂停</strong><button type="button" @click="activeSection = 'native'">重新读取映射</button></li>
             <li v-if="managedProcessRestartRequired"><strong>受控辅助进程配置已变更；新业务窗口和新原生调用已暂停，请退出并重新启动客户端</strong></li>
+            <li v-if="trackedInvocationsUnavailable"><strong>持久原生操作防重放不可用；打印、写卡等非幂等流程应暂停</strong><button type="button" @click="activeSection = 'security'">查看处置建议</button></li>
             <li v-if="configDraftDirty"><strong>项目配置有未保存更改，业务启动、原生能力变更和项目交付操作已暂停</strong><button type="button" @click="activeSection = 'configuration'">处理配置</button></li>
             <li v-if="mappingDraftDirty"><strong>原生映射工作台有未保存更改，插件变更、应用更新和项目交付操作已暂停</strong><button type="button" @click="activeSection = 'native'">处理映射</button></li>
             <li v-if="needsDeepDeploymentCheck"><strong>快速检查已通过，正式交付前还需验证当前 x86/x64 插件宿主</strong><button type="button" :disabled="busy || projectStateUnverified || projectDeliveryDraftDirty" @click="runDeploymentCheck">立即深度自检</button></li>
@@ -1927,7 +1947,7 @@ async function exportDeploymentCheck() {
         <section :class="['diagnostic-grid', { stale: controlRefreshIncomplete || runtimeStatusStale }]" aria-label="详细运行状态">
           <article><span>插件调用背压</span><strong v-if="status?.globalPluginMaintenanceActive">全局维护中</strong><strong v-else>{{ status ? `${status.inFlightInvocations} / ${status.maxInFlightInvocations}` : '—' }}</strong><small>容量拒绝 {{ status?.rejectedInvocations ?? '—' }} · 槽超时 {{ status?.executionLaneTimeouts ?? '—' }} · 维护拒绝 {{ status?.maintenanceRejectedInvocations ?? '—' }}</small></article>
           <article><span>隔离宿主监督</span><strong>{{ status?.activePluginHosts ?? '—' }} 个活动宿主</strong><small>累计启动 {{ status?.pluginHostStarts ?? '—' }} · 失败 {{ status?.pluginHostStartFailures ?? '—' }}</small></article>
-          <article><span>原生操作防重放</span><strong>{{ status?.trackedInvocationsAvailable ? (status.trackedInvocationsAccepting ? '持久协调可用' : '正在排空') : '不可用' }}</strong><small>{{ status?.trackedInvocationsAvailable ? `等待 ${status.trackedPendingOperations} · 可找回 ${status.trackedRetainedResults} · 落盘异常 ${status.trackedPersistenceFailures}` : status?.trackedInvocationsError ?? '状态尚未加载' }}</small></article>
+          <article><span>原生操作防重放</span><strong>{{ status?.trackedInvocationsAvailable ? (status.trackedInvocationsAccepting ? '持久协调可用' : '正在排空') : '不可用' }}</strong><small v-if="status?.trackedInvocationsAvailable">等待 {{ status.trackedPendingOperations }} · 可找回 {{ status.trackedRetainedResults }} · 落盘异常 {{ status.trackedPersistenceFailures }}</small><small v-else-if="status">{{ trackedInvocationGuidance(status.trackedInvocationsError) }}（{{ status.trackedInvocationsError ?? 'operation-ledger-unavailable' }}）</small><small v-else>状态尚未加载</small></article>
           <article><span>插件信任</span><strong>{{ status?.pluginTrustMode === 'ed25519-strict' ? '严格签名' : '开发模式' }}</strong><small :title="status?.pluginRoot">{{ status ? `${status.trustKeyCount} 把密钥 · ${status.pluginApiBaselineCount} 个契约基线 · 基线写入失败 ${status.pluginApiBaselineFailures}` : '完整清单与 SHA-256 校验' }}</small></article>
           <article><span>安装事务</span><strong>{{ status?.recoveredPluginTransactions ? '已自动恢复' : '状态正常' }}</strong><small>已清理或回滚 {{ status?.recoveredPluginTransactions ?? '—' }} 项</small></article>
           <article><span>宿主预检</span><strong>{{ status?.pluginPreflightFailures ? '存在失败' : '状态正常' }}</strong><small>通过 {{ status?.preflightedPluginHosts ?? '—' }} · 失败 {{ status?.pluginPreflightFailures ?? '—' }}</small></article>
