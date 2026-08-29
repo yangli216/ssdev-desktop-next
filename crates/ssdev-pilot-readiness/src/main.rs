@@ -6,7 +6,7 @@ use ssdev_pilot_readiness::{
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     match run() {
@@ -27,6 +27,7 @@ fn run() -> Result<bool, PilotReadinessError> {
 fn run_with_arguments(arguments: &[OsString]) -> Result<bool, PilotReadinessError> {
     match arguments.first().and_then(|value| value.to_str()) {
         Some("init") if arguments.len() == 3 => run_init(&arguments[1..]),
+        Some("check") if arguments.len() == 3 => run_check(&arguments[1..]),
         Some("create") if arguments.len() == 4 => run_create(&arguments[1..]),
         Some("verify") if arguments.len() == 4 => run_verify(&arguments[1..]),
         // Retained for the initial schema 1 CLI shipped before named operations existed.
@@ -47,6 +48,13 @@ fn run_init(arguments: &[OsString]) -> Result<bool, PilotReadinessError> {
     Ok(true)
 }
 
+fn run_check(arguments: &[OsString]) -> Result<bool, PilotReadinessError> {
+    let report =
+        inspect_stable_materials(&PathBuf::from(&arguments[0]), &PathBuf::from(&arguments[1]))?;
+    println!("{}", render_check_summary(&report));
+    Ok(report.intake_complete)
+}
+
 fn run_create(arguments: &[OsString]) -> Result<bool, PilotReadinessError> {
     let materials_root = PathBuf::from(&arguments[0]);
     let manifest_path = PathBuf::from(&arguments[1]);
@@ -57,17 +65,25 @@ fn run_create(arguments: &[OsString]) -> Result<bool, PilotReadinessError> {
             "report output must stay outside the materials root".into(),
         ));
     }
-    let (manifest, before) = load_manifest(&manifest_path)?;
-    let report = inspect_materials(&materials_root, &manifest, &before)?;
-    let (_, after) = load_manifest(&manifest_path)?;
+    let report = inspect_stable_materials(&materials_root, &manifest_path)?;
+    write_report(&output, &report)?;
+    println!("{}", render_report_summary(&report, false));
+    Ok(report.intake_complete)
+}
+
+fn inspect_stable_materials(
+    materials_root: &Path,
+    manifest_path: &Path,
+) -> Result<PilotReadinessReport, PilotReadinessError> {
+    let (manifest, before) = load_manifest(manifest_path)?;
+    let report = inspect_materials(materials_root, &manifest, &before)?;
+    let (_, after) = load_manifest(manifest_path)?;
     if before != after {
         return Err(PilotReadinessError::Invalid(
             "manifest changed during inspection".into(),
         ));
     }
-    write_report(&output, &report)?;
-    println!("{}", render_report_summary(&report, false));
-    Ok(report.intake_complete)
+    Ok(report)
 }
 
 fn run_verify(arguments: &[OsString]) -> Result<bool, PilotReadinessError> {
@@ -121,12 +137,7 @@ fn render_report_summary(report: &PilotReadinessReport, verified: bool) -> Strin
             "next: transfer the same materials root, manifest, and report; the receiver must run verify before migration audit".into()
         });
     } else {
-        for code in &report.blocker_codes {
-            lines.push(format!("blocker: {code}"));
-            if let Some(remediation) = blocker_remediation(code) {
-                lines.push(format!("action: {remediation}"));
-            }
-        }
+        append_blocker_guidance(&mut lines, report);
         lines.push(if verified {
             "next: this incomplete report is authentic; resolve its blocker codes and create a new non-overwriting report".into()
         } else {
@@ -136,8 +147,41 @@ fn render_report_summary(report: &PilotReadinessReport, verified: bool) -> Strin
     lines.join("\n")
 }
 
+fn render_check_summary(report: &PilotReadinessReport) -> String {
+    let mut lines = vec![if report.intake_complete {
+        "pilot material draft check: READY (0 blockers)".into()
+    } else {
+        format!(
+            "pilot material draft check: INCOMPLETE ({} blockers)",
+            report.blocker_codes.len()
+        )
+    }];
+    if report.intake_complete {
+        lines.push(
+            "next: run create with a new report output path; this draft check wrote no handoff report"
+                .into(),
+        );
+    } else {
+        append_blocker_guidance(&mut lines, report);
+        lines.push(
+            "next: resolve the blocker codes and rerun check; this draft check wrote no handoff report"
+                .into(),
+        );
+    }
+    lines.join("\n")
+}
+
+fn append_blocker_guidance(lines: &mut Vec<String>, report: &PilotReadinessReport) {
+    for code in &report.blocker_codes {
+        lines.push(format!("blocker: {code}"));
+        if let Some(remediation) = blocker_remediation(code) {
+            lines.push(format!("action: {remediation}"));
+        }
+    }
+}
+
 fn usage() -> &'static str {
-    "usage:\n  ssdev-pilot-readiness init <manifest-output.json> <project-label>\n  ssdev-pilot-readiness create <materials-root> <manifest.json> <report-output.json>\n  ssdev-pilot-readiness verify <materials-root> <manifest.json> <report.json>"
+    "usage:\n  ssdev-pilot-readiness init <manifest-output.json> <project-label>\n  ssdev-pilot-readiness check <materials-root> <manifest.json>\n  ssdev-pilot-readiness create <materials-root> <manifest.json> <report-output.json>\n  ssdev-pilot-readiness verify <materials-root> <manifest.json> <report.json>"
 }
 
 #[cfg(test)]
@@ -196,6 +240,12 @@ mod tests {
                 && code != "migration-audit-binding-mismatch"
                 && !code.ends_with("-missing")
         }));
+        assert!(!run_with_arguments(&[
+            "check".into(),
+            materials.as_os_str().into(),
+            output.as_os_str().into(),
+        ])
+        .unwrap());
 
         assert!(matches!(
             run_with_arguments(&[
@@ -241,6 +291,13 @@ mod tests {
         let report_path = temp.path().join("pilot-readiness.json");
         fs::write(&manifest_path, manifest_bytes).unwrap();
         assert!(run_with_arguments(&[
+            "check".into(),
+            materials.as_os_str().into(),
+            manifest_path.as_os_str().into(),
+        ])
+        .unwrap());
+        assert!(!report_path.exists());
+        assert!(run_with_arguments(&[
             "create".into(),
             materials.as_os_str().into(),
             manifest_path.as_os_str().into(),
@@ -284,6 +341,13 @@ mod tests {
         assert!(!summary.contains("hospital-a-pilot"));
         assert!(!summary.contains("D:\\ssdev-pilot"));
 
+        let check = render_check_summary(&incomplete);
+        assert!(check.contains("pilot material draft check: INCOMPLETE (2 blockers)"));
+        assert!(check.contains("blocker: business-hars-missing"));
+        assert!(check.contains("action: add the fixed category"));
+        assert!(check.contains("wrote no handoff report"));
+        assert!(!check.contains(&digest));
+
         let complete = PilotReadinessReport {
             intake_complete: true,
             blocker_codes: Vec::new(),
@@ -294,5 +358,12 @@ mod tests {
         assert!(summary.contains(&format!("material set sha256: {digest}")));
         assert!(summary.contains("run the migration audit"));
         assert!(!summary.contains("blocker:"));
+
+        let check = render_check_summary(&complete);
+        assert!(check.contains("pilot material draft check: READY (0 blockers)"));
+        assert!(check.contains("run create with a new report output path"));
+        assert!(check.contains("wrote no handoff report"));
+        assert!(!check.contains(&digest));
+        assert!(!check.contains("blocker:"));
     }
 }

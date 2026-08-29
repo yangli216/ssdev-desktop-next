@@ -35,9 +35,20 @@ schema 2 manifest 还必须填写 `migrationAuditBindings`，明确正式迁移�
 
 `legacy-keymap`、`legacy-processes` 和 `external-local-http-callers` 是条件类别。存在时提供输入；确认不存在时使用 `notApplicable`，同时填写只允许字母、数字、点、横线和下划线的审批引用。工具只在报告中保存该引用的 SHA-256，防止“不记得有没有”被当成零资产。
 
-## 2. 执行预检
+## 2. 草稿检查并生成交接报告
 
-报告必须写到材料目录之外，且不会覆盖已有文件：
+材料整理期间先使用只读草稿检查：
+
+```powershell
+cargo run --locked -p ssdev-pilot-readiness -- `
+  check `
+  D:\ssdev-pilot\materials `
+  D:\ssdev-pilot\pilot-materials.json
+```
+
+`check` 复用 `create` 的完整扫描、清单前后复核、稳定阻断码和处理动作，但不写 JSON 报告。未齐返回 `3`，就绪返回 `0`；即使就绪也不输出材料集合 SHA-256，只提示使用 `create` 生成正式记录，因此不能把控制台截图或草稿结果当成交接凭据。修正材料或清单后可以重复运行，不会积累正式样式的废报告。
+
+草稿检查就绪后再执行 `create`。报告必须写到材料目录之外，且不会覆盖已有文件：
 
 ```powershell
 cargo run --locked -p ssdev-pilot-readiness -- `
@@ -49,7 +60,7 @@ cargo run --locked -p ssdev-pilot-readiness -- `
 
 退出码 `0` 表示材料清单完整；`3` 表示报告已写出但仍有稳定阻断码；`1` 表示 manifest、路径或 I/O 本身无效。schema 2 报告会同时记录 `migrationAuditBindingsSha256`；材料内容、类别身份或审计角色变化都会改变总 `materialSetSha256`，后续移交应记录这个总摘要。
 
-命令行摘要与 JSON 报告使用同一组已经排序的稳定阻断码。材料不齐时会为每项连续输出 `blocker: <code>` 和 `action: <稳定处理动作>`，并提醒修正后使用新的报告路径再次执行，因为原报告不会覆盖。处理动作覆盖固定类别缺失/重复、审计角色不一致、路径、符号链接、材料变化、私钥误入、上一 Windows bundle 布局等所有合法阻断码；每项有长度上限且不包含目录、文件名、项目标签或审批引用。报告加载还要求每个合法阻断码存在对应处理动作，未来新增码不能静默退化为只有内部名称。材料齐全时只输出 `material set sha256`，并明确下一步是把同一材料根、manifest 和报告交给接收方独立执行 `verify`。该摘要便于现场处理，但不能替代 JSON 报告的归档和复验。
+`check`、`create` 与 JSON 报告使用同一组已经排序的稳定阻断码。材料不齐时会为每项连续输出 `blocker: <code>` 和 `action: <稳定处理动作>`；`check` 要求修正后重复草稿检查，`create` 则要求使用新的报告路径再次执行，因为原报告不会覆盖。处理动作覆盖固定类别缺失/重复、审计角色不一致、路径、符号链接、材料变化、私钥误入、上一 Windows bundle 布局等所有合法阻断码；每项有长度上限且不包含目录、文件名、项目标签或审批引用。报告加载还要求每个合法阻断码存在对应处理动作，未来新增码不能静默退化为只有内部名称。`create` 材料齐全时才输出 `material set sha256`，并明确下一步是把同一材料根、manifest 和报告交给接收方独立执行 `verify`。这些摘要便于现场处理，但草稿检查不能替代报告，正式摘要也不能替代 JSON 报告的归档和复验。
 
 接收方不能只查看对方提供的摘要，应对收到的同一 manifest 和材料目录独立复验：
 
