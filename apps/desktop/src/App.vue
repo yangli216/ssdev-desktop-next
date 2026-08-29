@@ -4,6 +4,12 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import LocalMappingStudio from './LocalMappingStudio.vue'
+import {
+  initialRuntimeStatusHealth,
+  updateRuntimeStatusHealth,
+  withRuntimeStatusTimeout,
+  type RuntimeStatusHealthEvent,
+} from './runtime-status.js'
 
 type BridgeStatus = {
   mode: string
@@ -345,11 +351,20 @@ const ssoActive = ref(false)
 const ssoError = ref('')
 const notice = ref('')
 const busy = ref(false)
+const runtimeStatusHealth = ref(initialRuntimeStatusHealth())
+const runtimeStatusRecovered = ref(false)
 const mappingDraftDirty = ref(false)
 const mappingWorkspaceRevision = ref(0)
 type ConsoleSection = 'overview' | 'configuration' | 'native' | 'plugins' | 'security'
 const activeSection = ref<ConsoleSection>('overview')
+const runtimeStatusStale = computed(() => runtimeStatusHealth.value.stale)
 const deploymentReadiness = computed(() => {
+  if (runtimeStatusStale.value) {
+    return {
+      label: '状态未知',
+      detail: '桌面核心通信中断，部署状态无法确认',
+    }
+  }
   const report = deploymentCheck.value
   if (!report) {
     return {
@@ -386,6 +401,7 @@ const needsDeepDeploymentCheck = computed(() => (
   && !deploymentCheck.value.deliveryReady
 ))
 const businessFrontendReadiness = computed(() => {
+  if (runtimeStatusStale.value) return { label: '状态未知', detail: '桌面核心通信中断，无法确认业务页面状态' }
   const current = status.value
   if (!current) return { label: '检查中', detail: '正在读取业务窗口状态' }
   if (current.businessTimedOutWindows > 0) {
@@ -424,6 +440,7 @@ const withdrawalReasonLabels = {
 let unlistenSsoStatus: UnlistenFn | undefined
 let ssoStatusEventSeen = false
 let statusRefreshTimer: number | undefined
+let runtimeStatusRecoveryTimer: number | undefined
 let statusRefreshActive = false
 
 function pluginHostNeedsAttention(host: PluginHostStatus) {
@@ -475,17 +492,39 @@ async function retryPluginHost(host: PluginHostStatus) {
   }, `${host.pluginId} ${host.architecture.toUpperCase()} 宿主 Health 已恢复；未调用业务方法。`)
 }
 
-async function refreshRuntimeStatus() {
-  if (busy.value || statusRefreshActive) return
+async function refreshRuntimeStatus(force = false) {
+  if (busy.value || statusRefreshActive || (runtimeStatusStale.value && !force)) return
   statusRefreshActive = true
   try {
-    status.value = await invoke<BridgeStatus>('bridge_status')
+    status.value = await withRuntimeStatusTimeout(invoke<BridgeStatus>('bridge_status'))
+    recordRuntimeStatusEvent('success')
   } catch {
-    // The explicit actions retain user-facing error handling. Background
-    // refresh must not replace a useful screen with a transient IPC warning.
+    recordRuntimeStatusEvent('failure')
   } finally {
     statusRefreshActive = false
   }
+}
+
+function retryRuntimeStatus() {
+  void refreshRuntimeStatus(true)
+}
+
+function recordRuntimeStatusEvent(event: RuntimeStatusHealthEvent) {
+  const transition = updateRuntimeStatusHealth(runtimeStatusHealth.value, event)
+  runtimeStatusHealth.value = transition.health
+  if (event === 'failure') {
+    runtimeStatusRecovered.value = false
+    if (runtimeStatusRecoveryTimer != null) window.clearTimeout(runtimeStatusRecoveryTimer)
+    runtimeStatusRecoveryTimer = undefined
+    return
+  }
+  if (!transition.recovered) return
+  runtimeStatusRecovered.value = true
+  if (runtimeStatusRecoveryTimer != null) window.clearTimeout(runtimeStatusRecoveryTimer)
+  runtimeStatusRecoveryTimer = window.setTimeout(() => {
+    runtimeStatusRecovered.value = false
+    runtimeStatusRecoveryTimer = undefined
+  }, 8_000)
 }
 
 function applySsoStatus(code?: string, active = false) {
@@ -532,6 +571,7 @@ onMounted(async () => {
 onUnmounted(() => {
   unlistenSsoStatus?.()
   if (statusRefreshTimer != null) window.clearInterval(statusRefreshTimer)
+  if (runtimeStatusRecoveryTimer != null) window.clearTimeout(runtimeStatusRecoveryTimer)
 })
 
 async function run(action: () => Promise<unknown>, success: string): Promise<boolean> {
@@ -1007,14 +1047,16 @@ async function exportDeploymentCheck() {
         </button>
       </nav>
       <div class="sidebar-status">
-        <span :class="['status-dot', { ready: Boolean(status), warning: Boolean(error || ssoError) }]" />
-        <span><strong>{{ error || ssoError ? '需要处理' : status ? '桌面服务正常' : '正在连接' }}</strong><small>{{ status?.serviceCount ?? '—' }} 个原生服务可用</small></span>
+        <span :class="['status-dot', { ready: Boolean(status) && !runtimeStatusStale, warning: Boolean(error || ssoError || runtimeStatusStale) }]" />
+        <span><strong>{{ runtimeStatusStale ? '桌面通信中断' : error || ssoError ? '需要处理' : status ? '桌面服务正常' : '正在连接' }}</strong><small>{{ runtimeStatusStale ? `状态连续 ${runtimeStatusHealth.consecutiveFailures} 次刷新失败` : `${status?.serviceCount ?? '—'} 个原生服务可用` }}</small></span>
       </div>
     </aside>
 
     <main class="workspace">
-      <div v-if="notice || ssoError || error" class="message-stack" aria-live="polite">
+      <div v-if="notice || ssoError || error || runtimeStatusStale || runtimeStatusRecovered" class="message-stack" aria-live="polite">
         <p v-if="notice" class="notice" role="status">{{ notice }}</p>
+        <p v-if="runtimeStatusRecovered" class="notice" role="status">桌面核心通信已经恢复，运行状态已重新验证。</p>
+        <div v-if="runtimeStatusStale" class="runtime-status-alert" role="alert"><span>桌面核心状态连续刷新失败，当前页面显示的数据可能已经过期。请立即重试；仍失败时重启客户端并查看日志。</span><button type="button" :disabled="busy || statusRefreshActive" @click="retryRuntimeStatus">立即重试</button></div>
         <p v-if="ssoError" class="error" role="alert">{{ ssoError }}</p>
         <p v-if="error" class="error" role="alert">操作失败：{{ error }}</p>
       </div>
@@ -1026,14 +1068,14 @@ async function exportDeploymentCheck() {
             <h1 id="overview-title">本地能力控制台</h1>
             <p class="lede">集中查看运行状态，并快速进入当前项目或专业配置工作区。</p>
           </div>
-          <span class="phase">{{ status?.acceptingPluginInvocations ? '服务就绪' : '正在初始化' }}</span>
+          <span class="phase">{{ runtimeStatusStale ? '状态不可用' : status?.acceptingPluginInvocations ? '服务就绪' : '正在初始化' }}</span>
         </header>
 
         <section class="summary-grid" aria-label="关键运行状态">
-          <article><span>桌面通信</span><strong>{{ status?.transport ?? '连接中' }}</strong><small>不开放 localhost 端口</small></article>
+          <article><span>桌面通信</span><strong>{{ runtimeStatusStale ? '连接中断' : status?.transport ?? '连接中' }}</strong><small>{{ runtimeStatusStale ? '无法确认本地能力状态；请立即重试' : '不开放 localhost 端口' }}</small></article>
           <article><span>原生服务</span><strong>{{ status?.serviceCount ?? '—' }}</strong><small>{{ status?.pluginCount ?? '—' }} 个插件 · x86 / x64 隔离</small></article>
           <article><span>业务页面</span><strong>{{ businessFrontendReadiness.label }}</strong><small>{{ businessFrontendReadiness.detail }}</small></article>
-          <article><span>部署状态</span><strong>{{ deploymentReadiness.label }}</strong><small>{{ deploymentReadiness.detail }}</small></article>
+          <article><span>部署状态</span><strong>{{ deploymentReadiness.label }}</strong><small>{{ runtimeStatusStale ? '桌面通信中断，部署状态无法确认' : deploymentReadiness.detail }}</small></article>
         </section>
 
         <div class="overview-layout">
@@ -1043,13 +1085,13 @@ async function exportDeploymentCheck() {
               <h2>进入业务系统</h2>
               <p>{{ snapshot?.config.website || '尚未配置默认业务地址' }}</p>
             </div>
-            <button class="primary large" type="button" :disabled="busy || !snapshot?.config.website" @click="openBusiness">启动默认环境</button>
+            <button class="primary large" type="button" :disabled="busy || runtimeStatusStale || !snapshot?.config.website" @click="openBusiness">启动默认环境</button>
             <div v-if="snapshot?.config.allowSwitch && snapshot.config.environments.length" class="environment-shortcuts">
               <button
                 v-for="environment in snapshot.config.environments"
                 :key="`${environment.name}:${environment.url}`"
                 type="button"
-                :disabled="busy || !environment.name || !environment.url"
+                :disabled="busy || runtimeStatusStale || !environment.name || !environment.url"
                 @click="openEnvironment(environment)"
               >{{ environment.name || '未命名环境' }}</button>
             </div>
@@ -1066,9 +1108,10 @@ async function exportDeploymentCheck() {
           </section>
         </div>
 
-        <section v-if="needsDeepDeploymentCheck || deploymentCheck?.failures || status?.businessTimedOutWindows || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
+        <section v-if="runtimeStatusStale || needsDeepDeploymentCheck || deploymentCheck?.failures || status?.businessTimedOutWindows || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
           <div><p class="eyebrow">ATTENTION</p><h2>待处理事项</h2></div>
           <ul>
+            <li v-if="runtimeStatusStale"><strong>桌面核心通信中断，所有运行状态和部署结论均已标记为未知</strong><button type="button" :disabled="busy || statusRefreshActive" @click="retryRuntimeStatus">重新连接</button></li>
             <li v-if="needsDeepDeploymentCheck"><strong>快速检查已通过，正式交付前还需验证当前 x86/x64 插件宿主</strong><button type="button" :disabled="busy" @click="runDeploymentCheck">立即深度自检</button></li>
             <li v-if="deploymentCheck?.failures"><strong>部署自检存在 {{ deploymentCheck.failures }} 项阻塞问题</strong><button type="button" @click="activeSection = 'security'">查看自检</button></li>
             <li v-if="status?.businessTimedOutWindows"><strong>{{ status.businessTimedOutWindows }} 个业务页面加载失败或未到达原生 IPC</strong><button type="button" @click="activeSection = 'security'">查看诊断</button></li>
@@ -1154,7 +1197,7 @@ async function exportDeploymentCheck() {
                 <label class="environment-default" title="设为默认环境"><input v-model="snapshot.config.website" type="radio" :value="environment.url" /><span>默认</span></label>
                 <input v-model.trim="environment.name" type="text" maxlength="128" placeholder="环境名称" />
                 <input :value="environment.url" type="url" maxlength="4096" placeholder="http://project.internal" @input="changeEnvironmentUrl(environment, ($event.target as HTMLInputElement).value)" />
-                <button type="button" :disabled="busy || !snapshot.config.allowSwitch || !environment.name || !environment.url" @click="openEnvironment(environment)">打开</button>
+                <button type="button" :disabled="busy || runtimeStatusStale || !snapshot.config.allowSwitch || !environment.name || !environment.url" @click="openEnvironment(environment)">打开</button>
                 <button type="button" :disabled="busy" aria-label="删除环境" @click="removeEnvironment(index)">删除</button>
               </div>
               <button class="environment-add" type="button" :disabled="busy || snapshot.config.environments.length >= 32" @click="addEnvironment">新增环境</button>
@@ -1169,7 +1212,7 @@ async function exportDeploymentCheck() {
               <label><span>仓库索引签名</span><input v-model.trim="snapshot.config.pluginCatalogSignatureUrl" type="url" placeholder="https://plugins.example/catalog.sig.json" /></label>
             </details>
             <div class="toggles"><label><input v-model="snapshot.config.allowSwitch" type="checkbox" />允许环境切换</label><label><input v-model="snapshot.config.autoClose" type="checkbox" />关闭前确认</label><label><input v-model="snapshot.config.autoStart" type="checkbox" />开机自动启动</label></div>
-            <div class="actions"><button class="primary" type="submit" :disabled="busy">保存配置</button><button type="button" :disabled="busy" @click="openBusiness">进入业务系统</button></div>
+            <div class="actions"><button class="primary" type="submit" :disabled="busy">保存配置</button><button type="button" :disabled="busy || runtimeStatusStale" @click="openBusiness">进入业务系统</button></div>
             <small class="config-path">配置位置：{{ snapshot.path }}</small>
           </form>
         </section>
@@ -1216,11 +1259,11 @@ async function exportDeploymentCheck() {
       </section>
 
       <section v-show="activeSection === 'security'" class="page" aria-labelledby="security-title">
-        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>快速检查用于日常状态刷新；正式交付前执行深度自检，实际启动当前插件宿主完成 Health 验证。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy" @click="runDeploymentCheck">深度自检</button><button type="button" :disabled="busy" @click="exportDeploymentCheck">导出深度自检记录</button><button type="button" :disabled="busy" @click="openDiagnosticsDirectory">打开日志目录</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
-        <section v-if="deploymentCheck" :class="['deployment-check', { ready: deploymentCheck.ready }]" aria-label="部署自检结果">
+        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>快速检查用于日常状态刷新；正式交付前执行深度自检，实际启动当前插件宿主完成 Health 验证。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy || runtimeStatusStale" @click="runDeploymentCheck">深度自检</button><button type="button" :disabled="busy || runtimeStatusStale" @click="exportDeploymentCheck">导出深度自检记录</button><button type="button" :disabled="busy" @click="openDiagnosticsDirectory">打开日志目录</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
+        <section v-if="deploymentCheck" :class="['deployment-check', { ready: deploymentCheck.ready && !runtimeStatusStale }]" aria-label="部署自检结果">
           <header>
-            <div><p class="eyebrow">{{ deploymentCheck.deep ? 'DEEP DEPLOYMENT CHECK' : 'QUICK DEPLOYMENT CHECK' }}</p><h2>{{ deploymentCheck.ready ? (deploymentCheck.deep ? '当前机器通过深度交付检查' : '快速检查未发现阻塞') : '部署条件尚未满足' }}</h2><p>{{ deploymentCheck.passed }} 项正常 · {{ deploymentCheck.warnings }} 项提醒 · {{ deploymentCheck.failures }} 项阻塞</p></div>
-            <span>{{ deploymentCheck.ready ? (deploymentCheck.deep ? 'READY' : 'QUICK PASS') : 'ACTION REQUIRED' }}</span>
+            <div><p class="eyebrow">{{ deploymentCheck.deep ? 'DEEP DEPLOYMENT CHECK' : 'QUICK DEPLOYMENT CHECK' }}</p><h2>{{ runtimeStatusStale ? '桌面核心通信中断，当前自检结论已过期' : deploymentCheck.ready ? (deploymentCheck.deep ? '当前机器通过深度交付检查' : '快速检查未发现阻塞') : '部署条件尚未满足' }}</h2><p>{{ deploymentCheck.passed }} 项正常 · {{ deploymentCheck.warnings }} 项提醒 · {{ deploymentCheck.failures }} 项阻塞</p></div>
+            <span>{{ runtimeStatusStale ? 'STATUS UNKNOWN' : deploymentCheck.ready ? (deploymentCheck.deep ? 'READY' : 'QUICK PASS') : 'ACTION REQUIRED' }}</span>
           </header>
           <div class="check-list">
             <article v-for="item in deploymentCheck.items" :key="item.id" :class="`check-${item.status}`">
@@ -1229,7 +1272,8 @@ async function exportDeploymentCheck() {
             </article>
           </div>
         </section>
-        <section class="diagnostic-grid" aria-label="详细运行状态">
+        <p v-if="runtimeStatusStale" class="stale-status-note">以下明细来自最后一次成功刷新，仅供定位，不代表当前运行状态。</p>
+        <section :class="['diagnostic-grid', { stale: runtimeStatusStale }]" aria-label="详细运行状态">
           <article><span>插件调用背压</span><strong v-if="status?.globalPluginMaintenanceActive">全局维护中</strong><strong v-else>{{ status ? `${status.inFlightInvocations} / ${status.maxInFlightInvocations}` : '—' }}</strong><small>容量拒绝 {{ status?.rejectedInvocations ?? '—' }} · 槽超时 {{ status?.executionLaneTimeouts ?? '—' }} · 维护拒绝 {{ status?.maintenanceRejectedInvocations ?? '—' }}</small></article>
           <article><span>隔离宿主监督</span><strong>{{ status?.activePluginHosts ?? '—' }} 个活动宿主</strong><small>累计启动 {{ status?.pluginHostStarts ?? '—' }} · 失败 {{ status?.pluginHostStartFailures ?? '—' }}</small></article>
           <article><span>原生操作防重放</span><strong>{{ status?.trackedInvocationsAvailable ? (status.trackedInvocationsAccepting ? '持久协调可用' : '正在排空') : '不可用' }}</strong><small>{{ status?.trackedInvocationsAvailable ? `等待 ${status.trackedPendingOperations} · 可找回 ${status.trackedRetainedResults} · 落盘异常 ${status.trackedPersistenceFailures}` : status?.trackedInvocationsError ?? '状态尚未加载' }}</small></article>
