@@ -43,6 +43,7 @@ enum BusinessFrontendState {
 struct BusinessWindowRuntime {
     state: BusinessFrontendState,
     generation: u64,
+    recovering_from_timeout: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -54,6 +55,14 @@ pub(crate) struct BusinessFrontendHealth {
     pub(crate) timed_out_windows: usize,
     pub(crate) total_timeouts: u64,
     pub(crate) recovered_after_timeout: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BusinessFrontendRetryResult {
+    retried_windows: usize,
+    failed_windows: usize,
+    unavailable_windows: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +161,7 @@ impl DesktopState {
                 entry.insert(BusinessWindowRuntime {
                     state: BusinessFrontendState::Loading,
                     generation: 0,
+                    recovering_from_timeout: false,
                 });
                 return Ok(label);
             }
@@ -171,6 +181,8 @@ impl DesktopState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let runtime = windows.get_mut(label)?;
+        runtime.recovering_from_timeout =
+            runtime.recovering_from_timeout || runtime.state == BusinessFrontendState::TimedOut;
         runtime.generation = runtime.generation.wrapping_add(1).max(1);
         runtime.state = if business_origin {
             BusinessFrontendState::Loading
@@ -188,9 +200,11 @@ impl DesktopState {
         let runtime = windows
             .get_mut(label)
             .ok_or_else(|| "业务窗口就绪状态已失效".to_owned())?;
-        let recovered_after_timeout = runtime.state == BusinessFrontendState::TimedOut;
+        let recovered_after_timeout =
+            runtime.state == BusinessFrontendState::TimedOut || runtime.recovering_from_timeout;
         let duplicate_signal = runtime.state == BusinessFrontendState::Ready;
         runtime.state = BusinessFrontendState::Ready;
+        runtime.recovering_from_timeout = false;
         if recovered_after_timeout {
             self.business_frontend_recoveries
                 .fetch_add(1, Ordering::Relaxed);
@@ -213,8 +227,46 @@ impl DesktopState {
             return false;
         }
         runtime.state = BusinessFrontendState::TimedOut;
+        runtime.recovering_from_timeout = false;
         self.business_frontend_timeouts
             .fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    fn claim_timed_out_business_windows(&self) -> Vec<(String, u64)> {
+        let mut windows = self
+            .business_windows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut claimed = windows
+            .iter_mut()
+            .filter_map(|(label, runtime)| {
+                if runtime.state != BusinessFrontendState::TimedOut {
+                    return None;
+                }
+                runtime.generation = runtime.generation.wrapping_add(1).max(1);
+                runtime.state = BusinessFrontendState::Loading;
+                runtime.recovering_from_timeout = true;
+                Some((label.clone(), runtime.generation))
+            })
+            .collect::<Vec<_>>();
+        claimed.sort_by(|left, right| left.0.cmp(&right.0));
+        claimed
+    }
+
+    fn restore_business_frontend_timeout(&self, label: &str, generation: u64) -> bool {
+        let mut windows = self
+            .business_windows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(runtime) = windows.get_mut(label) else {
+            return false;
+        };
+        if runtime.generation != generation || runtime.state != BusinessFrontendState::Loading {
+            return false;
+        }
+        runtime.state = BusinessFrontendState::TimedOut;
+        runtime.recovering_from_timeout = false;
         true
     }
 
@@ -1094,6 +1146,16 @@ pub(crate) fn reload_business_windows(caller: WebviewWindow, app: AppHandle) -> 
     reload_business_windows_internal(&app)
 }
 
+#[tauri::command]
+pub(crate) fn retry_timed_out_business_windows(
+    caller: WebviewWindow,
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<BusinessFrontendRetryResult, String> {
+    require_control(&caller)?;
+    Ok(retry_timed_out_business_windows_internal(&app, &state))
+}
+
 pub(crate) fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let menu = build_tray_menu(app.handle())?;
     let mut builder = TrayIconBuilder::with_id("ssdev-main")
@@ -1476,7 +1538,7 @@ fn start_business_frontend_watchdog(app: AppHandle, label: String, generation: u
         if let Some(window) = app.get_webview_window(&label) {
             app.dialog()
                 .message(
-                    "业务页面未在 30 秒内完成加载。请检查业务地址、网络和证书后重试；如仍失败，请导出诊断包。错误码：business-frontend-not-ready",
+                    "业务页面未在 30 秒内完成加载。请检查业务地址、网络和证书，并返回控制台选择“仅重试失败窗口”；如仍失败，请导出诊断包。错误码：business-frontend-not-ready",
                 )
                 .title("SSDEV Desktop")
                 .kind(MessageDialogKind::Error)
@@ -1827,6 +1889,33 @@ fn reload_business_windows_internal(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn retry_timed_out_business_windows_internal(
+    app: &AppHandle,
+    state: &DesktopState,
+) -> BusinessFrontendRetryResult {
+    let mut result = BusinessFrontendRetryResult::default();
+    for (label, generation) in state.claim_timed_out_business_windows() {
+        let Some(window) = app.get_webview_window(&label) else {
+            state.release_business_window_label(&label);
+            result.unavailable_windows += 1;
+            continue;
+        };
+        if window.reload().is_err() {
+            let _ = state.restore_business_frontend_timeout(&label, generation);
+            result.failed_windows += 1;
+            tracing::warn!(
+                event_code = "business-frontend-retry-failed",
+                error_code = "business-window-reload",
+                "timed out business frontend could not be reloaded"
+            );
+            continue;
+        }
+        result.retried_windows += 1;
+        start_business_frontend_watchdog(app.clone(), label, generation);
+    }
+    result
+}
+
 pub(crate) fn show_control(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("control") {
         let _ = window.show();
@@ -2001,6 +2090,62 @@ mod tests {
         assert_eq!(state.business_frontend_health().navigating_windows, 1);
         state.release_business_window_label(&label);
         assert_eq!(state.business_frontend_health().active_windows, 0);
+    }
+
+    #[test]
+    fn business_frontend_retry_claims_only_timed_out_windows_and_can_restore_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            ConfigStore::open(directory.path().join("config.json"), Vec::<PathBuf>::new()).unwrap();
+        let state = DesktopState::new(store, OriginPolicy::development_unrestricted());
+        let timed_out = state.reserve_business_window_label().unwrap();
+        let ready = state.reserve_business_window_label().unwrap();
+
+        let timed_out_generation = state.mark_business_navigation(&timed_out, true).unwrap();
+        assert!(state.report_business_frontend_timeout(&timed_out, timed_out_generation));
+        state.mark_business_navigation(&ready, true).unwrap();
+        state.mark_business_frontend_ready(&ready).unwrap();
+
+        let claimed = state.claim_timed_out_business_windows();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].0, timed_out);
+        assert!(claimed[0].1 > timed_out_generation);
+        let health = state.business_frontend_health();
+        assert_eq!(health.loading_windows, 1);
+        assert_eq!(health.ready_windows, 1);
+        assert_eq!(health.timed_out_windows, 0);
+
+        assert!(!state.restore_business_frontend_timeout(&timed_out, claimed[0].1 + 1));
+        assert!(state.restore_business_frontend_timeout(&timed_out, claimed[0].1));
+        let health = state.business_frontend_health();
+        assert_eq!(health.timed_out_windows, 1);
+        assert_eq!(health.total_timeouts, 1);
+
+        let claimed = state.claim_timed_out_business_windows();
+        state.mark_business_navigation(&timed_out, true).unwrap();
+        let transition = state.mark_business_frontend_ready(&timed_out).unwrap();
+        assert!(transition.recovered_after_timeout);
+        assert_eq!(state.business_frontend_health().recovered_after_timeout, 1);
+        assert_eq!(claimed.len(), 1);
+    }
+
+    #[test]
+    fn business_frontend_retry_result_exposes_only_aggregate_counts() {
+        let value = serde_json::to_value(BusinessFrontendRetryResult {
+            retried_windows: 2,
+            failed_windows: 1,
+            unavailable_windows: 3,
+        })
+        .unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "retriedWindows": 2,
+                "failedWindows": 1,
+                "unavailableWindows": 3,
+            })
+        );
     }
 
     #[test]

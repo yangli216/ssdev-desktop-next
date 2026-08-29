@@ -44,6 +44,7 @@
     "allow-open-business-window",
     "allow-clear-business-data",
     "allow-reload-business-windows",
+    "allow-retry-timed-out-business-windows",
     "allow-check-app-update",
     "allow-install-app-update",
     "allow-export-diagnostics",

@@ -334,6 +334,12 @@ type SsoStatusEvent = {
   active: boolean
 }
 
+type BusinessFrontendRetryResult = {
+  retriedWindows: number
+  failedWindows: number
+  unavailableWindows: number
+}
+
 const status = ref<BridgeStatus | null>(null)
 const deploymentCheck = ref<DeploymentCheckReport | null>(null)
 const projectBundlePreview = ref<ProjectBundlePreview | null>(null)
@@ -829,6 +835,25 @@ async function reloadBusiness() {
   await run(() => invoke('reload_business_windows'), '业务窗口已刷新。')
 }
 
+async function retryTimedOutBusinessWindows() {
+  let result: BusinessFrontendRetryResult | undefined
+  const completed = await run(async () => {
+    result = await invoke<BusinessFrontendRetryResult>('retry_timed_out_business_windows')
+  }, '')
+  if (!completed || !result) return
+  await refreshRuntimeStatus(true)
+  if (result.retriedWindows > 0) {
+    notice.value = `已重新加载 ${result.retriedWindows} 个超时业务窗口；页面完成加载后将自动复核原生连接。`
+  } else if (result.unavailableWindows > 0) {
+    notice.value = '超时业务窗口已经关闭，无需继续重试。'
+  } else {
+    notice.value = '当前没有仍处于超时状态的业务窗口。'
+  }
+  if (result.failedWindows > 0) {
+    error.value = `${result.failedWindows} 个超时业务窗口无法重新加载；请关闭后重新进入业务系统。`
+  }
+}
+
 async function selectPluginPackage() {
   const selected = await open({
     multiple: false,
@@ -1187,7 +1212,7 @@ async function exportDeploymentCheck() {
             <li v-if="runtimeStatusStale"><strong>桌面核心通信中断，所有运行状态和部署结论均已标记为未知</strong><button type="button" :disabled="busy || statusRefreshActive" @click="retryRuntimeStatus">重新连接</button></li>
             <li v-if="needsDeepDeploymentCheck"><strong>快速检查已通过，正式交付前还需验证当前 x86/x64 插件宿主</strong><button type="button" :disabled="busy" @click="runDeploymentCheck">立即深度自检</button></li>
             <li v-if="deploymentCheck?.failures"><strong>部署自检存在 {{ deploymentCheck.failures }} 项阻塞问题</strong><button type="button" @click="activeSection = 'security'">查看自检</button></li>
-            <li v-if="status?.businessTimedOutWindows"><strong>{{ status.businessTimedOutWindows }} 个业务页面加载失败或未到达原生 IPC</strong><button type="button" @click="activeSection = 'security'">查看诊断</button></li>
+            <li v-if="status?.businessTimedOutWindows"><strong>{{ status.businessTimedOutWindows }} 个业务页面加载失败或未到达原生 IPC</strong><button type="button" :disabled="busy || runtimeStatusStale" @click="retryTimedOutBusinessWindows">仅重试失败窗口</button></li>
             <li v-if="inventory?.quarantined.length"><strong>{{ inventory.quarantined.length }} 个插件已隔离</strong><button type="button" @click="activeSection = 'plugins'">查看插件</button></li>
             <li v-if="status?.pluginPreflightFailures"><strong>{{ status.pluginPreflightFailures }} 次宿主预检失败</strong><button type="button" @click="activeSection = 'security'">查看诊断</button></li>
             <li v-if="status?.pluginApiBaselineFailures"><strong>签名插件契约基线有 {{ status.pluginApiBaselineFailures }} 次持久化失败</strong><button type="button" @click="activeSection = 'security'">查看诊断</button></li>

@@ -5044,6 +5044,7 @@ pub fn run() {
             desktop::resolve_floating_window,
             desktop::clear_business_data,
             desktop::reload_business_windows,
+            desktop::retry_timed_out_business_windows,
             capture::capture_business_window,
             capture::capture_region_snapshot,
             capture::complete_region_capture,
