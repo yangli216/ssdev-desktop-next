@@ -12,6 +12,7 @@ import {
 } from './runtime-status.js'
 
 const CONTROL_BOOTSTRAP_TIMEOUT_MS = 15_000
+const CONTROL_POST_ACTION_REFRESH_TIMEOUT_MS = 15_000
 
 type BridgeStatus = {
   mode: string
@@ -340,6 +341,14 @@ type BusinessFrontendRetryResult = {
   unavailableWindows: number
 }
 
+type ControlRefreshField = 'status' | 'config' | 'inventory' | 'deployment'
+type PrimaryActionOutcome = {
+  succeeded: boolean
+  refreshed: boolean
+}
+
+const ALL_CONTROL_REFRESH_FIELDS: ControlRefreshField[] = ['status', 'config', 'inventory', 'deployment']
+
 const status = ref<BridgeStatus | null>(null)
 const deploymentCheck = ref<DeploymentCheckReport | null>(null)
 const projectBundlePreview = ref<ProjectBundlePreview | null>(null)
@@ -361,6 +370,8 @@ const notice = ref('')
 const busy = ref(false)
 const controlLoadActive = ref(false)
 const controlLoadFailed = ref(false)
+const controlRefreshActive = ref(false)
+const controlRefreshMissing = ref<ControlRefreshField[]>([])
 const deploymentCheckUnavailable = ref(false)
 const runtimeStatusHealth = ref(initialRuntimeStatusHealth())
 const runtimeStatusRecovered = ref(false)
@@ -369,11 +380,21 @@ const mappingWorkspaceRevision = ref(0)
 type ConsoleSection = 'overview' | 'configuration' | 'native' | 'plugins' | 'security'
 const activeSection = ref<ConsoleSection>('overview')
 const runtimeStatusStale = computed(() => runtimeStatusHealth.value.stale)
+const controlRefreshIncomplete = computed(() => controlRefreshMissing.value.length > 0)
+const controlStateUnverified = computed(() => (
+  controlLoadFailed.value || controlRefreshIncomplete.value || runtimeStatusStale.value
+))
 const deploymentReadiness = computed(() => {
   if (controlLoadFailed.value) {
     return {
       label: '初始化失败',
       detail: '控制台尚未取得完整项目状态，请重新加载',
+    }
+  }
+  if (controlRefreshIncomplete.value) {
+    return {
+      label: '状态待刷新',
+      detail: '操作已完成，但部分页面状态尚未重新读取',
     }
   }
   if (runtimeStatusStale.value) {
@@ -425,6 +446,7 @@ const needsDeepDeploymentCheck = computed(() => (
 ))
 const businessFrontendReadiness = computed(() => {
   if (controlLoadFailed.value) return { label: '状态未知', detail: '控制台初始化失败，无法确认业务页面状态' }
+  if (controlRefreshIncomplete.value) return { label: '状态未知', detail: '操作后的页面状态尚未完整刷新' }
   if (runtimeStatusStale.value) return { label: '状态未知', detail: '桌面核心通信中断，无法确认业务页面状态' }
   const current = status.value
   if (!current) return { label: '检查中', detail: '正在读取业务窗口状态' }
@@ -468,6 +490,9 @@ let ssoStatusEventSeen = false
 let statusRefreshTimer: number | undefined
 let runtimeStatusRecoveryTimer: number | undefined
 let statusRefreshActive = false
+let controlRefreshQueue: Promise<void> = Promise.resolve()
+let controlRefreshRequests = 0
+const pendingControlRefreshFields = new Set<ControlRefreshField>()
 
 function pluginHostNeedsAttention(host: PluginHostStatus) {
   return host.state === 'restart-backoff' || host.state === 'retry-ready'
@@ -506,25 +531,29 @@ function pluginHostAdvice(host: PluginHostStatus) {
 }
 
 async function retryPluginHost(host: PluginHostStatus) {
-  await run(async () => {
-    try {
-      await invoke('retry_plugin_host', {
-        pluginId: host.pluginId,
-        architecture: host.architecture,
-      })
-    } finally {
-      status.value = await invoke<BridgeStatus>('bridge_status')
-    }
-  }, `${host.pluginId} ${host.architecture.toUpperCase()} 宿主 Health 已恢复；未调用业务方法。`)
+  const outcome = await runPrimaryThenRefresh(
+    () => invoke('retry_plugin_host', {
+      pluginId: host.pluginId,
+      architecture: host.architecture,
+    }),
+    ['status'],
+  )
+  if (outcome.succeeded) {
+    showPrimaryActionSuccess(
+      `${host.pluginId} ${host.architecture.toUpperCase()} 宿主 Health 已恢复；未调用业务方法。`,
+      outcome.refreshed,
+    )
+  }
 }
 
 async function refreshRuntimeStatus(force = false) {
-  if (busy.value || statusRefreshActive || (runtimeStatusStale.value && !force)) return
+  if (busy.value || controlRefreshActive.value || statusRefreshActive || (runtimeStatusStale.value && !force)) return
   statusRefreshActive = true
   try {
     const next = await withBoundedTimeout(invoke<BridgeStatus>('bridge_status'))
     status.value = next
     if (!ssoStatusEventSeen) applySsoStatus(next.ssoError, next.ssoActive)
+    controlRefreshMissing.value = controlRefreshMissing.value.filter((field) => field !== 'status')
     recordRuntimeStatusEvent('success')
   } catch {
     recordRuntimeStatusEvent('failure')
@@ -620,6 +649,7 @@ async function loadControlConsole() {
     if (deployment) deploymentCheckUnavailable.value = false
     if (!ssoStatusEventSeen) applySsoStatus(bridge.ssoError, bridge.ssoActive)
     controlLoadFailed.value = false
+    controlRefreshMissing.value = []
     recordRuntimeStatusEvent('success')
     if (statusRefreshTimer == null) {
       statusRefreshTimer = window.setInterval(() => void refreshRuntimeStatus(), 5_000)
@@ -663,18 +693,123 @@ async function run(action: () => Promise<unknown>, success: string): Promise<boo
   }
 }
 
+async function refreshControlState(fields: ControlRefreshField[]): Promise<boolean> {
+  for (const field of fields) pendingControlRefreshFields.add(field)
+  controlRefreshRequests += 1
+  controlRefreshActive.value = true
+  let refreshed = false
+  const execute = async () => {
+    const targets = [...new Set([...controlRefreshMissing.value, ...pendingControlRefreshFields])]
+    for (const field of targets) pendingControlRefreshFields.delete(field)
+    let failures: Array<ControlRefreshField | null>
+    try {
+      failures = await Promise.all(targets.map(async (field) => {
+        try {
+          if (field === 'status') {
+            const next = await withBoundedTimeout(
+              invoke<BridgeStatus>('bridge_status'),
+              CONTROL_POST_ACTION_REFRESH_TIMEOUT_MS,
+            )
+            status.value = next
+            if (!ssoStatusEventSeen) applySsoStatus(next.ssoError, next.ssoActive)
+            recordRuntimeStatusEvent('success')
+          } else if (field === 'config') {
+            snapshot.value = await withBoundedTimeout(
+              invoke<ConfigSnapshot>('desktop_config'),
+              CONTROL_POST_ACTION_REFRESH_TIMEOUT_MS,
+            )
+          } else if (field === 'inventory') {
+            inventory.value = await withBoundedTimeout(
+              invoke<PluginInventory>('plugin_inventory'),
+              CONTROL_POST_ACTION_REFRESH_TIMEOUT_MS,
+            )
+          } else {
+            deploymentCheck.value = await withBoundedTimeout(
+              invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }),
+              CONTROL_POST_ACTION_REFRESH_TIMEOUT_MS,
+            )
+            deploymentCheckUnavailable.value = false
+          }
+          return null
+        } catch {
+          if (field === 'status') recordRuntimeStatusEvent('failure')
+          if (field === 'deployment') deploymentCheckUnavailable.value = true
+          return field
+        }
+      }))
+    } catch {
+      failures = targets
+    }
+    controlRefreshMissing.value = [...new Set([
+      ...failures.filter((field): field is ControlRefreshField => field !== null),
+      ...pendingControlRefreshFields,
+    ])]
+    refreshed = controlRefreshMissing.value.length === 0
+  }
+  const scheduled = controlRefreshQueue.then(execute, execute)
+  controlRefreshQueue = scheduled.then(() => undefined, () => undefined)
+  try {
+    await scheduled
+    return refreshed
+  } finally {
+    controlRefreshRequests = Math.max(0, controlRefreshRequests - 1)
+    controlRefreshActive.value = controlRefreshRequests > 0
+  }
+}
+
+async function runPrimaryThenRefresh(
+  action: () => Promise<unknown>,
+  fields: ControlRefreshField[],
+): Promise<PrimaryActionOutcome> {
+  busy.value = true
+  error.value = ''
+  notice.value = ''
+  try {
+    try {
+      await action()
+    } catch (reason) {
+      error.value = reason instanceof Error ? reason.message : String(reason)
+      return { succeeded: false, refreshed: false }
+    }
+    const refreshed = await refreshControlState(fields)
+    return { succeeded: true, refreshed }
+  } finally {
+    busy.value = false
+  }
+}
+
+function showPrimaryActionSuccess(message: string, refreshed: boolean) {
+  notice.value = refreshed
+    ? message
+    : `${message} 页面状态未完全刷新；操作已经完成，请勿重复执行，刷新状态后再继续。`
+}
+
+async function retryControlStateRefresh() {
+  if (controlRefreshActive.value) return
+  busy.value = true
+  error.value = ''
+  notice.value = ''
+  try {
+    const refreshed = await refreshControlState(ALL_CONTROL_REFRESH_FIELDS)
+    if (refreshed) notice.value = '操作后的项目、插件和运行状态已经重新验证。'
+  } finally {
+    busy.value = false
+  }
+}
+
 async function saveConfig() {
   if (!snapshot.value) return
-  await run(
+  const outcome = await runPrimaryThenRefresh(
     async () => {
       await invoke('save_desktop_config', { config: snapshot.value?.config })
-      deploymentCheck.value = await invoke<DeploymentCheckReport>('run_deployment_check', { deep: false })
-      deploymentCheckUnavailable.value = false
       configImportPreview.value = null
       selectedConfigImport.value = ''
     },
-    '配置已安全保存；已有业务窗口已关闭，请重新进入。',
+    ['status', 'config', 'deployment'],
   )
+  if (outcome.succeeded) {
+    showPrimaryActionSuccess('配置已安全保存；已有业务窗口已关闭，请重新进入。', outcome.refreshed)
+  }
 }
 
 async function importConfig() {
@@ -700,16 +835,20 @@ async function confirmConfigImport() {
   const source = selectedConfigImport.value
   const expectedPlanId = configImportPreview.value.planId
   const changed = configImportPreview.value.configChanged
-  await run(async () => {
-    snapshot.value = await invoke<ConfigSnapshot>('import_desktop_config', {
+  const outcome = await runPrimaryThenRefresh(async () => {
+    await invoke<ConfigSnapshot>('import_desktop_config', {
       source,
       expectedPlanId,
     })
-    deploymentCheck.value = await invoke<DeploymentCheckReport>('run_deployment_check', { deep: false })
-    deploymentCheckUnavailable.value = false
     configImportPreview.value = null
     selectedConfigImport.value = ''
-  }, changed ? '配置已按确认计划导入；已有业务窗口已关闭。' : '导入配置与当前配置一致，未执行替换。')
+  }, ['status', 'config', 'deployment'])
+  if (outcome.succeeded) {
+    showPrimaryActionSuccess(
+      changed ? '配置已按确认计划导入；已有业务窗口已关闭。' : '导入配置与当前配置一致，未执行替换。',
+      outcome.refreshed,
+    )
+  }
 }
 
 function cancelConfigImport() {
@@ -769,26 +908,25 @@ async function importSelectedProjectBundle() {
   const source = selectedProjectBundle.value
   const expectedPlanId = projectBundlePreview.value.planId
   let result: ProjectBundleImportResult | undefined
-  await run(async () => {
+  const outcome = await runPrimaryThenRefresh(async () => {
     result = await invoke<ProjectBundleImportResult>('import_project_bundle', {
       source,
       expectedPlanId,
     })
     mappingWorkspaceRevision.value += 1
     mappingDraftDirty.value = false
-    ;[status.value, snapshot.value, inventory.value, deploymentCheck.value] = await Promise.all([
-      invoke<BridgeStatus>('bridge_status'),
-      invoke<ConfigSnapshot>('desktop_config'),
-      invoke<PluginInventory>('plugin_inventory'),
-      invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }),
-    ])
+    pluginUpdates.value = null
+    appUpdate.value = null
     selectedProjectBundle.value = ''
     projectBundlePreview.value = null
     selectedConfigImport.value = ''
     configImportPreview.value = null
-  }, '')
+  }, ALL_CONTROL_REFRESH_FIELDS)
   if (result) {
-    notice.value = `项目已导入：${result.signedPlugins} 个签名插件、${result.localMappings} 个本地映射、${result.serviceCount} 个原生服务；已有业务窗口已关闭。`
+    showPrimaryActionSuccess(
+      `项目已导入：${result.signedPlugins} 个签名插件、${result.localMappings} 个本地映射、${result.serviceCount} 个原生服务；已有业务窗口已关闭。`,
+      outcome.refreshed,
+    )
   }
 }
 
@@ -798,12 +936,23 @@ async function openBusiness() {
 
 async function openEnvironment(environment: EnvironmentConfig) {
   if (!snapshot.value) return
-  await run(async () => {
+  const saved = await runPrimaryThenRefresh(async () => {
     await invoke('save_desktop_config', { config: snapshot.value?.config })
     selectedConfigImport.value = ''
     configImportPreview.value = null
-    await invoke('open_business_window', { environment: environment.name })
-  }, `已保存配置并创建环境「${environment.name}」窗口；页面完成加载后首页将显示“已连接”。`)
+  }, ['status', 'config', 'deployment'])
+  if (!saved.succeeded) return
+  if (!saved.refreshed) {
+    showPrimaryActionSuccess(`环境「${environment.name}」配置已保存。`, false)
+    return
+  }
+  const opened = await run(
+    () => invoke('open_business_window', { environment: environment.name }),
+    `已保存配置并创建环境「${environment.name}」窗口；页面完成加载后首页将显示“已连接”。`,
+  )
+  if (!opened) {
+    notice.value = `环境「${environment.name}」配置已经保存，但业务窗口未能创建；请根据错误提示处理后重新进入，无需再次保存。`
+  }
 }
 
 function addEnvironment() {
@@ -837,17 +986,19 @@ async function reloadBusiness() {
 
 async function retryTimedOutBusinessWindows() {
   let result: BusinessFrontendRetryResult | undefined
-  const completed = await run(async () => {
+  const outcome = await runPrimaryThenRefresh(async () => {
     result = await invoke<BusinessFrontendRetryResult>('retry_timed_out_business_windows')
-  }, '')
-  if (!completed || !result) return
-  await refreshRuntimeStatus(true)
+  }, ['status'])
+  if (!outcome.succeeded || !result) return
   if (result.retriedWindows > 0) {
-    notice.value = `已重新加载 ${result.retriedWindows} 个超时业务窗口；页面完成加载后将自动复核原生连接。`
+    showPrimaryActionSuccess(
+      `已重新加载 ${result.retriedWindows} 个超时业务窗口；页面完成加载后将自动复核原生连接。`,
+      outcome.refreshed,
+    )
   } else if (result.unavailableWindows > 0) {
-    notice.value = '超时业务窗口已经关闭，无需继续重试。'
+    showPrimaryActionSuccess('超时业务窗口已经关闭，无需继续重试。', outcome.refreshed)
   } else {
-    notice.value = '当前没有仍处于超时状态的业务窗口。'
+    showPrimaryActionSuccess('当前没有仍处于超时状态的业务窗口。', outcome.refreshed)
   }
   if (result.failedWindows > 0) {
     error.value = `${result.failedWindows} 个超时业务窗口无法重新加载；请关闭后重新进入业务系统。`
@@ -862,15 +1013,17 @@ async function selectPluginPackage() {
   })
   if (typeof selected !== 'string') return
 
-  await run(async () => {
+  const outcome = await runPrimaryThenRefresh(async () => {
     pluginPackagePreview.value = null
     selectedPluginPackage.value = ''
     pluginPackagePreview.value = await invoke<PluginPackagePreview>('inspect_plugin_package', {
       packagePath: selected,
     })
     selectedPluginPackage.value = selected
-    status.value = await invoke<BridgeStatus>('bridge_status')
-  }, '插件包验签和候选宿主预检已通过；请核对变更后确认安装。')
+  }, ['status'])
+  if (outcome.succeeded) {
+    showPrimaryActionSuccess('插件包验签和候选宿主预检已通过；请核对变更后确认安装。', outcome.refreshed)
+  }
 }
 
 async function confirmPluginPackageInstall() {
@@ -882,23 +1035,23 @@ async function confirmPluginPackageInstall() {
   const preview = pluginPackagePreview.value
 
   let result: PluginInstallResult | undefined
-  await run(async () => {
+  const outcome = await runPrimaryThenRefresh(async () => {
     result = await invoke<PluginInstallResult>('install_plugin_package', {
       packagePath,
       expectedPlanId: preview.planId,
     })
     pluginPackagePreview.value = null
     selectedPluginPackage.value = ''
-    ;[status.value, inventory.value, deploymentCheck.value] = await Promise.all([
-      invoke<BridgeStatus>('bridge_status'),
-      invoke<PluginInventory>('plugin_inventory'),
-      invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }),
-    ])
-  }, '')
+    pluginUpdates.value = null
+    appUpdate.value = null
+  }, ['status', 'inventory', 'deployment'])
 
   if (result) {
     const action = projectActionLabels[preview.action]
-    notice.value = `${result.pluginId} ${result.pluginVersion} 已${action}，${result.preflightedHosts} 个架构宿主预检通过，当前共 ${result.serviceCount} 个服务已热加载。`
+    showPrimaryActionSuccess(
+      `${result.pluginId} ${result.pluginVersion} 已${action}，${result.preflightedHosts} 个架构宿主预检通过，当前共 ${result.serviceCount} 个服务已热加载。`,
+      outcome.refreshed,
+    )
   }
 }
 
@@ -910,38 +1063,31 @@ function cancelPluginPackageInstall() {
 
 async function uninstallSignedPlugin(pluginId: string, displayName: string) {
   if (!window.confirm(`确定卸载签名插件「${displayName}」(${pluginId}) 吗？对应原生服务将立即停止。`)) return
-  await run(async () => {
+  const outcome = await runPrimaryThenRefresh(async () => {
     await invoke('uninstall_signed_plugin', { pluginId })
     pluginUpdates.value = null
-    ;[status.value, inventory.value, deploymentCheck.value] = await Promise.all([
-      invoke<BridgeStatus>('bridge_status'),
-      invoke<PluginInventory>('plugin_inventory'),
-      invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }),
-    ])
-  }, `签名插件 ${pluginId} 已卸载并从路由移除。`)
+    appUpdate.value = null
+  }, ['status', 'inventory', 'deployment'])
+  if (outcome.succeeded) {
+    showPrimaryActionSuccess(`签名插件 ${pluginId} 已卸载并从路由移除。`, outcome.refreshed)
+  }
 }
 
 async function reloadPlugins() {
-  await run(async () => {
+  const outcome = await runPrimaryThenRefresh(async () => {
     await invoke('reload_plugins')
-    ;[status.value, inventory.value, deploymentCheck.value] = await Promise.all([
-      invoke<BridgeStatus>('bridge_status'),
-      invoke<PluginInventory>('plugin_inventory'),
-      invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }),
-    ])
-  }, '插件目录已重新验签，候选宿主预检通过并热加载。')
+    pluginUpdates.value = null
+    appUpdate.value = null
+  }, ['status', 'inventory', 'deployment'])
+  if (outcome.succeeded) {
+    showPrimaryActionSuccess('插件目录已重新验签，候选宿主预检通过并热加载。', outcome.refreshed)
+  }
 }
 
 async function refreshPluginsAfterMapping() {
-  try {
-    ;[status.value, inventory.value, deploymentCheck.value] = await Promise.all([
-      invoke<BridgeStatus>('bridge_status'),
-      invoke<PluginInventory>('plugin_inventory'),
-      invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }),
-    ])
-  } catch (reason) {
-    error.value = reason instanceof Error ? reason.message : String(reason)
-  }
+  pluginUpdates.value = null
+  appUpdate.value = null
+  await refreshControlState(['status', 'inventory', 'deployment'])
 }
 
 async function checkPluginUpdates(requestedPluginId?: string) {
@@ -986,22 +1132,21 @@ async function installFromCatalog(pluginId: string, version?: string, installPla
   }
   if (action === 'rollback' && !window.confirm(`确定将插件「${pluginId}」回退到 ${version} 吗？这只替换插件程序，不会恢复设备状态或业务数据。`)) return
   let result: PluginInstallResult | undefined
-  await run(async () => {
+  const outcome = await runPrimaryThenRefresh(async () => {
     result = await invoke<PluginInstallResult>('install_plugin_from_catalog', {
       pluginId,
       version,
       expectedPlanId: installPlanId,
     })
-    ;[status.value, inventory.value, pluginUpdates.value, deploymentCheck.value] = await Promise.all([
-      invoke<BridgeStatus>('bridge_status'),
-      invoke<PluginInventory>('plugin_inventory'),
-      invoke<PluginUpdateCheck>('check_plugin_updates', { pluginId }),
-      invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }),
-    ])
-  }, '')
+    pluginUpdates.value = null
+    appUpdate.value = null
+  }, ['status', 'inventory', 'deployment'])
   if (result) {
     const actionLabel = action === 'rollback' ? '回退到' : result.replacedExisting ? '更新到' : '安装为'
-    notice.value = `${result.pluginId} 已从签名仓库${actionLabel} ${result.pluginVersion}，${result.preflightedHosts} 个架构宿主预检通过并热加载。`
+    showPrimaryActionSuccess(
+      `${result.pluginId} 已从签名仓库${actionLabel} ${result.pluginVersion}，${result.preflightedHosts} 个架构宿主预检通过并热加载。`,
+      outcome.refreshed,
+    )
   }
 }
 
@@ -1089,16 +1234,16 @@ async function openDiagnosticsDirectory() {
 
 async function runDeploymentCheck() {
   let result: DeploymentCheckReport | undefined
-  await run(async () => {
+  const outcome = await runPrimaryThenRefresh(async () => {
     result = await invoke<DeploymentCheckReport>('run_deployment_check', { deep: true })
     deploymentCheck.value = result
     deploymentCheckUnavailable.value = false
-    status.value = await invoke<BridgeStatus>('bridge_status')
-  }, '')
+  }, ['status'])
   if (result) {
-    notice.value = result.ready
+    const message = result.ready
       ? `${result.deep ? '深度' : '快速'}自检通过：${result.passed} 项正常，${result.warnings} 项提醒。`
       : `${result.deep ? '深度' : '快速'}自检发现 ${result.failures} 项阻塞问题，请按建议处理后重新检查。`
+    showPrimaryActionSuccess(message, outcome.refreshed)
   }
 }
 
@@ -1109,14 +1254,16 @@ async function exportDeploymentCheck() {
   })
   if (typeof destination !== 'string') return
   let result: { bytes: number; report: DeploymentCheckReport } | undefined
-  await run(async () => {
+  const outcome = await runPrimaryThenRefresh(async () => {
     result = await invoke<{ bytes: number; report: DeploymentCheckReport }>('export_deployment_check', { destination })
     deploymentCheck.value = result.report
     deploymentCheckUnavailable.value = false
-    status.value = await invoke<BridgeStatus>('bridge_status')
-  }, '')
+  }, ['status'])
   if (result) {
-    notice.value = `${result.report.deep ? '深度' : '快速'}部署自检已重新执行并导出（${(result.bytes / 1024).toFixed(1)} KiB）；这是脱敏的未签名现场记录，不替代生产切换证据。`
+    showPrimaryActionSuccess(
+      `${result.report.deep ? '深度' : '快速'}部署自检已重新执行并导出（${(result.bytes / 1024).toFixed(1)} KiB）；这是脱敏的未签名现场记录，不替代生产切换证据。`,
+      outcome.refreshed,
+    )
   }
 }
 </script>
@@ -1143,16 +1290,17 @@ async function exportDeploymentCheck() {
         </button>
       </nav>
       <div class="sidebar-status">
-        <span :class="['status-dot', { ready: Boolean(status) && !controlLoadFailed && !runtimeStatusStale, warning: Boolean(controlLoadFailed || error || ssoError || runtimeStatusStale) }]" />
-        <span><strong>{{ controlLoadFailed ? '控制台初始化失败' : runtimeStatusStale ? '桌面通信中断' : error || ssoError ? '需要处理' : status ? '桌面服务正常' : '正在连接' }}</strong><small>{{ controlLoadFailed ? '请重新加载核心项目状态' : runtimeStatusStale ? `状态连续 ${runtimeStatusHealth.consecutiveFailures} 次刷新失败` : `${status?.serviceCount ?? '—'} 个原生服务可用` }}</small></span>
+        <span :class="['status-dot', { ready: Boolean(status) && !controlLoadFailed && !controlRefreshIncomplete && !runtimeStatusStale, warning: Boolean(controlLoadFailed || controlRefreshIncomplete || error || ssoError || runtimeStatusStale) }]" />
+        <span><strong>{{ controlLoadFailed ? '控制台初始化失败' : runtimeStatusStale ? '桌面通信中断' : controlRefreshIncomplete ? '操作已完成，状态待刷新' : error || ssoError ? '需要处理' : status ? '桌面服务正常' : '正在连接' }}</strong><small>{{ controlLoadFailed ? '请重新加载核心项目状态' : runtimeStatusStale ? `状态连续 ${runtimeStatusHealth.consecutiveFailures} 次刷新失败` : controlRefreshIncomplete ? `${controlRefreshMissing.length} 类状态等待重新读取` : `${status?.serviceCount ?? '—'} 个原生服务可用` }}</small></span>
       </div>
     </aside>
 
     <main class="workspace">
-      <div v-if="notice || ssoError || error || controlLoadFailed || runtimeStatusStale || runtimeStatusRecovered" class="message-stack" aria-live="polite">
+      <div v-if="notice || ssoError || error || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || runtimeStatusRecovered" class="message-stack" aria-live="polite">
         <p v-if="notice" class="notice" role="status">{{ notice }}</p>
         <p v-if="runtimeStatusRecovered" class="notice" role="status">桌面核心通信已经恢复，运行状态已重新验证。</p>
         <div v-if="controlLoadFailed" class="runtime-status-alert" role="alert"><span>控制台未能读取完整项目状态。请重新加载；仍失败时重启客户端并查看日志。</span><button type="button" :disabled="controlLoadActive" @click="retryControlLoad">{{ controlLoadActive ? '正在加载…' : '重新加载' }}</button></div>
+        <div v-if="controlRefreshIncomplete" class="runtime-status-alert" role="alert"><span>上一项操作已经完成，但部分页面状态尚未重新读取。请勿重复执行该操作，刷新状态后再继续。</span><button type="button" :disabled="busy || controlRefreshActive" @click="retryControlStateRefresh">{{ controlRefreshActive ? '正在刷新…' : '刷新状态' }}</button></div>
         <div v-if="runtimeStatusStale" class="runtime-status-alert" role="alert"><span>桌面核心状态连续刷新失败，当前页面显示的数据可能已经过期。请立即重试；仍失败时重启客户端并查看日志。</span><button type="button" :disabled="busy || statusRefreshActive" @click="retryRuntimeStatus">立即重试</button></div>
         <p v-if="ssoError" class="error" role="alert">{{ ssoError }}</p>
         <p v-if="error" class="error" role="alert">操作失败：{{ error }}</p>
@@ -1165,7 +1313,7 @@ async function exportDeploymentCheck() {
             <h1 id="overview-title">本地能力控制台</h1>
             <p class="lede">集中查看运行状态，并快速进入当前项目或专业配置工作区。</p>
           </div>
-          <span class="phase">{{ controlLoadFailed ? '初始化失败' : runtimeStatusStale ? '状态不可用' : status?.acceptingPluginInvocations ? '服务就绪' : '正在初始化' }}</span>
+          <span class="phase">{{ controlLoadFailed ? '初始化失败' : runtimeStatusStale ? '状态不可用' : controlRefreshIncomplete ? '状态待刷新' : status?.acceptingPluginInvocations ? '服务就绪' : '正在初始化' }}</span>
         </header>
 
         <section class="summary-grid" aria-label="关键运行状态">
@@ -1182,13 +1330,13 @@ async function exportDeploymentCheck() {
               <h2>进入业务系统</h2>
               <p>{{ snapshot?.config.website || '尚未配置默认业务地址' }}</p>
             </div>
-            <button class="primary large" type="button" :disabled="busy || controlLoadFailed || runtimeStatusStale || !snapshot?.config.website" @click="openBusiness">启动默认环境</button>
+            <button class="primary large" type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || !snapshot?.config.website" @click="openBusiness">启动默认环境</button>
             <div v-if="snapshot?.config.allowSwitch && snapshot.config.environments.length" class="environment-shortcuts">
               <button
                 v-for="environment in snapshot.config.environments"
                 :key="`${environment.name}:${environment.url}`"
                 type="button"
-                :disabled="busy || controlLoadFailed || runtimeStatusStale || !environment.name || !environment.url"
+                :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || !environment.name || !environment.url"
                 @click="openEnvironment(environment)"
               >{{ environment.name || '未命名环境' }}</button>
             </div>
@@ -1205,14 +1353,15 @@ async function exportDeploymentCheck() {
           </section>
         </div>
 
-        <section v-if="controlLoadFailed || runtimeStatusStale || needsDeepDeploymentCheck || deploymentCheck?.failures || status?.businessTimedOutWindows || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
+        <section v-if="controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || needsDeepDeploymentCheck || deploymentCheck?.failures || status?.businessTimedOutWindows || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
           <div><p class="eyebrow">ATTENTION</p><h2>待处理事项</h2></div>
           <ul>
             <li v-if="controlLoadFailed"><strong>控制台初始化未完成，不能确认当前项目和原生能力状态</strong><button type="button" :disabled="controlLoadActive" @click="retryControlLoad">重新加载</button></li>
+            <li v-if="controlRefreshIncomplete"><strong>已完成的操作仍有 {{ controlRefreshMissing.length }} 类页面状态待刷新，请勿重复执行</strong><button type="button" :disabled="busy || controlRefreshActive" @click="retryControlStateRefresh">刷新状态</button></li>
             <li v-if="runtimeStatusStale"><strong>桌面核心通信中断，所有运行状态和部署结论均已标记为未知</strong><button type="button" :disabled="busy || statusRefreshActive" @click="retryRuntimeStatus">重新连接</button></li>
-            <li v-if="needsDeepDeploymentCheck"><strong>快速检查已通过，正式交付前还需验证当前 x86/x64 插件宿主</strong><button type="button" :disabled="busy" @click="runDeploymentCheck">立即深度自检</button></li>
+            <li v-if="needsDeepDeploymentCheck"><strong>快速检查已通过，正式交付前还需验证当前 x86/x64 插件宿主</strong><button type="button" :disabled="busy || controlStateUnverified" @click="runDeploymentCheck">立即深度自检</button></li>
             <li v-if="deploymentCheck?.failures"><strong>部署自检存在 {{ deploymentCheck.failures }} 项阻塞问题</strong><button type="button" @click="activeSection = 'security'">查看自检</button></li>
-            <li v-if="status?.businessTimedOutWindows"><strong>{{ status.businessTimedOutWindows }} 个业务页面加载失败或未到达原生 IPC</strong><button type="button" :disabled="busy || runtimeStatusStale" @click="retryTimedOutBusinessWindows">仅重试失败窗口</button></li>
+            <li v-if="status?.businessTimedOutWindows"><strong>{{ status.businessTimedOutWindows }} 个业务页面加载失败或未到达原生 IPC</strong><button type="button" :disabled="busy || controlStateUnverified" @click="retryTimedOutBusinessWindows">仅重试失败窗口</button></li>
             <li v-if="inventory?.quarantined.length"><strong>{{ inventory.quarantined.length }} 个插件已隔离</strong><button type="button" @click="activeSection = 'plugins'">查看插件</button></li>
             <li v-if="status?.pluginPreflightFailures"><strong>{{ status.pluginPreflightFailures }} 次宿主预检失败</strong><button type="button" @click="activeSection = 'security'">查看诊断</button></li>
             <li v-if="status?.pluginApiBaselineFailures"><strong>签名插件契约基线有 {{ status.pluginApiBaselineFailures }} 次持久化失败</strong><button type="button" @click="activeSection = 'security'">查看诊断</button></li>
@@ -1227,7 +1376,7 @@ async function exportDeploymentCheck() {
         <section v-if="configImportPreview" class="config-import-preview" aria-label="配置导入变更预览">
           <header>
             <div><p class="eyebrow">CONFIG IMPORT PLAN</p><h2>{{ configImportPreview.configChanged ? '核对配置变更' : '配置内容没有变化' }}</h2><p>确认时会重新读取文件并核对当前已保存配置；任一变化都会要求重新预检。</p></div>
-            <div class="config-import-actions"><button type="button" :disabled="busy" @click="cancelConfigImport">取消</button><button class="primary" type="button" :disabled="busy" @click="confirmConfigImport">{{ configImportPreview.configChanged ? '确认并应用配置' : '确认无须替换' }}</button></div>
+            <div class="config-import-actions"><button type="button" :disabled="busy" @click="cancelConfigImport">取消</button><button class="primary" type="button" :disabled="busy || controlStateUnverified" @click="confirmConfigImport">{{ configImportPreview.configChanged ? '确认并应用配置' : '确认无须替换' }}</button></div>
           </header>
           <div class="config-import-target"><span>目标默认入口</span><strong>{{ configImportPreview.candidateDefaultWebsite || '未配置' }}</strong></div>
           <div class="config-import-counts">
@@ -1252,7 +1401,7 @@ async function exportDeploymentCheck() {
           <div class="project-bundle-copy"><p class="eyebrow">PROJECT DELIVERY</p><h2>项目部署包</h2><p>将当前配置、签名插件和本地映射作为一个交付单元迁移到目标 Windows 机器；正式导入要求同目录组织签名旁签。</p></div>
           <div class="project-bundle-actions"><button type="button" :disabled="busy" @click="exportProjectBundle">导出当前项目</button><button class="primary" type="button" :disabled="busy" @click="inspectProjectBundle">选择项目包并预检</button></div>
           <div v-if="projectBundlePreview" class="project-bundle-preview">
-            <header><div><strong>变更计划已验证，可以导入</strong><small>由客户端 {{ projectBundlePreview.createdByVersion }} 创建 · schema {{ projectBundlePreview.schemaVersion }} · {{ projectBundlePreview.signatureVerified ? `组织签名 ${projectBundlePreview.signatureKeyId}` : '调试态未签名' }}</small></div><button class="primary" type="button" :disabled="busy" @click="importSelectedProjectBundle">确认计划并切换项目</button></header>
+            <header><div><strong>变更计划已验证，可以导入</strong><small>由客户端 {{ projectBundlePreview.createdByVersion }} 创建 · schema {{ projectBundlePreview.schemaVersion }} · {{ projectBundlePreview.signatureVerified ? `组织签名 ${projectBundlePreview.signatureKeyId}` : '调试态未签名' }}</small></div><button class="primary" type="button" :disabled="busy || controlStateUnverified" @click="importSelectedProjectBundle">确认计划并切换项目</button></header>
             <div class="bundle-summary"><span><strong>{{ projectBundlePreview.businessOrigins }}</strong>业务来源</span><span><strong>{{ projectBundlePreview.signedPlugins }}</strong>签名插件</span><span><strong>{{ projectBundlePreview.localMappings }}</strong>本地映射</span><span><strong>{{ projectBundlePreview.serviceCount }}</strong>原生服务</span><span><strong>{{ projectBundlePreview.preflightedHosts }}</strong>宿主预检</span></div>
             <div class="project-change-summary"><span :class="{ changed: projectBundlePreview.configPreview.configChanged }">配置{{ projectBundlePreview.configPreview.configChanged ? '更新' : '不变' }}</span><span>新增 {{ projectBundlePreview.installCount }}</span><span>升级 {{ projectBundlePreview.upgradeCount }}</span><span>修复/替换 {{ projectBundlePreview.replaceCount }}</span><span>保留本机 {{ projectBundlePreview.retainedCount }}</span></div>
             <h3>目标项目配置</h3>
@@ -1295,7 +1444,7 @@ async function exportDeploymentCheck() {
                 <label class="environment-default" title="设为默认环境"><input v-model="snapshot.config.website" type="radio" :value="environment.url" /><span>默认</span></label>
                 <input v-model.trim="environment.name" type="text" maxlength="128" placeholder="环境名称" />
                 <input :value="environment.url" type="url" maxlength="4096" placeholder="http://project.internal" @input="changeEnvironmentUrl(environment, ($event.target as HTMLInputElement).value)" />
-                <button type="button" :disabled="busy || controlLoadFailed || runtimeStatusStale || !snapshot.config.allowSwitch || !environment.name || !environment.url" @click="openEnvironment(environment)">打开</button>
+                <button type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || !snapshot.config.allowSwitch || !environment.name || !environment.url" @click="openEnvironment(environment)">打开</button>
                 <button type="button" :disabled="busy" aria-label="删除环境" @click="removeEnvironment(index)">删除</button>
               </div>
               <button class="environment-add" type="button" :disabled="busy || snapshot.config.environments.length >= 32" @click="addEnvironment">新增环境</button>
@@ -1310,7 +1459,7 @@ async function exportDeploymentCheck() {
               <label><span>仓库索引签名</span><input v-model.trim="snapshot.config.pluginCatalogSignatureUrl" type="url" placeholder="https://plugins.example/catalog.sig.json" /></label>
             </details>
             <div class="toggles"><label><input v-model="snapshot.config.allowSwitch" type="checkbox" />允许环境切换</label><label><input v-model="snapshot.config.autoClose" type="checkbox" />关闭前确认</label><label><input v-model="snapshot.config.autoStart" type="checkbox" />开机自动启动</label></div>
-            <div class="actions"><button class="primary" type="submit" :disabled="busy">保存配置</button><button type="button" :disabled="busy || controlLoadFailed || runtimeStatusStale" @click="openBusiness">进入业务系统</button></div>
+            <div class="actions"><button class="primary" type="submit" :disabled="busy || controlStateUnverified">保存配置</button><button type="button" :disabled="busy || controlStateUnverified" @click="openBusiness">进入业务系统</button></div>
             <small class="config-path">配置位置：{{ snapshot.path }}</small>
           </form>
         </section>
@@ -1321,18 +1470,18 @@ async function exportDeploymentCheck() {
         <header class="section-header"><div><p class="eyebrow">NATIVE MAPPING STUDIO</p><h1 id="native-title">原生映射</h1><p>发现本机组件、配置调用映射，并在发布前完成受控调试。</p></div><span class="section-chip">本机管理员能力</span></header>
         <LocalMappingStudio
           :key="mappingWorkspaceRevision"
-          :disabled="busy"
+          :disabled="busy || controlStateUnverified"
           @changed="refreshPluginsAfterMapping"
           @dirty="mappingDraftDirty = $event"
         />
       </section>
 
-      <section v-show="activeSection === 'plugins'" class="page" aria-labelledby="plugins-title">
-        <header class="section-header"><div><p class="eyebrow">PLUGIN MANAGEMENT</p><h1 id="plugins-title">插件管理</h1><p>管理签名插件包、本机动态映射和仓库更新。</p></div><div class="header-actions"><button type="button" :disabled="busy" @click="selectPluginPackage">选择签名插件</button><button type="button" :disabled="busy" @click="reloadPlugins">重新扫描</button></div></header>
+      <section v-show="activeSection === 'plugins'" class="page" aria-labelledby="plugins-title" :inert="controlStateUnverified">
+        <header class="section-header"><div><p class="eyebrow">PLUGIN MANAGEMENT</p><h1 id="plugins-title">插件管理</h1><p>管理签名插件包、本机动态映射和仓库更新。</p></div><div class="header-actions"><button type="button" :disabled="busy" @click="selectPluginPackage">选择签名插件</button><button type="button" :disabled="busy || controlStateUnverified" @click="reloadPlugins">重新扫描</button></div></header>
         <section v-if="pluginPackagePreview" class="plugin-package-preview" aria-label="签名插件安装预览">
           <header>
             <div><p class="eyebrow">SIGNED PLUGIN PLAN</p><h2>核对{{ projectActionLabels[pluginPackagePreview.action] }}计划</h2><p>确认时会重新读取和验签安装包，并复核当前插件状态；任一变化都会停止安装。</p></div>
-            <div class="plugin-package-actions"><button type="button" :disabled="busy" @click="cancelPluginPackageInstall">取消</button><button class="primary" type="button" :disabled="busy" @click="confirmPluginPackageInstall">确认并{{ projectActionLabels[pluginPackagePreview.action] }}</button></div>
+            <div class="plugin-package-actions"><button type="button" :disabled="busy" @click="cancelPluginPackageInstall">取消</button><button class="primary" type="button" :disabled="busy || controlStateUnverified" @click="confirmPluginPackageInstall">确认并{{ projectActionLabels[pluginPackagePreview.action] }}</button></div>
           </header>
           <div class="plugin-package-identity"><span><small>插件</small><strong>{{ pluginPackagePreview.displayName }}</strong><code>{{ pluginPackagePreview.pluginId }}</code></span><span><small>版本变化</small><strong>{{ pluginPackagePreview.currentVersion ?? '未安装' }} → {{ pluginPackagePreview.pluginVersion }}</strong><b :class="`plan-action ${pluginPackagePreview.action}`">{{ projectActionLabels[pluginPackagePreview.action] }}</b></span><span><small>Desktop 兼容范围</small><strong>{{ pluginPackagePreview.desktopVersionRequirement }}</strong></span></div>
           <div class="plugin-package-summary"><span><strong>{{ pluginPackagePreview.serviceCount }}</strong>个服务</span><span><strong>{{ pluginPackagePreview.methodCount }}</strong>个方法</span><span v-if="pluginPackagePreview.currentVersion"><strong>{{ pluginPackagePreview.apiAdditionCount }}</strong>项 API 兼容新增</span><span v-if="pluginPackagePreview.currentVersion"><strong>{{ pluginPackagePreview.apiReviewChangeCount }}</strong>项原生复核</span><span><strong>{{ pluginPackagePreview.preflightedHosts }}</strong>个宿主已预检</span></div>
@@ -1357,11 +1506,11 @@ async function exportDeploymentCheck() {
       </section>
 
       <section v-show="activeSection === 'security'" class="page" aria-labelledby="security-title">
-        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>快速检查用于日常状态刷新；正式交付前执行深度自检，实际启动当前插件宿主完成 Health 验证。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy || controlLoadFailed || runtimeStatusStale" @click="runDeploymentCheck">深度自检</button><button type="button" :disabled="busy || controlLoadFailed || runtimeStatusStale" @click="exportDeploymentCheck">导出深度自检记录</button><button type="button" :disabled="busy" @click="openDiagnosticsDirectory">打开日志目录</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
-        <section v-if="deploymentCheck" :class="['deployment-check', { ready: deploymentCheck.ready && !controlLoadFailed && !runtimeStatusStale }]" aria-label="部署自检结果">
+        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>快速检查用于日常状态刷新；正式交付前执行深度自检，实际启动当前插件宿主完成 Health 验证。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale" @click="runDeploymentCheck">深度自检</button><button type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale" @click="exportDeploymentCheck">导出深度自检记录</button><button type="button" :disabled="busy" @click="openDiagnosticsDirectory">打开日志目录</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
+        <section v-if="deploymentCheck" :class="['deployment-check', { ready: deploymentCheck.ready && !controlLoadFailed && !controlRefreshIncomplete && !runtimeStatusStale }]" aria-label="部署自检结果">
           <header>
-            <div><p class="eyebrow">{{ deploymentCheck.deep ? 'DEEP DEPLOYMENT CHECK' : 'QUICK DEPLOYMENT CHECK' }}</p><h2>{{ runtimeStatusStale ? '桌面核心通信中断，当前自检结论已过期' : deploymentCheck.ready ? (deploymentCheck.deep ? '当前机器通过深度交付检查' : '快速检查未发现阻塞') : '部署条件尚未满足' }}</h2><p>{{ deploymentCheck.passed }} 项正常 · {{ deploymentCheck.warnings }} 项提醒 · {{ deploymentCheck.failures }} 项阻塞</p></div>
-            <span>{{ runtimeStatusStale ? 'STATUS UNKNOWN' : deploymentCheck.ready ? (deploymentCheck.deep ? 'READY' : 'QUICK PASS') : 'ACTION REQUIRED' }}</span>
+            <div><p class="eyebrow">{{ deploymentCheck.deep ? 'DEEP DEPLOYMENT CHECK' : 'QUICK DEPLOYMENT CHECK' }}</p><h2>{{ controlRefreshIncomplete ? '操作后的项目状态尚未完整刷新' : runtimeStatusStale ? '桌面核心通信中断，当前自检结论已过期' : deploymentCheck.ready ? (deploymentCheck.deep ? '当前机器通过深度交付检查' : '快速检查未发现阻塞') : '部署条件尚未满足' }}</h2><p>{{ deploymentCheck.passed }} 项正常 · {{ deploymentCheck.warnings }} 项提醒 · {{ deploymentCheck.failures }} 项阻塞</p></div>
+            <span>{{ controlRefreshIncomplete || runtimeStatusStale ? 'STATUS UNKNOWN' : deploymentCheck.ready ? (deploymentCheck.deep ? 'READY' : 'QUICK PASS') : 'ACTION REQUIRED' }}</span>
           </header>
           <div class="check-list">
             <article v-for="item in deploymentCheck.items" :key="item.id" :class="`check-${item.status}`">
@@ -1370,8 +1519,8 @@ async function exportDeploymentCheck() {
             </article>
           </div>
         </section>
-        <p v-if="runtimeStatusStale" class="stale-status-note">以下明细来自最后一次成功刷新，仅供定位，不代表当前运行状态。</p>
-        <section :class="['diagnostic-grid', { stale: runtimeStatusStale }]" aria-label="详细运行状态">
+        <p v-if="controlRefreshIncomplete || runtimeStatusStale" class="stale-status-note">以下明细尚未在最近操作后全部复核，仅供定位，不代表当前完整运行状态。</p>
+        <section :class="['diagnostic-grid', { stale: controlRefreshIncomplete || runtimeStatusStale }]" aria-label="详细运行状态">
           <article><span>插件调用背压</span><strong v-if="status?.globalPluginMaintenanceActive">全局维护中</strong><strong v-else>{{ status ? `${status.inFlightInvocations} / ${status.maxInFlightInvocations}` : '—' }}</strong><small>容量拒绝 {{ status?.rejectedInvocations ?? '—' }} · 槽超时 {{ status?.executionLaneTimeouts ?? '—' }} · 维护拒绝 {{ status?.maintenanceRejectedInvocations ?? '—' }}</small></article>
           <article><span>隔离宿主监督</span><strong>{{ status?.activePluginHosts ?? '—' }} 个活动宿主</strong><small>累计启动 {{ status?.pluginHostStarts ?? '—' }} · 失败 {{ status?.pluginHostStartFailures ?? '—' }}</small></article>
           <article><span>原生操作防重放</span><strong>{{ status?.trackedInvocationsAvailable ? (status.trackedInvocationsAccepting ? '持久协调可用' : '正在排空') : '不可用' }}</strong><small>{{ status?.trackedInvocationsAvailable ? `等待 ${status.trackedPendingOperations} · 可找回 ${status.trackedRetainedResults} · 落盘异常 ${status.trackedPersistenceFailures}` : status?.trackedInvocationsError ?? '状态尚未加载' }}</small></article>
@@ -1394,7 +1543,7 @@ async function exportDeploymentCheck() {
             </article>
           </div>
         </details>
-        <section class="maintenance-panel"><div><p class="eyebrow">CLIENT MAINTENANCE</p><h2>客户端维护</h2><p>{{ status?.appUpdateError ?? (status?.appUpdateConfigured ? '应用更新包必须通过签名验证，并与当前插件及本地映射兼容。' : '当前构建未配置生产更新端点。') }}</p></div><div class="maintenance-actions"><button type="button" :disabled="busy || !status?.appUpdateConfigured" @click="checkAppUpdate">检查应用更新</button><button class="primary" type="button" :disabled="busy || !appUpdate?.available || !appUpdate.compatible || !appUpdate.installPlanId" @click="installAppUpdate">安装签名更新</button></div><details v-if="appUpdate?.available" class="update-details" open><summary>版本 {{ appUpdate.version }}{{ appUpdate.date ? ` · ${appUpdate.date}` : '' }}</summary><p v-if="!appUpdate.compatible">{{ appUpdate.capabilityBlockers }} 个插件或本地映射阻止升级；请先修复对应能力。</p><p>{{ appUpdate.notes || '此版本未提供发布说明。' }}</p><small v-if="updateProgress">{{ updateProgress }}</small></details></section>
+        <section class="maintenance-panel"><div><p class="eyebrow">CLIENT MAINTENANCE</p><h2>客户端维护</h2><p>{{ status?.appUpdateError ?? (status?.appUpdateConfigured ? '应用更新包必须通过签名验证，并与当前插件及本地映射兼容。' : '当前构建未配置生产更新端点。') }}</p></div><div class="maintenance-actions"><button type="button" :disabled="busy || !status?.appUpdateConfigured" @click="checkAppUpdate">检查应用更新</button><button class="primary" type="button" :disabled="busy || controlStateUnverified || !appUpdate?.available || !appUpdate.compatible || !appUpdate.installPlanId" @click="installAppUpdate">安装签名更新</button></div><details v-if="appUpdate?.available" class="update-details" open><summary>版本 {{ appUpdate.version }}{{ appUpdate.date ? ` · ${appUpdate.date}` : '' }}</summary><p v-if="!appUpdate.compatible">{{ appUpdate.capabilityBlockers }} 个插件或本地映射阻止升级；请先修复对应能力。</p><p>{{ appUpdate.notes || '此版本未提供发布说明。' }}</p><small v-if="updateProgress">{{ updateProgress }}</small></details></section>
         <section class="boundary"><div><p class="eyebrow">TRUST BOUNDARY</p><h2>第三方 DLL 永不进入主进程</h2></div><ol><li><b>业务 WebView</b><span>只调用受限的业务命令</span></li><li><b>Rust Controller</b><span>执行路由、策略、超时和监督</span></li><li><b>Plugin Host</b><span>加载 DLL、COM、OCX、EXE 或 BAT</span></li></ol></section>
       </section>
     </main>
