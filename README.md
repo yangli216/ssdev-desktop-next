@@ -21,7 +21,7 @@ business webview -> narrow Tauri command -> Rust controller
 - controller 最多接受 8 个在途插件调用；容量饱和时在进入原生宿主前快速拒绝，不建立无界等待队列。
 - localhost HTTP 仅作为可关闭的旧浏览器兼容网关，不是新架构内部依赖。
 
-每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归，并分别为 x64 与 x86 桌面构建 `0.0.1` 合成旧版本和当前候选版本，对离线 NSIS 执行原位升级、配置保留、布局/架构检查、真实启动和卸载；随后额外构建在线轻量 NSIS 并执行安装、启动和卸载冒烟。Linux DEB/AppImage 和 macOS DMG 仅在手动选择 `all` 平台时构建。CI 使用临时更新密钥且明确跳过平台代码签名，只验证工程链路，产物不能分发。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
+每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归；Windows 门禁还会实际生成、构建并调用两种架构的最小 DLL 插件脚手架。随后分别为 x64 与 x86 桌面构建 `0.0.1` 合成旧版本和当前候选版本，对离线 NSIS 执行原位升级、配置保留、布局/架构检查、真实启动和卸载；再额外构建在线轻量 NSIS 并执行安装、启动和卸载冒烟。Linux DEB/AppImage 和 macOS DMG 仅在手动选择 `all` 平台时构建。CI 使用临时更新密钥且明确跳过平台代码签名，只验证工程链路，产物不能分发。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
 
 架构决策和迁移门槛见 [docs/adr/0001-target-architecture.md](docs/adr/0001-target-architecture.md)。
 业务页面从 localhost HTTP 切换到窄桥接接口的方式见 [docs/web-bridge-migration.md](docs/web-bridge-migration.md)。
@@ -121,7 +121,7 @@ cargo run --locked -p ssdev-migration-audit -- \
 
 工具只读取审计输入；不会加载原生组件、执行 `installRun` 或旧快捷键脚本。正式模式以不覆盖方式写出完整报告和绑定源码提交、报告 SHA-256、覆盖计数及 HTTP 证据级别的精简证据；输出必须在源码工作区之外。省略最后四个正式参数时，报告写到标准输出用于探索。报告不复制源码、请求 URL、查询参数或 HAR 内容。
 
-完成只读审计并修复阻塞项后，使用 `ssdev-plugin-tool prepare` 生成隔离暂存目录、外部 Ed25519 待签材料和不会误触硬件的草稿黄金矩阵；组织签名系统返回签名后，再用 `finalize` 验签并制作可复现的 `.ssdev-plugin`。完整命令和信任边界见 [docs/plugin-release.md](docs/plugin-release.md)。
+新插件可用 `ssdev-plugin-tool init` 生成固定 x86/x64 的最小 Rust DLL、清单、矩阵种子和 Web 客户端；旧插件完成只读审计并修复阻塞项后，可用 `client` 从同一份已校验 `api.json` 生成类型化 Web Bridge 客户端。随后使用 `prepare` 生成隔离暂存目录、外部 Ed25519 待签材料和不会误触硬件的草稿黄金矩阵；组织签名系统返回签名后，用 `finalize` 验签并制作可复现的 `.ssdev-plugin`。工作台和命令行共用客户端生成器，正式插件与现场映射不会出现两套方法命名。完整命令和信任边界见 [docs/plugin-release.md](docs/plugin-release.md)。
 
 ## Windows 安装包
 

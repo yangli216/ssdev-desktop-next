@@ -72,6 +72,18 @@ x86 与 x64 示例使用不同插件 ID，但声明同一个 `windows.system` �
 
 [`web-example.ts`](web-example.ts) 使用正式 `@bsoft/ssdev-web-bridge`，没有 localhost HTTP 回退：
 
+正式项目可直接从同一份映射生成完整类型化客户端，不需要手写路由：
+
+```powershell
+cargo run --locked -p ssdev-plugin-tool -- client `
+  --source C:\secure-release\windows-system-example-x64-1.0.0\source `
+  --plugin-id windows-system-example-x64 `
+  --display-name "Windows System Capability Example (x64)" `
+  --output C:\business-web\src\generated\windows-system.ts
+```
+
+输出路径必须在插件源目录之外且不能覆盖已有文件；重新生成后的差异应与 `api.json` 一起评审。
+
 ```ts
 const result = await bridge.invokePlugin('windows.system', 'getMemoryStatus', {})
 // result.ResData:

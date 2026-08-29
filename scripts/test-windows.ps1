@@ -49,6 +49,27 @@ try {
     }
     cargo run --locked -p webplus-native --example windows_system_roundtrip --target $target -- $systemExample $systemApi
 
+    $scaffoldParent = Join-Path ([System.IO.Path]::GetTempPath()) ("ssdev-plugin-scaffold-" + [Guid]::NewGuid().ToString("N"))
+    $scaffold = Join-Path $scaffoldParent "echo-plugin"
+    $scaffoldArchitecture = if ($target -eq "i686-pc-windows-msvc") { "x86" } else { "x64" }
+    $scaffoldPluginId = "ci.echo-$scaffoldArchitecture"
+    New-Item -ItemType Directory -Path $scaffoldParent | Out-Null
+    try {
+      cargo run --locked -p ssdev-plugin-tool -- init `
+        --destination $scaffold `
+        --plugin-id $scaffoldPluginId `
+        --service-id "ci.echo" `
+        --display-name "CI Echo" `
+        --architecture $scaffoldArchitecture
+      if ($LASTEXITCODE -ne 0) { throw "plugin scaffold generation failed with exit code $LASTEXITCODE" }
+      & (Join-Path $scaffold "build.ps1")
+      cargo run --locked -p webplus-native --example scaffold_roundtrip --target $target -- `
+        (Join-Path $scaffold "release-source") $scaffoldPluginId
+      if ($LASTEXITCODE -ne 0) { throw "generated plugin round-trip failed with exit code $LASTEXITCODE" }
+    } finally {
+      Remove-Item -LiteralPath $scaffoldParent -Recurse -Force
+    }
+
     $pluginHostPath = Join-Path $workspace "target/$target/debug/webplus-plugin-host.exe"
     cargo run --locked -p webplus-controller --example host_roundtrip --target $target -- $pluginHostPath $fixture
   }

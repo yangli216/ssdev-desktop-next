@@ -34,6 +34,210 @@ pub struct PluginManifest {
     pub local_mapping_integrity_sha256: Option<String>,
 }
 
+/// Generates the public TypeScript client for a validated plugin service set.
+///
+/// Keeping this generator beside the manifest schema ensures the desktop
+/// mapping workbench and headless release tooling expose identical method
+/// names, result fields, and route literals.
+pub fn generate_typescript_client(
+    display_name: &str,
+    services: &[ServiceDefinition],
+) -> Result<String, serde_json::Error> {
+    let mut output = String::from(
+        "// Generated from an SSDEV plugin manifest. Regenerate after API changes.\n\
+import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker } from '@bsoft/ssdev-web-bridge'\n\n",
+    );
+    let methods = typescript_method_plans(services);
+    for plan in &methods {
+        output.push_str(&format!(
+            "export type {} = JsonObject & {{\n",
+            plan.parameters_type
+        ));
+        for parameter in plan
+            .method
+            .parameters
+            .iter()
+            .filter(|parameter| !parameter.name().starts_with('$'))
+        {
+            output.push_str(&format!(
+                "  {}: {}\n",
+                serde_json::to_string(parameter.name())?,
+                typescript_parameter_type(parameter)
+            ));
+        }
+        output.push_str("}\n\n");
+        output.push_str(&format!(
+            "export type {} = JsonObject & {{\n",
+            plan.data_type
+        ));
+        output.push_str(&format!(
+            "  {}: {}\n",
+            NATIVE_RETURN_VALUE_FIELD,
+            typescript_native_type(&plan.method.return_type)
+        ));
+        for parameter in plan
+            .method
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.name().starts_with('$'))
+        {
+            output.push_str(&format!(
+                "  {}: {}\n",
+                serde_json::to_string(parameter.name().trim_start_matches('$'))?,
+                typescript_parameter_type(parameter)
+            ));
+        }
+        for property in &plan.method.props {
+            output.push_str(&format!(
+                "  {}: JsonValue\n",
+                serde_json::to_string(property)?
+            ));
+        }
+        output.push_str("}\n\n");
+    }
+    output.push_str(&format!(
+        "export class {}Client {{\n  constructor(private readonly bridge: PluginInvoker) {{}}\n\n",
+        typescript_pascal_identifier(display_name)
+    ));
+    for plan in methods {
+        let default_parameters = if plan.has_input_parameters {
+            ""
+        } else {
+            " = {}"
+        };
+        output.push_str(&format!(
+            "  {}(parameters: {}{}): Promise<InvokeResponse<{}>> {{\n    return this.bridge.invokePlugin<{}>({}, {}, parameters)\n  }}\n\n",
+            plan.client_method,
+            plan.parameters_type,
+            default_parameters,
+            plan.data_type,
+            plan.data_type,
+            serde_json::to_string(&plan.service.service_id)?,
+            serde_json::to_string(plan.request_name)?,
+        ));
+    }
+    output.push_str("}\n");
+    Ok(output)
+}
+
+struct TypeScriptMethodPlan<'a> {
+    service: &'a ServiceDefinition,
+    method: &'a MethodDefinition,
+    request_name: &'a str,
+    client_method: String,
+    parameters_type: String,
+    data_type: String,
+    has_input_parameters: bool,
+}
+
+fn typescript_method_plans(services: &[ServiceDefinition]) -> Vec<TypeScriptMethodPlan<'_>> {
+    let mut simple_name_counts = HashMap::new();
+    for service in services {
+        for method in &service.methods {
+            let request_name = method.alias.as_deref().unwrap_or(&method.name);
+            *simple_name_counts
+                .entry(typescript_camel_identifier(request_name))
+                .or_insert(0_usize) += 1;
+        }
+    }
+
+    let mut used_names = HashSet::new();
+    let mut plans = Vec::new();
+    for service in services {
+        for method in &service.methods {
+            let request_name = method.alias.as_deref().unwrap_or(&method.name);
+            let simple_name = typescript_camel_identifier(request_name);
+            let mut base_name = if simple_name_counts.get(&simple_name) == Some(&1) {
+                simple_name
+            } else {
+                format!(
+                    "{}{}",
+                    typescript_camel_identifier(&service.service_id),
+                    typescript_pascal_identifier(request_name)
+                )
+            };
+            if matches!(base_name.as_str(), "constructor" | "bridge") {
+                base_name = format!("invoke{}", typescript_pascal_identifier(&base_name));
+            }
+            let client_method = unique_typescript_identifier(base_name, &mut used_names);
+            let stem = typescript_pascal_identifier(&client_method);
+            plans.push(TypeScriptMethodPlan {
+                service,
+                method,
+                request_name,
+                parameters_type: format!("{stem}Parameters"),
+                data_type: format!("{stem}Data"),
+                client_method,
+                has_input_parameters: method
+                    .parameters
+                    .iter()
+                    .any(|parameter| !parameter.name().starts_with('$')),
+            });
+        }
+    }
+    plans
+}
+
+fn unique_typescript_identifier(base: String, used: &mut HashSet<String>) -> String {
+    if used.insert(base.clone()) {
+        return base;
+    }
+    let mut suffix = 2_usize;
+    loop {
+        let candidate = format!("{base}{suffix}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
+    }
+}
+
+fn typescript_parameter_type(parameter: &ParameterDefinition) -> &'static str {
+    match parameter {
+        ParameterDefinition::Name(_) => "JsonValue",
+        ParameterDefinition::Detailed(detail) => typescript_native_type(&detail.parameter_type),
+    }
+}
+
+fn typescript_native_type(native: &str) -> &'static str {
+    match native.trim().to_ascii_lowercase().as_str() {
+        "string" => "string",
+        "bool" | "boolean" => "boolean",
+        "int" | "int32" | "long" | "uint" | "uint32" | "dword" | "float" | "double" => "number",
+        "void" => "null",
+        _ => "JsonValue",
+    }
+}
+
+fn typescript_pascal_identifier(value: &str) -> String {
+    let mut output = String::new();
+    let mut uppercase = true;
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            if uppercase {
+                output.push(character.to_ascii_uppercase());
+                uppercase = false;
+            } else {
+                output.push(character);
+            }
+        } else {
+            uppercase = true;
+        }
+    }
+    if output.is_empty() || output.starts_with(|character: char| character.is_ascii_digit()) {
+        output.insert_str(0, "Generated");
+    }
+    output
+}
+
+fn typescript_camel_identifier(value: &str) -> String {
+    let mut output = typescript_pascal_identifier(value);
+    if let Some(first) = output.get_mut(0..1) {
+        first.make_ascii_lowercase();
+    }
+    output
+}
+
 impl PluginManifest {
     pub fn load(
         plugin_id: impl Into<String>,
@@ -1018,6 +1222,50 @@ mod tests {
         let services: ApiDocument =
             serde_json::from_slice(&fs::read(root.join(API_FILENAME)).unwrap()).unwrap();
         services.into_services()
+    }
+
+    #[test]
+    fn generated_typescript_client_uses_public_routes_and_stable_types() {
+        let services: Vec<ServiceDefinition> = serde_json::from_value(serde_json::json!([{
+            "serviceId": "reader.card",
+            "mainClass": "reader.dll",
+            "mainType": "dll",
+            "architecture": "x64",
+            "methods": [{
+                "name": "ReadCard",
+                "alias": "read",
+                "returnType": "uint32",
+                "parameters": [
+                    { "name": "port", "type": "string" },
+                    { "name": "$cardNo", "type": "string", "len": 256 }
+                ]
+            }]
+        }, {
+            "serviceId": "reader.status",
+            "mainClass": "Scripting.Dictionary",
+            "mainType": "com",
+            "architecture": "x86",
+            "methods": [{
+                "name": "Read",
+                "alias": "read",
+                "returnType": "void",
+                "parameters": [],
+                "props": ["Count"]
+            }]
+        }]))
+        .unwrap();
+
+        let source = generate_typescript_client("Card Reader", &services).unwrap();
+        assert!(source.contains("export class CardReaderClient"));
+        assert!(source.contains("readerCardRead(parameters: ReaderCardReadParameters)"));
+        assert!(source.contains("\"port\": string"));
+        assert!(source.contains("\"cardNo\": string"));
+        assert!(source.contains("ReturnValue: number"));
+        assert!(source.contains("readerStatusRead(parameters: ReaderStatusReadParameters = {})"));
+        assert!(source.contains("\"Count\": JsonValue"));
+        assert!(source.contains("ReturnValue: null"));
+        assert!(source.contains("invokePlugin<ReaderCardReadData>(\"reader.card\", \"read\""));
+        assert!(!source.contains("$cardNo"));
     }
 
     #[test]

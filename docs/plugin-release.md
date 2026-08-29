@@ -13,6 +13,39 @@
 
 私钥不应传给本工具，也不能通过命令行参数、环境变量、源码或客户端安装包注入。签名请求包含文件相对路径、SHA-256 和待签字节，应按发布材料管理；它不包含文件内容。
 
+## 0. 新建最小 DLL 插件
+
+没有旧插件或工作台映射可转换时，可生成一个能够直接构建和调试的最小 Rust DLL 插件：
+
+```powershell
+cargo run --locked -p ssdev-plugin-tool -- init `
+  --destination C:\plugin-development\card-reader `
+  --plugin-id hospital.card-reader `
+  --service-id device.card `
+  --display-name "读卡器插件" `
+  --architecture x64
+```
+
+目标目录必须不存在。工具生成独立的 `native` Rust crate、锁文件、固定 x86 或 x64 的 `build.ps1`、仅包含发布运行文件的 `release-source`、草稿黄金矩阵种子和 `web/client.ts`。模板实现一个真实的 `SsdevEcho` 导出，用 UTF-8 输入和 1 KiB 调用方输出缓冲区覆盖最常见 DLL 接入形态；Windows 上运行 `./build.ps1` 后即可在工作台加载和调试。
+
+该命令有意不提供结构体、回调、浮点 ABI、任意 Win32 API 或自动设备操作选项。这些能力必须依据厂商文档开发专用 Rust 适配器并经过真实硬件矩阵，不能让脚手架猜测。
+
+### 生成业务 Web 客户端
+
+确定 `api.json` 后，可在不启动桌面端和原生组件的情况下生成类型化 Web Bridge 客户端：
+
+```powershell
+cargo run --locked -p ssdev-plugin-tool -- client `
+  --source C:\secure-migration\legacy\reader `
+  --plugin-id reader-plugin `
+  --display-name "读卡器插件" `
+  --output C:\business-web\src\generated\reader-plugin.ts
+```
+
+命令先使用运行时同源规则完整校验 `api.json`，再生成输入类型、`ReturnValue`、输出参数、COM 属性和固定的 service/method 路由。未提供 `--display-name` 时优先使用已有 `plugin.json` 的名称，否则使用插件 ID。输出必须是尚不存在的文件，并且必须位于待签名插件源目录之外，避免把业务 TypeScript 意外放入原生插件签名载荷。
+
+控制台本地映射工作台的“TS”按钮也调用同一个共享生成器，因此现场映射转成正式插件后不会产生另一套方法命名规则。生成文件依赖 `@bsoft/ssdev-web-bridge` 的公开 `PluginInvoker`，业务项目应把它作为受控代码制品提交并随 `api.json` 变更一起评审。
+
 ## 1. 准备发布目录
 
 所有输出都必须是尚不存在的新路径，并位于旧插件目录之外：

@@ -12,7 +12,9 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tempfile::Builder as TempBuilder;
 use thiserror::Error;
-use webplus_plugin_config::{discover_plugins, PluginManifest, PluginMetadata};
+use webplus_plugin_config::{
+    discover_plugins, generate_typescript_client, PluginManifest, PluginMetadata,
+};
 use webplus_plugin_package::{create_deterministic_package, PreparedPlugin};
 use webplus_plugin_repository::{
     encode_catalog_document_with_withdrawals, CatalogEntry, CatalogWithdrawal,
@@ -79,6 +81,23 @@ pub struct MaterializeReleaseSetOptions<'a> {
     pub trust_store: &'a Path,
     pub matrix: &'a Path,
     pub plugin_root: &'a Path,
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerateClientOptions<'a> {
+    pub source: &'a Path,
+    pub plugin_id: &'a str,
+    pub display_name: Option<&'a str>,
+    pub output: &'a Path,
+}
+
+#[derive(Debug, Clone)]
+pub struct InitDllPluginOptions<'a> {
+    pub destination: &'a Path,
+    pub plugin_id: &'a str,
+    pub service_id: &'a str,
+    pub display_name: &'a str,
+    pub architecture: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -211,6 +230,32 @@ pub struct CatalogReport {
     pub catalog_sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerateClientReport {
+    pub schema_version: u8,
+    pub plugin_id: String,
+    pub display_name: String,
+    pub service_count: usize,
+    pub method_count: usize,
+    pub output: PathBuf,
+    pub output_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitDllPluginReport {
+    pub schema_version: u8,
+    pub plugin_id: String,
+    pub service_id: String,
+    pub display_name: String,
+    pub architecture: PluginArchitecture,
+    pub rust_crate_name: String,
+    pub native_library: String,
+    pub file_count: usize,
+    pub destination: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SigningRequest {
@@ -303,6 +348,307 @@ struct CatalogSpec {
 struct CatalogPackageSpec {
     package: PathBuf,
     url: url::Url,
+}
+
+/// Creates a minimal, buildable Windows DLL plugin workspace for the common
+/// UTF-8 input + caller-owned output-buffer ABI. Complex vendor ABIs still
+/// require an explicit adapter design rather than additional scaffold flags.
+pub fn init_dll_plugin(
+    options: &InitDllPluginOptions<'_>,
+) -> Result<InitDllPluginReport, ToolError> {
+    ensure_fresh_output(options.destination, "plugin workspace")?;
+    let destination = normalized_new_path(options.destination)?;
+    let architecture = match options.architecture.trim().to_ascii_lowercase().as_str() {
+        "x86" => PluginArchitecture::X86,
+        "x64" => PluginArchitecture::X64,
+        _ => {
+            return Err(ToolError::Invalid(
+                "DLL plugin architecture must be x86 or x64".into(),
+            ))
+        }
+    };
+    let display_name = checked_scaffold_text(options.display_name, "display name", 128)?;
+    let service_id = checked_scaffold_text(options.service_id, "service ID", 256)?;
+    let crate_name = scaffold_crate_name(options.plugin_id);
+    let native_library = format!("{crate_name}.dll");
+    let target = match architecture {
+        PluginArchitecture::X86 => "i686-pc-windows-msvc",
+        PluginArchitecture::X64 => "x86_64-pc-windows-msvc",
+    };
+
+    with_fresh_directory(&destination, "plugin workspace", |workspace| {
+        for directory in [
+            workspace.join("native/src"),
+            workspace.join("release-source/bin"),
+            workspace.join("web"),
+        ] {
+            fs::create_dir_all(&directory).map_err(|source| ToolError::Io {
+                path: directory,
+                source,
+            })?;
+        }
+
+        let api = serde_json::json!([{
+            "serviceId": service_id,
+            "mainClass": format!("bin/{native_library}"),
+            "mainType": "dll",
+            "architecture": architecture,
+            "charset": "utf8",
+            "callingConvention": "cdecl",
+            "cacheable": true,
+            "timeout": 30_000,
+            "deps": [],
+            "methods": [{
+                "name": "SsdevEcho",
+                "alias": "echo",
+                "returnType": "int",
+                "parameters": [
+                    { "name": "input", "type": "string" },
+                    { "name": "$value", "type": "string", "len": 1024 }
+                ]
+            }]
+        }]);
+        write_new_json(workspace.join("release-source/api.json"), &api)?;
+
+        let cargo_manifest = format!(
+            "[package]\nname = {crate_name:?}\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[workspace]\n"
+        );
+        write_new_bytes(
+            &workspace.join("native/Cargo.toml"),
+            cargo_manifest.as_bytes(),
+        )?;
+        let cargo_lock = format!(
+            "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = {crate_name:?}\nversion = \"0.1.0\"\n"
+        );
+        write_new_bytes(&workspace.join("native/Cargo.lock"), cargo_lock.as_bytes())?;
+        write_new_bytes(
+            &workspace.join("native/src/lib.rs"),
+            DLL_SCAFFOLD_RUST.as_bytes(),
+        )?;
+
+        let build_script = format!(
+            "param()\n\n$ErrorActionPreference = \"Stop\"\nSet-StrictMode -Version Latest\n\n$root = $PSScriptRoot\n$target = \"{target}\"\n$library = \"{native_library}\"\n$manifest = Join-Path $root \"native/Cargo.toml\"\n$destination = Join-Path $root \"release-source/bin/$library\"\n\nrustup target add $target\nif ($LASTEXITCODE -ne 0) {{ throw \"rustup failed with exit code $LASTEXITCODE\" }}\ncargo build --locked --release --manifest-path $manifest --target $target\nif ($LASTEXITCODE -ne 0) {{ throw \"native plugin build failed with exit code $LASTEXITCODE\" }}\nCopy-Item -LiteralPath (Join-Path $root \"native/target/$target/release/$library\") -Destination $destination -Force\nWrite-Host \"Built plugin source: $destination\"\n"
+        );
+        write_new_bytes(&workspace.join("build.ps1"), build_script.as_bytes())?;
+
+        let manifest = PluginManifest::load(options.plugin_id, workspace.join("release-source"))?;
+        let client = generate_typescript_client(&display_name, &manifest.services)?;
+        write_new_bytes(&workspace.join("web/client.ts"), client.as_bytes())?;
+        let matrix = serde_json::json!({
+            "schemaVersion": 1,
+            "draft": true,
+            "cases": [{
+                "name": format!("{}.echo synthetic", service_id),
+                "enabled": true,
+                "reviewRequired": true,
+                "request": {
+                    "serviceId": service_id,
+                    "method": "echo",
+                    "parameters": { "input": "SSDEV_TEST" }
+                },
+                "expected": {
+                    "ResCode": 0,
+                    "ResData": { "ReturnValue": 0, "value": "SSDEV_TEST" }
+                }
+            }]
+        });
+        write_new_json(workspace.join("matrix-seed.json"), &matrix)?;
+
+        let readme = scaffold_readme(
+            options.plugin_id,
+            &display_name,
+            &service_id,
+            architecture,
+            &native_library,
+        );
+        write_new_bytes(&workspace.join("README.md"), readme.as_bytes())?;
+        Ok(())
+    })?;
+
+    Ok(InitDllPluginReport {
+        schema_version: 1,
+        plugin_id: options.plugin_id.to_owned(),
+        service_id,
+        display_name,
+        architecture,
+        rust_crate_name: crate_name,
+        native_library,
+        file_count: 8,
+        destination,
+    })
+}
+
+fn checked_scaffold_text(value: &str, role: &str, limit: usize) -> Result<String, ToolError> {
+    if value.trim() != value
+        || value.is_empty()
+        || value.chars().count() > limit
+        || value.chars().any(char::is_control)
+    {
+        return Err(ToolError::Invalid(format!(
+            "plugin {role} must be trimmed, non-empty, and at most {limit} safe characters"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+fn scaffold_crate_name(plugin_id: &str) -> String {
+    let mut stem = String::new();
+    let mut separator = false;
+    for character in plugin_id.chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator && !stem.is_empty() {
+                stem.push('_');
+            }
+            stem.push(character.to_ascii_lowercase());
+            separator = false;
+        } else {
+            separator = true;
+        }
+        if stem.len() >= 40 {
+            break;
+        }
+    }
+    while stem.ends_with('_') {
+        stem.pop();
+    }
+    if stem.is_empty() {
+        stem.push_str("plugin");
+    }
+    let identity = sha256_hex(plugin_id.as_bytes());
+    format!("ssdev_{stem}_{}_native", &identity[..8])
+}
+
+fn scaffold_readme(
+    plugin_id: &str,
+    display_name: &str,
+    service_id: &str,
+    architecture: PluginArchitecture,
+    native_library: &str,
+) -> String {
+    let architecture = match architecture {
+        PluginArchitecture::X86 => "x86",
+        PluginArchitecture::X64 => "x64",
+    };
+    format!(
+        "# {display_name}\n\nSSDEV DLL 插件脚手架。插件 ID：`{plugin_id}`；服务：`{service_id}`；架构：`{architecture}`。\n\n## 1. 构建 DLL\n\n在 Windows PowerShell 中运行：\n\n```powershell\n./build.ps1\n```\n\n脚本使用锁定依赖构建 `native` crate，并把 `{native_library}` 复制到 `release-source/bin`。修改导出函数后必须同步评审 `release-source/api.json`。\n\n## 2. 本地调试\n\n在 SSDEV Desktop 的“原生映射”工作台中选择 `release-source/bin/{native_library}`，按照 `release-source/api.json` 配置 `SsdevEcho`，然后使用输入 `SSDEV_TEST` 调用 `echo`。不要把生产账号、患者数据或不可逆设备操作放入调试用例。\n\n## 3. Web 接入\n\n`web/client.ts` 由共享清单生成器产生，依赖 `@bsoft/ssdev-web-bridge`。业务代码创建桌面连接后，把 `connection.bridge` 传给生成的客户端；`api.json` 变化后重新运行 `ssdev-plugin-tool client`，输出到一个新的临时文件，评审差异后替换业务制品。\n\n## 4. 签名发布\n\n先运行 `ssdev-plugin-tool prepare --source release-source ... --matrix-seed matrix-seed.json`。矩阵种子保持 `draft: true` 和 `reviewRequired: true`；必须在 Windows 测试环境核对完整响应后才可解除这两项门禁。随后由组织 KMS/HSM 签名，并使用 `finalize` 生成 `.ssdev-plugin`。私钥、真实硬件数据和业务 Web 源码都不能放入 `release-source`。\n\n此模板只覆盖 UTF-8 字符串输入和 1 KiB 调用方输出缓冲区。结构体、回调、浮点 ABI、厂商内存释放或线程绑定组件需要单独设计 Rust 适配器，不能通过修改 JSON 猜测。\n"
+    )
+}
+
+const DLL_SCAFFOLD_RUST: &str = r#"//! Minimal SSDEV native adapter for the bounded DLL ABI.
+
+const OUTPUT_CAPACITY: usize = 1024;
+const MAX_INPUT_BYTES: usize = 32 * 1024;
+const ERROR_SUCCESS: usize = 0;
+const ERROR_INVALID_PARAMETER: usize = 87;
+const ERROR_INSUFFICIENT_BUFFER: usize = 122;
+
+/// Echoes one NUL-terminated UTF-8 input into the caller-owned output buffer.
+///
+/// # Safety
+///
+/// `input` must point to a readable NUL-terminated string no longer than
+/// `MAX_INPUT_BYTES`. `output` must point to the 1024-byte writable buffer
+/// declared in `release-source/api.json`.
+#[export_name = "SsdevEcho"]
+pub unsafe extern "C" fn ssdev_echo(input: *const u8, output: *mut u8) -> usize {
+    let value = match unsafe { read_utf8(input) } {
+        Ok(value) => value,
+        Err(code) => return code,
+    };
+    unsafe { write_output(output, value.as_bytes()) }
+}
+
+unsafe fn read_utf8(input: *const u8) -> Result<String, usize> {
+    if input.is_null() {
+        return Err(ERROR_INVALID_PARAMETER);
+    }
+    for length in 0..MAX_INPUT_BYTES {
+        if unsafe { *input.add(length) } == 0 {
+            return std::str::from_utf8(unsafe { std::slice::from_raw_parts(input, length) })
+                .map(str::to_owned)
+                .map_err(|_| ERROR_INVALID_PARAMETER);
+        }
+    }
+    Err(ERROR_INVALID_PARAMETER)
+}
+
+unsafe fn write_output(output: *mut u8, value: &[u8]) -> usize {
+    if output.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+    if value.len() >= OUTPUT_CAPACITY {
+        return ERROR_INSUFFICIENT_BUFFER;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(value.as_ptr(), output, value.len());
+        output.add(value.len()).write(0);
+    }
+    ERROR_SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn echoes_utf8_into_the_declared_buffer() {
+        let input = b"SSDEV_TEST\0";
+        let mut output = [0_u8; OUTPUT_CAPACITY];
+        let code = unsafe { ssdev_echo(input.as_ptr(), output.as_mut_ptr()) };
+        assert_eq!(code, ERROR_SUCCESS);
+        assert_eq!(&output[..10], b"SSDEV_TEST");
+        assert_eq!(output[10], 0);
+    }
+}
+"#;
+
+/// Generates the same typed Web Bridge client used by the desktop mapping
+/// workbench, without requiring an interactive desktop session.
+pub fn generate_client(
+    options: &GenerateClientOptions<'_>,
+) -> Result<GenerateClientReport, ToolError> {
+    ensure_fresh_output(options.output, "typed client output")?;
+    let source = canonical_real_directory(options.source)?;
+    let output = normalized_new_path(options.output)?;
+    if output.starts_with(&source) {
+        return Err(ToolError::Invalid(
+            "typed client output must stay outside the signed plugin source directory".into(),
+        ));
+    }
+    let manifest = PluginManifest::load(options.plugin_id, &source)?;
+    let display_name = options
+        .display_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            manifest
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.display_name.trim())
+                .filter(|name| !name.is_empty())
+        })
+        .unwrap_or(options.plugin_id)
+        .to_owned();
+    if display_name.chars().count() > 128 {
+        return Err(ToolError::Invalid(
+            "plugin display name must not exceed 128 characters".into(),
+        ));
+    }
+    let client = generate_typescript_client(&display_name, &manifest.services)?;
+    write_new_bytes(&output, client.as_bytes())?;
+    Ok(GenerateClientReport {
+        schema_version: 1,
+        plugin_id: manifest.plugin_id,
+        display_name,
+        service_count: manifest.services.len(),
+        method_count: manifest
+            .services
+            .iter()
+            .map(|service| service.methods.len())
+            .sum(),
+        output,
+        output_sha256: sha256_hex(client.as_bytes()),
+    })
 }
 
 pub fn prepare(options: &PrepareOptions<'_>) -> Result<PrepareReport, ToolError> {
@@ -2075,6 +2421,137 @@ mod tests {
                 "ResData": { "ReturnValue": 0 }
             }
         })
+    }
+
+    #[test]
+    fn generates_a_typed_client_without_mutating_the_signed_source() {
+        let root = tempfile::tempdir().unwrap();
+        let source = source(root.path());
+        let output = root.path().join("reader-client.ts");
+
+        let report = generate_client(&GenerateClientOptions {
+            source: &source,
+            plugin_id: "reader",
+            display_name: Some("Patient Reader"),
+            output: &output,
+        })
+        .unwrap();
+        let generated = fs::read_to_string(&output).unwrap();
+        assert_eq!(report.plugin_id, "reader");
+        assert_eq!(report.display_name, "Patient Reader");
+        assert_eq!(report.service_count, 1);
+        assert_eq!(report.method_count, 1);
+        assert_eq!(report.output_sha256, sha256_hex(generated.as_bytes()));
+        assert!(generated.contains("export class PatientReaderClient"));
+        assert!(generated.contains("invokePlugin<ReadData>(\"reader\", \"read\""));
+        assert!(generated.contains("\"timeout\": JsonValue"));
+        assert!(generate_client(&GenerateClientOptions {
+            source: &source,
+            plugin_id: "reader",
+            display_name: None,
+            output: &output,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("already exists"));
+    }
+
+    #[test]
+    fn initializes_a_bounded_buildable_dll_plugin_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("card-reader");
+        let report = init_dll_plugin(&InitDllPluginOptions {
+            destination: &destination,
+            plugin_id: "hospital.card-reader",
+            service_id: "device.card",
+            display_name: "Card Reader",
+            architecture: "x64",
+        })
+        .unwrap();
+
+        assert_eq!(report.architecture, PluginArchitecture::X64);
+        assert_eq!(report.file_count, 8);
+        assert!(report
+            .rust_crate_name
+            .starts_with("ssdev_hospital_card_reader_"));
+        assert!(report.native_library.ends_with("_native.dll"));
+        let manifest =
+            PluginManifest::load("hospital.card-reader", destination.join("release-source"))
+                .unwrap();
+        let service = manifest.service("device.card").unwrap();
+        assert_eq!(service.architecture, PluginArchitecture::X64);
+        assert_eq!(service.main_class, format!("bin/{}", report.native_library));
+        assert_eq!(service.method("echo").unwrap().name, "SsdevEcho");
+        let client = fs::read_to_string(destination.join("web/client.ts")).unwrap();
+        assert!(client.contains("export class CardReaderClient"));
+        assert!(client.contains("invokePlugin<EchoData>(\"device.card\", \"echo\""));
+        let build = fs::read_to_string(destination.join("build.ps1")).unwrap();
+        assert!(build.contains("x86_64-pc-windows-msvc"));
+        assert!(build.contains("cargo build --locked --release"));
+        let matrix: PluginMatrix =
+            serde_json::from_slice(&fs::read(destination.join("matrix-seed.json")).unwrap())
+                .unwrap();
+        assert!(matrix.draft);
+        assert!(matrix.cases[0].review_required);
+        assert_eq!(
+            matrix.cases[0].request.parameters["input"],
+            Value::String("SSDEV_TEST".into())
+        );
+        assert!(init_dll_plugin(&InitDllPluginOptions {
+            destination: &destination,
+            plugin_id: "hospital.card-reader",
+            service_id: "device.card",
+            display_name: "Card Reader",
+            architecture: "x64",
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("already exists"));
+    }
+
+    #[test]
+    fn invalid_dll_scaffold_input_leaves_no_partial_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let invalid_architecture = root.path().join("invalid-architecture");
+        assert!(init_dll_plugin(&InitDllPluginOptions {
+            destination: &invalid_architecture,
+            plugin_id: "reader",
+            service_id: "reader",
+            display_name: "Reader",
+            architecture: "arm64",
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("x86 or x64"));
+        assert!(!invalid_architecture.exists());
+
+        let invalid_plugin = root.path().join("invalid-plugin");
+        assert!(init_dll_plugin(&InitDllPluginOptions {
+            destination: &invalid_plugin,
+            plugin_id: "../reader",
+            service_id: "reader",
+            display_name: "Reader",
+            architecture: "x86",
+        })
+        .is_err());
+        assert!(!invalid_plugin.exists());
+    }
+
+    #[test]
+    fn typed_client_cannot_be_written_into_the_signed_source() {
+        let root = tempfile::tempdir().unwrap();
+        let source = source(root.path());
+        let error = generate_client(&GenerateClientOptions {
+            source: &source,
+            plugin_id: "reader",
+            display_name: None,
+            output: &source.join("generated-client.ts"),
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("outside the signed plugin source"));
+        assert!(!source.join("generated-client.ts").exists());
     }
 
     #[test]
