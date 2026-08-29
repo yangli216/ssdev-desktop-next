@@ -12,14 +12,17 @@ import {
   CURRENT_BRIDGE_PROTOCOL_VERSION,
   CURRENT_PROTOCOL_VERSION,
   DesktopBridgeUnavailableError,
+  InvalidPluginFixtureError,
   InvalidDesktopDeclarationError,
   PLUGIN_INVOCATION_CONTROL_CODES,
   UnsupportedDesktopProtocolError,
   TRACKED_INVOCATION_METHODS,
   TrackedInvocationsUnavailableError,
+  UnexpectedPluginInvocationError,
   canRetryPluginInvocationWithBackoff,
   classifyPluginInvocationResponse,
   connectDesktop,
+  createPluginFixtureInvoker,
   createPluginOperationId,
   getTrackedInvocationCapabilities,
   isDesktopBridgeAvailable,
@@ -177,6 +180,97 @@ test('keeps tracked invocations additive for older desktop clients', () => {
 test('creates canonical random operation IDs when tracked calls are available', () => {
   const operationId = createPluginOperationId()
   assert.match(operationId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+})
+
+test('fixture invoker matches exact routes and canonical JSON parameters', async () => {
+  const invoker = createPluginFixtureInvoker([
+    {
+      serviceId: 'card.reader',
+      method: 'readCard',
+      parameters: { options: { retries: 1, audible: true }, timeout: 30 },
+      response: {
+        ResCode: 0,
+        ResData: { ReturnValue: 0, cardNumber: 'TEST-001' },
+      },
+    },
+    {
+      serviceId: 'card.reader',
+      method: 'status',
+      response: { ResCode: 0, ResData: { ReturnValue: 1 } },
+    },
+  ])
+
+  assert.equal(Object.isFrozen(invoker), true)
+  assert.equal(globalThis.ssdevDesktop, undefined)
+  const first = await invoker.invokePlugin('card.reader', 'readCard', {
+    timeout: 30,
+    options: { audible: true, retries: 1 },
+  })
+  assert.deepEqual(first, {
+    ResCode: 0,
+    ResData: { ReturnValue: 0, cardNumber: 'TEST-001' },
+  })
+  first.ResData.cardNumber = 'mutated-by-test'
+  assert.deepEqual(
+    await invoker.invokePlugin('card.reader', 'readCard', {
+      options: { retries: 1, audible: true },
+      timeout: 30,
+    }),
+    {
+      ResCode: 0,
+      ResData: { ReturnValue: 0, cardNumber: 'TEST-001' },
+    },
+  )
+  assert.deepEqual(
+    await invoker.invokePlugin('card.reader', 'status'),
+    { ResCode: 0, ResData: { ReturnValue: 1 } },
+  )
+})
+
+test('fixture invoker rejects ambiguous definitions and unexpected calls without logging parameters', async () => {
+  const duplicate = {
+    serviceId: 'card.reader',
+    method: 'readCard',
+    parameters: { token: 'fixture-secret' },
+    response: { ResCode: 0, ResData: null },
+  }
+  assert.throws(
+    () => createPluginFixtureInvoker([duplicate, structuredClone(duplicate)]),
+    (error) => error instanceof InvalidPluginFixtureError
+      && error.reason === 'duplicate-invocation'
+      && error.fixtureIndex === 1,
+  )
+  assert.throws(
+    () => createPluginFixtureInvoker([{
+      serviceId: 'card.reader',
+      method: 'readCard',
+      response: { ResCode: 0, ResData: null, debug: true },
+    }]),
+    (error) => error instanceof InvalidPluginFixtureError
+      && error.reason === 'invalid-response',
+  )
+
+  const cyclicParameters = {}
+  cyclicParameters.self = cyclicParameters
+  assert.throws(
+    () => createPluginFixtureInvoker([{
+      serviceId: 'card.reader',
+      method: 'readCard',
+      parameters: cyclicParameters,
+      response: { ResCode: 0, ResData: null },
+    }]),
+    (error) => error instanceof InvalidPluginFixtureError
+      && error.reason === 'invalid-parameters',
+  )
+
+  const invoker = createPluginFixtureInvoker([duplicate])
+  await assert.rejects(
+    invoker.invokePlugin('card.reader', 'readCard', { token: 'different-secret' }),
+    (error) => error instanceof UnexpectedPluginInvocationError
+      && error.serviceId === 'card.reader'
+      && error.method === 'readCard'
+      && !error.message.includes('different-secret'),
+  )
 })
 
 test('fails explicitly outside an authorized desktop window', () => {

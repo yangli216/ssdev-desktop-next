@@ -75,7 +75,7 @@ cargo run --locked -p ssdev-plugin-tool -- client `
 
 命令先使用运行时同源规则完整校验 `api.json`，再生成输入类型、`ReturnValue`、输出参数、COM 属性和固定的 service/method 路由。未提供 `--display-name` 时优先使用已有 `plugin.json` 的名称，否则使用插件 ID。输出必须是尚不存在的文件，并且必须位于待签名插件源目录之外，避免把业务 TypeScript 意外放入原生插件签名载荷。
 
-控制台本地映射工作台的“TS”按钮也调用同一个共享生成器，因此现场映射转成正式插件后不会产生另一套方法命名规则。生成文件依赖 `@bsoft/ssdev-web-bridge` 的公开 `PluginInvoker`，业务项目应把它作为受控代码制品提交并随 `api.json` 变更一起评审。
+控制台本地映射工作台的“TS”按钮也调用同一个共享生成器，因此现场映射转成正式插件后不会产生另一套方法命名规则。生成文件依赖 `@bsoft/ssdev-web-bridge` 的公开 `PluginInvoker`，业务项目应把它作为受控代码制品提交并随 `api.json` 变更一起评审。业务前端单元测试可向生成客户端注入 SDK 的 `createPluginFixtureInvoker`；它严格匹配公开路由和完整 JSON 参数并隔离每次响应，但不会伪造桌面全局对象、持久调用或原生硬件语义，正式发布仍必须通过下方黄金矩阵。
 
 ## 1. 准备发布目录
 

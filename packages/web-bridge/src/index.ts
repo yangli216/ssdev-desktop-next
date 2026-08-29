@@ -102,6 +102,125 @@ export interface PluginInvoker {
   ): Promise<InvokeResponse<T>>
 }
 
+export interface PluginInvocationFixture<T = JsonValue> {
+  serviceId: string
+  method: string
+  parameters?: JsonObject
+  response: InvokeResponse<T>
+}
+
+export type InvalidPluginFixtureReason =
+  | 'fixtures-not-array'
+  | 'too-many-fixtures'
+  | 'invalid-fixture'
+  | 'invalid-route'
+  | 'invalid-parameters'
+  | 'invalid-response'
+  | 'duplicate-invocation'
+
+export class InvalidPluginFixtureError extends Error {
+  override readonly name = 'InvalidPluginFixtureError'
+  readonly reason: InvalidPluginFixtureReason
+  readonly fixtureIndex: number | null
+
+  constructor(reason: InvalidPluginFixtureReason, fixtureIndex: number | null = null) {
+    super(fixtureIndex === null
+      ? `SSDEV plugin fixtures are invalid (${reason})`
+      : `SSDEV plugin fixture ${fixtureIndex} is invalid (${reason})`)
+    this.reason = reason
+    this.fixtureIndex = fixtureIndex
+  }
+}
+
+export class UnexpectedPluginInvocationError extends Error {
+  override readonly name = 'UnexpectedPluginInvocationError'
+  readonly serviceId: string
+  readonly method: string
+
+  constructor(serviceId: string, method: string) {
+    super(`No SSDEV plugin fixture matches route [${serviceId}/${method}] and the supplied parameters`)
+    this.serviceId = serviceId
+    this.method = method
+  }
+}
+
+const MAX_PLUGIN_FIXTURES = 1024
+const MAX_FIXTURE_ROUTE_LENGTH = 256
+const MAX_FIXTURE_JSON_DEPTH = 64
+
+/**
+ * Creates a deterministic PluginInvoker for business-frontend unit tests.
+ * It never installs a global desktop bridge and intentionally does not model
+ * tracked invocations, timing, retries, or native hardware side effects.
+ */
+export function createPluginFixtureInvoker(
+  fixtures: readonly PluginInvocationFixture[],
+): PluginInvoker {
+  if (!Array.isArray(fixtures)) {
+    throw new InvalidPluginFixtureError('fixtures-not-array')
+  }
+  if (fixtures.length > MAX_PLUGIN_FIXTURES) {
+    throw new InvalidPluginFixtureError('too-many-fixtures')
+  }
+
+  const responses = new Map<string, string>()
+  for (const [index, fixture] of fixtures.entries()) {
+    if (!isRecord(fixture) || !hasOnlyFixtureFields(fixture)) {
+      throw new InvalidPluginFixtureError('invalid-fixture', index)
+    }
+    if (!isFixtureRoute(fixture.serviceId) || !isFixtureRoute(fixture.method)) {
+      throw new InvalidPluginFixtureError('invalid-route', index)
+    }
+    const parameters = fixture.parameters ?? {}
+    if (!isRecord(parameters)) {
+      throw new InvalidPluginFixtureError('invalid-parameters', index)
+    }
+    let parameterJson: string
+    try {
+      parameterJson = canonicalFixtureJson(parameters)
+    } catch {
+      throw new InvalidPluginFixtureError('invalid-parameters', index)
+    }
+    if (!isFixtureResponse(fixture.response)) {
+      throw new InvalidPluginFixtureError('invalid-response', index)
+    }
+    let responseJson: string
+    try {
+      responseJson = canonicalFixtureJson(fixture.response)
+    } catch {
+      throw new InvalidPluginFixtureError('invalid-response', index)
+    }
+    const key = fixtureInvocationKey(fixture.serviceId, fixture.method, parameterJson)
+    if (responses.has(key)) {
+      throw new InvalidPluginFixtureError('duplicate-invocation', index)
+    }
+    responses.set(key, responseJson)
+  }
+
+  return Object.freeze({
+    async invokePlugin<T = JsonValue>(
+      serviceId: string,
+      method: string,
+      parameters: JsonObject = {},
+    ): Promise<InvokeResponse<T>> {
+      let parameterJson: string
+      try {
+        if (!isFixtureRoute(serviceId) || !isFixtureRoute(method) || !isRecord(parameters)) {
+          throw new Error('invalid invocation')
+        }
+        parameterJson = canonicalFixtureJson(parameters)
+      } catch {
+        throw new UnexpectedPluginInvocationError(serviceId, method)
+      }
+      const responseJson = responses.get(fixtureInvocationKey(serviceId, method, parameterJson))
+      if (responseJson === undefined) {
+        throw new UnexpectedPluginInvocationError(serviceId, method)
+      }
+      return JSON.parse(responseJson) as InvokeResponse<T>
+    },
+  })
+}
+
 export type TrackedInvocationStatus<T = JsonValue> =
   | { state: 'unknown' }
   | { state: 'pending' }
@@ -379,6 +498,90 @@ const TRACKED_INVOCATION_LIMIT_FIELDS = [
 
 function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function hasOnlyFixtureFields(value: UnknownRecord): boolean {
+  return Object.keys(value).every((key) => (
+    key === 'serviceId'
+    || key === 'method'
+    || key === 'parameters'
+    || key === 'response'
+  ))
+    && Object.hasOwn(value, 'serviceId')
+    && Object.hasOwn(value, 'method')
+    && Object.hasOwn(value, 'response')
+}
+
+function isFixtureRoute(value: unknown): value is string {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= MAX_FIXTURE_ROUTE_LENGTH
+    && value.trim() === value
+    && ![...value].some((character) => {
+      const code = character.charCodeAt(0)
+      return code <= 0x1f || code === 0x7f
+    })
+}
+
+function isFixtureResponse(value: unknown): value is InvokeResponse {
+  if (!isRecord(value)) return false
+  const keys = Object.keys(value).sort()
+  return keys.length === 2
+    && keys[0] === 'ResCode'
+    && keys[1] === 'ResData'
+    && Number.isSafeInteger(value.ResCode)
+}
+
+function fixtureInvocationKey(serviceId: string, method: string, parameterJson: string): string {
+  return JSON.stringify([serviceId, method, parameterJson])
+}
+
+function canonicalFixtureJson(
+  value: unknown,
+  depth = 0,
+  ancestors = new Set<object>(),
+): string {
+  if (depth > MAX_FIXTURE_JSON_DEPTH) {
+    throw new Error('fixture JSON is too deeply nested')
+  }
+  if (value === null) return 'null'
+  switch (typeof value) {
+    case 'string':
+    case 'boolean':
+      return JSON.stringify(value)
+    case 'number':
+      if (!Number.isFinite(value)) throw new Error('fixture JSON number is not finite')
+      return JSON.stringify(value)
+    case 'object': {
+      if (ancestors.has(value)) throw new Error('fixture JSON is cyclic')
+      ancestors.add(value)
+      try {
+        if (Array.isArray(value)) {
+          const entries = []
+          for (let index = 0; index < value.length; index += 1) {
+            if (!Object.hasOwn(value, index)) {
+              throw new Error('fixture JSON array is sparse')
+            }
+            entries.push(canonicalFixtureJson(value[index], depth + 1, ancestors))
+          }
+          return `[${entries.join(',')}]`
+        }
+        const prototype = Object.getPrototypeOf(value)
+        if (prototype !== Object.prototype && prototype !== null) {
+          throw new Error('fixture JSON object is not plain')
+        }
+        const record = value as UnknownRecord
+        return `{${Object.keys(record)
+          .sort()
+          .map((key) => `${JSON.stringify(key)}:${canonicalFixtureJson(record[key], depth + 1, ancestors)}`)
+          .join(',')}}`
+      } finally {
+        ancestors.delete(value)
+      }
+    }
+    default:
+      throw new Error('fixture value is not JSON')
+  }
 }
 
 function isBoundedIdentifier(value: unknown, maximumLength: number): value is string {

@@ -11,6 +11,26 @@ const result = await bridge.invokePlugin('card.reader', 'readCard', {
 })
 ```
 
+业务前端单元测试不需要伪造完整桌面对象。生成的插件客户端只依赖最小 `PluginInvoker`，可以注入 SDK 提供的严格 fixture invoker：
+
+```ts
+import { createPluginFixtureInvoker } from '@bsoft/ssdev-web-bridge'
+import { ReaderPluginClient } from './generated/reader-plugin-client'
+
+const invoker = createPluginFixtureInvoker([{
+  serviceId: 'card.reader',
+  method: 'readCard',
+  parameters: { timeout: 30 },
+  response: {
+    ResCode: 0,
+    ResData: { ReturnValue: 0, cardNumber: 'TEST-001' },
+  },
+}])
+const reader = new ReaderPluginClient(invoker)
+```
+
+fixture 按 service、method 和完整 JSON 参数精确匹配，对象键顺序不影响结果；省略参数与 `{}` 等价。重复定义、非 JSON 数据和未声明调用都会显式失败，错误不复制参数内容；每次调用返回独立副本，测试代码修改结果不会污染下一用例。该工具不会写入 `window.ssdevDesktop`，也不模拟持久操作 ID、超时、重试、DLL/COM 行为或硬件副作用，只用于业务前端单元测试，不能替代 Windows 插件黄金矩阵。
+
 `connectDesktop()` 会先读取并运行时校验最小系统声明，再检查协议版本。页面不在授权桌面窗口中时抛出 `DesktopBridgeUnavailableError`；系统声明损坏或与当前能力 schema 自相矛盾时抛出带稳定 `reason` 的 `InvalidDesktopDeclarationError`；协议不兼容时抛出 `UnsupportedDesktopProtocolError`。业务代码应显示客户端升级或修复提示，不要把这些错误静默切换到 HTTP。
 
 能力 schema 与桥接协议独立演进。SDK 对当前 schema 严格检查布尔状态、错误码和全部容量边界；遇到更高的未知 schema 时保留并冻结原声明，但 `getTrackedInvocationCapabilities()` 返回 `null`，不会仅因可选 JavaScript 方法存在就误报持久调用可用。升级 SDK 后才能使用新 schema 的能力。
