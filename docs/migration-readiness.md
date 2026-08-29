@@ -50,7 +50,7 @@
    同一受控签名流程还需生成精确的业务 origin/service/method、SSO 导航与外链来源策略；旧 HTTP 业务站点必须经过风险确认后单独放行。
 2. 提供当前生产插件目录及代表性脱敏请求/响应；先运行迁移审计，再通过 `ssdev-plugin-tool` 建立隔离暂存、签名请求、确定性包和覆盖全部 service/method 的黄金矩阵草稿。替换占位符、清除 `draft` 标记后完成实机回归。
 3. 在真实 Windows x64 设备上执行 `scripts/test-windows.ps1`，同时覆盖实际 32 位 DLL、已注册 OCX、硬件驱动和院内证书环境。
-4. 提供业务前端构建产物，并在代表性账号、设备和关键流程中导出 HAR；使用 `ssdev-migration-audit --browser-assets ... --browser-har ...` 确认普通 Chrome/Edge 是否仍直连 `7711` 或 `45121`。只有 HAR 确认且调用方无法同步迁移时，才交付默认关闭、带会话挑战的独立 HTTP 兼容 adapter；Tauri 内部不依赖它。
+4. 提供业务前端构建产物，并在代表性账号、设备和关键流程中导出 HAR；使用 `ssdev-migration-audit --browser-assets ... --browser-har ...` 确认普通 Chrome/Edge 是否仍直连 `7711` 或 `45121`。HAR 中缺失、相对或损坏的 `request.url` 不计入已扫描请求，并以 `browser-har-scan-incomplete` warning 阻断生产判定，不能用一个有效请求掩盖其余无效条目。只有 HAR 确认且调用方无法同步迁移时，才交付默认关闭、带会话挑战的独立 HTTP 兼容 adapter；Tauri 内部不依赖它。
 5. 确认旧 `/desktop/notice`、`/desktop/cache` 是否仍有外部进程调用。浏览器调用纳入上述 HAR 门禁；非浏览器调用优先改为经过身份校验的命名管道，仅在调用方无法改造时保留受限 HTTP adapter。
 6. 提供仍在用的 `processes` 和 `keymap.json` 样例，并先运行 `ssdev-migration-audit`，用于生成生产签名进程策略和声明式动作映射；旧版 Shell 启动与 `eval(snippet)` 不迁移。
 7. 在 Windows 构建机提供代码签名证书或 HSM/KMS 签名命令，以及独立的 Tauri 更新签名私钥；CI 已覆盖合成版本升级/配置保留/启动/卸载，仍需用真实上一生产版本重复升级门禁并演练失败回滚。两类私钥均不得进入仓库。

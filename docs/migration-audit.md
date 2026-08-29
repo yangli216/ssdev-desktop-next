@@ -31,6 +31,7 @@ cargo run --locked -p ssdev-migration-audit -- \
 
 - 单个 JSON 输入最多 4 MiB。
 - 单个 HAR 最多 64 MiB、100,000 个请求；浏览器文本资源单文件最多 4 MiB、总计最多 128 MiB 和 20,000 个文件。
+- HAR 的 `harRequestsScanned` 只统计 `log.entries` 中带可解析绝对 `request.url` 的条目；缺少 URL、相对 URL 或损坏 URL 计入 `harRequestsSkipped`，并产生 `browser-har-scan-incomplete` warning。有效的 `data:` 等非网络绝对 URL 可以完整计数但不会被误判为 HTTP 依赖。
 - 浏览器资源扫描不跟随符号链接，只读取常见 HTML、JavaScript、TypeScript、Vue、JSON 和 CSS 文本文件。
 - 不调用 DLL、COM、OCX、EXE 或 BAT；PE 架构仅通过读取文件头判断。
 - 不执行 `installRun`，不解释或执行快捷键脚本。
@@ -51,3 +52,4 @@ cargo run --locked -p ssdev-migration-audit -- \
 - `legacy-browser-*-static-reference`：资源中仍有静态引用，但尚不能证明代码路径实际执行。先定位和迁移，再用 HAR 验证。
 - `legacy-browser-*-not-observed`：当前样本未发现依赖，不代表依赖不存在；必须覆盖代表性账号、设备和关键流程后才能关闭兼容评审项。
 - `browser-assets-not-supplied` / `browser-har-not-supplied`：静态资源和运行时 HAR 是互补证据，缺少任一类都会保留警告；只有其中一种输入时不能关闭 HTTP 兼容评审项。
+- `browser-har-scan-incomplete`：至少一个 HAR 条目缺少可安全分类的绝对请求 URL；重新从 Chrome/Edge DevTools 导出完整 HAR。跳过项不会冒充已覆盖请求，warning 未清零时生产 Go/No-Go 必须保持 `NO-GO`。

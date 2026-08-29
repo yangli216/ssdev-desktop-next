@@ -57,6 +57,7 @@ pub struct BrowserCompatibilityAudit {
     pub asset_bytes_scanned: u64,
     pub har_files: usize,
     pub har_requests_scanned: usize,
+    pub har_requests_skipped: usize,
     pub webplus_static_reference_files: usize,
     pub webplus_runtime_requests: usize,
     pub desktop_callback_static_reference_files: usize,
@@ -290,6 +291,7 @@ fn audit_browser_har(
     audit: &mut BrowserCompatibilityAudit,
     findings: &mut Vec<Finding>,
 ) {
+    let skipped_before = audit.har_requests_skipped;
     let document = match read_json_with_limit(path, MAX_HAR_BYTES) {
         Ok(document) => document,
         Err(error) => {
@@ -334,10 +336,14 @@ fn audit_browser_har(
             .and_then(|request| request.get("url"))
             .and_then(Value::as_str)
         else {
+            audit.har_requests_skipped += 1;
+            continue;
+        };
+        let Some(runtime) = classify_runtime_url(request_url) else {
+            audit.har_requests_skipped += 1;
             continue;
         };
         audit.har_requests_scanned += 1;
-        let runtime = classify_runtime_url(request_url);
         if runtime.iter().any(is_webplus_capability) {
             audit.webplus_runtime_requests += 1;
         }
@@ -345,6 +351,18 @@ fn audit_browser_har(
             audit.desktop_callback_runtime_requests += 1;
         }
         add_evidence_counts(&mut audit.evidence_counts, runtime);
+    }
+    if audit.har_requests_skipped > skipped_before {
+        findings.push(Finding {
+            severity: Severity::Warning,
+            code: "browser-har-scan-incomplete",
+            source: path.to_path_buf(),
+            message: format!(
+                "浏览器 HAR 跳过了 {} 个缺少绝对请求 URL 或 URL 无效的条目；报告不会输出 URL 或请求内容",
+                audit.har_requests_skipped - skipped_before
+            ),
+            remediation: "重新从 Chrome/Edge DevTools 导出完整 HAR，确保每个 log.entries 条目都包含可解析的绝对 request.url",
+        });
     }
 }
 
@@ -513,16 +531,17 @@ fn classify_static_browser_text(text: &str) -> BTreeSet<&'static str> {
     capabilities
 }
 
-fn classify_runtime_url(value: &str) -> BTreeSet<&'static str> {
+fn classify_runtime_url(value: &str) -> Option<BTreeSet<&'static str>> {
     let Ok(url) = url::Url::parse(value) else {
-        return BTreeSet::new();
+        return None;
     };
-    let Some(host) = url.host_str() else {
-        return BTreeSet::new();
-    };
+    if !matches!(url.scheme(), "http" | "https" | "ws" | "wss") {
+        return Some(BTreeSet::new());
+    }
+    let host = url.host_str()?;
     let loopback = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1";
     if !loopback {
-        return BTreeSet::new();
+        return Some(BTreeSet::new());
     }
     let path = url.path().to_ascii_lowercase();
     let mut capabilities = endpoint_capabilities(&path);
@@ -534,7 +553,7 @@ fn classify_runtime_url(value: &str) -> BTreeSet<&'static str> {
     {
         capabilities.insert("desktop-callback-local-origin");
     }
-    capabilities
+    Some(capabilities)
 }
 
 fn endpoint_capabilities(value: &str) -> BTreeSet<&'static str> {
@@ -1039,6 +1058,7 @@ mod tests {
             EvidenceLevel::ConfirmedRuntime
         );
         assert_eq!(report.browser_compatibility.har_requests_scanned, 3);
+        assert_eq!(report.browser_compatibility.har_requests_skipped, 0);
         assert_eq!(report.browser_compatibility.webplus_runtime_requests, 1);
         assert_eq!(
             report
@@ -1130,6 +1150,38 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.code == "browser-assets-not-supplied"));
+    }
+
+    #[test]
+    fn malformed_har_entries_are_not_counted_as_covered_requests() {
+        let directory = tempdir().unwrap();
+        let har = directory.path().join("incomplete.har");
+        fs::write(
+            &har,
+            r#"{"log":{"entries":[
+                {"request":{"url":"https://business.example/health"}},
+                {"request":{"url":"data:text/plain,local"}},
+                {"request":{}},
+                {"request":{"url":"/relative/request"}},
+                {"request":{"url":"not a url patient-secret"}}
+            ]}}"#,
+        )
+        .unwrap();
+
+        let report = audit(&AuditInputs {
+            browser_hars: vec![har],
+            ..AuditInputs::default()
+        });
+
+        assert_eq!(report.browser_compatibility.har_requests_scanned, 2);
+        assert_eq!(report.browser_compatibility.har_requests_skipped, 3);
+        assert_eq!(report.summary.browser_har_requests, 2);
+        assert!(report.findings.iter().any(|finding| {
+            finding.code == "browser-har-scan-incomplete" && finding.severity == Severity::Warning
+        }));
+        let output = serde_json::to_string(&report).unwrap();
+        assert!(!output.contains("patient-secret"));
+        assert!(!output.contains("business.example"));
     }
 
     #[test]

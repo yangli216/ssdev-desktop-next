@@ -121,7 +121,7 @@ cargo run --locked -p ssdev-migration-audit -- \
   --evidence-environment hospital-a-production-workflows
 ```
 
-工具只读取审计输入；不会加载原生组件、执行 `installRun` 或旧快捷键脚本。正式模式以不覆盖方式写出完整报告和绑定源码提交、报告 SHA-256、覆盖计数及 HTTP 证据级别的精简证据；输出必须在源码工作区之外。省略最后四个正式参数时，报告写到标准输出用于探索。报告不复制源码、请求 URL、查询参数或 HAR 内容。
+工具只读取审计输入；不会加载原生组件、执行 `installRun` 或旧快捷键脚本。正式模式以不覆盖方式写出完整报告和绑定源码提交、报告 SHA-256、覆盖计数及 HTTP 证据级别的精简证据；输出必须在源码工作区之外。省略最后四个正式参数时，报告写到标准输出用于探索。报告不复制源码、请求 URL、查询参数或 HAR 内容。HAR 覆盖只计入带可解析绝对 `request.url` 的条目，缺失、相对或损坏 URL 会单独计为跳过并产生阻断生产判定的 warning。
 
 新插件可用 `ssdev-plugin-tool init` 生成固定 x86/x64 的最小 Rust DLL、清单、矩阵种子和 Web 客户端；DLL 构建或旧插件清理后先用 `source-check` 在不接触密钥的情况下检查文件边界、PE 位数、命名导出和 ABI。已有插件升级再用 `api-check` 对照上一份已验签包，阻止删除路由、增加必填输入或改变输入/响应类型，并把原生绑定变化列为黄金矩阵复核项；随后用 `client` 从同一份已校验 `api.json` 生成类型化 Web Bridge 客户端。SDK 的严格 fixture invoker 可把生成客户端直接用于无桌面、无硬件的业务前端单元测试；已脱敏并完成精确复核的正式矩阵还可用 `web-fixtures` 生成同路由测试数组，避免再次手抄。单插件正式交接推荐使用 `web-kit`，把同版本客户端、fixture 及 API/矩阵摘要清单原子写入一个新目录，业务 CI 再用 `web-kit-check` 拒绝文件集或摘要漂移，并用 `web-integration-consumer.mjs` 把精确 kit 与 SDK `.tgz` 放入离线临时项目完成严格编译和全路由运行冒烟，避免两份制品分别正确、组合后不可用；多插件项目通过重复 `--kit` 联合检查身份、公开路由、编译与共享 invoker，不创建额外集合格式。这些前端工具都不模拟持久调用或原生副作用。`prepare` 生成隔离暂存目录、外部 Ed25519 待签材料和不会误触硬件的草稿黄金矩阵；组织签名系统返回签名后，用 `finalize` 验签并制作可复现的 `.ssdev-plugin`。工作台和命令行共用客户端生成器，正式插件与现场映射不会出现两套方法命名。完整命令和信任边界见 [docs/plugin-release.md](docs/plugin-release.md)。
 
