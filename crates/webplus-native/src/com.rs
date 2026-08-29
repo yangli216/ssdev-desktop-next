@@ -1,7 +1,11 @@
 use serde_json::{Map, Value};
 use webplus_plugin_config::{MethodDefinition, ServiceDefinition};
 use webplus_protocol::InvokeResponse;
+#[cfg(windows)]
+use webplus_protocol::NATIVE_RETURN_VALUE_FIELD;
 
+#[cfg(windows)]
+use crate::arguments::insert_result_field;
 use crate::NativeError;
 
 pub(crate) struct ComAdapter {
@@ -114,10 +118,20 @@ mod platform {
             )?;
 
             let mut data = prepared.collect_outputs()?;
-            data.insert("ReturnValue".into(), variant_to_json(&return_value)?);
+            insert_result_field(
+                &mut data,
+                NATIVE_RETURN_VALUE_FIELD,
+                variant_to_json(&return_value)?,
+                "COM return value",
+            )?;
             for property in &method.props {
                 let value = invoke_member(&dispatch, property, DISPATCH_PROPERTYGET, &mut [])?;
-                data.insert(property.clone(), variant_to_json(&value)?);
+                insert_result_field(
+                    &mut data,
+                    property,
+                    variant_to_json(&value)?,
+                    "COM property",
+                )?;
             }
             Ok(InvokeResponse::success(Value::Object(data)))
         }
@@ -230,7 +244,12 @@ mod platform {
         fn collect_outputs(&self) -> Result<Map<String, Value>, NativeError> {
             let mut values = Map::new();
             for output in &self.outputs {
-                values.insert(output.name.clone(), output.value()?);
+                insert_result_field(
+                    &mut values,
+                    &output.name,
+                    output.value()?,
+                    "COM output parameter",
+                )?;
             }
             Ok(values)
         }

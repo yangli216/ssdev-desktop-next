@@ -15,7 +15,7 @@ use webplus_plugin_config::{
 };
 use webplus_protocol::{
     contains_draft_placeholder, InvokeRequest, InvokeResponse, DRAFT_INPUT_PLACEHOLDER,
-    DRAFT_RESPONSE_PLACEHOLDER,
+    DRAFT_RESPONSE_PLACEHOLDER, NATIVE_RETURN_VALUE_FIELD,
 };
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
@@ -1427,7 +1427,8 @@ import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker } from '@bsof
             plan.data_type
         ));
         output.push_str(&format!(
-            "  ReturnValue: {}\n",
+            "  {}: {}\n",
+            NATIVE_RETURN_VALUE_FIELD,
             ts_native_type(&plan.method.return_type)
         ));
         for parameter in plan
@@ -1442,6 +1443,9 @@ import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker } from '@bsof
                 ts_property(name)?,
                 ts_parameter_type(parameter)
             ));
+        }
+        for property in &plan.method.props {
+            output.push_str(&format!("  {}: JsonValue\n", ts_property(property)?));
         }
         output.push_str("}\n\n");
     }
@@ -2286,12 +2290,14 @@ mod tests {
             }))
             .unwrap(),
         );
+        definition.services[0].methods[0].props = vec!["Count".into()];
         let source = generate_typescript(&definition).unwrap();
         assert!(source.contains("from '@bsoft/ssdev-web-bridge'"));
         assert!(source.contains("PluginInvoker"));
         assert!(!source.contains("SsdevDesktopBridge"));
         assert!(source.contains("\"port\": string"));
         assert!(source.contains("\"message\": string"));
+        assert!(source.contains("\"Count\": JsonValue"));
         assert!(source.contains("read(parameters: ReadParameters)"));
         assert!(source.contains("invokePlugin<ReadData>(\"ReaderService\", \"read\", parameters)"));
         assert!(!source.contains("readerService1Read1"));

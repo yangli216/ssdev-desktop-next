@@ -13,7 +13,7 @@ use std::os::windows::process::CommandExt;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use webplus_plugin_config::{MethodDefinition, ServiceDefinition};
-use webplus_protocol::InvokeResponse;
+use webplus_protocol::{InvokeResponse, NATIVE_RETURN_VALUE_FIELD};
 
 use crate::{resolve_component_with_extension, NativeError};
 
@@ -181,7 +181,7 @@ impl ProcessAdapter {
             let (stderr, stderr_truncated) = join_output_reader(stderr_reader, "stderr")?;
             let mut result = Map::new();
             result.insert(
-                "ReturnValue".into(),
+                NATIVE_RETURN_VALUE_FIELD.into(),
                 Value::Number(status.code().unwrap_or(-1).into()),
             );
             result.insert(
@@ -469,7 +469,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.res_code, 0);
-        assert_eq!(response.res_data["ReturnValue"], 0);
+        assert_eq!(response.res_data[NATIVE_RETURN_VALUE_FIELD], 0);
     }
 
     #[cfg(windows)]

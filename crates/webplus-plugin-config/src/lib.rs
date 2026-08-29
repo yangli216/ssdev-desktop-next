@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use webplus_protocol::PluginArchitecture;
+use webplus_protocol::{PluginArchitecture, NATIVE_RETURN_VALUE_FIELD};
 
 pub const API_FILENAME: &str = "api.json";
 pub const PLUGIN_METADATA_FILENAME: &str = "plugin.json";
@@ -19,6 +19,7 @@ const MAX_LOCAL_MAPPING_INTEGRITY_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_SERVICES: usize = 1024;
 const MAX_METHODS_PER_SERVICE: usize = 1024;
 const MAX_PARAMETERS_PER_METHOD: usize = 256;
+const MAX_PROPERTIES_PER_METHOD: usize = 256;
 const MAX_DEPENDENCIES_PER_SERVICE: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -765,6 +766,7 @@ fn validate_service<'a>(
             }
         }
         let mut parameter_names = HashSet::new();
+        let mut response_field_names = HashSet::from([NATIVE_RETURN_VALUE_FIELD]);
         if method.parameters.len() > MAX_PARAMETERS_PER_METHOD {
             return Err(ConfigError::Validation(format!(
                 "method [{}] defines too many parameters",
@@ -781,6 +783,32 @@ fn validate_service<'a>(
                 return Err(ConfigError::Validation(format!(
                     "method [{}] contains an empty or duplicate parameter [{}]",
                     method.name, parameter_name
+                )));
+            }
+            if parameter_name.starts_with('$') && !response_field_names.insert(normalized_name) {
+                return Err(ConfigError::Validation(format!(
+                    "method [{}] output parameter [{}] conflicts with reserved or duplicate ResData field [{}]",
+                    method.name, parameter_name, normalized_name
+                )));
+            }
+        }
+        if method.props.len() > MAX_PROPERTIES_PER_METHOD {
+            return Err(ConfigError::Validation(format!(
+                "method [{}] defines too many COM properties",
+                method.name
+            )));
+        }
+        for property in &method.props {
+            if property.trim().is_empty() || property.chars().count() > 256 {
+                return Err(ConfigError::Validation(format!(
+                    "method [{}] contains an empty or too long COM property",
+                    method.name
+                )));
+            }
+            if !response_field_names.insert(property.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "method [{}] COM property [{}] conflicts with a reserved, output-parameter, or duplicate ResData field",
+                    method.name, property
                 )));
             }
         }
@@ -986,6 +1014,52 @@ mod tests {
 
         let error = PluginManifest::load("escape", root.path()).unwrap_err();
         assert!(matches!(error, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn native_response_fields_cannot_shadow_return_value_or_each_other() {
+        let cases = [
+            (
+                r#"{"serviceId":"reader","mainClass":"reader.dll","methods":[{"name":"read","parameters":["$ReturnValue"]}]}"#,
+                "output parameter [$ReturnValue] conflicts",
+            ),
+            (
+                r#"{"serviceId":"reader","mainClass":"Reader.Dictionary","mainType":"com","methods":[{"name":"read","props":["ReturnValue"]}]}"#,
+                "COM property [ReturnValue] conflicts",
+            ),
+            (
+                r#"{"serviceId":"reader","mainClass":"Reader.Dictionary","mainType":"com","methods":[{"name":"read","parameters":["$Count"],"props":["Count"]}]}"#,
+                "COM property [Count] conflicts",
+            ),
+            (
+                r#"{"serviceId":"reader","mainClass":"Reader.Dictionary","mainType":"com","methods":[{"name":"read","props":["Count","Count"]}]}"#,
+                "COM property [Count] conflicts",
+            ),
+        ];
+
+        for (api, expected) in cases {
+            let root = tempdir().unwrap();
+            fs::write(root.path().join(API_FILENAME), api).unwrap();
+
+            let error = PluginManifest::load("reader", root.path()).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected [{expected}] in [{error}]"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_com_outputs_and_properties_remain_valid() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join(API_FILENAME),
+            r#"{"serviceId":"reader","mainClass":"Reader.Dictionary","mainType":"com","methods":[{"name":"read","parameters":["$Status"],"props":["Count"]}]}"#,
+        )
+        .unwrap();
+
+        let manifest = PluginManifest::load("reader", root.path()).unwrap();
+        assert_eq!(manifest.services[0].methods[0].props, ["Count"]);
     }
 
     #[test]

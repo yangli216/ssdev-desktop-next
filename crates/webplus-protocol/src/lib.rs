@@ -6,6 +6,9 @@ use thiserror::Error;
 /// This is intentionally independent from the public business Web Bridge.
 pub const HOST_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_INVOKE_PARAMETERS_BYTES: usize = 8 * 1024 * 1024;
+/// Stable `ResData` field carrying the native method/process return value.
+/// Plugin output parameters and COM properties must not reuse this name.
+pub const NATIVE_RETURN_VALUE_FIELD: &str = "ReturnValue";
 pub const DRAFT_INPUT_PLACEHOLDER: &str = "<replace-with-redacted-input>";
 pub const DRAFT_RESPONSE_PLACEHOLDER: &str = "<replace-with-redacted-golden-response>";
 /// Rejected before routing because the bounded controller admission capacity is full.
@@ -232,12 +235,12 @@ mod tests {
     #[test]
     fn preserves_legacy_response_field_names() {
         let value = serde_json::to_value(InvokeResponse::success(json!({
-            "ReturnValue": 42
+            (NATIVE_RETURN_VALUE_FIELD): 42
         })))
         .unwrap();
 
         assert_eq!(value["ResCode"], 0);
-        assert_eq!(value["ResData"]["ReturnValue"], 42);
+        assert_eq!(value["ResData"][NATIVE_RETURN_VALUE_FIELD], 42);
         assert!(value.get("res_code").is_none());
     }
 

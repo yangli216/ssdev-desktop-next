@@ -302,8 +302,8 @@ mod platform {
                 convert_return_value(return_word, &method.return_type, &service.charset)?;
             Ok(InvokeResponse::success(result_data(
                 return_value,
-                prepared.collect_outputs(),
-            )))
+                prepared.collect_outputs()?,
+            )?))
         }
 
         fn library_for(

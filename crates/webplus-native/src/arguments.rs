@@ -3,6 +3,7 @@ use serde_json::{Map, Number, Value};
 use webplus_plugin_config::{
     MethodDefinition, ParameterDefinition, ParameterDetail, ServiceDefinition,
 };
+use webplus_protocol::NATIVE_RETURN_VALUE_FIELD;
 
 use crate::NativeError;
 
@@ -48,7 +49,7 @@ impl PreparedArguments {
         Ok(prepared)
     }
 
-    pub fn collect_outputs(&self) -> Map<String, Value> {
+    pub fn collect_outputs(&self) -> Result<Map<String, Value>, NativeError> {
         let mut result = Map::new();
         for output in &self.outputs {
             let value = match &self.allocations[output.allocation_index] {
@@ -61,9 +62,9 @@ impl PreparedArguments {
                 }
                 Allocation::I32(value) => Value::Number(Number::from(**value)),
             };
-            result.insert(output.name.clone(), value);
+            insert_result_field(&mut result, &output.name, value, "output parameter")?;
         }
-        result
+        Ok(result)
     }
 
     fn push(
@@ -247,10 +248,33 @@ impl TextEncoding {
     }
 }
 
-#[cfg(windows)]
-pub(crate) fn result_data(return_value: Value, mut outputs: Map<String, Value>) -> Value {
-    outputs.insert("ReturnValue".into(), return_value);
-    Value::Object(outputs)
+pub(crate) fn insert_result_field(
+    data: &mut Map<String, Value>,
+    name: &str,
+    value: Value,
+    source: &str,
+) -> Result<(), NativeError> {
+    if data.contains_key(name) {
+        return Err(NativeError::InvalidParameter {
+            name: name.into(),
+            message: format!("{source} conflicts with an existing ResData field"),
+        });
+    }
+    data.insert(name.into(), value);
+    Ok(())
+}
+
+pub(crate) fn result_data(
+    return_value: Value,
+    mut outputs: Map<String, Value>,
+) -> Result<Value, NativeError> {
+    insert_result_field(
+        &mut outputs,
+        NATIVE_RETURN_VALUE_FIELD,
+        return_value,
+        "native return value",
+    )?;
+    Ok(Value::Object(outputs))
 }
 
 #[cfg(test)]
@@ -285,7 +309,7 @@ mod tests {
 
         assert_eq!(prepared.words[0], 30);
         assert_ne!(prepared.words[1], 0);
-        assert_eq!(prepared.collect_outputs()["cardNo"], "");
+        assert_eq!(prepared.collect_outputs().unwrap()["cardNo"], "");
     }
 
     #[test]
@@ -302,5 +326,34 @@ mod tests {
         let values = json!({"ratio": 1.5}).as_object().unwrap().clone();
 
         assert!(PreparedArguments::build(&service, &method, &values).is_err());
+    }
+
+    #[test]
+    fn refuses_to_overwrite_native_return_value_at_runtime() {
+        let error = result_data(
+            json!(42),
+            Map::from_iter([(NATIVE_RETURN_VALUE_FIELD.into(), json!("shadow"))]),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NativeError::InvalidParameter { ref name, .. }
+                if name == NATIVE_RETURN_VALUE_FIELD
+        ));
+    }
+
+    #[test]
+    fn refuses_duplicate_dynamic_result_fields_at_runtime() {
+        let mut data = Map::new();
+        insert_result_field(&mut data, "Count", json!(1), "output parameter").unwrap();
+
+        let error = insert_result_field(&mut data, "Count", json!(2), "COM property").unwrap_err();
+
+        assert!(matches!(
+            error,
+            NativeError::InvalidParameter { ref name, .. } if name == "Count"
+        ));
+        assert_eq!(data["Count"], 1);
     }
 }
