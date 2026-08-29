@@ -25,7 +25,7 @@ business webview -> narrow Tauri command -> Rust controller
 
 架构决策和迁移门槛见 [docs/adr/0001-target-architecture.md](docs/adr/0001-target-architecture.md)。
 业务页面从 localhost HTTP 切换到窄桥接接口的方式见 [docs/web-bridge-migration.md](docs/web-bridge-migration.md)。
-业务前端应通过 [packages/web-bridge](packages/web-bridge/README.md) 的类型化协议适配层接入，不直接依赖 Tauri 内部 API。SDK 会运行时校验系统声明并提供稳定错误分类；当前能力 schema 严格验证，未来未知 schema 保留但不会被误判为已经支持。
+业务前端应通过 [packages/web-bridge](packages/web-bridge/README.md) 的类型化协议适配层接入，不直接依赖 Tauri 内部 API。SDK 会运行时校验系统声明并提供稳定错误分类；当前能力 schema 严格验证，未来未知 schema 保留但不会被误判为已经支持。主分支 CI 还会生成并自检固定 `.tgz + 摘要清单` 的平台无关 SDK 制品，业务项目不再需要从源码目录人工打包。
 打印、写卡等非幂等调用的持久操作 ID、防重放和崩溃后对账语义见 [docs/tracked-invocations.md](docs/tracked-invocations.md)。
 插件完整性、公钥信任链以及可崩溃恢复的安装、更新和卸载生命周期见 [docs/plugin-signing.md](docs/plugin-signing.md)。
 无需重新编译客户端的 DLL/COM 可视化配置、热加载、现场调试和本地映射包迁移见 [docs/local-mapping-studio.md](docs/local-mapping-studio.md)。未签名映射包先进行不加载原生代码的结构预检，用户确认信任后才复核状态、启动隔离宿主并原子热加载。

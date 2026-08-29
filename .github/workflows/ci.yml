@@ -72,8 +72,20 @@ jobs:
         run: |
           npm ci --prefix packages/web-bridge
           npm test --prefix packages/web-bridge
+      - name: Build and verify Web Bridge SDK artifact
+        run: |
+          node scripts/web-bridge-package.mjs build --output "${{ runner.temp }}/ssdev-web-bridge-sdk"
+          node scripts/web-bridge-package.mjs verify --directory "${{ runner.temp }}/ssdev-web-bridge-sdk"
       - name: Test release metadata tooling
         run: node --test scripts/test/*.test.mjs
+      - name: Upload verified Web Bridge SDK artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ssdev-web-bridge-sdk
+          path: ${{ runner.temp }}/ssdev-web-bridge-sdk/**
+          if-no-files-found: error
+          retention-days: 14
 
   windows-native:
     name: Windows x86 and x64 native matrix
