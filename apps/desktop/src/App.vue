@@ -182,6 +182,19 @@ type EnvironmentConfig = {
   [key: string]: unknown
 }
 
+type DesktopAction =
+  | 'open-business-window'
+  | 'capture-business-window'
+  | 'capture-region'
+  | 'reset-business-zoom'
+  | 'find-in-business-window'
+
+type KeyBindingConfig = {
+  shortcut: string
+  action: DesktopAction
+  enabled: boolean
+}
+
 type DesktopConfig = {
   website?: string
   environments: EnvironmentConfig[]
@@ -191,6 +204,7 @@ type DesktopConfig = {
   tenantId: string
   processes: string[]
   managedProcesses: string[]
+  keyBindings: KeyBindingConfig[]
   trustedOrigins: string[]
   externalOrigins: string[]
   pluginCatalogUrl?: string
@@ -412,6 +426,14 @@ type PrimaryActionOutcome = {
 
 const ALL_CONTROL_REFRESH_FIELDS: ControlRefreshField[] = ['status', 'config', 'inventory', 'deployment']
 
+const shortcutActions: Array<{ id: DesktopAction; label: string; detail: string }> = [
+  { id: 'open-business-window', label: '打开业务窗口', detail: '创建当前默认业务环境窗口' },
+  { id: 'capture-business-window', label: '截取业务窗口', detail: '截图后发送给当前业务页面' },
+  { id: 'capture-region', label: '框选区域截图', detail: '打开本地遮罩后发送裁剪结果' },
+  { id: 'reset-business-zoom', label: '重置页面缩放', detail: '恢复业务窗口默认缩放比例' },
+  { id: 'find-in-business-window', label: '页面内查找', detail: '在当前业务窗口打开查找' },
+]
+
 const status = ref<BridgeStatus | null>(null)
 const deploymentCheck = ref<DeploymentCheckReport | null>(null)
 const projectBundlePreview = ref<ProjectBundlePreview | null>(null)
@@ -477,6 +499,23 @@ const managedProcessOptions = computed(() => {
     ...catalog.map((entry) => ({ ...entry, unavailable: false })),
     ...unavailable,
   ]
+})
+const shortcutConfigError = computed(() => {
+  const bindings = snapshot.value?.config.keyBindings ?? []
+  if (bindings.length > 32) return '快捷键最多配置 32 项。'
+  const enabled = new Set<string>()
+  for (const binding of bindings) {
+    const shortcut = binding.shortcut.trim()
+    if (!shortcut || shortcut.length > 64 || !/^[\x21-\x7e]+$/.test(shortcut)) {
+      return '每项快捷键必须是 1–64 个可打印 ASCII 字符，且不能包含空格。'
+    }
+    if (binding.enabled) {
+      const normalized = shortcut.toLowerCase()
+      if (enabled.has(normalized)) return `启用的快捷键「${shortcut}」存在重复。`
+      enabled.add(normalized)
+    }
+  }
+  return ''
 })
 const deploymentReadiness = computed(() => {
   if (controlLoadFailed.value) {
@@ -748,6 +787,10 @@ function processPolicyGuidance(code?: string): string {
   return ''
 }
 
+function shortcutActionDetail(action: DesktopAction): string {
+  return shortcutActions.find((candidate) => candidate.id === action)?.detail ?? ''
+}
+
 function requireSavedMapping(action: string): boolean {
   if (!mappingDraftDirty.value) return true
   notice.value = ''
@@ -1011,12 +1054,19 @@ async function discardConfigChanges() {
 
 async function saveConfig() {
   if (!snapshot.value) return
+  if (shortcutConfigError.value) {
+    notice.value = ''
+    error.value = shortcutConfigError.value
+    activeSection.value = 'configuration'
+    return
+  }
   const candidate = cloneConfig(snapshot.value.config)
   let closedSurfaces: BusinessSurfaceCloseResult | undefined
   const outcome = await runPrimaryThenRefresh(
     async () => {
       closedSurfaces = await invoke<BusinessSurfaceCloseResult>('save_desktop_config', { config: candidate })
       savedConfigFingerprint.value = configFingerprint(candidate)
+      savedManagedProcesses.value = [...candidate.managedProcesses]
       configImportPreview.value = null
       selectedConfigImport.value = ''
     },
@@ -1172,6 +1222,19 @@ async function openEnvironment(environment: EnvironmentConfig) {
 
 function addEnvironment() {
   snapshot.value?.config.environments.push({ name: '', url: '' })
+}
+
+function addKeyBinding() {
+  if (!snapshot.value || snapshot.value.config.keyBindings.length >= 32) return
+  snapshot.value.config.keyBindings.push({
+    shortcut: '',
+    action: 'open-business-window',
+    enabled: false,
+  })
+}
+
+function removeKeyBinding(index: number) {
+  snapshot.value?.config.keyBindings.splice(index, 1)
 }
 
 function removeEnvironment(index: number) {
@@ -1770,13 +1833,31 @@ async function exportDeploymentCheck() {
               <p v-else class="managed-process-empty">正在读取签名进程策略…</p>
               <small v-if="managedProcessDraftChanged" class="managed-process-restart-note">当前选择尚未保存；保存后客户端会暂停新业务和原生调用，直到完成重启。</small>
             </fieldset>
+            <fieldset class="shortcut-editor">
+              <legend>声明式快捷键</legend>
+              <div class="shortcut-editor-heading">
+                <p>快捷键只能映射到五种内置动作，不接受脚本、命令行或自定义代码。保存时会先注册完整新集合，失败则恢复原集合。</p>
+                <button type="button" :disabled="busy || snapshot.config.keyBindings.length >= 32" @click="addKeyBinding">新增快捷键</button>
+              </div>
+              <div v-if="snapshot.config.keyBindings.length" class="shortcut-list">
+                <div v-for="(binding, index) in snapshot.config.keyBindings" :key="index" class="shortcut-row">
+                  <label class="shortcut-enabled"><input v-model="binding.enabled" type="checkbox" /><span>{{ binding.enabled ? '启用' : '停用' }}</span></label>
+                  <label><span>组合键</span><input v-model.trim="binding.shortcut" type="text" maxlength="64" placeholder="control+shift+n" /></label>
+                  <label><span>内置动作</span><select v-model="binding.action"><option v-for="action in shortcutActions" :key="action.id" :value="action.id">{{ action.label }}</option></select><small>{{ shortcutActionDetail(binding.action) }}</small></label>
+                  <button type="button" :disabled="busy" aria-label="删除快捷键" @click="removeKeyBinding(index)">删除</button>
+                </div>
+              </div>
+              <p v-else class="shortcut-empty">当前没有声明式快捷键；业务页面仍可通过界面完成对应操作。</p>
+              <p v-if="shortcutConfigError" class="shortcut-error" role="alert">{{ shortcutConfigError }}</p>
+              <small>示例：<code>control+shift+n</code>。实际可用组合键由当前 Windows 和系统占用情况决定。</small>
+            </fieldset>
             <details class="advanced-settings">
               <summary>插件仓库高级配置</summary>
               <label><span>签名插件仓库索引</span><input v-model.trim="snapshot.config.pluginCatalogUrl" type="url" placeholder="https://plugins.example/catalog.json" /></label>
               <label><span>仓库索引签名</span><input v-model.trim="snapshot.config.pluginCatalogSignatureUrl" type="url" placeholder="https://plugins.example/catalog.sig.json" /></label>
             </details>
             <div class="toggles"><label><input v-model="snapshot.config.allowSwitch" type="checkbox" />允许环境切换</label><label><input v-model="snapshot.config.autoClose" type="checkbox" />关闭前确认</label><label><input v-model="snapshot.config.autoStart" type="checkbox" />开机自动启动</label></div>
-            <div class="actions"><button class="primary" type="submit" :disabled="busy || controlStateUnverified || !configDraftDirty">保存配置</button><button v-if="configDraftDirty" type="button" :disabled="busy || controlStateUnverified" @click="discardConfigChanges">放弃更改</button><button type="button" :disabled="busy || controlStateUnverified || managedProcessRestartRequired || configDraftDirty" @click="openBusiness">进入业务系统</button></div>
+            <div class="actions"><button class="primary" type="submit" :disabled="busy || controlStateUnverified || Boolean(shortcutConfigError) || !configDraftDirty">保存配置</button><button v-if="configDraftDirty" type="button" :disabled="busy || controlStateUnverified" @click="discardConfigChanges">放弃更改</button><button type="button" :disabled="busy || controlStateUnverified || managedProcessRestartRequired || configDraftDirty" @click="openBusiness">进入业务系统</button></div>
             <small class="config-path">配置位置：{{ snapshot.path }}</small>
           </form>
         </section>

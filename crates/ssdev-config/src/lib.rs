@@ -145,14 +145,18 @@ impl DesktopConfig {
             ));
         }
         let mut shortcuts = BTreeSet::new();
-        for binding in self.key_bindings.iter().filter(|binding| binding.enabled) {
+        for binding in &self.key_bindings {
             let shortcut = binding.shortcut.trim();
-            if shortcut.is_empty() || shortcut.len() > 64 || !shortcut.is_ascii() {
+            if shortcut.is_empty()
+                || shortcut.len() > 64
+                || !shortcut.bytes().all(|byte| byte.is_ascii_graphic())
+            {
                 return Err(ConfigError::Validation(
-                    "enabled shortcuts must contain 1 to 64 ASCII characters".into(),
+                    "shortcuts must contain 1 to 64 printable ASCII characters without spaces"
+                        .into(),
                 ));
             }
-            if !shortcuts.insert(shortcut.to_ascii_lowercase()) {
+            if binding.enabled && !shortcuts.insert(shortcut.to_ascii_lowercase()) {
                 return Err(ConfigError::Validation(format!(
                     "duplicate desktop shortcut [{}]",
                     binding.shortcut
@@ -849,5 +853,13 @@ mod tests {
             }]
         }));
         assert!(parsed.is_err());
+
+        let mut invalid_disabled = DesktopConfig::default();
+        invalid_disabled.key_bindings.push(KeyBindingConfig {
+            shortcut: "not a shortcut".into(),
+            action: DesktopAction::OpenBusinessWindow,
+            enabled: false,
+        });
+        assert!(invalid_disabled.validate().is_err());
     }
 }

@@ -144,9 +144,9 @@ button:disabled { cursor: wait !important; opacity: .5; }
 .warning { color: #7c4d2b !important; background: #fff2df !important; }
 .operations form { display: grid; gap: 16px; }
 .operations form > label, .form-columns label, .advanced-settings label { display: grid; gap: 7px; color: #4c5d53; font-size: 12px; font-weight: 700; }
-.operations input[type="text"], .operations input[type="url"], .operations textarea { width: 100%; padding: 11px 13px; border: 1px solid #bfc9c1; border-radius: 9px; outline: none; background: #fff; color: #13231c; }
+.operations input[type="text"], .operations input[type="url"], .operations textarea, .operations select { width: 100%; padding: 11px 13px; border: 1px solid #bfc9c1; border-radius: 9px; outline: none; background: #fff; color: #13231c; }
 .operations textarea { min-height: 84px; resize: vertical; }
-.operations input:focus, .operations textarea:focus { border-color: #2f654b; box-shadow: 0 0 0 3px rgba(47,101,75,.12); }
+.operations input:focus, .operations textarea:focus, .operations select:focus { border-color: #2f654b; box-shadow: 0 0 0 3px rgba(47,101,75,.12); }
 .form-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .environments { display: grid; gap: 10px; margin: 0; padding: 16px; border: 1px solid #c8d1c9; border-radius: 10px; }
 .environments legend { padding: 0 6px; color: #4c5d53; font-size: 12px; font-weight: 700; }
@@ -168,6 +168,19 @@ button:disabled { cursor: wait !important; opacity: .5; }
 .managed-process-policy-warning { padding: 9px 11px; border-radius: 8px; color: #774627 !important; background: #fff0dc; }
 .managed-process-restart-note { color: #8a4d2d; font-weight: 700; }
 .managed-process-empty { padding: 10px 12px; border-radius: 8px; background: #f0f3ee; }
+.shortcut-editor { display: grid; gap: 11px; margin: 0; padding: 16px; border: 1px solid #c8d1c9; border-radius: 10px; background: #fbfcf9; }
+.shortcut-editor legend { padding: 0 6px; color: #4c5d53; font-size: 12px; font-weight: 700; }
+.shortcut-editor-heading { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; }
+.shortcut-editor-heading p, .shortcut-editor > small { margin: 0; color: #718078; font-size: 11px; line-height: 1.55; }
+.shortcut-editor-heading button, .shortcut-row > button { flex: 0 0 auto; padding: 8px 10px; border: 1px solid #9eaaa2; border-radius: 8px; background: transparent; color: #274735; cursor: pointer; }
+.shortcut-list { display: grid; gap: 8px; }
+.shortcut-row { display: grid; grid-template-columns: auto minmax(130px, .9fr) minmax(190px, 1.2fr) auto; gap: 8px; align-items: center; padding: 11px; border: 1px solid #d2d9d2; border-radius: 9px; background: #fff; }
+.shortcut-row > label:not(.shortcut-enabled) { display: grid; gap: 5px; min-width: 0; color: #536158; font-size: 10px; font-weight: 700; }
+.shortcut-row label small { overflow: hidden; color: #7a857d; font-size: 9px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.shortcut-enabled { display: grid; gap: 3px; justify-items: center; color: #647168; font-size: 9px; }
+.shortcut-error { margin: 0; padding: 9px 11px; border-radius: 8px; color: #8a3f2c; background: #fff0ea; font-size: 11px; }
+.shortcut-empty { margin: 0; padding: 10px 12px; border-radius: 8px; color: #718078; background: #f0f3ee; font-size: 11px; }
+.shortcut-editor code { color: #365a47; }
 .advanced-settings { display: grid; gap: 13px; padding: 14px 16px; border: 1px solid #d5dcd5; border-radius: 10px; background: #f8faf6; }
 .advanced-settings summary { color: #43564b; font-size: 12px; font-weight: 750; cursor: pointer; }
 .advanced-settings[open] summary { margin-bottom: 3px; }
@@ -354,6 +367,9 @@ button:disabled { cursor: wait !important; opacity: .5; }
   .attention-panel, .boundary { grid-template-columns: 1fr; gap: 24px; }
   .form-columns { grid-template-columns: 1fr; }
   .managed-process-options { grid-template-columns: 1fr; }
+  .shortcut-editor-heading { flex-direction: column; }
+  .shortcut-row { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .shortcut-row > label:nth-child(3) { grid-column: 2 / -1; }
   .config-import-preview > header { align-items: flex-start; flex-direction: column; }
   .business-data-clear-preview > header { align-items: flex-start; flex-direction: column; }
   .plugin-package-preview > header { align-items: flex-start; flex-direction: column; }
