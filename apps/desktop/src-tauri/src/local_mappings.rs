@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 use tempfile::{Builder as TempBuilder, NamedTempFile, TempDir};
 use uuid::Uuid;
 use webplus_plugin_config::{
-    ParameterDefinition, PluginManifest, PluginMetadata, ServiceDefinition, API_FILENAME,
-    PLUGIN_METADATA_FILENAME,
+    build_local_mapping_integrity, ParameterDefinition, PluginManifest, PluginMetadata,
+    ServiceDefinition, API_FILENAME, LOCAL_MAPPING_INTEGRITY_FILENAME, PLUGIN_METADATA_FILENAME,
 };
 use webplus_protocol::{
     contains_draft_placeholder, InvokeRequest, InvokeResponse, DRAFT_INPUT_PLACEHOLDER,
@@ -20,6 +20,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
 const LOCAL_MAPPING_FILENAME: &str = "local-mapping.json";
+const LOCAL_MAPPING_SCHEMA_VERSION: u8 = 2;
 const MAX_COMPONENT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXPORTS: usize = 4096;
 const MAX_PE_INSPECTION_BYTES: u64 = 512 * 1024 * 1024;
@@ -485,6 +486,7 @@ pub(crate) fn prepare(
     mut definition: LocalMappingDefinition,
 ) -> Result<PreparedLocalMapping, String> {
     validate_definition_header(&definition)?;
+    definition.schema_version = LOCAL_MAPPING_SCHEMA_VERSION;
     fs::create_dir_all(root).map_err(|error| format!("无法创建本地映射目录: {error}"))?;
     let staging = TempBuilder::new()
         .prefix(".mapping-stage-")
@@ -527,6 +529,12 @@ pub(crate) fn prepare(
     write_json(staging.path().join(API_FILENAME), &definition.services)?;
     write_json(staging.path().join(PLUGIN_METADATA_FILENAME), &metadata)?;
     write_json(staging.path().join(LOCAL_MAPPING_FILENAME), &definition)?;
+    let integrity = build_local_mapping_integrity(staging.path(), &definition.services)
+        .map_err(|error| error.to_string())?;
+    write_bytes(
+        staging.path().join(LOCAL_MAPPING_INTEGRITY_FILENAME),
+        &integrity,
+    )?;
     let manifest = PluginManifest::load(&definition.plugin_id, staging.path())
         .map_err(|error| error.to_string())?;
     Ok(PreparedLocalMapping {
@@ -658,11 +666,24 @@ pub(crate) fn prepare_import(root: &Path, source: &Path) -> Result<PreparedLocal
         .tempdir_in(root)
         .map_err(|error| format!("无法创建映射导入暂存目录: {error}"))?;
     extract_bundle(source, staging.path())?;
-    let definition = load_stored_definition(staging.path())?;
+    let mut definition = load_stored_definition(staging.path())?;
     validate_definition_header(&definition)?;
-    let manifest = PluginManifest::load(&definition.plugin_id, staging.path())
+    let mut manifest = PluginManifest::load(&definition.plugin_id, staging.path())
         .map_err(|error| error.to_string())?;
     validate_stored_manifest(&manifest, &definition)?;
+    if definition.schema_version == 1 {
+        definition.schema_version = LOCAL_MAPPING_SCHEMA_VERSION;
+        let integrity = build_local_mapping_integrity(staging.path(), &definition.services)
+            .map_err(|error| error.to_string())?;
+        write_bytes_atomic(
+            staging.path().join(LOCAL_MAPPING_INTEGRITY_FILENAME),
+            &integrity,
+        )?;
+        write_json_atomic(staging.path().join(LOCAL_MAPPING_FILENAME), &definition)?;
+        manifest = PluginManifest::load(&definition.plugin_id, staging.path())
+            .map_err(|error| error.to_string())?;
+        validate_stored_manifest(&manifest, &definition)?;
+    }
     Ok(PreparedLocalMapping {
         staging,
         definition,
@@ -1033,7 +1054,71 @@ fn write_json_noclobber(path: &Path, value: &impl Serialize) -> Result<(), Strin
 pub(crate) fn validate_installed_manifest(manifest: &PluginManifest) -> Result<(), String> {
     let definition = load_stored_definition(&manifest.plugin_dir)?;
     validate_definition_header(&definition)?;
+    if definition.schema_version != LOCAL_MAPPING_SCHEMA_VERSION
+        || manifest.local_mapping_integrity_sha256.is_none()
+    {
+        return Err("本地映射尚未建立运行时完整性清单".into());
+    }
     validate_stored_manifest(manifest, &definition)
+}
+
+/// One-time upgrade for local mappings created before runtime content pinning.
+/// The integrity file is committed first; schema 2 is only exposed after the
+/// protected bytes are durable, so interrupted upgrades are safe to retry.
+pub(crate) fn migrate_legacy_integrity(root: &Path) -> Result<usize, String> {
+    fs::create_dir_all(root).map_err(|error| format!("无法创建本地映射目录: {error}"))?;
+    let mut entries = fs::read_dir(root)
+        .map_err(|error| format!("无法读取本地映射目录: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法读取本地映射目录项: {error}"))?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+    let mut migrated = 0_usize;
+    let mut failed = 0_usize;
+    for entry in entries {
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("无法检查本地映射目录项: {error}"))?;
+        if !file_type.is_dir() || entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let plugin_dir = entry.path();
+        let outcome: Result<bool, String> = (|| {
+            require_mapping_directory(&plugin_dir, "本地映射")?;
+            let mut definition = load_stored_definition(&plugin_dir)?;
+            validate_definition_header(&definition)?;
+            if definition.schema_version == LOCAL_MAPPING_SCHEMA_VERSION {
+                return Ok(false);
+            }
+            let manifest = PluginManifest::load(&definition.plugin_id, &plugin_dir)
+                .map_err(|error| error.to_string())?;
+            validate_stored_manifest(&manifest, &definition)?;
+            let integrity = build_local_mapping_integrity(&plugin_dir, &definition.services)
+                .map_err(|error| error.to_string())?;
+            write_bytes_atomic(
+                plugin_dir.join(LOCAL_MAPPING_INTEGRITY_FILENAME),
+                &integrity,
+            )?;
+            definition.schema_version = LOCAL_MAPPING_SCHEMA_VERSION;
+            write_json_atomic(plugin_dir.join(LOCAL_MAPPING_FILENAME), &definition)?;
+            let verified = PluginManifest::load(&definition.plugin_id, &plugin_dir)
+                .map_err(|error| error.to_string())?;
+            validate_installed_manifest(&verified)?;
+            Ok(true)
+        })();
+        match outcome {
+            Ok(true) => migrated = migrated.saturating_add(1),
+            Ok(false) => {}
+            Err(_) => failed = failed.saturating_add(1),
+        }
+    }
+    if failed > 0 {
+        tracing::warn!(
+            event_code = "local-mapping-integrity-migration-failed",
+            failure_count = failed,
+            "legacy local mappings were quarantined during integrity migration"
+        );
+    }
+    Ok(migrated)
 }
 
 fn load_stored_definition(plugin_dir: &Path) -> Result<LocalMappingDefinition, String> {
@@ -1068,8 +1153,10 @@ fn validate_plugin_id(plugin_id: &str) -> Result<(), String> {
 }
 
 fn validate_definition_header(definition: &LocalMappingDefinition) -> Result<(), String> {
-    if definition.schema_version != 1 {
-        return Err("仅支持本地映射 schemaVersion 1".into());
+    if !matches!(definition.schema_version, 1 | LOCAL_MAPPING_SCHEMA_VERSION) {
+        return Err(format!(
+            "仅支持本地映射 schemaVersion 1 或 {LOCAL_MAPPING_SCHEMA_VERSION}"
+        ));
     }
     validate_plugin_id(&definition.plugin_id)?;
     if definition.display_name.trim().is_empty() || definition.display_name.chars().count() > 128 {
@@ -1445,6 +1532,11 @@ fn validate_stored_manifest(
     manifest: &PluginManifest,
     definition: &LocalMappingDefinition,
 ) -> Result<(), String> {
+    if definition.schema_version == LOCAL_MAPPING_SCHEMA_VERSION
+        && manifest.local_mapping_integrity_sha256.is_none()
+    {
+        return Err("schemaVersion 2 本地映射缺少运行时完整性清单".into());
+    }
     if manifest.plugin_id != definition.plugin_id {
         return Err("本地映射目录身份与映射定义不一致".into());
     }
@@ -1656,6 +1748,27 @@ fn write_json(path: PathBuf, value: &impl Serialize) -> Result<(), String> {
         .map_err(|error| format!("无法持久化映射文件: {error}"))
 }
 
+fn write_bytes(path: PathBuf, bytes: &[u8]) -> Result<(), String> {
+    let mut file = fs::File::create(&path).map_err(|error| format!("无法写入映射文件: {error}"))?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("无法持久化映射文件: {error}"))
+}
+
+fn write_bytes_atomic(path: PathBuf, bytes: &[u8]) -> Result<(), String> {
+    let parent = path.parent().ok_or("映射完整性清单缺少父目录")?;
+    let mut temporary = NamedTempFile::new_in(parent)
+        .map_err(|error| format!("无法创建映射完整性清单暂存文件: {error}"))?;
+    temporary
+        .write_all(bytes)
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|error| format!("无法持久化映射完整性清单: {error}"))?;
+    temporary
+        .persist(&path)
+        .map_err(|error| format!("无法替换映射完整性清单: {}", error.error))?;
+    Ok(())
+}
+
 fn write_json_atomic(path: PathBuf, value: &impl Serialize) -> Result<(), String> {
     let parent = path.parent().ok_or("映射定义缺少父目录")?;
     let mut temporary = NamedTempFile::new_in(parent)
@@ -1830,6 +1943,15 @@ mod tests {
         let prepared = prepare(active_root.path(), fixture_definition(&component)).unwrap();
         let activated = prepared.activate(active_root.path()).unwrap();
         activated.commit().unwrap();
+        let installed_dir = active_root.path().join("reader.local");
+        let installed = PluginManifest::load("reader.local", &installed_dir).unwrap();
+        assert!(installed.local_mapping_integrity_sha256.is_some());
+        assert_eq!(
+            load_stored_definition(&installed_dir)
+                .unwrap()
+                .schema_version,
+            2
+        );
 
         let loaded = load_definition(&active_root.path().join("reader.local")).unwrap();
         assert!(Path::new(&loaded.services[0].main_class).is_absolute());
@@ -1853,6 +1975,43 @@ mod tests {
         fs::write(&bundle, b"changed bundle").unwrap();
         assert_ne!(exported_sha256, import_bundle_sha256(&bundle).unwrap());
         assert!(import_bundle_sha256(export_dir.path()).is_err());
+    }
+
+    #[test]
+    fn legacy_mapping_migration_is_one_time_and_schema_two_fails_closed() {
+        let source = tempfile::tempdir().unwrap();
+        let component = source.path().join("reader.bat");
+        fs::write(&component, b"legacy mapping").unwrap();
+        let active_root = tempfile::tempdir().unwrap();
+        prepare(active_root.path(), fixture_definition(&component))
+            .unwrap()
+            .activate(active_root.path())
+            .unwrap()
+            .commit()
+            .unwrap();
+        let plugin_dir = active_root.path().join("reader.local");
+        let mut definition = load_stored_definition(&plugin_dir).unwrap();
+        definition.schema_version = 1;
+        write_json_atomic(plugin_dir.join(LOCAL_MAPPING_FILENAME), &definition).unwrap();
+        fs::remove_file(plugin_dir.join(LOCAL_MAPPING_INTEGRITY_FILENAME)).unwrap();
+
+        assert_eq!(migrate_legacy_integrity(active_root.path()).unwrap(), 1);
+        assert_eq!(migrate_legacy_integrity(active_root.path()).unwrap(), 0);
+        let manifest = PluginManifest::load("reader.local", &plugin_dir).unwrap();
+        validate_installed_manifest(&manifest).unwrap();
+
+        fs::remove_file(plugin_dir.join(LOCAL_MAPPING_INTEGRITY_FILENAME)).unwrap();
+        assert_eq!(migrate_legacy_integrity(active_root.path()).unwrap(), 0);
+        let unpinned = PluginManifest::load("reader.local", &plugin_dir).unwrap();
+        assert!(validate_installed_manifest(&unpinned).is_err());
+
+        let broken = active_root.path().join("broken.local");
+        fs::create_dir(&broken).unwrap();
+        let mut broken_definition = definition;
+        broken_definition.plugin_id = "broken.local".into();
+        broken_definition.schema_version = 1;
+        write_json(broken.join(LOCAL_MAPPING_FILENAME), &broken_definition).unwrap();
+        assert_eq!(migrate_legacy_integrity(active_root.path()).unwrap(), 0);
     }
 
     #[test]

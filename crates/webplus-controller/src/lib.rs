@@ -42,6 +42,7 @@ pub struct PluginDescriptor {
     pub plugin_id: String,
     pub plugin_dir: PathBuf,
     pub architecture: PluginArchitecture,
+    pub local_mapping_integrity_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +218,7 @@ impl PluginController {
                     plugin_id: manifest.plugin_id.clone(),
                     plugin_dir: manifest.plugin_dir.clone(),
                     architecture: service.architecture,
+                    local_mapping_integrity_sha256: manifest.local_mapping_integrity_sha256.clone(),
                 },
             )
             .await?;
@@ -691,6 +693,7 @@ impl PluginMaintenance<'_> {
                     plugin_id: manifest.plugin_id.clone(),
                     plugin_dir: manifest.plugin_dir.clone(),
                     architecture: service.architecture,
+                    local_mapping_integrity_sha256: manifest.local_mapping_integrity_sha256.clone(),
                 };
                 if !routes
                     .get(&service.service_id)
@@ -789,6 +792,7 @@ fn preflight_descriptors(manifest: &PluginManifest) -> Vec<PluginDescriptor> {
             plugin_id: manifest.plugin_id.clone(),
             plugin_dir: manifest.plugin_dir.clone(),
             architecture: service.architecture,
+            local_mapping_integrity_sha256: manifest.local_mapping_integrity_sha256.clone(),
         };
         if keys.insert(WorkerKey::from(&descriptor)) {
             descriptors.push(descriptor);
@@ -809,6 +813,7 @@ fn routes_from_manifests(
                 plugin_id: manifest.plugin_id.clone(),
                 plugin_dir: manifest.plugin_dir.clone(),
                 architecture: service.architecture,
+                local_mapping_integrity_sha256: manifest.local_mapping_integrity_sha256.clone(),
             };
             let mut method_timeouts = HashMap::new();
             for method in &service.methods {
@@ -1133,10 +1138,20 @@ impl PluginWorker {
                 local_mapping_root,
             } => {
                 if is_within_root(&descriptor.plugin_dir, local_mapping_root) {
+                    let integrity = descriptor
+                        .local_mapping_integrity_sha256
+                        .as_deref()
+                        .ok_or_else(|| {
+                            ControllerError::MissingLocalMappingIntegrity(
+                                descriptor.plugin_id.clone(),
+                            )
+                        })?;
                     command
                         .arg("--allow-local-mapping")
                         .arg("--local-mapping-root")
-                        .arg(local_mapping_root);
+                        .arg(local_mapping_root)
+                        .arg("--local-mapping-integrity-sha256")
+                        .arg(integrity);
                 } else {
                     command.arg("--trust-store").arg(trust_store);
                 }
@@ -1383,6 +1398,8 @@ pub enum ControllerError {
     MaintenancePluginMismatch { expected: String, actual: String },
     #[error("plugin host [{0}] initialization failed in another concurrent request")]
     HostInitializationFailed(String),
+    #[error("local mapping [{0}] does not have an approved integrity identity")]
+    MissingLocalMappingIntegrity(String),
     #[error("failed to spawn plugin host {executable:?}: {source}")]
     Spawn {
         executable: PathBuf,
@@ -1437,6 +1454,7 @@ impl ControllerError {
             Self::MaintenanceUnavailable => "maintenance-unavailable",
             Self::MaintenancePluginMismatch { .. } => "maintenance-plugin-mismatch",
             Self::HostInitializationFailed(_) => "host-initialization-failed",
+            Self::MissingLocalMappingIntegrity(_) => "local-mapping-integrity-missing",
             Self::Spawn { .. } => "host-spawn-failed",
             Self::MissingPipe(_) => "host-pipe-missing",
             Self::HostExited(_) => "host-exited",
@@ -1922,6 +1940,7 @@ mod tests {
                     plugin_id: "plugin-a".into(),
                     plugin_dir: "plugins/plugin-a".into(),
                     architecture: PluginArchitecture::X86,
+                    local_mapping_integrity_sha256: None,
                 },
             )
             .await
@@ -1937,6 +1956,7 @@ mod tests {
                     plugin_id: "plugin-b".into(),
                     plugin_dir: "plugins/plugin-b".into(),
                     architecture: PluginArchitecture::X86,
+                    local_mapping_integrity_sha256: None,
                 },
             )
             .await
@@ -2087,11 +2107,13 @@ mod tests {
             plugin_id: "mixed".into(),
             plugin_dir: "plugins/mixed".into(),
             architecture: PluginArchitecture::X86,
+            local_mapping_integrity_sha256: None,
         });
         let x64 = WorkerKey::from(&PluginDescriptor {
             plugin_id: "mixed".into(),
             plugin_dir: "plugins/mixed".into(),
             architecture: PluginArchitecture::X64,
+            local_mapping_integrity_sha256: None,
         });
 
         assert_ne!(x86, x64);

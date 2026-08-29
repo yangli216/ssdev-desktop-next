@@ -1,15 +1,21 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use webplus_protocol::PluginArchitecture;
 
 pub const API_FILENAME: &str = "api.json";
 pub const PLUGIN_METADATA_FILENAME: &str = "plugin.json";
+pub const LOCAL_MAPPING_INTEGRITY_FILENAME: &str = "local-mapping-integrity.json";
 const MAX_API_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LOCAL_MAPPING_INTEGRITY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LOCAL_MAPPING_INTEGRITY_FILES: usize = 512;
+const MAX_LOCAL_MAPPING_INTEGRITY_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_SERVICES: usize = 1024;
 const MAX_METHODS_PER_SERVICE: usize = 1024;
 const MAX_PARAMETERS_PER_METHOD: usize = 256;
@@ -21,6 +27,9 @@ pub struct PluginManifest {
     pub plugin_dir: PathBuf,
     pub metadata: Option<PluginMetadata>,
     pub services: Vec<ServiceDefinition>,
+    /// SHA-256 of the verified local integrity document. `None` identifies a
+    /// normal signed plugin or a legacy local mapping without content pinning.
+    pub local_mapping_integrity_sha256: Option<String>,
 }
 
 impl PluginManifest {
@@ -58,11 +67,18 @@ impl PluginManifest {
             })?;
         let services = document.into_services();
         validate_manifest(&plugin_id, &services)?;
+        let integrity_path = plugin_dir.join(LOCAL_MAPPING_INTEGRITY_FILENAME);
+        let local_mapping_integrity_sha256 = if integrity_path.exists() {
+            Some(verify_local_mapping_integrity(&plugin_dir, &services)?)
+        } else {
+            None
+        };
         Ok(Self {
             plugin_id,
             plugin_dir,
             metadata,
             services,
+            local_mapping_integrity_sha256,
         })
     }
 
@@ -71,6 +87,262 @@ impl PluginManifest {
             .iter()
             .find(|service| service.service_id == service_id)
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalMappingIntegrityDocument {
+    schema_version: u8,
+    files: Vec<LocalMappingIntegrityFile>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalMappingIntegrityFile {
+    path: String,
+    size: u64,
+    sha256: String,
+}
+
+/// Builds a deterministic integrity document for immutable local-mapping
+/// runtime inputs. The caller persists the returned bytes atomically.
+pub fn build_local_mapping_integrity(
+    plugin_dir: &Path,
+    services: &[ServiceDefinition],
+) -> Result<Vec<u8>, ConfigError> {
+    let paths = local_mapping_protected_paths(services)?;
+    let mut files = Vec::with_capacity(paths.len());
+    let mut total = 0_u64;
+    for path in paths.values() {
+        let full_path = plugin_dir.join(path);
+        let metadata = fs::symlink_metadata(&full_path).map_err(|source| ConfigError::Read {
+            path: full_path.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ConfigError::Validation(format!(
+                "protected local mapping path must be a regular non-symlink file [{}]",
+                path.display()
+            )));
+        }
+        total = total.checked_add(metadata.len()).ok_or_else(|| {
+            ConfigError::Validation("local mapping protected byte count overflowed".into())
+        })?;
+        if total > MAX_LOCAL_MAPPING_INTEGRITY_TOTAL_BYTES {
+            return Err(ConfigError::Validation(
+                "local mapping protected files exceed 1 GiB".into(),
+            ));
+        }
+        files.push(LocalMappingIntegrityFile {
+            path: path_to_document_string(path)?,
+            size: metadata.len(),
+            sha256: hash_regular_file(&full_path)?,
+        });
+    }
+    let mut bytes = serde_json::to_vec_pretty(&LocalMappingIntegrityDocument {
+        schema_version: 1,
+        files,
+    })
+    .map_err(|source| ConfigError::Json {
+        path: plugin_dir.join(LOCAL_MAPPING_INTEGRITY_FILENAME),
+        source,
+    })?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_LOCAL_MAPPING_INTEGRITY_BYTES {
+        return Err(ConfigError::TooLarge {
+            path: plugin_dir.join(LOCAL_MAPPING_INTEGRITY_FILENAME),
+            actual: bytes.len(),
+            limit: MAX_LOCAL_MAPPING_INTEGRITY_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+/// Verifies the persisted document and every protected runtime file, then
+/// returns the document identity used to pin controller-to-host restarts.
+pub fn verify_local_mapping_integrity(
+    plugin_dir: &Path,
+    services: &[ServiceDefinition],
+) -> Result<String, ConfigError> {
+    let integrity_path = plugin_dir.join(LOCAL_MAPPING_INTEGRITY_FILENAME);
+    let bytes = fs::read(&integrity_path).map_err(|source| ConfigError::Read {
+        path: integrity_path.clone(),
+        source,
+    })?;
+    if bytes.len() > MAX_LOCAL_MAPPING_INTEGRITY_BYTES {
+        return Err(ConfigError::TooLarge {
+            path: integrity_path,
+            actual: bytes.len(),
+            limit: MAX_LOCAL_MAPPING_INTEGRITY_BYTES,
+        });
+    }
+    let document: LocalMappingIntegrityDocument =
+        serde_json::from_slice(&bytes).map_err(|source| ConfigError::Json {
+            path: integrity_path,
+            source,
+        })?;
+    if document.schema_version != 1 {
+        return Err(ConfigError::Validation(format!(
+            "unsupported local mapping integrity schema [{}]",
+            document.schema_version
+        )));
+    }
+    if document.files.len() > MAX_LOCAL_MAPPING_INTEGRITY_FILES {
+        return Err(ConfigError::Validation(format!(
+            "local mapping integrity contains more than {MAX_LOCAL_MAPPING_INTEGRITY_FILES} files"
+        )));
+    }
+    let expected = local_mapping_protected_paths(services)?;
+    let mut actual = BTreeMap::new();
+    for file in document.files {
+        let relative = document_path(&file.path)?;
+        let key = file.path.to_ascii_lowercase();
+        if actual.insert(key, (relative, file)).is_some() {
+            return Err(ConfigError::Validation(
+                "local mapping integrity contains duplicate or case-colliding paths".into(),
+            ));
+        }
+    }
+    if actual.len() != expected.len() || actual.keys().ne(expected.keys()) {
+        return Err(ConfigError::Validation(
+            "local mapping integrity file set does not match the runtime declaration".into(),
+        ));
+    }
+    let mut total = 0_u64;
+    for (key, expected_path) in expected {
+        let (relative, entry) = actual.remove(&key).expect("sets were compared");
+        if relative != expected_path {
+            return Err(ConfigError::Validation(format!(
+                "local mapping integrity path spelling does not match declaration [{}]",
+                entry.path
+            )));
+        }
+        if entry.sha256.len() != 64 || !entry.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ConfigError::Validation(format!(
+                "local mapping integrity contains an invalid SHA-256 [{}]",
+                entry.path
+            )));
+        }
+        let full_path = plugin_dir.join(&relative);
+        let metadata = fs::symlink_metadata(&full_path).map_err(|source| ConfigError::Read {
+            path: full_path.clone(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ConfigError::Validation(format!(
+                "protected local mapping path must be a regular non-symlink file [{}]",
+                entry.path
+            )));
+        }
+        if metadata.len() != entry.size {
+            return Err(ConfigError::Validation(format!(
+                "protected local mapping file size changed [{}]",
+                entry.path
+            )));
+        }
+        total = total.checked_add(metadata.len()).ok_or_else(|| {
+            ConfigError::Validation("local mapping protected byte count overflowed".into())
+        })?;
+        if total > MAX_LOCAL_MAPPING_INTEGRITY_TOTAL_BYTES {
+            return Err(ConfigError::Validation(
+                "local mapping protected files exceed 1 GiB".into(),
+            ));
+        }
+        if hash_regular_file(&full_path)? != entry.sha256.to_ascii_lowercase() {
+            return Err(ConfigError::Validation(format!(
+                "protected local mapping file content changed [{}]",
+                entry.path
+            )));
+        }
+    }
+    Ok(hex_sha256(&bytes))
+}
+
+fn local_mapping_protected_paths(
+    services: &[ServiceDefinition],
+) -> Result<BTreeMap<String, PathBuf>, ConfigError> {
+    let mut paths = BTreeMap::new();
+    for fixed in [API_FILENAME, PLUGIN_METADATA_FILENAME] {
+        insert_protected_path(&mut paths, fixed)?;
+    }
+    for service in services {
+        let main_type = service.resolved_main_type().to_ascii_lowercase();
+        if matches!(main_type.as_str(), "dll" | "exe" | "bat") {
+            insert_protected_path(&mut paths, &service.main_class)?;
+        }
+        for dependency in &service.deps {
+            insert_protected_path(&mut paths, dependency)?;
+        }
+    }
+    if paths.len() > MAX_LOCAL_MAPPING_INTEGRITY_FILES {
+        return Err(ConfigError::Validation(format!(
+            "local mapping protects more than {MAX_LOCAL_MAPPING_INTEGRITY_FILES} files"
+        )));
+    }
+    Ok(paths)
+}
+
+fn insert_protected_path(
+    paths: &mut BTreeMap<String, PathBuf>,
+    value: &str,
+) -> Result<(), ConfigError> {
+    let path = document_path(value)?;
+    let rendered = path_to_document_string(&path)?;
+    let key = rendered.to_ascii_lowercase();
+    if let Some(existing) = paths.insert(key, path.clone()) {
+        if existing != path {
+            return Err(ConfigError::Validation(
+                "local mapping runtime paths collide by ASCII case".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn document_path(value: &str) -> Result<PathBuf, ConfigError> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || value.contains('\\')
+        || path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(ConfigError::Validation(format!(
+            "local mapping protected path is unsafe [{value}]"
+        )));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn path_to_document_string(path: &Path) -> Result<String, ConfigError> {
+    path.to_str()
+        .map(|value| value.replace('\\', "/"))
+        .ok_or_else(|| ConfigError::Validation("local mapping path is not UTF-8".into()))
+}
+
+fn hash_regular_file(path: &Path) -> Result<String, ConfigError> {
+    let mut file = fs::File::open(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -534,6 +806,24 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    fn write_integrity_fixture(root: &Path) -> Vec<ServiceDefinition> {
+        fs::create_dir_all(root.join("components")).unwrap();
+        fs::write(
+            root.join(API_FILENAME),
+            r#"[{"serviceId":"reader.card","mainClass":"components/reader.dll","mainType":"dll","methods":[]}]"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join(PLUGIN_METADATA_FILENAME),
+            r#"{"schemaVersion":1,"pluginId":"reader","version":"0.0.0-local","displayName":"Reader"}"#,
+        )
+        .unwrap();
+        fs::write(root.join("components/reader.dll"), b"fixture-binary").unwrap();
+        let services: ApiDocument =
+            serde_json::from_slice(&fs::read(root.join(API_FILENAME)).unwrap()).unwrap();
+        services.into_services()
+    }
+
     #[test]
     fn reads_legacy_single_service_and_defaults_to_x86() {
         let root = tempdir().unwrap();
@@ -561,6 +851,62 @@ mod tests {
             ParameterDefinition::Detailed(detail) => assert_eq!(detail.len, 256),
             ParameterDefinition::Name(_) => panic!("expected detailed parameter"),
         }
+    }
+
+    #[test]
+    fn local_mapping_integrity_pins_runtime_files_and_document_identity() {
+        let root = tempdir().unwrap();
+        let services = write_integrity_fixture(root.path());
+        let bytes = build_local_mapping_integrity(root.path(), &services).unwrap();
+        fs::write(root.path().join(LOCAL_MAPPING_INTEGRITY_FILENAME), &bytes).unwrap();
+
+        let digest = verify_local_mapping_integrity(root.path(), &services).unwrap();
+        assert_eq!(digest.len(), 64);
+        let manifest = PluginManifest::load("reader", root.path()).unwrap();
+        assert_eq!(
+            manifest.local_mapping_integrity_sha256.as_deref(),
+            Some(digest.as_str())
+        );
+
+        fs::write(root.path().join("components/reader.dll"), b"changed-binary").unwrap();
+        assert!(PluginManifest::load("reader", root.path()).is_err());
+    }
+
+    #[test]
+    fn local_mapping_integrity_rejects_manifest_file_set_drift() {
+        let root = tempdir().unwrap();
+        let services = write_integrity_fixture(root.path());
+        let bytes = build_local_mapping_integrity(root.path(), &services).unwrap();
+        let mut document: LocalMappingIntegrityDocument = serde_json::from_slice(&bytes).unwrap();
+        document.files.pop();
+        fs::write(
+            root.path().join(LOCAL_MAPPING_INTEGRITY_FILENAME),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+
+        assert!(verify_local_mapping_integrity(root.path(), &services).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_mapping_integrity_rejects_protected_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let services = write_integrity_fixture(root.path());
+        fs::rename(
+            root.path().join("components/reader.dll"),
+            root.path().join("reader.real"),
+        )
+        .unwrap();
+        symlink(
+            root.path().join("reader.real"),
+            root.path().join("components/reader.dll"),
+        )
+        .unwrap();
+
+        assert!(build_local_mapping_integrity(root.path(), &services).is_err());
     }
 
     #[test]

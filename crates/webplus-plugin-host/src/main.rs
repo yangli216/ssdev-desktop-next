@@ -44,6 +44,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Path::new(&arguments.plugin_dir),
             Path::new(local_mapping_root),
         )?;
+        let expected = arguments
+            .local_mapping_integrity_sha256
+            .as_deref()
+            .ok_or("local mapping hosts require an approved integrity identity")?;
+        let actual = manifest
+            .local_mapping_integrity_sha256
+            .as_deref()
+            .ok_or("local mapping does not contain a verified integrity document")?;
+        if actual != expected {
+            return Err("local mapping integrity identity changed after route approval".into());
+        }
     } else {
         let trust_store_path = arguments
             .trust_store
@@ -144,6 +155,7 @@ struct HostArguments {
     trust_store: Option<String>,
     allow_unsigned: bool,
     local_mapping_root: Option<String>,
+    local_mapping_integrity_sha256: Option<String>,
     #[cfg(windows)]
     ipc_pipe: String,
     #[cfg(windows)]
@@ -159,6 +171,7 @@ impl HostArguments {
         let mut allow_unsigned = false;
         let mut allow_local_mapping = false;
         let mut local_mapping_root = None;
+        let mut local_mapping_integrity_sha256 = None;
         #[cfg(windows)]
         let mut ipc_pipe = None;
         #[cfg(windows)]
@@ -192,6 +205,11 @@ impl HostArguments {
                     "--local-mapping-root",
                     take_value(&mut arguments, "--local-mapping-root")?,
                 )?,
+                "--local-mapping-integrity-sha256" => set_once(
+                    &mut local_mapping_integrity_sha256,
+                    "--local-mapping-integrity-sha256",
+                    take_value(&mut arguments, "--local-mapping-integrity-sha256")?,
+                )?,
                 #[cfg(windows)]
                 "--ipc-pipe" => set_once(
                     &mut ipc_pipe,
@@ -216,10 +234,21 @@ impl HostArguments {
         if allow_unsigned && allow_local_mapping {
             return Err("unsigned and local mapping modes are mutually exclusive".into());
         }
-        if allow_local_mapping != local_mapping_root.is_some() {
+        if allow_local_mapping != local_mapping_root.is_some()
+            || allow_local_mapping != local_mapping_integrity_sha256.is_some()
+        {
             return Err(
-                "--allow-local-mapping and --local-mapping-root must be supplied together".into(),
+                "--allow-local-mapping, --local-mapping-root, and --local-mapping-integrity-sha256 must be supplied together".into(),
             );
+        }
+        if let Some(digest) = local_mapping_integrity_sha256.as_deref() {
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err("--local-mapping-integrity-sha256 must be lowercase SHA-256".into());
+            }
         }
         if trust_store.is_some() && (allow_unsigned || allow_local_mapping) {
             return Err("trust modes are mutually exclusive".into());
@@ -230,6 +259,7 @@ impl HostArguments {
             trust_store,
             allow_unsigned,
             local_mapping_root,
+            local_mapping_integrity_sha256,
             #[cfg(windows)]
             ipc_pipe: ipc_pipe.ok_or("missing required argument --ipc-pipe")?,
             #[cfg(windows)]
@@ -409,6 +439,8 @@ mod tests {
             "--allow-local-mapping".into(),
             "--local-mapping-root".into(),
             "mappings".into(),
+            "--local-mapping-integrity-sha256".into(),
+            "a".repeat(64),
         ];
         valid.extend(required_platform_arguments());
         let parsed = HostArguments::parse(valid).unwrap();
@@ -431,6 +463,8 @@ mod tests {
             "--allow-local-mapping".into(),
             "--local-mapping-root".into(),
             "mappings".into(),
+            "--local-mapping-integrity-sha256".into(),
+            "a".repeat(64),
             "--trust-store".into(),
             "trust.json".into(),
         ];

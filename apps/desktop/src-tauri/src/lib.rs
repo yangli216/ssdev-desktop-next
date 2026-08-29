@@ -776,7 +776,7 @@ impl PreparedProjectComponent {
 
 enum ActivatedProjectComponent {
     Signed(PluginActivation),
-    Local(local_mappings::ActivatedLocalMapping),
+    Local(Box<local_mappings::ActivatedLocalMapping>),
 }
 
 impl ActivatedProjectComponent {
@@ -1122,6 +1122,7 @@ async fn import_project_bundle(
                 .map_err(|error| error.to_string()),
             PreparedProjectComponent::Local(mapping) => mapping
                 .activate(&state.local_mapping_root)
+                .map(Box::new)
                 .map(ActivatedProjectComponent::Local),
         };
         match activation {
@@ -4241,6 +4242,16 @@ pub fn run() {
             )
             .map_err(std::io::Error::other)?;
             log_project_recovery(recovery);
+            let migrated_local_mappings =
+                local_mappings::migrate_legacy_integrity(&local_mapping_root)
+                    .map_err(std::io::Error::other)?;
+            if migrated_local_mappings > 0 {
+                tracing::info!(
+                    event_code = "local-mapping-integrity-migrated",
+                    mapping_count = migrated_local_mappings,
+                    "legacy local mappings upgraded with runtime integrity manifests"
+                );
+            }
             let config = ConfigStore::open(
                 config_path.clone(),
                 legacy_config_candidates(&system_config_dir),
@@ -4535,6 +4546,14 @@ fn recover_plugin_store(
             .fetch_add(recovered, Ordering::AcqRel);
         log_project_recovery(report);
     }
+    let migrated = local_mappings::migrate_legacy_integrity(&state.local_mapping_root)?;
+    if migrated > 0 {
+        tracing::info!(
+            event_code = "local-mapping-integrity-migrated",
+            mapping_count = migrated,
+            "legacy local mappings upgraded with runtime integrity manifests"
+        );
+    }
     Ok(report)
 }
 
@@ -4685,6 +4704,7 @@ fn same_manifest_contracts(left: &[PluginManifest], right: &[PluginManifest]) ->
         left.plugin_id == right.plugin_id
             && left.metadata == right.metadata
             && left.services == right.services
+            && left.local_mapping_integrity_sha256 == right.local_mapping_integrity_sha256
     })
 }
 
@@ -5955,6 +5975,7 @@ mod tests {
             plugin_dir: local_root.join("reader"),
             metadata: None,
             services: Vec::new(),
+            local_mapping_integrity_sha256: None,
         };
         let blocked_plugins =
             inspected_plugins(vec![local_mapping], HashSet::from(["reader".to_owned()]));
@@ -6204,6 +6225,7 @@ mod tests {
             plugin_dir: PathBuf::from("staging/reader.local"),
             metadata: None,
             services: Vec::new(),
+            local_mapping_integrity_sha256: None,
         };
         let mut installed = left.clone();
         installed.plugin_dir = PathBuf::from("installed/reader.local");
