@@ -97,4 +97,4 @@ cargo run --locked -p ssdev-release-signing -- verify `
 - 插件目录签名只证明索引本身。客户端仍会校验 HTTPS、下载字节数/摘要、插件内部签名、候选宿主预检和真实硬件黄金矩阵。
 - 项目包签名绑定整个交付容器和发布者身份，但不会把本地映射提升为通用组织插件。客户端仍会验证每个签名插件、当前来源授权、联合路由、目标架构宿主，并在确认前保持目标机器不变。
 - 应用更新与 bundle 产物使用 Tauri Minisign/Authenticode，不复用本工具的 Ed25519 封套或密钥。
-- `cutover-decision` 签名证明具备独立用途的审批密钥批准了某一精确 `GO` 文档；验证方仍应保留并按文档中的 SHA-256 复核原始策略与三份证据。
+- `cutover-decision` 签名证明具备独立用途的审批密钥批准了某一精确 `GO` 文档；`prepare`、`finalize` 和 `verify` 都要求实际发布信任库摘要等于 schema 2 决策中的 `approvalTrustStoreSha256`，同名 keyId 的替代库无效。验证方仍应保留并按文档中的 SHA-256 复核原始策略与三份证据。

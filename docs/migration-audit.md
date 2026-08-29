@@ -19,7 +19,7 @@ cargo run --locked -p ssdev-migration-audit -- `
 
 工具先严格复验 schema 2 试点报告、manifest 与全部材料，要求 `intakeComplete: true`，再从 manifest 的 `migrationAuditBindings` 精确派生五类审计输入和签名来源策略三件套。正式模式禁止同时提供任何手工 `--config`、`--plugins`、`--keymap`、`--browser-assets`、`--browser-har` 或策略参数；审计完成后还会再次复验材料、报告、源码和策略输入，期间发生变化即失败。正式报告与证据必须同时位于源码工作区和试点材料根目录之外，且只创建、不覆盖。
 
-schema 4 完整报告绑定 `materialSetSha256` 和 `migrationAuditBindingsSha256`。schema 3 迁移证据继续绑定完整报告和来源策略 SHA-256，并新增同一个试点材料集合摘要。后续 schema 6 Go/No-Go 策略必须精确指定该材料集合，Windows 包 schema 4 继续绑定同一来源策略并锁定上一生产 bundle，因此不能用一套材料完成移交、再用另一套较小样本或其他低版本通过审计与升级。
+schema 4 完整报告绑定 `materialSetSha256` 和 `migrationAuditBindingsSha256`。schema 3 迁移证据继续绑定完整报告和来源策略 SHA-256，并新增同一个试点材料集合摘要。后续 schema 7 Go/No-Go 策略必须精确指定该材料集合，Windows 包 schema 4 继续绑定同一来源策略并锁定上一生产 bundle，因此不能用一套材料完成移交、再用另一套较小样本或其他低版本通过审计与升级。
 
 ## 探索性盘点
 

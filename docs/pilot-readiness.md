@@ -18,7 +18,7 @@ schema 2 manifest 还必须填写 `migrationAuditBindings`，明确正式迁移�
 - `business-assets` 与 `business-hars`：实际业务前端构建产物和代表性账号/设备流程 HAR；
 - `signed-origin-policy`：候选来源策略、旁签封套和发布信任库；
 - `plugin-release-set`：批准发布集合规范及其确定性插件包目录；
-- `organization-public-trust`：插件、策略、项目、应用更新和 Authenticode 所需的公钥、证书及流程说明。私钥、令牌和口令不得进入材料目录；工具会阻断常见私钥容器扩展名和 PEM 私钥标记，但这不是秘密扫描器，材料提供方仍需承担脱敏责任；
+- `organization-public-trust`：插件、策略、项目、应用更新、Authenticode 和三类 QA 证据所需的公钥、证书及流程说明，其中必须包含供 `prepare-policy` 精确选择的 evidence trust store。私钥、令牌和口令不得进入材料目录；工具会阻断常见私钥容器扩展名和 PEM 私钥标记，但这不是秘密扫描器，材料提供方仍需承担脱敏责任；
 - `previous-windows-release`：上一正式版本的完整已验签 bundle 根目录，至少保留 `metadata/release.json`、`metadata/artifacts.json` 及其签名、NSIS 安装器和 updater 产物；不能只交一个安装器或从其他低版本临时补齐；
 - `windows-hardware-plan`：x86/x64、COM/OCX、硬件/驱动、院内网络/证书、升级、回退和卸载的责任人及执行环境计划。
 
@@ -55,7 +55,7 @@ cargo run --locked -p ssdev-pilot-readiness -- `
 1. 把材料根目录、同一 manifest 和已复验报告三件套交给正式迁移审计；工具只从 `migrationAuditBindings` 派生输入和签名来源策略，并在审计完成后再次复验全部材料；
 2. 对批准发布集合运行真实 x86/x64 插件黄金矩阵；
 3. 使用上一正式版本和候选 NSIS 运行 Windows 升级、启动、回退与卸载验收；
-4. 使用 `ssdev-cutover-evidence prepare-policy` 从同一试点三件套、候选 bundle 和少量人工批准项自动生成生产策略，禁止手工复制材料、插件和版本摘要；
+4. 使用 `ssdev-cutover-evidence prepare-policy` 从同一试点三件套、候选 bundle、组织公开材料中的 QA 证据信任库和少量人工批准项自动生成生产策略，禁止手工复制材料、插件、版本或信任库摘要；
 5. 对三份独立证据签名并运行生产 Go/No-Go。
 
 材料报告不能代替以上任一步，也不应进入远程业务 WebView。

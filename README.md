@@ -224,4 +224,4 @@ powershell -ExecutionPolicy Bypass -File scripts/test-plugin-matrix.ps1 `
 
 正式迁移审计、真实插件矩阵和 Windows 包验收各自生成不可覆盖的精简证据，并由对应 QA 环境使用 `cutover-evidence` 用途密钥签名。使用 [生产切换证据与 Go/No-Go](docs/cutover-evidence.md) 中的严格判定器按策略指定 keyId 验证三份封套，确认三者来自同一 clean commit、仍在有效期内，最终 Windows 产物清单和插件发布集合、信任库、黄金矩阵精确匹配审批输入，实机测试信任库/宿主与安装包实际内容逐字节一致，旧配置/插件/快捷键/前端/HAR 覆盖达到项目下限，且 HTTP 清理、迁移 finding、NSIS 安装、签名、启动和跨版本升级全部满足。`NO-GO` 会留存阻塞码并返回非零状态；只有 `GO` 文档能由另一把具备独立 `cutover-decision` 用途的组织 KMS/HSM 密钥签发最终审批封套。
 
-生产策略使用 `ssdev-cutover-evidence prepare-policy` 自动生成：版本、提交和全部材料/插件/bundle 摘要来自已复验试点输入与候选包，人工只批准证据时效、迁移覆盖下限和四个职责签名人。工具在写入前二次复验输入且禁止覆盖，避免把复制错误或不匹配版本固化为看似有效的策略。
+生产策略使用 `ssdev-cutover-evidence prepare-policy` 自动生成：版本、提交和全部材料/插件/bundle/信任库摘要来自已复验试点输入与候选包，人工只批准证据时效、迁移覆盖下限和四个职责签名人。schema 7 策略固定 QA 证据信任库，schema 2 GO 决策固定最终审批信任库；同名 keyId 的替代公钥库不能通过判定或签发。工具在写入前二次复验输入且禁止覆盖，避免把复制错误或不匹配版本固化为看似有效的策略。

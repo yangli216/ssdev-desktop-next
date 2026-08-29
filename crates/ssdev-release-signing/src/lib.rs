@@ -97,6 +97,8 @@ pub enum ArtifactSummary {
         app_version: String,
         evaluated_at_unix_seconds: u64,
         approval_signer_key_id: String,
+        evidence_trust_store_sha256: String,
+        approval_trust_store_sha256: String,
     },
     MigrationAuditEvidence {
         source_revision: String,
@@ -219,10 +221,12 @@ struct Material {
 pub fn prepare(options: &PrepareOptions<'_>) -> Result<SigningReport, SigningError> {
     ensure_fresh_output(options.request, "signing request")?;
     validate_signing_key_id(options.key_id)?;
-    TrustStore::load(options.trust_store)?
-        .ensure_key_can_issue(options.kind.trust_purpose(), options.key_id)?;
     let material = prepare_material_from_path(options.kind, options.document, options.now)?;
     ensure_expected_signer(&material.summary, options.key_id)?;
+    ensure_expected_trust_store(&material.summary, options.trust_store)?;
+    TrustStore::load(options.trust_store)?
+        .ensure_key_can_issue(options.kind.trust_purpose(), options.key_id)?;
+    ensure_expected_trust_store(&material.summary, options.trust_store)?;
     let request = SigningRequest {
         schema_version: 1,
         artifact_kind: options.kind,
@@ -254,7 +258,9 @@ pub fn finalize(options: &FinalizeOptions<'_>) -> Result<SigningReport, SigningE
     validate_request(options.kind, options.document, &request, options.now)?;
     let signature = read_signature(options.signature)?;
     let envelope = DetachedSignatureDocument::new(&request.key_id, &signature)?;
+    ensure_expected_trust_store(&request.summary, options.trust_store)?;
     let trust_store = TrustStore::load(options.trust_store)?;
+    ensure_expected_trust_store(&request.summary, options.trust_store)?;
     let payload = BASE64.decode(&request.payload_base64).map_err(|error| {
         SigningError::Invalid(format!(
             "signing request payload is invalid base64: {error}"
@@ -288,7 +294,9 @@ pub fn verify(
     envelope.validate()?;
     let material = prepare_material_from_path(kind, document_path, now)?;
     ensure_expected_signer(&material.summary, &envelope.key_id)?;
+    ensure_expected_trust_store(&material.summary, trust_store_path)?;
     let trust_store = TrustStore::load(trust_store_path)?;
+    ensure_expected_trust_store(&material.summary, trust_store_path)?;
     trust_store.verify_detached_for_issuance(
         kind.trust_purpose(),
         &envelope.key_id,
@@ -377,6 +385,8 @@ fn prepare_material(
                     app_version: decision.app_version,
                     evaluated_at_unix_seconds: decision.evaluated_at_unix_seconds,
                     approval_signer_key_id: decision.approval_signer_key_id,
+                    evidence_trust_store_sha256: decision.evidence_trust_store_sha256,
+                    approval_trust_store_sha256: decision.approval_trust_store_sha256,
                 },
             )
         }
@@ -514,6 +524,25 @@ fn ensure_expected_signer(summary: &ArtifactSummary, key_id: &str) -> Result<(),
     Ok(())
 }
 
+fn ensure_expected_trust_store(
+    summary: &ArtifactSummary,
+    trust_store_path: &Path,
+) -> Result<(), SigningError> {
+    if let ArtifactSummary::CutoverDecision {
+        approval_trust_store_sha256,
+        ..
+    } = summary
+    {
+        let actual = sha256_hex(&read_bounded(trust_store_path, MAX_DOCUMENT_BYTES)?);
+        if &actual != approval_trust_store_sha256 {
+            return Err(SigningError::Invalid(
+                "cutover approval trust store does not match the production policy".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn report(request: &SigningRequest, verified: bool) -> SigningReport {
     SigningReport {
         schema_version: 1,
@@ -557,9 +586,18 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, SigningError> {
             path: path.to_path_buf(),
             source,
         })?;
-    if bytes.len() as u64 > limit {
+    let after = fs::symlink_metadata(path).map_err(|source| SigningError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if bytes.len() as u64 > limit
+        || bytes.len() as u64 != metadata.len()
+        || !after.file_type().is_file()
+        || after.len() != metadata.len()
+        || after.modified().ok() != metadata.modified().ok()
+    {
         return Err(SigningError::Invalid(format!(
-            "input exceeds {limit} bytes while being read"
+            "input changed or exceeded {limit} bytes while being read"
         )));
     }
     Ok(bytes)
@@ -817,13 +855,14 @@ mod tests {
             (
                 ArtifactKind::CutoverDecision,
                 serde_json::json!({
-                    "schemaVersion": 1,
+                    "schemaVersion": ssdev_cutover_evidence::CUTOVER_DECISION_SCHEMA_VERSION,
                     "targetSourceRevision": "aa".repeat(20),
                     "appVersion": "1.2.3",
                     "approvalSignerKeyId": "release-key",
                     "evaluatedAtUnixSeconds": NOW,
                     "policySha256": "11".repeat(32),
                     "evidenceTrustStoreSha256": "88".repeat(32),
+                    "approvalTrustStoreSha256": sha256_hex(&fs::read(root.join("trust.json")).unwrap()),
                     "pluginMatrixEvidenceSha256": "22".repeat(32),
                     "migrationAuditEvidenceSha256": "33".repeat(32),
                     "windowsPackageEvidenceSha256": "44".repeat(32),
@@ -1061,6 +1100,82 @@ mod tests {
         })
         .is_err());
         assert!(!request.exists());
+    }
+
+    #[test]
+    fn cutover_decision_rejects_a_substituted_same_id_trust_store() {
+        let root = tempfile::tempdir().unwrap();
+        let approved_key = SigningKey::from_bytes(&[62_u8; 32]);
+        let approved_trust = trust_store(root.path(), &approved_key);
+        let (_, document) = documents(root.path()).pop().unwrap();
+
+        let substitute_root = root.path().join("substitute");
+        fs::create_dir(&substitute_root).unwrap();
+        let substitute_key = SigningKey::from_bytes(&[63_u8; 32]);
+        let substitute_trust = trust_store(&substitute_root, &substitute_key);
+        let request = root.path().join("substitute.request.json");
+        let error = prepare(&PrepareOptions {
+            kind: ArtifactKind::CutoverDecision,
+            document: &document,
+            key_id: "release-key",
+            trust_store: &substitute_trust,
+            request: &request,
+            now: unix_time(NOW).unwrap(),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("trust store"));
+        assert!(!request.exists());
+
+        let approved_request = root.path().join("approved.request.json");
+        let signature = root.path().join("approved.signature");
+        let envelope = root.path().join("approved.sig.json");
+        let now = unix_time(NOW).unwrap();
+        prepare(&PrepareOptions {
+            kind: ArtifactKind::CutoverDecision,
+            document: &document,
+            key_id: "release-key",
+            trust_store: &approved_trust,
+            request: &approved_request,
+            now,
+        })
+        .unwrap();
+        let request_document: SigningRequest =
+            serde_json::from_slice(&fs::read(&approved_request).unwrap()).unwrap();
+        let payload = BASE64.decode(request_document.payload_base64).unwrap();
+        fs::write(
+            &signature,
+            BASE64.encode(approved_key.sign(&payload).to_bytes()),
+        )
+        .unwrap();
+        assert!(finalize(&FinalizeOptions {
+            kind: ArtifactKind::CutoverDecision,
+            document: &document,
+            request: &approved_request,
+            signature: &signature,
+            trust_store: &substitute_trust,
+            envelope: &envelope,
+            now,
+        })
+        .is_err());
+        assert!(!envelope.exists());
+        finalize(&FinalizeOptions {
+            kind: ArtifactKind::CutoverDecision,
+            document: &document,
+            request: &approved_request,
+            signature: &signature,
+            trust_store: &approved_trust,
+            envelope: &envelope,
+            now,
+        })
+        .unwrap();
+        assert!(verify(
+            ArtifactKind::CutoverDecision,
+            &document,
+            &envelope,
+            &substitute_trust,
+            now,
+        )
+        .is_err());
     }
 
     #[test]

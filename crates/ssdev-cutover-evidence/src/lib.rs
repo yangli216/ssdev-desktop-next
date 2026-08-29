@@ -15,8 +15,8 @@ use webplus_plugin_trust::{
 pub const EVIDENCE_SCHEMA_VERSION: u8 = 3;
 pub const PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION: u8 = 2;
 pub const WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION: u8 = 4;
-pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 6;
-pub const CUTOVER_DECISION_SCHEMA_VERSION: u8 = 1;
+pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 7;
+pub const CUTOVER_DECISION_SCHEMA_VERSION: u8 = 2;
 const MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_HASHED_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -170,6 +170,7 @@ pub struct ProductionCutoverPolicy {
     pub expected_plugin_release_set_spec_sha256: String,
     pub expected_plugin_package_set_sha256: String,
     pub expected_plugin_trust_store_sha256: String,
+    pub expected_evidence_trust_store_sha256: String,
     pub expected_plugin_matrix_sha256: String,
     pub expected_pilot_material_set_sha256: String,
     pub expected_origin_policy_sha256: String,
@@ -214,6 +215,7 @@ impl ProductionCutoverPolicy {
             &self.expected_plugin_release_set_spec_sha256,
             &self.expected_plugin_package_set_sha256,
             &self.expected_plugin_trust_store_sha256,
+            &self.expected_evidence_trust_store_sha256,
             &self.expected_plugin_matrix_sha256,
             &self.expected_pilot_material_set_sha256,
             &self.expected_origin_policy_sha256,
@@ -258,6 +260,7 @@ pub struct CutoverDecision {
     pub evaluated_at_unix_seconds: u64,
     pub policy_sha256: String,
     pub evidence_trust_store_sha256: String,
+    pub approval_trust_store_sha256: String,
     pub plugin_matrix_evidence_sha256: String,
     pub migration_audit_evidence_sha256: String,
     pub windows_package_evidence_sha256: String,
@@ -288,6 +291,7 @@ impl CutoverDecision {
         for digest in [
             &self.policy_sha256,
             &self.evidence_trust_store_sha256,
+            &self.approval_trust_store_sha256,
             &self.plugin_matrix_evidence_sha256,
             &self.migration_audit_evidence_sha256,
             &self.windows_package_evidence_sha256,
@@ -757,6 +761,9 @@ pub fn evaluate_production_cutover(
     }
 
     let mut blockers = std::collections::BTreeSet::new();
+    if evidence_trust_store_sha256 != policy.expected_evidence_trust_store_sha256 {
+        blockers.insert("evidence-trust-store-mismatch".into());
+    }
     for (name, revision, dirty, executed_at) in [
         (
             "plugin-matrix",
@@ -934,6 +941,7 @@ pub fn evaluate_production_cutover(
         evaluated_at_unix_seconds,
         policy_sha256,
         evidence_trust_store_sha256,
+        approval_trust_store_sha256: policy.expected_plugin_trust_store_sha256.clone(),
         plugin_matrix_evidence_sha256: plugin_sha256,
         migration_audit_evidence_sha256: migration_sha256,
         windows_package_evidence_sha256: windows_sha256,
@@ -1275,6 +1283,7 @@ mod tests {
             expected_plugin_release_set_spec_sha256: "0".repeat(64),
             expected_plugin_package_set_sha256: "9".repeat(64),
             expected_plugin_trust_store_sha256: "2".repeat(64),
+            expected_evidence_trust_store_sha256: "8".repeat(64),
             expected_plugin_matrix_sha256: "3".repeat(64),
             expected_pilot_material_set_sha256: "b".repeat(64),
             expected_origin_policy_sha256: "a".repeat(64),
@@ -1390,6 +1399,33 @@ mod tests {
         .unwrap();
         assert!(decision.eligible);
         assert!(decision.blocker_codes.is_empty());
+        assert_eq!(decision.approval_trust_store_sha256, "2".repeat(64));
+        let mut legacy_decision = decision.clone();
+        legacy_decision.schema_version = 1;
+        assert!(legacy_decision.validate().is_err());
+
+        let substituted_trust = evaluate_production_cutover(
+            ProductionCutoverInputs {
+                policy: &policy,
+                policy_sha256: "1".repeat(64),
+                evidence_trust_store_sha256: "f".repeat(64),
+                plugin: &plugin,
+                plugin_sha256: "2".repeat(64),
+                plugin_attestation_sha256: "5".repeat(64),
+                migration: &migration,
+                migration_sha256: "3".repeat(64),
+                migration_attestation_sha256: "6".repeat(64),
+                windows: &windows,
+                windows_sha256: "4".repeat(64),
+                windows_attestation_sha256: "7".repeat(64),
+            },
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            substituted_trust.blocker_codes,
+            ["evidence-trust-store-mismatch"]
+        );
 
         let mut policy_drift_migration = migration.clone();
         policy_drift_migration.origin_policy_sha256 = "b".repeat(64);
@@ -1594,7 +1630,7 @@ mod tests {
         assert!(policy.validate().is_err());
 
         let mut legacy = valid_policy("d".repeat(40));
-        legacy.schema_version = 5;
+        legacy.schema_version = 6;
         assert!(legacy.validate().is_err());
 
         let mut malformed = valid_policy("d".repeat(40));

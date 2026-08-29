@@ -49,7 +49,7 @@ struct BundlePolicyIdentity {
 }
 
 fn run_prepare_policy(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
-    if arguments.len() != 8 {
+    if arguments.len() != 9 {
         return Err(usage().into());
     }
     let workspace =
@@ -70,11 +70,15 @@ fn run_prepare_policy(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
         &path_argument(arguments.get(5), "candidate bundle root")?,
         "candidate bundle root",
     )?;
+    let evidence_trust_store = canonical_regular_file(
+        &path_argument(arguments.get(6), "evidence trust store")?,
+        "evidence trust store",
+    )?;
     let approval_path = canonical_regular_file(
-        &path_argument(arguments.get(6), "policy approval inputs")?,
+        &path_argument(arguments.get(7), "policy approval inputs")?,
         "policy approval inputs",
     )?;
-    let output = prepare_new_output(&path_argument(arguments.get(7), "policy output")?)?;
+    let output = prepare_new_output(&path_argument(arguments.get(8), "policy output")?)?;
 
     let source_before = capture_source_identity(&workspace)?;
     if source_before.dirty {
@@ -104,6 +108,11 @@ fn run_prepare_policy(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
         resolve_material_category_inputs(&materials_root, &manifest, "previous-windows-release")?,
         "previous Windows release",
     )?;
+    require_category_contains_file(
+        &evidence_trust_store,
+        &resolve_material_category_inputs(&materials_root, &manifest, "organization-public-trust")?,
+        "evidence trust store",
+    )?;
     for protected_root in [&workspace, &materials_root, &candidate_root, &previous_root] {
         if output.starts_with(protected_root) {
             return Err(invalid_input(
@@ -121,6 +130,12 @@ fn run_prepare_policy(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
     if approval.schema_version != 1 {
         return Err(invalid_input("policy approval inputs must use schema 1"));
     }
+    let evidence_trust_store_sha256 = sha256_file(&evidence_trust_store)?;
+    validate_cutover_signing_keys(
+        &evidence_trust_store,
+        &migration_inputs.release_trust_store,
+        &approval,
+    )?;
 
     let candidate_before = capture_bundle_policy_identity(&candidate_root, Some(&workspace))?;
     let previous_before = capture_bundle_policy_identity(&previous_root, None)?;
@@ -158,6 +173,7 @@ fn run_prepare_policy(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
         || candidate_before != candidate_after
         || previous_before != previous_after
         || approval_bytes_before != approval_bytes_after
+        || evidence_trust_store_sha256 != sha256_file(&evidence_trust_store)?
         || manifest_bytes_before != manifest_bytes_after
         || report_bytes_before != report_bytes_after
     {
@@ -178,6 +194,7 @@ fn run_prepare_policy(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
         expected_plugin_release_set_spec_sha256: release_set.spec_sha256,
         expected_plugin_package_set_sha256: release_set.package_set_sha256,
         expected_plugin_trust_store_sha256: release_set.trust_store_sha256,
+        expected_evidence_trust_store_sha256: evidence_trust_store_sha256,
         expected_plugin_matrix_sha256: release_set.matrix_sha256,
         expected_pilot_material_set_sha256: report_after.material_set_sha256,
         expected_origin_policy_sha256: origin_policy_sha256,
@@ -608,6 +625,41 @@ fn single_real_directory(paths: Vec<PathBuf>, label: &str) -> Result<PathBuf, Bo
     canonical_real_directory(&paths[0], label)
 }
 
+fn require_category_contains_file(
+    file: &Path,
+    category_inputs: &[PathBuf],
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    if category_inputs.iter().any(|input| {
+        (input.is_file() && file == input) || (input.is_dir() && file.starts_with(input))
+    }) {
+        return Ok(());
+    }
+    Err(invalid_input(&format!(
+        "{label} must come from the approved pilot material category"
+    )))
+}
+
+fn validate_cutover_signing_keys(
+    evidence_trust_store: &Path,
+    approval_trust_store: &Path,
+    approval: &PolicyApprovalInputs,
+) -> Result<(), Box<dyn Error>> {
+    let evidence_trust = TrustStore::load(evidence_trust_store)?;
+    for key_id in [
+        &approval.plugin_matrix_signer_key_id,
+        &approval.migration_audit_signer_key_id,
+        &approval.windows_package_signer_key_id,
+    ] {
+        evidence_trust.ensure_key_can_issue(TrustPurpose::CutoverEvidence, key_id)?;
+    }
+    TrustStore::load(approval_trust_store)?.ensure_key_can_issue(
+        TrustPurpose::CutoverDecision,
+        &approval.cutover_decision_signer_key_id,
+    )?;
+    Ok(())
+}
+
 fn canonical_real_directory(path: &Path, label: &str) -> Result<PathBuf, Box<dyn Error>> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -709,7 +761,7 @@ fn invalid_input(message: &str) -> Box<dyn Error> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ssdev-cutover-evidence prepare-policy <workspace> <pilot-materials-root> <pilot-manifest.json> <pilot-report.json> <candidate-bundle-root> <policy-approval-inputs.json> <policy-output.json>\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
+    "usage:\n  ssdev-cutover-evidence prepare-policy <workspace> <pilot-materials-root> <pilot-manifest.json> <pilot-report.json> <candidate-bundle-root> <evidence-trust.json> <policy-approval-inputs.json> <policy-output.json>\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
 }
 
 #[cfg(test)]
@@ -758,5 +810,79 @@ mod tests {
         let second = root.path().join("second.json");
         fs::write(&second, b"{}").unwrap();
         assert!(single_file_and_directory(vec![spec, second], "release set").is_err());
+    }
+
+    #[test]
+    fn trust_store_must_be_inside_an_approved_material_input() {
+        let root = tempdir().unwrap();
+        let approved = root.path().join("approved");
+        let unrelated = root.path().join("unrelated");
+        fs::create_dir(&approved).unwrap();
+        fs::create_dir(&unrelated).unwrap();
+        let trust = approved.join("evidence-trust.json");
+        let substitute = unrelated.join("evidence-trust.json");
+        fs::write(&trust, b"{}").unwrap();
+        fs::write(&substitute, b"{}").unwrap();
+        assert!(require_category_contains_file(&trust, &[approved], "evidence trust").is_ok());
+        assert!(require_category_contains_file(&substitute, &[trust], "evidence trust").is_err());
+    }
+
+    #[test]
+    fn policy_preparation_requires_active_keys_for_each_cutover_duty() {
+        let root = tempdir().unwrap();
+        let evidence = root.path().join("evidence-trust.json");
+        let approval_trust = root.path().join("release-trust.json");
+        let public_key = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+        let approval: PolicyApprovalInputs = serde_json::from_str(include_str!(
+            "../../../docs/cutover-policy-approval.example.json"
+        ))
+        .unwrap();
+        let evidence_keys = [
+            &approval.plugin_matrix_signer_key_id,
+            &approval.migration_audit_signer_key_id,
+            &approval.windows_package_signer_key_id,
+        ]
+        .into_iter()
+        .map(|key_id| {
+            serde_json::json!({
+                "keyId": key_id,
+                "algorithm": "ed25519",
+                "publicKey": public_key,
+                "purposes": ["cutover-evidence"],
+                "status": "active"
+            })
+        })
+        .collect::<Vec<_>>();
+        fs::write(
+            &evidence,
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "keys": evidence_keys
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &approval_trust,
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "keys": [{
+                    "keyId": approval.cutover_decision_signer_key_id,
+                    "algorithm": "ed25519",
+                    "publicKey": public_key,
+                    "purposes": ["cutover-decision"],
+                    "status": "active"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        validate_cutover_signing_keys(&evidence, &approval_trust, &approval).unwrap();
+
+        let mut retired: serde_json::Value =
+            serde_json::from_slice(&fs::read(&evidence).unwrap()).unwrap();
+        retired["keys"][0]["status"] = serde_json::json!("retired");
+        fs::write(&evidence, serde_json::to_vec(&retired).unwrap()).unwrap();
+        assert!(validate_cutover_signing_keys(&evidence, &approval_trust, &approval).is_err());
     }
 }
