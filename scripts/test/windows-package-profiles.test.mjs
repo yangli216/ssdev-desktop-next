@@ -130,6 +130,28 @@ test("Windows package smoke requires a rendered frontend IPC signal", async () =
   assert.match(controlHtml, /SSDEV Desktop 正在启动/);
 });
 
+test("Windows upgrade gate reinstalls and launches the exact previous release", async () => {
+  const packageTest = await readFile(packageTestUrl, "utf8");
+
+  assert.match(
+    packageTest,
+    /\$rollbackExecutable = Install-ApplicationPackage \$PreviousInstaller \$previousSignerSubject/,
+  );
+  assert.match(
+    packageTest,
+    /Assert-InstalledLayout \$rollbackExecutable \$PreviousMetadataDirectory \$previousSignerSubject/,
+  );
+  assert.match(
+    packageTest,
+    /Invoke-ApplicationSmoke \$rollbackExecutable \$script:PreviousRelease\.appVersion/,
+  );
+  assert.match(packageTest, /rollback reinstall did not preserve/);
+  assert.match(
+    packageTest,
+    /Uninstall-ApplicationPackage \$rollbackExecutable \$previousSignerSubject/,
+  );
+});
+
 test("production evidence binds delivery hosts, trust store, and origin policy", async () => {
   const [matrixTest, packageTest] = await Promise.all([
     readFile(pluginMatrixTestUrl, "utf8"),

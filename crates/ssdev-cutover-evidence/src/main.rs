@@ -416,6 +416,7 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
             msi_install_verified: false,
             launch_verified,
             upgrade_verified: previous.is_some(),
+            rollback_verified: previous.is_some() && launch_verified,
             previous_app_version: previous.map(|metadata| metadata.app_version),
             previous_release_metadata_sha256: previous_hash_after,
             previous_artifact_manifest_sha256: previous_artifact_manifest_hash_after,

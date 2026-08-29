@@ -26,7 +26,7 @@ GitHub Actions 将离线版命名为 `ssdev-windows-<arch>-offline-unsigned`，�
 
 - Linux 上执行 Rust 格式、Clippy、测试、桌面安全边界和前端/SDK 测试；
 - Windows 上分别验证 x86/x64 DLL、COM 和插件宿主；
-- 对 x64 与 x86 桌面各构建一套合成旧版本和当前版本，执行 NSIS 原位升级、启动、布局、架构与卸载验证；
+- 对 x64 与 x86 桌面各构建一套合成旧版本和当前版本，执行 NSIS 原位升级、候选启动、布局、架构、候选卸载、旧版精确回装启动与最终卸载验证；
 - 默认只构建 Windows 安装包；手动触发并选择 `all` 时才额外构建 Linux DEB/AppImage 和 macOS DMG 开发预览包；
 - 主分支推送额外上传经过可重复打包、固定文件集、摘要复核及离线 ESM/TypeScript 消费者冒烟的平台无关 Web Bridge SDK `.tgz`，Pull Request 只验证而不上传；
 - 将通过门禁的未签名产物保存 14 天。

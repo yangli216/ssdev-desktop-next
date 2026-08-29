@@ -854,7 +854,23 @@ function Test-Upgrade {
 
     Uninstall-ApplicationPackage $candidateExecutable
     $activeExecutable = $null
-    Write-Host "PASS NSIS upgrade, configuration preservation, launch, and uninstall"
+
+    $rollbackExecutable = Install-ApplicationPackage $PreviousInstaller $previousSignerSubject
+    $activeExecutable = $rollbackExecutable
+    $activeInstaller = $PreviousInstaller
+    Assert-InstalledLayout $rollbackExecutable $PreviousMetadataDirectory $previousSignerSubject
+    $preserved = Get-Content -Raw -LiteralPath $dataPaths.ConfigPath | ConvertFrom-Json
+    if ((Get-OptionalProperty $preserved "upgradeSentinel") -ne $sentinel) {
+      throw "NSIS rollback reinstall did not preserve the existing desktop configuration."
+    }
+    Invoke-ApplicationSmoke $rollbackExecutable $script:PreviousRelease.appVersion
+    $preserved = Get-Content -Raw -LiteralPath $dataPaths.ConfigPath | ConvertFrom-Json
+    if ((Get-OptionalProperty $preserved "upgradeSentinel") -ne $sentinel) {
+      throw "NSIS rolled-back application startup did not preserve unknown configuration fields."
+    }
+    Uninstall-ApplicationPackage $rollbackExecutable $previousSignerSubject
+    $activeExecutable = $null
+    Write-Host "PASS NSIS upgrade, configuration preservation, candidate launch, rollback reinstall, previous-version launch, and final uninstall"
   } finally {
     if ($activeExecutable -and @(Get-AppRegistrations).Count -gt 0) {
       try {

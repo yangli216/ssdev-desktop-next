@@ -4,7 +4,7 @@
 
 - 真实插件黄金矩阵证据：必须由 Windows x64 运行器产生，覆盖全部已声明 service/method；schema 2 同时绑定批准的发布集合规范、确定性包集合、实际插件载荷、信任库、矩阵和 x86/x64 待交付宿主。现场插件根目录必须能逐包重建出发布集合中的相同 SHA-256，证据中的发布集合规范、包集合、信任库及矩阵摘要还必须精确匹配生产策略，不能用另一套较小或不同输入但内部自洽的结果替代。
 - 迁移审计证据：schema 3 必须从已复验的 schema 2 试点材料 manifest 精确派生全部输入，同时扫描业务前端静态资源和代表性真实 HAR，并绑定试点 `materialSetSha256` 以及通过 active 签名验证、实际授权全部迁移配置的来源策略 SHA-256；旧 WebPlus `7711` 与桌面回调 `45121` 均不得有静态或运行时证据，HTTP 业务来源必须全部获得该策略批准，且不能留有 critical 或 warning finding。配置文件、插件目录、服务、快捷键、前端资源和 HAR 的八类计数还必须达到项目策略批准的最低覆盖，避免用另一组较小或不同输入替代已移交材料。
-- Windows 包证据：schema 5 必须验证 Authenticode、NSIS、实际启动事件，以及从指定上一生产版本升级并保留配置；证据绑定上一版本号、`release.json` 与已验签 `artifacts.json` 的 SHA-256，不能用任意更低版本或 CI 合成版本替代。它同时从实际安装目录记录插件信任库、来源策略和 x86/x64 插件宿主 SHA-256，并可绑定一小时内由同版本 Windows 客户端导出的深度部署记录。该记录必须包含完整 13 项检查、真实业务页面到 Rust IPC 的 `pass` 和 `deliveryReady: true`。最终判定要求部署记录存在、来源策略与迁移审计及生产策略一致，信任库和宿主与真实硬件矩阵使用的输入逐字节一致。普通 CI 可以留下空部署记录以证明安装脚本本身，但这种包证据稳定返回 `windows-business-frontend-not-verified`，不能生产 GO。历史 MSI 字段仅为格式兼容保留，不参与新发布判定；旧 schema 包证据缺少这些身份，不能用于新决策。
+- Windows 包证据：schema 6 必须验证 Authenticode、NSIS、实际启动事件，以及从指定上一生产版本升级并保留配置；随后必须卸载候选、回装同一输入 bundle 中的上一版本，再次验证上一版本签名、布局、启动和配置保留，最后完成卸载。`upgradeVerified` 与 `rollbackVerified` 独立记录，任一缺失都会阻断生产切换。证据绑定上一版本号、`release.json` 与已验签 `artifacts.json` 的 SHA-256，不能用任意更低版本或 CI 合成版本替代。它同时从实际安装目录记录插件信任库、来源策略和 x86/x64 插件宿主 SHA-256，并可绑定一小时内由同版本 Windows 客户端导出的深度部署记录。该记录必须包含完整 13 项检查、真实业务页面到 Rust IPC 的 `pass` 和 `deliveryReady: true`。最终判定要求部署记录存在、来源策略与迁移审计及生产策略一致，信任库和宿主与真实硬件矩阵使用的输入逐字节一致。普通 CI 可以留下空部署记录以证明安装脚本本身，但这种包证据稳定返回 `windows-business-frontend-not-verified`，不能生产 GO。历史 MSI 字段仅为格式兼容保留，不参与新发布判定；旧 schema 包证据缺少独立回退结果，不能用于新决策。
 
 三份证据必须指向策略指定的同一 Git 提交、全部为 clean source，并且不超过策略允许的年龄。schema 7 策略还绑定批准的试点材料集合、候选与上一生产版本、两者的 Windows 产物清单、上一版本发布元数据、来源策略、QA 证据信任库，以及发布集合规范、确定性插件包集合、插件发布/审批信任库和定稿黄金矩阵 SHA-256，并设置项目级迁移覆盖下限；它可以为项目确实不存在的旧资产类别显式填 `0`，但不能省略字段或用旧 schema 绕过确认。策略只能指定这些项目事实、目标提交、预期 SemVer、60 秒至 31 天的证据有效期，以及三类证据和最终审批各自预期的签名 `keyId`，不能关闭其他固化门禁。四个职责的 `keyId` 必须互不相同。生成后的策略还必须由最终审批职责签名；未签名策略不能进入判定。
 
@@ -73,7 +73,7 @@ scripts/test-windows-package.ps1 `
   -ExpectedSignerSubject "CN=Approved Publisher"
 ```
 
-工具只接受 schema 1、`unsigned-local-record`、Windows、候选版本一致、13 个固定检查项齐全且 `business-frontend` 为 `pass` 的深度记录；记录必须在包证据生成前一小时内产生。它会在读取前后复算摘要并把摘要及生成时间写入待签名的 schema 5 包证据，原始记录仍应随 QA 归档保存。未传参数时脚本显式写入空绑定，适用于普通 CI，但最终判定不会把它当作现场验收。
+工具只接受 schema 1、`unsigned-local-record`、Windows、候选版本一致、13 个固定检查项齐全且 `business-frontend` 为 `pass` 的深度记录；记录必须在包证据生成前一小时内产生。它会在读取前后复算摘要并把摘要及生成时间写入待签名的 schema 6 包证据，原始记录仍应随 QA 归档保存。未传参数时脚本显式写入空绑定，适用于普通 CI，但最终判定不会把它当作现场验收。
 
 每份证据生成后，由对应受控 QA 环境使用统一外部签名流程处理，三个 artifact kind 分别为 `plugin-matrix-evidence`、`migration-audit-evidence` 和 `windows-package-evidence`。例如：
 
@@ -105,9 +105,9 @@ cargo run --locked -p ssdev-cutover-evidence -- decide `
   D:\cutover-output\cutover-decision.json
 ```
 
-输入必须是有大小上限的普通文件，决策输出的父目录必须预先存在且目标不能已存在。工具先使用获准发布信任库验证策略的 `cutover-policy` 封套、keyId、用途和独立签名域，再按策略指定 `keyId` 和 `cutover-evidence` 用途验证三个 active-key 证据封套；所有策略、封套、信任库和证据都在读取前后重新计算摘要，执行中变化直接拒绝。插件矩阵只接受 schema 2，迁移审计只接受 schema 3，Windows 包只接受 schema 5；对应旧证据必须用已复验试点输入、指定上一生产 bundle 和实际候选包重新执行。schema 3 决策记录策略、策略封套、实际 QA 证据信任库和实际最终审批信任库摘要；旧 schema 2 GO 缺少策略授权身份，不能继续签发。`GO` 返回 0；`NO-GO` 仍以不覆盖方式写出排序后的稳定阻塞码，随后返回 3，便于 CI 阻断发布；输入损坏、签名/用途/keyId 不匹配、schema 不匹配或 I/O 失败返回 1。
+输入必须是有大小上限的普通文件，决策输出的父目录必须预先存在且目标不能已存在。工具先使用获准发布信任库验证策略的 `cutover-policy` 封套、keyId、用途和独立签名域，再按策略指定 `keyId` 和 `cutover-evidence` 用途验证三个 active-key 证据封套；所有策略、封套、信任库和证据都在读取前后重新计算摘要，执行中变化直接拒绝。插件矩阵只接受 schema 2，迁移审计只接受 schema 3，Windows 包只接受 schema 6；对应旧证据必须用已复验试点输入、指定上一生产 bundle 和实际候选包重新执行。schema 3 决策记录策略、策略封套、实际 QA 证据信任库和实际最终审批信任库摘要；旧 schema 2 GO 缺少策略授权身份，不能继续签发。`GO` 返回 0；`NO-GO` 仍以不覆盖方式写出排序后的稳定阻塞码，随后返回 3，便于 CI 阻断发布；输入损坏、签名/用途/keyId 不匹配、schema 不匹配或 I/O 失败返回 1。
 
-常见阻塞码包括 dirty/source mismatch、证据过期或未来时间、试点材料集合不匹配、候选或上一生产 Windows 版本/产物清单/发布元数据不匹配、插件发布集合/信任库/矩阵不匹配、实机矩阵与安装包信任库或宿主不一致、迁移/安装/策略三方来源策略摘要不一致、HTTP 来源授权不完整、迁移资产计数低于策略、静态资源/HAR 未覆盖、旧本机 HTTP 仍被观察到、迁移 warning/critical 未清零，以及 Windows 签名、NSIS 安装、启动或升级未验证。
+常见阻塞码包括 dirty/source mismatch、证据过期或未来时间、试点材料集合不匹配、候选或上一生产 Windows 版本/产物清单/发布元数据不匹配、插件发布集合/信任库/矩阵不匹配、实机矩阵与安装包信任库或宿主不一致、迁移/安装/策略三方来源策略摘要不一致、HTTP 来源授权不完整、迁移资产计数低于策略、静态资源/HAR 未覆盖、旧本机 HTTP 仍被观察到、迁移 warning/critical 未清零，以及 Windows 签名、NSIS 安装、启动、升级或上一版本回装启动未验证。`windows-rollback-not-verified` 不能由已有升级结果替代，必须重新执行完整回退演练并生成 schema 6 包证据。
 
 `windows-business-frontend-not-verified` 表示 Windows QA 证据没有绑定合格的深度部署记录。它不能通过签名一个空字段消除；必须在目标网络重新打开实际业务页面、确认到达 Rust IPC、导出深度记录并重新生成/签署 Windows 包证据。
 

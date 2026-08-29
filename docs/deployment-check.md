@@ -42,7 +42,7 @@
 
 记录明确带有 `evidenceLevel: "unsigned-local-record"`。它适合项目实施交接和修复前后对照，但不提供发布者身份、目标机身份或不可抵赖性，不能代替真实插件黄金矩阵、Windows 包验收和生产切换 Go/No-Go 签名证据。
 
-正式 Windows QA 可以在真实业务页面已显示“已连接”后立即导出该记录，并在一小时内通过 `scripts/test-windows-package.ps1 -DeploymentCheckRecord <file>` 将其 SHA-256 和生成时间纳入 schema 5 Windows 包证据，再由对应 QA 职责签名。包证据工具会重新严格核对候选版本、Windows 平台、完整 13 项、计数、深度交付状态和 `business-frontend: pass`。原记录自身仍是未签名现场记录；只有被包证据摘要绑定并完成 QA 签名后才进入 Go/No-Go，普通 CI 不会伪造该输入。
+正式 Windows QA 可以在真实业务页面已显示“已连接”后立即导出该记录，并在一小时内通过 `scripts/test-windows-package.ps1 -DeploymentCheckRecord <file>` 将其 SHA-256 和生成时间纳入 schema 6 Windows 包证据，再由对应 QA 职责签名。包证据工具会重新严格核对候选版本、Windows 平台、完整 13 项、计数、深度交付状态和 `business-frontend: pass`。原记录自身仍是未签名现场记录；只有被包证据摘要绑定并完成 QA 签名后才进入 Go/No-Go，普通 CI 不会伪造该输入。
 
 ## 不替代的验证
 

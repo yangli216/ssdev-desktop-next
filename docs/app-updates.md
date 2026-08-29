@@ -66,8 +66,8 @@ Windows 构建只生成 NSIS。默认使用 `-WebViewInstallMode OfflineInstalle
 
 - 安装包版本必须高于当前版本，发布说明不得包含敏感信息。
 - 发布 Desktop 前必须先保证每个仍需保留的签名插件已发布覆盖目标版本的兼容范围，并在代表性机器复核本地映射；客户端会阻止导致现有插件或映射被隔离的升级，不以“升级后再修能力”作为正常流程。
-- 在隔离 Windows 账户运行 `scripts/test-windows-package.ps1 -ExpectedAppUpdatePublicKey <独立公钥文件> -EvidenceOutput <工作区和 bundle 外的新文件> -EvidenceEnvironment <验证环境标签> -DeploymentCheckRecord <同版本客户端刚导出的深度检查 JSON> -RequireAuthenticode -ExpectedSignerSubject "<完整证书主题 DN>"`；门禁先验证签名的全产物清单、源码提交/锁文件/工具链溯源、SBOM、updater 包、信任密钥生命周期及来源/可选进程策略的 active 密钥签名，再要求 NSIS 通过安装、架构/资源/注入策略一致性/签名检查、启动诊断和卸载，且所有 Authenticode 签名者主题必须精确匹配；成功后才写出绑定本次结果、实际安装插件信任库、来源策略、x86/x64 宿主及深度部署记录 SHA-256 且不可覆盖的 schema 5 包验收证据。传入 `-PreviousBundleRoot` 时还记录上一版本号、发布元数据和全产物清单摘要；不传部署记录的普通 CI 证据不能进入生产 GO。
-- CI 使用同一源码构建较低的 `0.0.1` 合成版本，对 NSIS 自动验证原位升级、候选版本启动和配置哨兵保留；正式发布还必须通过 `-PreviousBundleRoot` 输入真实上一生产版本重复该门禁。
+- 在隔离 Windows 账户运行 `scripts/test-windows-package.ps1 -ExpectedAppUpdatePublicKey <独立公钥文件> -EvidenceOutput <工作区和 bundle 外的新文件> -EvidenceEnvironment <验证环境标签> -DeploymentCheckRecord <同版本客户端刚导出的深度检查 JSON> -RequireAuthenticode -ExpectedSignerSubject "<完整证书主题 DN>"`；门禁先验证签名的全产物清单、源码提交/锁文件/工具链溯源、SBOM、updater 包、信任密钥生命周期及来源/可选进程策略的 active 密钥签名，再要求 NSIS 通过安装、架构/资源/注入策略一致性/签名检查、启动诊断和卸载，且所有 Authenticode 签名者主题必须精确匹配；成功后才写出绑定本次结果、实际安装插件信任库、来源策略、x86/x64 宿主及深度部署记录 SHA-256 且不可覆盖的 schema 6 包验收证据。传入 `-PreviousBundleRoot` 时还记录上一版本号、发布元数据、全产物清单摘要以及独立 `rollbackVerified`；不传部署记录的普通 CI 证据不能进入生产 GO。
+- CI 使用同一源码构建较低的 `0.0.1` 合成版本，对 NSIS 自动验证原位升级、候选版本启动、配置哨兵保留、候选卸载、旧版精确回装、旧版启动与最终卸载；正式发布还必须通过 `-PreviousBundleRoot` 输入真实上一生产版本重复该门禁。该演练只验证客户端安装与配置恢复，不逆转外部硬件或业务副作用。
 - 先在隔离 Windows 验证机测试下载、签名错误、网络中断、安装失败和配置保留。
 - 分批发布时由更新服务控制可见范围，不在客户端实现任意降级。
 - 需要回滚时优先发布更高版本号的修复包；紧急降级必须通过重新构建的受控恢复安装包完成。

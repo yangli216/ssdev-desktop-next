@@ -176,6 +176,7 @@ pub enum ArtifactSummary {
         msi_install_verified: bool,
         launch_verified: bool,
         upgrade_verified: bool,
+        rollback_verified: bool,
     },
 }
 
@@ -532,6 +533,7 @@ fn prepare_material(
                     msi_install_verified: evidence.msi_install_verified,
                     launch_verified: evidence.launch_verified,
                     upgrade_verified: evidence.upgrade_verified,
+                    rollback_verified: evidence.rollback_verified,
                 },
             )
         }
@@ -900,6 +902,7 @@ mod tests {
                     "msiInstallVerified": true,
                     "launchVerified": true,
                     "upgradeVerified": true,
+                    "rollbackVerified": true,
                     "previousAppVersion": "1.2.2",
                     "previousReleaseMetadataSha256": "99".repeat(32),
                     "previousArtifactManifestSha256": "dd".repeat(32),

@@ -22,7 +22,7 @@ business webview -> narrow Tauri command -> Rust controller
 - controller 最多接受 8 个在途插件调用；容量饱和时在进入原生宿主前快速拒绝，不建立无界等待队列。
 - localhost HTTP 仅作为可关闭的旧浏览器兼容网关，不是新架构内部依赖。
 
-每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归；Windows 门禁还会实际生成并构建两种架构的最小 DLL 插件脚手架，用公开 RFC 8032 测试向量制作两个仅供 CI 的签名包，经过正式发布集合检查和物化后，由生产黄金矩阵包装器分别拉起已经构建的 Release x86/x64 宿主完成调用并核对 schema 2 证据。随后分别为 x64 与 x86 桌面构建 `0.0.1` 合成旧版本和当前候选版本，对离线 NSIS 执行原位升级、配置保留、布局/架构检查、真实启动和卸载；再额外构建在线轻量 NSIS 并执行安装、启动和卸载冒烟。Linux DEB/AppImage 和 macOS DMG 仅在手动选择 `all` 平台时构建。CI 测试签名密钥、临时更新密钥均非生产信任材料，平台代码签名也被明确跳过，产物不能分发；生产硬件矩阵仍必须输入候选安装包构建留下的已签名宿主原文件，CI Release 宿主不能替代该身份门禁。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
+每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归；Windows 门禁还会实际生成并构建两种架构的最小 DLL 插件脚手架，用公开 RFC 8032 测试向量制作两个仅供 CI 的签名包，经过正式发布集合检查和物化后，由生产黄金矩阵包装器分别拉起已经构建的 Release x86/x64 宿主完成调用并核对 schema 2 证据。随后分别为 x64 与 x86 桌面构建 `0.0.1` 合成旧版本和当前候选版本，对离线 NSIS 执行原位升级、配置保留、布局/架构检查、候选启动、候选卸载、精确旧版回装、旧版启动和最终卸载；再额外构建在线轻量 NSIS 并执行安装、启动和卸载冒烟。Linux DEB/AppImage 和 macOS DMG 仅在手动选择 `all` 平台时构建。CI 测试签名密钥、临时更新密钥均非生产信任材料，平台代码签名也被明确跳过，产物不能分发；生产硬件矩阵仍必须输入候选安装包构建留下的已签名宿主原文件，CI Release 宿主不能替代该身份门禁。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
 
 架构决策和迁移门槛见 [docs/adr/0001-target-architecture.md](docs/adr/0001-target-architecture.md)。
 
@@ -183,7 +183,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
   -ExpectedSignerSubject "<完整证书主题 DN>"
 ```
 
-该门禁先要求包内更新公钥与独立输入的组织公钥逐字节一致，再验证签名的全产物 SHA-256 清单、源码提交/锁文件/工具链溯源、Rust/npm CycloneDX SBOM、updater Minisign、信任密钥生命周期以及来源/可选进程策略的 active 密钥签名；随后安装 NSIS，验证 x64 主程序、x86/x64 宿主、注入策略及 Authenticode 发布者，启动到 `app-started` 诊断事件，最后静默卸载并确认程序与注册项清理完成。只有全部请求项成功后，才会以不覆盖方式在源码和 bundle 之外写出绑定发布元数据、产物清单、版本、实际安装插件信任库、来源策略与双宿主摘要、安装器覆盖、启动、升级和签名结果的 schema 5 Windows 包证据；使用上一生产 bundle 时还绑定其版本、`release.json` 和 `artifacts.json` 摘要。正式验收另传 `-DeploymentCheckRecord`，把一小时内由同版本客户端导出的 Windows 深度检查摘要写入证据；普通 CI 不伪造真实业务页面结果，因此该字段为空且不能用于生产 GO。
+该门禁先要求包内更新公钥与独立输入的组织公钥逐字节一致，再验证签名的全产物 SHA-256 清单、源码提交/锁文件/工具链溯源、Rust/npm CycloneDX SBOM、updater Minisign、信任密钥生命周期以及来源/可选进程策略的 active 密钥签名；随后安装 NSIS，验证 x64 主程序、x86/x64 宿主、注入策略及 Authenticode 发布者，启动到 `app-started` 诊断事件，最后静默卸载并确认程序与注册项清理完成。只有全部请求项成功后，才会以不覆盖方式在源码和 bundle 之外写出绑定发布元数据、产物清单、版本、实际安装插件信任库、来源策略与双宿主摘要、安装器覆盖、启动、升级、回退和签名结果的 schema 6 Windows 包证据；使用上一生产 bundle 时还绑定其版本、`release.json` 和 `artifacts.json` 摘要。正式验收另传 `-DeploymentCheckRecord`，把一小时内由同版本客户端导出的 Windows 深度检查摘要写入证据；普通 CI 不伪造真实业务页面结果，因此该字段为空且不能用于生产 GO。
 
 若要验证覆盖升级，将上一正式版本解包目录作为额外输入：
 
@@ -199,7 +199,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
   -PreviousExpectedAppUpdatePublicKey C:\release-inputs\previous\app-update.pub
 ```
 
-脚本要求旧版本号严格低于候选版本；它只在确认测试账户没有既有应用数据后，向 Windows 标准应用配置目录写入升级哨兵，升级后同时验证新版本启动事件和未知配置字段保留，并清理由测试创建的数据。若未指定上一版本的证书主题或更新公钥，旧包默认必须与候选包使用相同信任材料；轮换时可分别通过 `-PreviousExpectedSignerSubject` 和 `-PreviousExpectedAppUpdatePublicKey` 显式提供旧信任锚。
+脚本要求旧版本号严格低于候选版本；它只在确认测试账户没有既有应用数据后，向 Windows 标准应用配置目录写入升级哨兵。候选升级后验证新版本启动和未知配置字段保留，再卸载候选、回装输入 bundle 中的精确上一版本，重新验证上一版本的 Authenticode、安装布局、启动事件和配置保留，最后卸载上一版本并清理由测试创建的数据。`upgradeVerified` 与 `rollbackVerified` 是两个独立证据字段；跳过启动或没有上一版本时不能得到回退通过。若未指定上一版本的证书主题或更新公钥，旧包默认必须与候选包使用相同信任材料；轮换时可分别通过 `-PreviousExpectedSignerSubject` 和 `-PreviousExpectedAppUpdatePublicKey` 显式提供旧信任锚。这是客户端安装层的受控回退演练，不声称能够逆转已经发生的硬件操作或业务系统副作用。
 
 ## 真实插件黄金矩阵
 
@@ -219,10 +219,10 @@ powershell -ExecutionPolicy Bypass -File scripts/test-plugin-matrix.ps1 `
   -EvidenceEnvironment hospital-a-reader-lab
 ```
 
-矩阵运行器不会自行编译方便但不同字节的 Debug 宿主；`X86Host` 与 `X64Host` 必须是本次候选安装包构建留下的精确 Release/签名文件。运行器会在启动 controller 和接触硬件前拒绝草稿、尚未解除的 `reviewRequired`、生成器保留占位符、无效或不完整输入、重复名称、未知路由，或未覆盖任一已声明 service/method 的矩阵；还会把插件根目录中的每个已安装插件重新确定性封包，要求插件身份、版本、签名 keyId 和包 SHA-256 与批准的发布集合逐项一致。随后由 x64 控制器分别拉起这两个待交付宿主，逐项对 `ResCode` 和 `ResData` 做精确黄金比对。全部通过且源码、发布集合、插件、信任库、矩阵和两个宿主在执行前后保持一致时，才以不覆盖方式写出绑定这些 SHA-256、源码提交、环境标签和覆盖计数的 schema 2 机器证据。Windows 包验收的 schema 5 证据会从实际安装目录记录同一对宿主摘要，并绑定目标网络中真实业务页面已到达 Rust IPC 的深度部署记录；最终 Go/No-Go 要求宿主逐字节一致且该记录存在。任何无效插件、签名问题、输入变化、宿主不一致、崩溃、超时或结果差异都会使门禁失败。
+矩阵运行器不会自行编译方便但不同字节的 Debug 宿主；`X86Host` 与 `X64Host` 必须是本次候选安装包构建留下的精确 Release/签名文件。运行器会在启动 controller 和接触硬件前拒绝草稿、尚未解除的 `reviewRequired`、生成器保留占位符、无效或不完整输入、重复名称、未知路由，或未覆盖任一已声明 service/method 的矩阵；还会把插件根目录中的每个已安装插件重新确定性封包，要求插件身份、版本、签名 keyId 和包 SHA-256 与批准的发布集合逐项一致。随后由 x64 控制器分别拉起这两个待交付宿主，逐项对 `ResCode` 和 `ResData` 做精确黄金比对。全部通过且源码、发布集合、插件、信任库、矩阵和两个宿主在执行前后保持一致时，才以不覆盖方式写出绑定这些 SHA-256、源码提交、环境标签和覆盖计数的 schema 2 机器证据。Windows 包验收的 schema 6 证据会从实际安装目录记录同一对宿主摘要，并绑定目标网络中真实业务页面已到达 Rust IPC 的深度部署记录；最终 Go/No-Go 要求宿主逐字节一致且该记录存在。任何无效插件、签名问题、输入变化、宿主不一致、崩溃、超时或结果差异都会使门禁失败。
 
 ## 生产切换判定
 
-正式迁移审计、真实插件矩阵和 Windows 包验收各自生成不可覆盖的精简证据，并由对应 QA 环境使用 `cutover-evidence` 用途密钥签名。使用 [生产切换证据与 Go/No-Go](docs/cutover-evidence.md) 中的严格判定器按策略指定 keyId 验证三份封套，确认三者来自同一 clean commit、仍在有效期内，最终 Windows 产物清单和插件发布集合、信任库、黄金矩阵精确匹配审批输入，实机测试信任库/宿主与安装包实际内容逐字节一致，旧配置/插件/快捷键/前端/HAR 覆盖达到项目下限，且 HTTP 清理、迁移 finding、NSIS 安装、签名、启动和跨版本升级全部满足。`NO-GO` 会留存阻塞码并返回非零状态；只有 `GO` 文档能由另一把具备独立 `cutover-decision` 用途的组织 KMS/HSM 密钥签发最终审批封套。
+正式迁移审计、真实插件矩阵和 Windows 包验收各自生成不可覆盖的精简证据，并由对应 QA 环境使用 `cutover-evidence` 用途密钥签名。使用 [生产切换证据与 Go/No-Go](docs/cutover-evidence.md) 中的严格判定器按策略指定 keyId 验证三份封套，确认三者来自同一 clean commit、仍在有效期内，最终 Windows 产物清单和插件发布集合、信任库、黄金矩阵精确匹配审批输入，实机测试信任库/宿主与安装包实际内容逐字节一致，旧配置/插件/快捷键/前端/HAR 覆盖达到项目下限，且 HTTP 清理、迁移 finding、NSIS 安装、签名、启动、跨版本升级和上一版本回装启动全部满足。`NO-GO` 会留存阻塞码并返回非零状态；只有 `GO` 文档能由另一把具备独立 `cutover-decision` 用途的组织 KMS/HSM 密钥签发最终审批封套。
 
 生产策略使用 `ssdev-cutover-evidence prepare-policy` 自动生成：版本、提交和全部材料/插件/bundle/信任库摘要来自已复验试点输入与候选包，人工只批准证据时效、迁移覆盖下限和四个职责签名人。schema 7 策略固定 QA 与最终审批信任库，并必须先由现有最终审批职责以独立 `cutover-policy` 域签名；`decide` 不接受未签名或被替换的策略。schema 3 GO 决策继续固定策略封套和实际两份信任库；同名 keyId 的替代公钥库不能通过判定或签发。工具在写入前二次复验输入且禁止覆盖，避免把复制错误或不匹配版本固化为看似有效的策略。
