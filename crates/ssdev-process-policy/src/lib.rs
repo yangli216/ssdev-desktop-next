@@ -39,6 +39,12 @@ pub struct ProcessPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessPolicyEntrySummary {
+    pub id: String,
+    pub singleton: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchFailure {
     pub process_id: String,
     pub error: String,
@@ -114,6 +120,19 @@ impl ProcessPolicy {
 
     pub fn is_empty(&self) -> bool {
         self.processes.is_empty()
+    }
+
+    pub fn entries(&self) -> Vec<ProcessPolicyEntrySummary> {
+        let mut entries = self
+            .processes
+            .values()
+            .map(|process| ProcessPolicyEntrySummary {
+                id: process.id.clone(),
+                singleton: process.singleton,
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.id.cmp(&right.id));
+        entries
     }
 
     fn from_unsigned_bytes_at(bytes: &[u8], path: &Path) -> Result<Self, PolicyError> {
@@ -460,6 +479,13 @@ mod tests {
         let (_root, trust, policy, signature) = fixture();
         let loaded = ProcessPolicy::load(&policy, &signature, &trust).unwrap();
         assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded.entries(),
+            vec![ProcessPolicyEntrySummary {
+                id: "helper".into(),
+                singleton: true,
+            }]
+        );
     }
 
     #[test]
@@ -476,6 +502,52 @@ mod tests {
         let report = loaded.launch_selected(&["missing".into()]);
         assert_eq!(report.failures.len(), 1);
         assert!(report.started.is_empty());
+    }
+
+    #[test]
+    fn policy_entries_are_sorted_and_expose_only_selection_metadata() {
+        let executable = if cfg!(windows) {
+            r#"C:\SSDEV\helper.exe"#
+        } else {
+            "/opt/ssdev/helper"
+        };
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1,
+            "processes": [
+                {
+                    "id": "zeta-helper",
+                    "executable": executable,
+                    "sha256": "00".repeat(32),
+                    "arguments": ["--secret-runtime-detail"],
+                    "singleton": false
+                },
+                {
+                    "id": "alpha-helper",
+                    "executable": executable,
+                    "sha256": "11".repeat(32),
+                    "singleton": true
+                }
+            ]
+        }))
+        .unwrap();
+
+        let entries = ProcessPolicy::from_unsigned_bytes(&bytes)
+            .unwrap()
+            .entries();
+
+        assert_eq!(
+            entries,
+            vec![
+                ProcessPolicyEntrySummary {
+                    id: "alpha-helper".into(),
+                    singleton: true,
+                },
+                ProcessPolicyEntrySummary {
+                    id: "zeta-helper".into(),
+                    singleton: false,
+                },
+            ]
+        );
     }
 
     #[cfg(unix)]

@@ -210,9 +210,23 @@ struct BridgeState {
     trust_store: Option<Arc<TrustStore>>,
     plugin_api_baseline: std::sync::Mutex<PluginApiBaselineStore>,
     install_lock: tokio::sync::Mutex<()>,
-    process_policy_entries: usize,
+    process_policy_catalog: Vec<ManagedProcessCatalogEntry>,
+    process_policy_error: Option<&'static str>,
     managed_process_failures: usize,
     repository_client: reqwest::Client,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedProcessCatalogEntry {
+    id: String,
+    singleton: bool,
+}
+
+struct ManagedProcessStartup {
+    catalog: Vec<ManagedProcessCatalogEntry>,
+    failures: usize,
+    error: Option<&'static str>,
 }
 
 struct DiagnosticsRuntime {
@@ -384,6 +398,8 @@ struct BridgeStatus {
     revoked_trust_key_count: usize,
     plugin_root: PathBuf,
     process_policy_entries: usize,
+    process_policy_error: Option<&'static str>,
+    managed_process_catalog: Vec<ManagedProcessCatalogEntry>,
     managed_process_failures: usize,
     managed_process_restart_required: bool,
     auto_start_enabled: Option<bool>,
@@ -519,7 +535,9 @@ async fn bridge_status(
         retired_trust_key_count: trust_keys.retired,
         revoked_trust_key_count: trust_keys.revoked,
         plugin_root: state.plugin_root.clone(),
-        process_policy_entries: state.process_policy_entries,
+        process_policy_entries: state.process_policy_catalog.len(),
+        process_policy_error: state.process_policy_error,
+        managed_process_catalog: state.process_policy_catalog.clone(),
         managed_process_failures: state.managed_process_failures,
         managed_process_restart_required: desktop_state.managed_process_restart_required(),
         auto_start_enabled,
@@ -1020,7 +1038,7 @@ async fn export_diagnostics(
         active_trust_key_count: trust_keys.active,
         retired_trust_key_count: trust_keys.retired,
         revoked_trust_key_count: trust_keys.revoked,
-        process_policy_entries: bridge_state.process_policy_entries,
+        process_policy_entries: bridge_state.process_policy_catalog.len(),
         managed_process_failures: bridge_state.managed_process_failures,
         managed_process_restart_required: desktop_state.managed_process_restart_required(),
         origin_policy_enforced: origin.enforced,
@@ -5607,7 +5625,7 @@ pub fn run() {
             tauri::async_runtime::block_on(controller.replace_manifests(&plugins.manifests))?;
             StartupStage::CoreServices.enter();
             let initial_config = config.snapshot();
-            let (process_policy_entries, managed_process_failures) = launch_managed_processes(
+            let managed_process_startup = launch_managed_processes(
                 &resource_dir,
                 &trust_store_path,
                 &initial_config.managed_processes,
@@ -5662,8 +5680,9 @@ pub fn run() {
                 trust_store,
                 plugin_api_baseline: std::sync::Mutex::new(plugin_api_baseline),
                 install_lock: tokio::sync::Mutex::new(()),
-                process_policy_entries,
-                managed_process_failures,
+                process_policy_catalog: managed_process_startup.catalog,
+                process_policy_error: managed_process_startup.error,
+                managed_process_failures: managed_process_startup.failures,
                 repository_client,
             });
             StartupStage::DesktopShell.enter();
@@ -6331,7 +6350,7 @@ fn launch_managed_processes(
     resource_dir: &std::path::Path,
     trust_store_path: &std::path::Path,
     selected: &[String],
-) -> (usize, usize) {
+) -> ManagedProcessStartup {
     let policy_path = select_runtime_path(
         resource_dir.join("process-policy.json"),
         development_path_override("SSDEV_PROCESS_POLICY"),
@@ -6350,7 +6369,11 @@ fn launch_managed_processes(
                 "managed processes selected without a signed process policy"
             );
         }
-        return (0, selected.len());
+        return ManagedProcessStartup {
+            catalog: Vec::new(),
+            failures: selected.len(),
+            error: Some("process-policy-not-installed"),
+        };
     }
     let policy = TrustStore::load(trust_store_path)
         .map_err(|error| error.to_string())
@@ -6365,10 +6388,21 @@ fn launch_managed_processes(
                 event_code = "process-policy-rejected",
                 "signed managed process policy rejected"
             );
-            return (0, selected.len().max(1));
+            return ManagedProcessStartup {
+                catalog: Vec::new(),
+                failures: selected.len().max(1),
+                error: Some("process-policy-invalid"),
+            };
         }
     };
-    let entries = policy.len();
+    let catalog = policy
+        .entries()
+        .into_iter()
+        .map(|entry| ManagedProcessCatalogEntry {
+            id: entry.id,
+            singleton: entry.singleton,
+        })
+        .collect();
     let report = policy.launch_selected(selected);
     for failure in &report.failures {
         tracing::warn!(
@@ -6377,7 +6411,11 @@ fn launch_managed_processes(
             "managed process was not started"
         );
     }
-    (entries, report.failures.len())
+    ManagedProcessStartup {
+        catalog,
+        failures: report.failures.len(),
+        error: None,
+    }
 }
 
 fn legacy_config_candidates(system_config_dir: &std::path::Path) -> Vec<PathBuf> {

@@ -155,6 +155,19 @@ button:disabled { cursor: wait !important; opacity: .5; }
 .environment-default { display: flex; gap: 5px; align-items: center; color: #5d6b63; font-size: 11px; }
 .environments button { padding: 9px 10px; border: 1px solid #9eaaa2; border-radius: 8px; background: transparent; color: #274735; cursor: pointer; }
 .environment-add { justify-self: start; }
+.managed-process-selector { display: grid; gap: 10px; margin: 0; padding: 16px; border: 1px solid #c8d1c9; border-radius: 10px; background: #fbfcf9; }
+.managed-process-selector legend { padding: 0 6px; color: #4c5d53; font-size: 12px; font-weight: 700; }
+.managed-process-selector > p { margin: 0; color: #718078; font-size: 11px; line-height: 1.55; }
+.managed-process-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.managed-process-options label { display: flex; gap: 9px; align-items: flex-start; min-width: 0; padding: 11px 12px; border: 1px solid #d2d9d2; border-radius: 9px; background: #fff; cursor: pointer; }
+.managed-process-options label.unavailable { border-color: #dfc9b3; background: #fff8ee; }
+.managed-process-options input { margin-top: 2px; }
+.managed-process-options span { display: grid; gap: 3px; min-width: 0; }
+.managed-process-options strong { overflow: hidden; color: #284735; font: 650 12px ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.managed-process-options small { color: #758078; font-size: 10px; line-height: 1.4; }
+.managed-process-policy-warning { padding: 9px 11px; border-radius: 8px; color: #774627 !important; background: #fff0dc; }
+.managed-process-restart-note { color: #8a4d2d; font-weight: 700; }
+.managed-process-empty { padding: 10px 12px; border-radius: 8px; background: #f0f3ee; }
 .advanced-settings { display: grid; gap: 13px; padding: 14px 16px; border: 1px solid #d5dcd5; border-radius: 10px; background: #f8faf6; }
 .advanced-settings summary { color: #43564b; font-size: 12px; font-weight: 750; cursor: pointer; }
 .advanced-settings[open] summary { margin-bottom: 3px; }
@@ -340,6 +353,7 @@ button:disabled { cursor: wait !important; opacity: .5; }
   .module-panel > header > small { text-align: left; }
   .attention-panel, .boundary { grid-template-columns: 1fr; gap: 24px; }
   .form-columns { grid-template-columns: 1fr; }
+  .managed-process-options { grid-template-columns: 1fr; }
   .config-import-preview > header { align-items: flex-start; flex-direction: column; }
   .business-data-clear-preview > header { align-items: flex-start; flex-direction: column; }
   .plugin-package-preview > header { align-items: flex-start; flex-direction: column; }

@@ -66,6 +66,11 @@ type BridgeStatus = {
   revokedTrustKeyCount: number
   pluginRoot: string
   processPolicyEntries: number
+  processPolicyError?: string
+  managedProcessCatalog: Array<{
+    id: string
+    singleton: boolean
+  }>
   managedProcessFailures: number
   managedProcessRestartRequired: boolean
   autoStartEnabled?: boolean
@@ -415,6 +420,7 @@ const configImportPreview = ref<ConfigImportPreview | null>(null)
 const selectedConfigImport = ref('')
 const snapshot = ref<ConfigSnapshot | null>(null)
 const savedConfigFingerprint = ref('')
+const savedManagedProcesses = ref<string[]>([])
 const inventory = ref<PluginInventory | null>(null)
 const pluginPackagePreview = ref<PluginPackagePreview | null>(null)
 const selectedPluginPackage = ref('')
@@ -456,6 +462,22 @@ const projectStateUnverified = computed(() => (
 const managedProcessRestartRequired = computed(() => (
   status.value?.managedProcessRestartRequired ?? false
 ))
+const managedProcessDraftChanged = computed(() => {
+  const selected = [...new Set(snapshot.value?.config.managedProcesses ?? [])].sort()
+  const saved = [...new Set(savedManagedProcesses.value)].sort()
+  return selected.length !== saved.length || selected.some((value, index) => value !== saved[index])
+})
+const managedProcessOptions = computed(() => {
+  const catalog = status.value?.managedProcessCatalog ?? []
+  const known = new Set(catalog.map((entry) => entry.id))
+  const unavailable = (snapshot.value?.config.managedProcesses ?? [])
+    .filter((id) => !known.has(id))
+    .map((id) => ({ id, singleton: false, unavailable: true }))
+  return [
+    ...catalog.map((entry) => ({ ...entry, unavailable: false })),
+    ...unavailable,
+  ]
+})
 const deploymentReadiness = computed(() => {
   if (controlLoadFailed.value) {
     return {
@@ -697,6 +719,7 @@ function applySsoStatus(code?: string, active = false) {
 function applyConfigSnapshot(next: ConfigSnapshot) {
   snapshot.value = next
   savedConfigFingerprint.value = configFingerprint(next.config)
+  savedManagedProcesses.value = [...next.config.managedProcesses]
 }
 
 function requireSavedConfig(action: string): boolean {
@@ -713,6 +736,16 @@ function requireCurrentManagedProcesses(action: string): boolean {
   error.value = `受控辅助进程配置已变更。请退出并重新启动客户端后再${action}。`
   activeSection.value = 'overview'
   return false
+}
+
+function processPolicyGuidance(code?: string): string {
+  if (code === 'process-policy-not-installed') {
+    return '当前安装包未提供签名进程策略；不能新增辅助进程选择。'
+  }
+  if (code === 'process-policy-invalid') {
+    return '签名进程策略未通过验证；请由发布人员检查策略、签名和信任库。'
+  }
+  return ''
 }
 
 function requireSavedMapping(action: string): boolean {
@@ -1723,6 +1756,20 @@ async function exportDeploymentCheck() {
               <label><span>SSO 额外可信来源</span><textarea :value="snapshot.config.trustedOrigins.join('\n')" placeholder="每行一个来源，例如 https://sso.example.internal" @input="snapshot.config.trustedOrigins = ($event.target as HTMLTextAreaElement).value.split(/\s+/).filter(Boolean)" /></label>
               <label><span>系统浏览器允许来源</span><textarea :value="snapshot.config.externalOrigins.join('\n')" placeholder="每行一个来源" @input="snapshot.config.externalOrigins = ($event.target as HTMLTextAreaElement).value.split(/\s+/).filter(Boolean)" /></label>
             </div>
+            <fieldset class="managed-process-selector">
+              <legend>受控辅助进程</legend>
+              <p>这里只列出安装包内签名策略允许的 ID，不展示程序路径或启动参数。选择变化保存后需要重启客户端才会生效。</p>
+              <p v-if="status?.processPolicyError" class="managed-process-policy-warning" role="status">{{ processPolicyGuidance(status.processPolicyError) }}</p>
+              <div v-if="managedProcessOptions.length" class="managed-process-options">
+                <label v-for="entry in managedProcessOptions" :key="entry.id" :class="{ unavailable: entry.unavailable }">
+                  <input v-model="snapshot.config.managedProcesses" type="checkbox" :value="entry.id" />
+                  <span><strong>{{ entry.id }}</strong><small>{{ entry.unavailable ? '已选择但当前签名策略中不存在；取消后不能重新选择' : entry.singleton ? '单实例辅助进程' : '允许启动独立实例' }}</small></span>
+                </label>
+              </div>
+              <p v-else-if="status" class="managed-process-empty">当前签名策略没有可选辅助进程。</p>
+              <p v-else class="managed-process-empty">正在读取签名进程策略…</p>
+              <small v-if="managedProcessDraftChanged" class="managed-process-restart-note">当前选择尚未保存；保存后客户端会暂停新业务和原生调用，直到完成重启。</small>
+            </fieldset>
             <details class="advanced-settings">
               <summary>插件仓库高级配置</summary>
               <label><span>签名插件仓库索引</span><input v-model.trim="snapshot.config.pluginCatalogUrl" type="url" placeholder="https://plugins.example/catalog.json" /></label>
@@ -1803,7 +1850,7 @@ async function exportDeploymentCheck() {
           <article><span>插件信任</span><strong>{{ status?.pluginTrustMode === 'ed25519-strict' ? '严格签名' : '开发模式' }}</strong><small :title="status?.pluginRoot">{{ status ? `${status.trustKeyCount} 把密钥 · ${status.pluginApiBaselineCount} 个契约基线 · 基线写入失败 ${status.pluginApiBaselineFailures}` : '完整清单与 SHA-256 校验' }}</small></article>
           <article><span>安装事务</span><strong>{{ status?.recoveredPluginTransactions ? '已自动恢复' : '状态正常' }}</strong><small>已清理或回滚 {{ status?.recoveredPluginTransactions ?? '—' }} 项</small></article>
           <article><span>宿主预检</span><strong>{{ status?.pluginPreflightFailures ? '存在失败' : '状态正常' }}</strong><small>通过 {{ status?.preflightedPluginHosts ?? '—' }} · 失败 {{ status?.pluginPreflightFailures ?? '—' }}</small></article>
-          <article><span>受控进程策略</span><strong>{{ managedProcessRestartRequired ? '配置等待重启' : `${status?.processPolicyEntries ?? '—'} 项` }}</strong><small>{{ managedProcessRestartRequired ? '当前实例仍使用启动时选择；新业务和原生调用已暂停' : `启动失败 ${status?.managedProcessFailures ?? '—'} · 不经过 Shell` }}</small></article>
+          <article><span>受控进程策略</span><strong>{{ managedProcessRestartRequired ? '配置等待重启' : status?.processPolicyError ? '策略不可用' : `${status?.processPolicyEntries ?? '—'} 项` }}</strong><small>{{ managedProcessRestartRequired ? '当前实例仍使用启动时选择；新业务和原生调用已暂停' : status?.processPolicyError ? processPolicyGuidance(status.processPolicyError) : `启动失败 ${status?.managedProcessFailures ?? '—'} · 不经过 Shell` }}</small></article>
           <article><span>开机启动</span><strong>{{ status?.autoStartEnabled == null ? '状态未知' : status.autoStartEnabled ? '已启用' : '未启用' }}</strong><small :title="status?.autoStartError">{{ status?.autoStartError ?? '由本机系统机制管理' }}</small></article>
           <article><span>SSO 传输</span><strong>{{ ssoActive ? '登录处理中' : ssoError ? '最近失败' : 'HTTPS-only' }}</strong><small>禁止重定向 · 请求与响应均有上限</small></article>
           <article><span>业务来源策略</span><strong>{{ status?.originPolicy.allowConfiguredBusinessOrigins ? '项目地址兼容' : status?.originPolicy.enforced ? '发布方签名' : '开发模式' }}</strong><small :title="status?.originPolicyError">{{ status?.originPolicyError ?? `${status?.originPolicy.businessOrigins ?? '—'} 个来源 · HTTP ${status?.originPolicy.allowInsecureHttp ? '允许' : '禁止'}` }}</small></article>
