@@ -21,6 +21,7 @@
     "allow-inspect-signed-plugin-uninstall",
     "allow-uninstall-signed-plugin",
     "allow-check-plugin-updates",
+    "allow-inspect-plugin-reload",
     "allow-reload-plugins",
     "allow-plugin-inventory",
     "allow-inspect-native-component",

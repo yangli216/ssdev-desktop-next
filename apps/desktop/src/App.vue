@@ -266,6 +266,26 @@ type SignedPluginUninstallPreview = {
   methodCount: number
 }
 
+type PluginReloadPreview = {
+  planId: string
+  pluginCount: number
+  signedPluginCount: number
+  localMappingCount: number
+  serviceCount: number
+  methodCount: number
+  addedPluginCount: number
+  changedRoutePluginCount: number
+  removedLocalMappingCount: number
+  quarantinedPlugins: number
+  preflightedHosts: number
+}
+
+type PluginReloadResult = {
+  serviceCount: number
+  quarantinedPlugins: number
+  preflightedHosts: number
+}
+
 type PluginInventory = {
   plugins: Array<{
     pluginId: string
@@ -1193,13 +1213,30 @@ async function uninstallSignedPlugin(pluginId: string) {
 
 async function reloadPlugins() {
   if (!requireCleanProjectDrafts('重新扫描插件目录')) return
+  let preview: PluginReloadPreview | undefined
+  const inspected = await run(async () => {
+    preview = await invoke<PluginReloadPreview>('inspect_plugin_reload')
+  }, '')
+  if (!inspected || !preview) return
+  const confirmed = preview
+  if (!window.confirm(
+    `重新扫描候选包含 ${confirmed.signedPluginCount} 个签名插件、${confirmed.localMappingCount} 个本地映射，` +
+    `共 ${confirmed.serviceCount} 个服务、${confirmed.methodCount} 个方法；` +
+    `将新增 ${confirmed.addedPluginCount} 个插件、变更 ${confirmed.changedRoutePluginCount} 个插件的路由，` +
+    `移除 ${confirmed.removedLocalMappingCount} 个未进入候选清单的本地映射，并保留 ${confirmed.quarantinedPlugins} 个隔离项。` +
+    `${confirmed.preflightedHosts} 个候选架构宿主已完成无业务调用预检。确定进入全局维护并替换活动路由吗？`,
+  )) return
+  let result: PluginReloadResult | undefined
   const outcome = await runPrimaryThenRefresh(async () => {
-    await invoke('reload_plugins')
+    result = await invoke<PluginReloadResult>('reload_plugins', { expectedPlanId: confirmed.planId })
     pluginUpdates.value = null
     appUpdate.value = null
   }, ['status', 'inventory', 'deployment'])
-  if (outcome.succeeded) {
-    showPrimaryActionSuccess('插件目录已重新验签，候选宿主预检通过并热加载。', outcome.refreshed)
+  if (outcome.succeeded && result) {
+    showPrimaryActionSuccess(
+      `插件目录已重新验签，${result.preflightedHosts} 个架构宿主预检通过，当前路由包含 ${result.serviceCount} 个服务；${result.quarantinedPlugins} 个无效项保持隔离。`,
+      outcome.refreshed,
+    )
   }
 }
 

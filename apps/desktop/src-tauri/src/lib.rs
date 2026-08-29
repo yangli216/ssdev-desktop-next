@@ -2417,6 +2417,34 @@ struct PluginReloadResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct PluginReloadPreview {
+    plan_id: String,
+    plugin_count: usize,
+    signed_plugin_count: usize,
+    local_mapping_count: usize,
+    service_count: usize,
+    method_count: usize,
+    added_plugin_count: usize,
+    changed_route_plugin_count: usize,
+    removed_local_mapping_count: usize,
+    quarantined_plugins: usize,
+    preflighted_hosts: usize,
+}
+
+#[derive(Default)]
+struct PluginReloadImpact {
+    plugin_count: usize,
+    signed_plugin_count: usize,
+    local_mapping_count: usize,
+    service_count: usize,
+    method_count: usize,
+    added_plugin_count: usize,
+    changed_route_plugin_count: usize,
+    removed_local_mapping_count: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PluginInventoryResult {
     plugins: Vec<PluginInventoryItem>,
     quarantined: Vec<String>,
@@ -3157,6 +3185,157 @@ fn ensure_signed_plugin_uninstall_plan_matches(expected: &str, actual: &str) -> 
         return Err("签名插件状态在卸载确认后发生变化，请重新检查卸载影响".to_owned());
     }
     Ok(())
+}
+
+fn plugin_reload_active_state_digest(
+    manifests: &[PluginManifest],
+    local_mapping_root: &std::path::Path,
+) -> Result<String, String> {
+    let mut manifests = manifests.iter().collect::<Vec<_>>();
+    manifests.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-PLUGIN-RELOAD-ACTIVE-STATE\0");
+    for manifest in manifests {
+        hash_plan_field(&mut hasher, manifest.plugin_id.as_bytes());
+        hash_plan_field(
+            &mut hasher,
+            if is_local_manifest(manifest, local_mapping_root) {
+                b"local-mapping"
+            } else {
+                b"signed-package"
+            },
+        );
+        let metadata = serde_json::to_vec(&manifest.metadata)
+            .map_err(|error| format!("无法生成活动插件状态摘要: {error}"))?;
+        let services = serde_json::to_vec(&manifest.services)
+            .map_err(|error| format!("无法生成活动插件路由摘要: {error}"))?;
+        hash_plan_field(&mut hasher, &metadata);
+        hash_plan_field(&mut hasher, &services);
+        hash_plan_field(
+            &mut hasher,
+            manifest
+                .local_mapping_integrity_sha256
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+        );
+    }
+    Ok(lowercase_hex(&hasher.finalize()))
+}
+
+fn plugin_reload_candidate_state_digest(
+    inspected: &InspectedPlugins,
+    local_mapping_root: &std::path::Path,
+) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-PLUGIN-RELOAD-CANDIDATE-STATE\0");
+    hash_complete_plugin_state(&mut hasher, &inspected.manifests, local_mapping_root)?;
+
+    let mut signed_ids = inspected.discovered_plugin_ids.iter().collect::<Vec<_>>();
+    signed_ids.sort();
+    for plugin_id in signed_ids {
+        hash_plan_field(&mut hasher, b"signed-identity");
+        hash_plan_field(&mut hasher, plugin_id.as_bytes());
+    }
+    let mut local_ids = inspected.local_mapping_ids.iter().collect::<Vec<_>>();
+    local_ids.sort();
+    for plugin_id in local_ids {
+        hash_plan_field(&mut hasher, b"local-identity");
+        hash_plan_field(&mut hasher, plugin_id.as_bytes());
+    }
+    let mut failures = inspected.failures.iter().collect::<Vec<_>>();
+    failures.sort();
+    for failure in failures {
+        hash_plan_field(&mut hasher, b"quarantined");
+        hash_plan_field(&mut hasher, failure.as_bytes());
+    }
+    Ok(lowercase_hex(&hasher.finalize()))
+}
+
+fn plugin_reload_plan_id(
+    active_state_sha256: &str,
+    candidate_state_sha256: &str,
+    desktop_version: &semver::Version,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-PLUGIN-RELOAD-PLAN\0");
+    hash_plan_field(&mut hasher, active_state_sha256.as_bytes());
+    hash_plan_field(&mut hasher, candidate_state_sha256.as_bytes());
+    hash_plan_field(&mut hasher, desktop_version.to_string().as_bytes());
+    lowercase_hex(&hasher.finalize())
+}
+
+fn ensure_plugin_reload_plan_matches(expected: &str, actual: &str) -> Result<(), String> {
+    if expected != actual {
+        return Err("插件目录或活动路由在重新扫描确认后发生变化，请重新检查扫描影响".to_owned());
+    }
+    Ok(())
+}
+
+fn ensure_plugin_reload_candidate_state_matches(
+    expected: &str,
+    actual: &str,
+) -> Result<(), String> {
+    if expected != actual {
+        return Err("插件目录在全局路由切换期间发生变化".to_owned());
+    }
+    Ok(())
+}
+
+fn plugin_reload_impact(
+    current: &[PluginManifest],
+    candidates: &[PluginManifest],
+    local_mapping_root: &std::path::Path,
+) -> PluginReloadImpact {
+    let mut impact = PluginReloadImpact {
+        plugin_count: candidates.len(),
+        service_count: candidates
+            .iter()
+            .map(|manifest| manifest.services.len())
+            .sum(),
+        method_count: candidates
+            .iter()
+            .flat_map(|manifest| &manifest.services)
+            .map(|service| service.methods.len())
+            .sum(),
+        ..PluginReloadImpact::default()
+    };
+    for candidate in candidates {
+        if is_local_manifest(candidate, local_mapping_root) {
+            impact.local_mapping_count += 1;
+        } else {
+            impact.signed_plugin_count += 1;
+        }
+        match current.iter().find(|manifest| {
+            normalized_plugin_id(&manifest.plugin_id) == normalized_plugin_id(&candidate.plugin_id)
+        }) {
+            None => impact.added_plugin_count += 1,
+            Some(previous)
+                if previous.plugin_id != candidate.plugin_id
+                    || is_local_manifest(previous, local_mapping_root)
+                        != is_local_manifest(candidate, local_mapping_root)
+                    || previous.metadata != candidate.metadata
+                    || previous.services != candidate.services
+                    || previous.local_mapping_integrity_sha256
+                        != candidate.local_mapping_integrity_sha256 =>
+            {
+                impact.changed_route_plugin_count += 1;
+            }
+            Some(_) => {}
+        }
+    }
+    impact.removed_local_mapping_count = current
+        .iter()
+        .filter(|manifest| is_local_manifest(manifest, local_mapping_root))
+        .filter(|manifest| {
+            !candidates.iter().any(|candidate| {
+                is_local_manifest(candidate, local_mapping_root)
+                    && normalized_plugin_id(&candidate.plugin_id)
+                        == normalized_plugin_id(&manifest.plugin_id)
+            })
+        })
+        .count();
+    impact
 }
 
 fn plugin_update_plan_id(
@@ -3903,15 +4082,18 @@ async fn uninstall_signed_plugin(
     Ok(())
 }
 
-#[tauri::command]
-async fn reload_plugins(
-    caller: WebviewWindow,
-    state: State<'_, BridgeState>,
-    desktop_state: State<'_, desktop::DesktopState>,
-) -> Result<PluginReloadResult, String> {
-    desktop::require_control(&caller)?;
-    let _install = state.install_lock.lock().await;
-    recover_plugin_store(&state)?;
+struct PluginReloadContext {
+    current: Vec<PluginManifest>,
+    plugins: InspectedPlugins,
+    active_state_sha256: String,
+    candidate_state_sha256: String,
+    impact: PluginReloadImpact,
+}
+
+async fn plugin_reload_context(
+    state: &BridgeState,
+    desktop_state: &desktop::DesktopState,
+) -> Result<PluginReloadContext, String> {
     let current = state
         .controller
         .active_manifests()
@@ -3922,44 +4104,192 @@ async fn reload_plugins(
         &state.local_mapping_root,
         state.trust_store.as_deref(),
         &state.desktop_version,
-    )?;
-    validate_signed_plugin_api_baseline(&state, &plugins.manifests)?;
+    )
+    .map_err(|_| "无法安全读取插件目录；请检查目录权限、事务状态和隔离项后重新扫描".to_owned())?;
+    validate_signed_plugin_api_baseline(state, &plugins.manifests)?;
     validate_signed_plugin_api_changes(&current, &plugins.manifests, &state.local_mapping_root)?;
     validate_signed_plugin_activation_routes(
-        &desktop_state,
+        desktop_state,
         &plugins.manifests,
         &state.local_mapping_root,
     )?;
+    let impact = plugin_reload_impact(&current, &plugins.manifests, &state.local_mapping_root);
+    let digest_current = current.clone();
+    let digest_plugins = plugins.clone();
+    let digest_local_root = state.local_mapping_root.clone();
+    let digest = tokio::task::spawn_blocking(move || {
+        Ok::<_, String>((
+            plugin_reload_active_state_digest(&digest_current, &digest_local_root)?,
+            plugin_reload_candidate_state_digest(&digest_plugins, &digest_local_root)?,
+        ))
+    })
+    .await
+    .map_err(|_| "插件重新扫描状态复核任务异常终止".to_owned())?;
+    let (active_state_sha256, candidate_state_sha256) = digest
+        .map_err(|_| "无法生成插件重新扫描确认状态；请检查插件和本地映射完整性".to_owned())?;
+    Ok(PluginReloadContext {
+        current,
+        plugins,
+        active_state_sha256,
+        candidate_state_sha256,
+        impact,
+    })
+}
+
+fn plugin_reload_context_plan_id(
+    context: &PluginReloadContext,
+    desktop_version: &semver::Version,
+) -> String {
+    plugin_reload_plan_id(
+        &context.active_state_sha256,
+        &context.candidate_state_sha256,
+        desktop_version,
+    )
+}
+
+#[tauri::command]
+async fn inspect_plugin_reload(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    desktop_state: State<'_, desktop::DesktopState>,
+) -> Result<PluginReloadPreview, String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    recover_plugin_store(&state)?;
+    let inspected = plugin_reload_context(&state, &desktop_state).await?;
+    let expected_plan_id = plugin_reload_context_plan_id(&inspected, &state.desktop_version);
     let preflighted_hosts =
-        preflight_manifests(&state, &plugins.manifests, "待重载插件或映射").await?;
+        preflight_manifests(&state, &inspected.plugins.manifests, "待重载插件或映射").await?;
+    let verified = plugin_reload_context(&state, &desktop_state).await?;
+    let actual_plan_id = plugin_reload_context_plan_id(&verified, &state.desktop_version);
+    ensure_plugin_reload_plan_matches(&expected_plan_id, &actual_plan_id)?;
+    Ok(PluginReloadPreview {
+        plan_id: actual_plan_id,
+        plugin_count: verified.impact.plugin_count,
+        signed_plugin_count: verified.impact.signed_plugin_count,
+        local_mapping_count: verified.impact.local_mapping_count,
+        service_count: verified.impact.service_count,
+        method_count: verified.impact.method_count,
+        added_plugin_count: verified.impact.added_plugin_count,
+        changed_route_plugin_count: verified.impact.changed_route_plugin_count,
+        removed_local_mapping_count: verified.impact.removed_local_mapping_count,
+        quarantined_plugins: verified.plugins.failures.len(),
+        preflighted_hosts,
+    })
+}
+
+#[tauri::command]
+async fn reload_plugins(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    desktop_state: State<'_, desktop::DesktopState>,
+    expected_plan_id: String,
+) -> Result<PluginReloadResult, String> {
+    desktop::require_control(&caller)?;
+    if !is_lowercase_sha256(&expected_plan_id) {
+        return Err("插件重新扫描确认标识无效，请重新检查扫描影响".to_owned());
+    }
+    let _install = state.install_lock.lock().await;
+    recover_plugin_store(&state)?;
+    let inspected = plugin_reload_context(&state, &desktop_state).await?;
+    let actual_plan_id = plugin_reload_context_plan_id(&inspected, &state.desktop_version);
+    ensure_plugin_reload_plan_matches(&expected_plan_id, &actual_plan_id)?;
+    let preflighted_hosts =
+        preflight_manifests(&state, &inspected.plugins.manifests, "待重载插件或映射").await?;
+    let preflight_verified = plugin_reload_context(&state, &desktop_state).await?;
+    let preflight_plan_id =
+        plugin_reload_context_plan_id(&preflight_verified, &state.desktop_version);
+    ensure_plugin_reload_plan_matches(&expected_plan_id, &preflight_plan_id)?;
+
+    let maintenance = state.controller.begin_maintenance().await;
+    let verified = plugin_reload_context(&state, &desktop_state).await?;
+    let verified_plan_id = plugin_reload_context_plan_id(&verified, &state.desktop_version);
+    ensure_plugin_reload_plan_matches(&expected_plan_id, &verified_plan_id)?;
+    let previous_manifests = verified.current;
+    let candidate_manifests = verified.plugins.manifests;
+    let expected_candidate_state_sha256 = verified.candidate_state_sha256;
     let baseline_transition =
-        SignedPluginApiBaselineTransition::prepare(&state, &plugins.manifests)?;
-    state
-        .controller
-        .replace_manifests(&plugins.manifests)
+        SignedPluginApiBaselineTransition::prepare(&state, &candidate_manifests)?;
+    maintenance
+        .replace_manifests(&candidate_manifests)
         .await
         .map_err(|error| error.to_string())?;
+
+    let final_plugins = match inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+        &state.desktop_version,
+    ) {
+        Ok(plugins) => plugins,
+        Err(_) => {
+            maintenance
+                .replace_manifests(&previous_manifests)
+                .await
+                .map_err(|restore| {
+                    format!("插件目录最终复核失败；恢复扫描前路由同时失败: {restore}")
+                })?;
+            return Err("无法复核重新扫描后的插件目录，已恢复原路由".to_owned());
+        }
+    };
+    let digest_plugins = final_plugins.clone();
+    let digest_local_root = state.local_mapping_root.clone();
+    let final_candidate_state_sha256 = match tokio::task::spawn_blocking(move || {
+        plugin_reload_candidate_state_digest(&digest_plugins, &digest_local_root)
+    })
+    .await
+    {
+        Ok(Ok(digest)) => digest,
+        Ok(Err(_)) => {
+            maintenance
+                .replace_manifests(&previous_manifests)
+                .await
+                .map_err(|restore| {
+                    format!("插件字节最终复核失败；恢复扫描前路由同时失败: {restore}")
+                })?;
+            return Err("无法复核重新扫描后的插件字节，已恢复原路由".to_owned());
+        }
+        Err(_) => {
+            maintenance
+                .replace_manifests(&previous_manifests)
+                .await
+                .map_err(|restore| {
+                    format!("插件目录最终复核任务异常终止；恢复扫描前路由同时失败: {restore}")
+                })?;
+            return Err("插件目录最终复核任务异常终止，已恢复原路由".to_owned());
+        }
+    };
+    if let Err(error) = ensure_plugin_reload_candidate_state_matches(
+        &expected_candidate_state_sha256,
+        &final_candidate_state_sha256,
+    ) {
+        maintenance
+            .replace_manifests(&previous_manifests)
+            .await
+            .map_err(|restore| format!("{error}; 恢复扫描前路由同时失败: {restore}"))?;
+        return Err(format!("{error}，已恢复原路由；请重新检查扫描影响"));
+    }
     baseline_transition.commit();
     state
         .plugin_load_failures
-        .store(plugins.failures.len(), Ordering::Release);
+        .store(final_plugins.failures.len(), Ordering::Release);
     state
         .plugin_count
-        .store(plugins.manifests.len(), Ordering::Release);
+        .store(final_plugins.manifests.len(), Ordering::Release);
     tracing::info!(
         event_code = "plugins-reloaded",
-        plugin_count = plugins.manifests.len(),
-        quarantined_count = plugins.failures.len(),
+        plugin_count = final_plugins.manifests.len(),
+        quarantined_count = final_plugins.failures.len(),
         preflighted_hosts,
         "plugin routes reloaded"
     );
     Ok(PluginReloadResult {
-        service_count: plugins
+        service_count: final_plugins
             .manifests
             .iter()
             .map(|item| item.services.len())
             .sum(),
-        quarantined_plugins: plugins.failures.len(),
+        quarantined_plugins: final_plugins.failures.len(),
         preflighted_hosts,
     })
 }
@@ -5380,6 +5710,7 @@ pub fn run() {
             inspect_signed_plugin_uninstall,
             uninstall_signed_plugin,
             check_plugin_updates,
+            inspect_plugin_reload,
             reload_plugins,
             plugin_inventory,
             inspect_native_component,
@@ -5445,6 +5776,7 @@ fn app_context<R: tauri::Runtime>() -> tauri::Context<R> {
     tauri::generate_context!()
 }
 
+#[derive(Clone)]
 struct InspectedPlugins {
     manifests: Vec<webplus_plugin_config::PluginManifest>,
     failures: Vec<String>,
@@ -6088,7 +6420,8 @@ mod tests {
         classify_local_plugin_install_action, classify_project_component_action,
         collect_plugin_updates, desktop, ensure_config_signed_plugin_route_coverage,
         ensure_local_mapping_import_plan_matches, ensure_local_mapping_removal_plan_matches,
-        ensure_local_plugin_install_plan_matches, ensure_plugin_update_plan_matches,
+        ensure_local_plugin_install_plan_matches, ensure_plugin_reload_candidate_state_matches,
+        ensure_plugin_reload_plan_matches, ensure_plugin_update_plan_matches,
         ensure_plugin_version_change_allowed, ensure_project_export_active_manifests_match,
         ensure_project_export_runtime_matches, ensure_signed_plugin_compatible,
         ensure_signed_plugin_route_coverage, ensure_signed_plugin_uninstall_plan_matches,
@@ -6097,17 +6430,19 @@ mod tests {
         local_mapping_import_plan_id, local_mapping_import_state_digest,
         local_mapping_removal_plan_id, local_mappings, local_plugin_install_plan_id,
         open_project_bundle_for_mode, persist_startup_failure_document,
-        plugin_update_installed_state_digest, plugin_update_plan_id, preflight_failure_message,
-        prepare_plugin_removal, project_bundle, project_import_plan_id,
-        project_import_state_digest, resolve_startup_failure_document, same_manifest_contracts,
-        select_runtime_path, service_inventory_item, signed_plugin_api_change_summary,
-        signed_plugin_directory_state_digest, signed_plugin_route_policy_coverage,
-        signed_plugin_uninstall_plan_id, startup_failure_message,
-        validate_signed_plugin_activation_routes, validate_signed_plugin_api_changes,
-        BridgePluginHostHealth, CatalogWithdrawalReason, FrontendRuntime, InspectedPlugins,
-        LocalMappingImportPreview, LocalMappingImportServicePreview, LocalMappingRemovalPreview,
-        PluginInstallBlocker, PluginInstallSource, PluginPackagePreview,
-        PluginPackageServicePreview, ProjectBundlePreview, SignedPluginUninstallPreview,
+        plugin_reload_active_state_digest, plugin_reload_candidate_state_digest,
+        plugin_reload_impact, plugin_reload_plan_id, plugin_update_installed_state_digest,
+        plugin_update_plan_id, preflight_failure_message, prepare_plugin_removal, project_bundle,
+        project_import_plan_id, project_import_state_digest, resolve_startup_failure_document,
+        same_manifest_contracts, select_runtime_path, service_inventory_item,
+        signed_plugin_api_change_summary, signed_plugin_directory_state_digest,
+        signed_plugin_route_policy_coverage, signed_plugin_uninstall_plan_id,
+        startup_failure_message, validate_signed_plugin_activation_routes,
+        validate_signed_plugin_api_changes, BridgePluginHostHealth, CatalogWithdrawalReason,
+        FrontendRuntime, InspectedPlugins, LocalMappingImportPreview,
+        LocalMappingImportServicePreview, LocalMappingRemovalPreview, PluginInstallBlocker,
+        PluginInstallSource, PluginPackagePreview, PluginPackageServicePreview,
+        PluginReloadPreview, ProjectBundlePreview, SignedPluginUninstallPreview,
         StartupFailureDocument, StartupStage, FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
@@ -7452,6 +7787,180 @@ mod tests {
         assert_ne!(absent, before);
         assert_ne!(before, after);
         assert!(plugin_update_installed_state_digest(root.path(), "reader", None).is_err());
+    }
+
+    #[test]
+    fn plugin_reload_plan_binds_active_candidate_and_desktop_states() {
+        let desktop = Version::new(0, 1, 5);
+        let active = "11".repeat(32);
+        let candidate = "22".repeat(32);
+        let base = plugin_reload_plan_id(&active, &candidate, &desktop);
+        assert!(is_lowercase_sha256(&base));
+        assert_ne!(
+            base,
+            plugin_reload_plan_id(&"33".repeat(32), &candidate, &desktop)
+        );
+        assert_ne!(
+            base,
+            plugin_reload_plan_id(&active, &"44".repeat(32), &desktop)
+        );
+        assert_ne!(
+            base,
+            plugin_reload_plan_id(&active, &candidate, &Version::new(0, 2, 0))
+        );
+        assert!(ensure_plugin_reload_plan_matches(&base, &base).is_ok());
+        assert!(ensure_plugin_reload_plan_matches(&base, &"55".repeat(32)).is_err());
+        assert!(ensure_plugin_reload_candidate_state_matches(&candidate, &candidate).is_ok());
+        assert!(
+            ensure_plugin_reload_candidate_state_matches(&candidate, &"66".repeat(32)).is_err()
+        );
+    }
+
+    #[test]
+    fn plugin_reload_candidate_state_binds_bytes_identities_and_quarantine() {
+        let root = tempfile::tempdir().unwrap();
+        let local_root = root.path().join("local-mappings");
+        fs::create_dir(&local_root).unwrap();
+        let plugin = root.path().join("reader");
+        fs::create_dir(&plugin).unwrap();
+        fs::write(
+            plugin.join(API_FILENAME),
+            r#"{"serviceId":"reader","mainClass":"reader.dll"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin.join("plugin.json"),
+            r#"{"schemaVersion":1,"pluginId":"reader","version":"1.0.0","desktopVersionRequirement":">=0.1.0, <0.2.0"}"#,
+        )
+        .unwrap();
+        fs::write(plugin.join("reader.dll"), b"first payload").unwrap();
+        let signing_key = SigningKey::from_bytes(&[94_u8; 32]);
+        let material = prepare_signing_material(&plugin, "reader", "test-key").unwrap();
+        let signature = BASE64.encode(signing_key.sign(&material.payload).to_bytes());
+        fs::write(
+            plugin.join(SIGNATURE_FILENAME),
+            encode_signature_document(&material, &signature).unwrap(),
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("reader", &plugin).unwrap();
+        let mut inspected = inspected_plugins(vec![manifest], HashSet::new());
+        let before = plugin_reload_candidate_state_digest(&inspected, &local_root).unwrap();
+
+        fs::write(plugin.join("reader.dll"), b"second payload").unwrap();
+        let changed_bytes = plugin_reload_candidate_state_digest(&inspected, &local_root).unwrap();
+        assert_ne!(before, changed_bytes);
+        inspected
+            .discovered_plugin_ids
+            .insert("invalid-reader".to_owned());
+        let changed_identity =
+            plugin_reload_candidate_state_digest(&inspected, &local_root).unwrap();
+        assert_ne!(changed_bytes, changed_identity);
+        inspected
+            .failures
+            .push("invalid-reader remains quarantined".to_owned());
+        let changed_quarantine =
+            plugin_reload_candidate_state_digest(&inspected, &local_root).unwrap();
+        assert_ne!(changed_identity, changed_quarantine);
+    }
+
+    #[test]
+    fn plugin_reload_active_state_and_impact_ignore_paths_but_bind_routes() {
+        let root = tempfile::tempdir().unwrap();
+        let local_root = root.path().join("local-mappings");
+        let signed = PluginManifest {
+            plugin_id: "reader".to_owned(),
+            plugin_dir: root.path().join("plugins/reader"),
+            metadata: None,
+            services: Vec::new(),
+            local_mapping_integrity_sha256: None,
+        };
+        let local = PluginManifest {
+            plugin_id: "legacy.local".to_owned(),
+            plugin_dir: local_root.join("legacy.local"),
+            metadata: None,
+            services: Vec::new(),
+            local_mapping_integrity_sha256: Some("11".repeat(32)),
+        };
+        let current = vec![signed.clone(), local];
+        let mut relocated = current.clone();
+        relocated[0].plugin_dir = root.path().join("other/reader");
+        assert_eq!(
+            plugin_reload_active_state_digest(&current, &local_root).unwrap(),
+            plugin_reload_active_state_digest(&relocated, &local_root).unwrap()
+        );
+
+        let mut changed_signed = signed;
+        changed_signed.services.push(
+            serde_json::from_value(serde_json::json!({
+                "serviceId": "reader",
+                "mainClass": "reader.dll",
+                "methods": [{"name": "read"}]
+            }))
+            .unwrap(),
+        );
+        let added_local = PluginManifest {
+            plugin_id: "new.local".to_owned(),
+            plugin_dir: local_root.join("new.local"),
+            metadata: None,
+            services: Vec::new(),
+            local_mapping_integrity_sha256: Some("22".repeat(32)),
+        };
+        let candidates = vec![changed_signed, added_local];
+        let impact = plugin_reload_impact(&current, &candidates, &local_root);
+        assert_eq!(impact.plugin_count, 2);
+        assert_eq!(impact.signed_plugin_count, 1);
+        assert_eq!(impact.local_mapping_count, 1);
+        assert_eq!(impact.service_count, 1);
+        assert_eq!(impact.method_count, 1);
+        assert_eq!(impact.added_plugin_count, 1);
+        assert_eq!(impact.changed_route_plugin_count, 1);
+        assert_eq!(impact.removed_local_mapping_count, 1);
+
+        let replaced_local = PluginManifest {
+            plugin_id: "reader".to_owned(),
+            plugin_dir: local_root.join("reader"),
+            metadata: None,
+            services: Vec::new(),
+            local_mapping_integrity_sha256: Some("33".repeat(32)),
+        };
+        let replacement = PluginManifest {
+            plugin_id: "reader".to_owned(),
+            plugin_dir: root.path().join("plugins/reader"),
+            metadata: None,
+            services: Vec::new(),
+            local_mapping_integrity_sha256: None,
+        };
+        let replacement_impact =
+            plugin_reload_impact(&[replaced_local], &[replacement], &local_root);
+        assert_eq!(replacement_impact.changed_route_plugin_count, 1);
+        assert_eq!(replacement_impact.removed_local_mapping_count, 1);
+    }
+
+    #[test]
+    fn plugin_reload_preview_exposes_only_bounded_impact_counts() {
+        let preview = PluginReloadPreview {
+            plan_id: "11".repeat(32),
+            plugin_count: 3,
+            signed_plugin_count: 2,
+            local_mapping_count: 1,
+            service_count: 4,
+            method_count: 5,
+            added_plugin_count: 1,
+            changed_route_plugin_count: 1,
+            removed_local_mapping_count: 0,
+            quarantined_plugins: 2,
+            preflighted_hosts: 3,
+        };
+        let value = serde_json::to_value(preview).unwrap();
+        assert_eq!(value["pluginCount"], 3);
+        assert_eq!(value["signedPluginCount"], 2);
+        assert_eq!(value["localMappingCount"], 1);
+        assert_eq!(value["quarantinedPlugins"], 2);
+        let text = value.to_string().to_ascii_lowercase();
+        assert!(!text.contains("path"));
+        assert!(!text.contains("keyid"));
+        assert!(!text.contains("serviceid"));
+        assert!(!text.contains("pluginid"));
     }
 
     #[test]
