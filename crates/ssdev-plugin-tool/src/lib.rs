@@ -15,7 +15,7 @@ use thiserror::Error;
 pub use webplus_plugin_config::PublicApiChange as ApiCompatibilityChange;
 use webplus_plugin_config::{
     compare_public_api, discover_plugins, generate_typescript_client, PluginManifest,
-    PluginMetadata,
+    PluginMetadata, ServiceDefinition,
 };
 use webplus_plugin_package::{create_deterministic_package, PreparedPlugin};
 use webplus_plugin_repository::{
@@ -248,6 +248,8 @@ pub struct CatalogReport {
     pub expires_at: u64,
     pub package_count: usize,
     pub withdrawal_count: usize,
+    pub api_comparison_count: usize,
+    pub api_compatibility_verified: bool,
     pub catalog_sha256: String,
 }
 
@@ -408,6 +410,15 @@ struct CatalogSpec {
 struct CatalogPackageSpec {
     package: PathBuf,
     url: url::Url,
+}
+
+struct CatalogVerifiedPackage {
+    path: PathBuf,
+    plugin_id: String,
+    portable_plugin_id: String,
+    version: Version,
+    size: u64,
+    sha256: String,
 }
 
 /// Creates a minimal, buildable Windows DLL plugin workspace for the common
@@ -1475,6 +1486,9 @@ pub fn create_catalog(options: &CatalogOptions<'_>) -> Result<CatalogReport, Too
     })?;
     let mut package_paths = HashSet::new();
     let mut package_urls = HashSet::new();
+    let mut portable_plugin_ids = BTreeMap::new();
+    let mut release_identities = BTreeSet::new();
+    let mut verified_packages = Vec::with_capacity(spec.packages.len());
     let mut entries = Vec::with_capacity(spec.packages.len());
     for package_spec in spec.packages {
         let package_path = if package_spec.package.is_absolute() {
@@ -1524,6 +1538,23 @@ pub fn create_catalog(options: &CatalogOptions<'_>) -> Result<CatalogReport, Too
                 ))
             })?
             .clone();
+        let portable_plugin_id = identity.plugin_id.to_ascii_lowercase();
+        if let Some(existing) =
+            portable_plugin_ids.insert(portable_plugin_id.clone(), identity.plugin_id.clone())
+        {
+            if existing != identity.plugin_id {
+                return Err(ToolError::Invalid(format!(
+                    "catalog plugin ID [{}] uses inconsistent ASCII casing across releases",
+                    identity.plugin_id
+                )));
+            }
+        }
+        if !release_identities.insert((portable_plugin_id.clone(), version.clone())) {
+            return Err(ToolError::Invalid(format!(
+                "catalog contains duplicate portable plugin release [{} {}]",
+                identity.plugin_id, version
+            )));
+        }
         drop(prepared);
         let metadata_after =
             fs::symlink_metadata(&package_path).map_err(|source| ToolError::Io {
@@ -1539,6 +1570,14 @@ pub fn create_catalog(options: &CatalogOptions<'_>) -> Result<CatalogReport, Too
                 "plugin package changed while the catalog was being created".into(),
             ));
         }
+        verified_packages.push(CatalogVerifiedPackage {
+            path: package_path,
+            plugin_id: identity.plugin_id.clone(),
+            portable_plugin_id,
+            version: version.clone(),
+            size: size_before,
+            sha256: digest_before.clone(),
+        });
         entries.push(CatalogEntry {
             plugin_id: identity.plugin_id,
             version,
@@ -1548,6 +1587,11 @@ pub fn create_catalog(options: &CatalogOptions<'_>) -> Result<CatalogReport, Too
             size: size_before,
         });
     }
+    let api_comparison_count = verify_catalog_api_compatibility(
+        &mut verified_packages,
+        &trust_store,
+        verification_root.path(),
+    )?;
     let withdrawal_count = spec.withdrawals.len();
     let bytes = encode_catalog_document_with_withdrawals(
         spec.issued_at,
@@ -1564,8 +1608,83 @@ pub fn create_catalog(options: &CatalogOptions<'_>) -> Result<CatalogReport, Too
         expires_at: spec.expires_at,
         package_count: package_urls.len(),
         withdrawal_count,
+        api_comparison_count,
+        api_compatibility_verified: true,
         catalog_sha256,
     })
+}
+
+fn verify_catalog_api_compatibility(
+    packages: &mut [CatalogVerifiedPackage],
+    trust_store: &TrustStore,
+    verification_root: &Path,
+) -> Result<usize, ToolError> {
+    packages.sort_by(|left, right| {
+        left.portable_plugin_id
+            .cmp(&right.portable_plugin_id)
+            .then_with(|| left.version.cmp(&right.version))
+    });
+
+    let mut comparison_count = 0;
+    let mut previous: Option<(String, String, Version, Vec<ServiceDefinition>)> = None;
+    for package in packages {
+        ensure_catalog_package_unchanged(package)?;
+        let prepared = PreparedPlugin::prepare(&package.path, verification_root, trust_store)?;
+        if prepared.identity().plugin_id != package.plugin_id
+            || prepared.metadata().version != package.version
+        {
+            return Err(ToolError::Invalid(
+                "plugin package identity changed while the catalog was being created".into(),
+            ));
+        }
+        let services = prepared.manifest().services.clone();
+        ensure_catalog_package_unchanged(package)?;
+
+        if let Some((
+            previous_portable_plugin_id,
+            previous_plugin_id,
+            previous_version,
+            previous_services,
+        )) = &previous
+        {
+            if previous_portable_plugin_id == &package.portable_plugin_id {
+                let compatibility = compare_public_api(previous_services, &services);
+                comparison_count += 1;
+                if !compatibility.compatible {
+                    return Err(ToolError::Invalid(format!(
+                        "catalog plugin [{}] version [{}] breaks {} public Web Bridge contract(s) from version [{}]; publish an incompatible API under a new plugin ID and run api-check for the detailed report",
+                        previous_plugin_id,
+                        package.version,
+                        compatibility.breaking_changes.len(),
+                        previous_version
+                    )));
+                }
+            }
+        }
+        previous = Some((
+            package.portable_plugin_id.clone(),
+            package.plugin_id.clone(),
+            package.version.clone(),
+            services,
+        ));
+    }
+    Ok(comparison_count)
+}
+
+fn ensure_catalog_package_unchanged(package: &CatalogVerifiedPackage) -> Result<(), ToolError> {
+    let metadata = fs::symlink_metadata(&package.path).map_err(|source| ToolError::Io {
+        path: package.path.clone(),
+        source,
+    })?;
+    if !metadata.file_type().is_file()
+        || metadata.len() != package.size
+        || sha256_file(&package.path)? != package.sha256
+    {
+        return Err(ToolError::Invalid(
+            "plugin package changed while the catalog was being created".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -3735,6 +3854,8 @@ mod tests {
         .unwrap();
         assert_eq!(catalog_report.package_count, 1);
         assert_eq!(catalog_report.withdrawal_count, 1);
+        assert_eq!(catalog_report.api_comparison_count, 0);
+        assert!(catalog_report.api_compatibility_verified);
         let catalog_bytes = fs::read(&catalog_path).unwrap();
         assert_eq!(catalog_report.catalog_sha256, sha256_hex(&catalog_bytes));
         let catalog =
@@ -3758,6 +3879,112 @@ mod tests {
         assert!(catalog
             .withdrawal("reader-plugin", &Version::parse("1.2.2").unwrap())
             .is_some());
+    }
+
+    #[test]
+    fn catalog_verifies_compatible_versions_and_rejects_public_api_breaks() {
+        let root = tempfile::tempdir().unwrap();
+        let source = source(root.path());
+        let signing_key = SigningKey::from_bytes(&[91; 32]);
+        let trust = trust_store(root.path(), &signing_key, None);
+        let version_one = signed_package(
+            root.path(),
+            &source,
+            "reader-v1",
+            "reader-plugin",
+            "1.0.0",
+            &trust,
+            &signing_key,
+        );
+
+        fs::write(
+            source.join("api.json"),
+            r#"{"serviceId":"reader","mainClass":"reader.dll","architecture":"x86","methods":[{"name":"read","parameters":["timeout"]},{"name":"status","parameters":[]}]}"#,
+        )
+        .unwrap();
+        fs::write(source.join("reader.dll"), pe(0x014c, &["read", "status"])).unwrap();
+        let version_two = signed_package(
+            root.path(),
+            &source,
+            "reader-v2",
+            "reader-plugin",
+            "1.1.0",
+            &trust,
+            &signing_key,
+        );
+
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let compatible_spec = matrix_file(
+            root.path(),
+            "compatible-catalog-spec.json",
+            json!({
+                "schemaVersion": 1,
+                "issuedAt": 1_699_999_940_u64,
+                "expiresAt": 1_700_003_600_u64,
+                "packages": [{
+                    "package": version_two.file_name().unwrap().to_string_lossy(),
+                    "url": "https://plugins.example.test/reader-v2.ssdev-plugin"
+                }, {
+                    "package": version_one.file_name().unwrap().to_string_lossy(),
+                    "url": "https://plugins.example.test/reader-v1.ssdev-plugin"
+                }]
+            }),
+        );
+        let compatible_catalog = root.path().join("compatible-catalog.json");
+        let report = create_catalog(&CatalogOptions {
+            spec: &compatible_spec,
+            trust_store: &trust,
+            catalog: &compatible_catalog,
+            now,
+        })
+        .unwrap();
+        assert_eq!(report.package_count, 2);
+        assert_eq!(report.api_comparison_count, 1);
+        assert!(report.api_compatibility_verified);
+
+        fs::write(
+            source.join("api.json"),
+            r#"{"serviceId":"reader","mainClass":"reader.dll","architecture":"x86","methods":[{"name":"status","parameters":[]}]}"#,
+        )
+        .unwrap();
+        fs::write(source.join("reader.dll"), pe(0x014c, &["status"])).unwrap();
+        let version_three = signed_package(
+            root.path(),
+            &source,
+            "reader-v3",
+            "reader-plugin",
+            "1.2.0",
+            &trust,
+            &signing_key,
+        );
+        let breaking_spec = matrix_file(
+            root.path(),
+            "breaking-catalog-spec.json",
+            json!({
+                "schemaVersion": 1,
+                "issuedAt": 1_699_999_940_u64,
+                "expiresAt": 1_700_003_600_u64,
+                "packages": [{
+                    "package": version_two.file_name().unwrap().to_string_lossy(),
+                    "url": "https://plugins.example.test/reader-v2.ssdev-plugin"
+                }, {
+                    "package": version_three.file_name().unwrap().to_string_lossy(),
+                    "url": "https://plugins.example.test/reader-v3.ssdev-plugin"
+                }]
+            }),
+        );
+        let breaking_catalog = root.path().join("breaking-catalog.json");
+        let error = create_catalog(&CatalogOptions {
+            spec: &breaking_spec,
+            trust_store: &trust,
+            catalog: &breaking_catalog,
+            now,
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("breaks 1 public Web Bridge contract(s)"));
+        assert!(!breaking_catalog.exists());
     }
 
     #[test]
