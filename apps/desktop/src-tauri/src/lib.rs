@@ -51,7 +51,9 @@ use webplus_controller::{
     PluginController, PluginPreflightFailure, PluginTrust, SupervisorConfig,
     DEFAULT_MAX_IN_FLIGHT_INVOCATIONS,
 };
-use webplus_plugin_config::{discover_plugins, PluginManifest, ServiceDefinition};
+use webplus_plugin_config::{
+    compare_public_api, discover_plugins, PluginManifest, ServiceDefinition,
+};
 use webplus_plugin_package::{prepare_plugin_removal, PluginActivation, PreparedPlugin};
 use webplus_plugin_repository::{
     download_package, fetch_catalog, secure_http_client, CatalogEntry, CatalogWithdrawalReason,
@@ -833,6 +835,8 @@ struct ProjectBundleComponentPreview {
     source: &'static str,
     action: &'static str,
     service_count: usize,
+    api_addition_count: usize,
+    api_review_change_count: usize,
 }
 
 #[derive(Serialize)]
@@ -1445,6 +1449,8 @@ async fn prepare_project_bundle(
                     .and_then(|manifest| manifest.metadata.as_ref())
                     .map(|metadata| &metadata.version);
                 ensure_upgrade_allowed(current_version, &metadata.version)?;
+                let api_changes =
+                    signed_plugin_api_change_summary(current_manifest, prepared.manifest())?;
                 let action = classify_project_component_action(
                     project_bundle::ProjectComponentKind::SignedPlugin,
                     current_manifest.is_some(),
@@ -1461,6 +1467,8 @@ async fn prepare_project_bundle(
                     source: "signed-package",
                     action,
                     service_count: prepared.manifest().services.len(),
+                    api_addition_count: api_changes.addition_count,
+                    api_review_change_count: api_changes.review_change_count,
                 });
                 components.push(PreparedProjectComponent::Signed(prepared));
             }
@@ -1501,6 +1509,8 @@ async fn prepare_project_bundle(
                         None,
                     ),
                     service_count: prepared.manifest().services.len(),
+                    api_addition_count: 0,
+                    api_review_change_count: 0,
                 });
                 components.push(PreparedProjectComponent::Local(prepared));
             }
@@ -1539,19 +1549,23 @@ async fn prepare_project_bundle(
                 },
                 action: "retain",
                 service_count: manifest.services.len(),
+                api_addition_count: 0,
+                api_review_change_count: 0,
             }
         })
         .collect::<Vec<_>>();
     let mut candidates = current
         .manifests
-        .into_iter()
+        .iter()
         .filter(|manifest| !imported_ids.contains(&manifest.plugin_id))
+        .cloned()
         .collect::<Vec<_>>();
     candidates.extend(
         components
             .iter()
             .map(|component| component.manifest().clone()),
     );
+    validate_signed_plugin_api_changes(&current.manifests, &candidates, &state.local_mapping_root)?;
     validate_project_delivery_routes(desktop_state, &opened.config, &candidates)?;
     let project_manifests = components
         .iter()
@@ -1725,6 +1739,75 @@ fn validate_project_delivery_routes(
             "项目来源与插件能力授权不完整：{} 个来源无法访问任何能力，{} 条调用路由未被当前来源授权",
             coverage.uncovered_origin_count, coverage.uncovered_route_count
         ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SignedPluginApiChangeSummary {
+    addition_count: usize,
+    review_change_count: usize,
+}
+
+fn signed_plugin_api_change_summary(
+    previous: Option<&PluginManifest>,
+    candidate: &PluginManifest,
+) -> Result<SignedPluginApiChangeSummary, String> {
+    let Some(previous) = previous else {
+        return Ok(SignedPluginApiChangeSummary::default());
+    };
+    if previous.plugin_id != candidate.plugin_id {
+        return Err("候选插件身份与当前签名插件不一致".into());
+    }
+    let comparison = compare_public_api(&previous.services, &candidate.services);
+    if !comparison.compatible {
+        tracing::warn!(
+            event_code = "plugin-api-compatibility-blocked",
+            error_code = "plugin-api-breaking-change",
+            plugin_id = candidate.plugin_id,
+            breaking_changes = comparison.breaking_changes.len(),
+            baseline_routes = comparison.baseline_route_count,
+            candidate_routes = comparison.candidate_route_count,
+            "signed plugin activation was blocked by a breaking Web Bridge contract change"
+        );
+        return Err(format!(
+            "候选签名插件 [{}] 会破坏 {} 条现有 Web Bridge 调用契约；请保留旧 service、方法名/alias 和输入输出类型，或使用新的插件 ID 发布不兼容能力",
+            candidate.plugin_id,
+            comparison.breaking_changes.len()
+        ));
+    }
+    Ok(SignedPluginApiChangeSummary {
+        addition_count: comparison.additions.len(),
+        review_change_count: comparison.review_changes.len(),
+    })
+}
+
+fn validate_signed_plugin_api_changes(
+    current: &[PluginManifest],
+    candidates: &[PluginManifest],
+    local_mapping_root: &std::path::Path,
+) -> Result<(), String> {
+    for previous in current
+        .iter()
+        .filter(|manifest| !is_local_manifest(manifest, local_mapping_root))
+    {
+        let candidate = candidates.iter().find(|manifest| {
+            manifest.plugin_id == previous.plugin_id
+                && !is_local_manifest(manifest, local_mapping_root)
+        });
+        let Some(candidate) = candidate else {
+            tracing::warn!(
+                event_code = "plugin-api-compatibility-blocked",
+                error_code = "plugin-api-plugin-removed",
+                plugin_id = previous.plugin_id,
+                "plugin reload was blocked from implicitly removing a signed plugin"
+            );
+            return Err(format!(
+                "候选插件集合会移除当前签名插件 [{}]；请使用显式卸载操作",
+                previous.plugin_id
+            ));
+        };
+        signed_plugin_api_change_summary(Some(previous), candidate)?;
     }
     Ok(())
 }
@@ -2074,6 +2157,8 @@ struct PluginPackagePreview {
     action: &'static str,
     service_count: usize,
     method_count: usize,
+    api_addition_count: usize,
+    api_review_change_count: usize,
     services: Vec<PluginPackageServicePreview>,
     preflighted_hosts: usize,
 }
@@ -2090,6 +2175,8 @@ struct LocalPluginInstallContext {
     current_state_sha256: String,
     current_version: Option<semver::Version>,
     action: &'static str,
+    api_addition_count: usize,
+    api_review_change_count: usize,
 }
 
 #[derive(Serialize)]
@@ -2346,6 +2433,8 @@ async fn inspect_plugin_package(
         action: context.action,
         service_count: services.len(),
         method_count,
+        api_addition_count: context.api_addition_count,
+        api_review_change_count: context.api_review_change_count,
         services,
         preflighted_hosts: preflight.hosts_started,
     })
@@ -2961,6 +3050,8 @@ async fn local_plugin_install_context(
         .and_then(|manifest| manifest.metadata.as_ref())
         .map(|metadata| metadata.version.clone());
     ensure_upgrade_allowed(current_version.as_ref(), &prepared.metadata().version)?;
+    let api_changes =
+        signed_plugin_api_change_summary(previous_manifest.as_ref(), prepared.manifest())?;
 
     let current_state_sha256 = plugin_update_installed_state_digest(
         &state.plugin_root,
@@ -2984,6 +3075,8 @@ async fn local_plugin_install_context(
         current_state_sha256,
         current_version,
         action,
+        api_addition_count: api_changes.addition_count,
+        api_review_change_count: api_changes.review_change_count,
     })
 }
 
@@ -3055,6 +3148,7 @@ async fn activate_prepared_plugin(
                 && !is_local_manifest(manifest, &state.local_mapping_root)
         })
         .cloned();
+    signed_plugin_api_change_summary(previous_manifest.as_ref(), prepared.manifest())?;
     if let Some(expected) = expected_current_state_sha256 {
         let actual = plugin_update_installed_state_digest(
             &plugin_root,
@@ -3301,12 +3395,18 @@ async fn reload_plugins(
     desktop::require_control(&caller)?;
     let _install = state.install_lock.lock().await;
     recover_plugin_store(&state)?;
+    let current = state
+        .controller
+        .active_manifests()
+        .await
+        .map_err(|error| format!("无法读取当前插件运行状态 ({})", error.diagnostic_code()))?;
     let plugins = inspect_all_plugins(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
         &state.desktop_version,
     )?;
+    validate_signed_plugin_api_changes(&current, &plugins.manifests, &state.local_mapping_root)?;
     validate_signed_plugin_activation_routes(
         &desktop_state,
         &plugins.manifests,
@@ -5279,12 +5379,13 @@ mod tests {
         plugin_update_installed_state_digest, plugin_update_plan_id, preflight_failure_message,
         project_bundle, project_import_plan_id, project_import_state_digest,
         resolve_startup_failure_document, same_manifest_contracts, select_runtime_path,
-        service_inventory_item, signed_plugin_route_policy_coverage, startup_failure_message,
-        validate_signed_plugin_activation_routes, BridgePluginHostHealth, CatalogWithdrawalReason,
-        FrontendRuntime, InspectedPlugins, LocalMappingImportPreview,
-        LocalMappingImportServicePreview, PluginInstallBlocker, PluginInstallSource,
-        PluginPackagePreview, PluginPackageServicePreview, ProjectBundlePreview,
-        StartupFailureDocument, StartupStage, FRONTEND_READY_TIMEOUT,
+        service_inventory_item, signed_plugin_api_change_summary,
+        signed_plugin_route_policy_coverage, startup_failure_message,
+        validate_signed_plugin_activation_routes, validate_signed_plugin_api_changes,
+        BridgePluginHostHealth, CatalogWithdrawalReason, FrontendRuntime, InspectedPlugins,
+        LocalMappingImportPreview, LocalMappingImportServicePreview, PluginInstallBlocker,
+        PluginInstallSource, PluginPackagePreview, PluginPackageServicePreview,
+        ProjectBundlePreview, StartupFailureDocument, StartupStage, FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -5319,6 +5420,20 @@ mod tests {
             failures: Vec::new(),
             discovered_plugin_ids,
             local_mapping_ids,
+        }
+    }
+
+    fn plugin_manifest_with_service(
+        plugin_id: &str,
+        plugin_dir: PathBuf,
+        service: serde_json::Value,
+    ) -> PluginManifest {
+        PluginManifest {
+            plugin_id: plugin_id.to_owned(),
+            plugin_dir,
+            metadata: None,
+            services: vec![serde_json::from_value(service).unwrap()],
+            local_mapping_integrity_sha256: None,
         }
     }
 
@@ -5494,6 +5609,80 @@ mod tests {
             PluginInstallSource::SignedCatalog,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn signed_plugin_api_gate_blocks_breaking_routes_and_summarizes_safe_changes() {
+        let previous = plugin_manifest_with_service(
+            "reader",
+            PathBuf::from("plugins/reader"),
+            serde_json::json!({
+                "serviceId": "card.reader",
+                "mainClass": "reader.dll",
+                "methods": [{"name": "read", "alias": "scan"}]
+            }),
+        );
+        let breaking = plugin_manifest_with_service(
+            "reader",
+            PathBuf::from("staging/reader"),
+            serde_json::json!({
+                "serviceId": "card.reader",
+                "mainClass": "reader.dll",
+                "methods": [{"name": "read"}]
+            }),
+        );
+        let error = signed_plugin_api_change_summary(Some(&previous), &breaking).unwrap_err();
+        assert!(error.contains("Web Bridge"));
+        assert!(error.contains("reader"));
+
+        let compatible = plugin_manifest_with_service(
+            "reader",
+            PathBuf::from("staging/reader"),
+            serde_json::json!({
+                "serviceId": "card.reader",
+                "mainClass": "reader-v2.dll",
+                "methods": [
+                    {"name": "read", "alias": "scan"},
+                    {"name": "status"}
+                ]
+            }),
+        );
+        let summary = signed_plugin_api_change_summary(Some(&previous), &compatible).unwrap();
+        assert_eq!(summary.addition_count, 1);
+        assert_eq!(summary.review_change_count, 1);
+    }
+
+    #[test]
+    fn signed_plugin_api_set_gate_blocks_implicit_removal_but_exempts_local_mappings() {
+        let root = tempfile::tempdir().unwrap();
+        let local_root = root.path().join("local-mappings");
+        let signed = plugin_manifest_with_service(
+            "reader",
+            root.path().join("plugins/reader"),
+            serde_json::json!({
+                "serviceId": "card.reader",
+                "mainClass": "reader.dll",
+                "methods": [{"name": "read"}]
+            }),
+        );
+        let local = plugin_manifest_with_service(
+            "reader.local",
+            local_root.join("reader.local"),
+            serde_json::json!({
+                "serviceId": "card.reader.local",
+                "mainClass": "reader.dll",
+                "methods": [{"name": "read"}]
+            }),
+        );
+
+        assert!(
+            validate_signed_plugin_api_changes(std::slice::from_ref(&local), &[], &local_root,)
+                .is_ok()
+        );
+        let error =
+            validate_signed_plugin_api_changes(&[signed, local], &[], &local_root).unwrap_err();
+        assert!(error.contains("显式卸载"));
+        assert!(error.contains("reader"));
     }
 
     #[test]
@@ -6404,6 +6593,8 @@ mod tests {
                 method_count: 2,
             }],
             preflighted_hosts: 1,
+            api_addition_count: 0,
+            api_review_change_count: 0,
         };
         let value = serde_json::to_value(preview).unwrap();
         let object = value.as_object().unwrap();

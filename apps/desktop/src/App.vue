@@ -125,6 +125,8 @@ type ProjectBundlePreview = {
     source: 'signed-package' | 'local-mapping'
     action: 'install' | 'upgrade' | 'reinstall' | 'replace'
     serviceCount: number
+    apiAdditionCount: number
+    apiReviewChangeCount: number
   }>
   retainedComponents: Array<{
     pluginId: string
@@ -133,6 +135,8 @@ type ProjectBundlePreview = {
     source: 'signed-package' | 'local-mapping'
     action: 'retain'
     serviceCount: number
+    apiAdditionCount: number
+    apiReviewChangeCount: number
   }>
 }
 
@@ -224,6 +228,8 @@ type PluginPackagePreview = {
   action: 'install' | 'upgrade' | 'reinstall'
   serviceCount: number
   methodCount: number
+  apiAdditionCount: number
+  apiReviewChangeCount: number
   services: Array<{
     serviceId: string
     architecture: 'x86' | 'x64'
@@ -1087,7 +1093,7 @@ async function exportDeploymentCheck() {
             </div>
             <details v-if="projectBundlePreview.configPreview.candidateEnvironments.length" class="config-import-environments"><summary>查看目标业务环境（{{ projectBundlePreview.configPreview.candidateEnvironments.length }}）</summary><ul><li v-for="environment in projectBundlePreview.configPreview.candidateEnvironments" :key="`${environment.name}:${environment.url}`"><strong>{{ environment.name }}</strong><code>{{ environment.url }}</code></li></ul></details>
             <h3>项目包变更</h3>
-            <ul><li v-for="component in projectBundlePreview.components" :key="component.pluginId"><span><strong>{{ component.pluginId }}</strong><small>{{ component.source === 'signed-package' ? `签名插件 ${component.version ?? ''} · Desktop ${component.desktopVersionRequirement ?? '未声明'}` : '本地动态映射' }}</small></span><em><b :class="`plan-action ${component.action}`">{{ projectActionLabels[component.action] }}</b>{{ component.serviceCount }} 个服务</em></li></ul>
+            <ul><li v-for="component in projectBundlePreview.components" :key="component.pluginId"><span><strong>{{ component.pluginId }}</strong><small>{{ component.source === 'signed-package' ? `签名插件 ${component.version ?? ''} · Desktop ${component.desktopVersionRequirement ?? '未声明'}${component.action === 'install' ? '' : ` · API 新增 ${component.apiAdditionCount} / 原生复核 ${component.apiReviewChangeCount}`}` : '本地动态映射' }}</small></span><em><b :class="`plan-action ${component.action}`">{{ projectActionLabels[component.action] }}</b>{{ component.serviceCount }} 个服务</em></li></ul>
             <details v-if="projectBundlePreview.retainedComponents.length" class="retained-components"><summary>不会删除的本机现有能力（{{ projectBundlePreview.retainedCount }}）</summary><ul><li v-for="component in projectBundlePreview.retainedComponents" :key="component.pluginId"><span><strong>{{ component.pluginId }}</strong><small>{{ component.source === 'signed-package' ? `签名插件 ${component.version ?? ''}` : '本地动态映射' }}</small></span><em><b class="plan-action retain">保留</b>{{ component.serviceCount }} 个服务</em></li></ul></details>
           </div>
         </section>
@@ -1147,7 +1153,7 @@ async function exportDeploymentCheck() {
             <div class="plugin-package-actions"><button type="button" :disabled="busy" @click="cancelPluginPackageInstall">取消</button><button class="primary" type="button" :disabled="busy" @click="confirmPluginPackageInstall">确认并{{ projectActionLabels[pluginPackagePreview.action] }}</button></div>
           </header>
           <div class="plugin-package-identity"><span><small>插件</small><strong>{{ pluginPackagePreview.displayName }}</strong><code>{{ pluginPackagePreview.pluginId }}</code></span><span><small>版本变化</small><strong>{{ pluginPackagePreview.currentVersion ?? '未安装' }} → {{ pluginPackagePreview.pluginVersion }}</strong><b :class="`plan-action ${pluginPackagePreview.action}`">{{ projectActionLabels[pluginPackagePreview.action] }}</b></span><span><small>Desktop 兼容范围</small><strong>{{ pluginPackagePreview.desktopVersionRequirement }}</strong></span></div>
-          <div class="plugin-package-summary"><span><strong>{{ pluginPackagePreview.serviceCount }}</strong>个服务</span><span><strong>{{ pluginPackagePreview.methodCount }}</strong>个方法</span><span><strong>{{ pluginPackagePreview.preflightedHosts }}</strong>个宿主已预检</span></div>
+          <div class="plugin-package-summary"><span><strong>{{ pluginPackagePreview.serviceCount }}</strong>个服务</span><span><strong>{{ pluginPackagePreview.methodCount }}</strong>个方法</span><span v-if="pluginPackagePreview.currentVersion"><strong>{{ pluginPackagePreview.apiAdditionCount }}</strong>项 API 兼容新增</span><span v-if="pluginPackagePreview.currentVersion"><strong>{{ pluginPackagePreview.apiReviewChangeCount }}</strong>项原生复核</span><span><strong>{{ pluginPackagePreview.preflightedHosts }}</strong>个宿主已预检</span></div>
           <ul><li v-for="service in pluginPackagePreview.services" :key="service.serviceId"><code>{{ service.serviceId }}</code><span>{{ service.architecture }} · {{ service.methodCount }} 个方法</span></li></ul>
         </section>
         <section class="plugin-inventory" aria-label="已安装插件">

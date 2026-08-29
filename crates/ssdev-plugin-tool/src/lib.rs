@@ -12,9 +12,10 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tempfile::Builder as TempBuilder;
 use thiserror::Error;
+pub use webplus_plugin_config::PublicApiChange as ApiCompatibilityChange;
 use webplus_plugin_config::{
-    discover_plugins, generate_typescript_client, MethodDefinition, ParameterDefinition,
-    PluginManifest, PluginMetadata, ServiceDefinition,
+    compare_public_api, discover_plugins, generate_typescript_client, PluginManifest,
+    PluginMetadata,
 };
 use webplus_plugin_package::{create_deterministic_package, PreparedPlugin};
 use webplus_plugin_repository::{
@@ -26,7 +27,7 @@ use webplus_plugin_trust::{
 };
 use webplus_protocol::{
     contains_draft_placeholder, InvokeRequest, InvokeResponse, PluginArchitecture,
-    DRAFT_INPUT_PLACEHOLDER, DRAFT_RESPONSE_PLACEHOLDER, NATIVE_RETURN_VALUE_FIELD,
+    DRAFT_INPUT_PLACEHOLDER, DRAFT_RESPONSE_PLACEHOLDER,
 };
 
 const MAX_PLUGIN_BYTES: u64 = 512 * 1024 * 1024;
@@ -291,21 +292,6 @@ pub struct SourceCheckReport {
     pub source_file_count: usize,
     pub source_bytes: u64,
     pub legacy_license_excluded: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ApiCompatibilityChange {
-    pub code: String,
-    pub service_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub route: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub field: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub baseline: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub candidate: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1765,93 +1751,7 @@ fn compare_api_contracts(
     candidate_source_sha256: String,
     trust_store_sha256: String,
 ) -> ApiCompatibilityReport {
-    let baseline_services = baseline
-        .services
-        .iter()
-        .map(|service| (service.service_id.as_str(), service))
-        .collect::<BTreeMap<_, _>>();
-    let candidate_services = candidate
-        .services
-        .iter()
-        .map(|service| (service.service_id.as_str(), service))
-        .collect::<BTreeMap<_, _>>();
-    let mut breaking_changes = Vec::new();
-    let mut review_changes = Vec::new();
-    let mut additions = Vec::new();
-
-    for (service_id, baseline_service) in &baseline_services {
-        let Some(candidate_service) = candidate_services.get(service_id) else {
-            breaking_changes.push(api_change(
-                "service-removed",
-                service_id,
-                None,
-                None,
-                None,
-                None,
-            ));
-            continue;
-        };
-        compare_service_execution_contract(
-            baseline_service,
-            candidate_service,
-            &mut review_changes,
-        );
-        let baseline_routes = public_routes(baseline_service);
-        let candidate_routes = public_routes(candidate_service);
-        for (route, baseline_method) in &baseline_routes {
-            let Some(candidate_method) = candidate_routes.get(route) else {
-                breaking_changes.push(api_change(
-                    "route-removed",
-                    service_id,
-                    Some(route),
-                    None,
-                    None,
-                    None,
-                ));
-                continue;
-            };
-            compare_method_contract(
-                baseline_service,
-                baseline_method,
-                candidate_service,
-                candidate_method,
-                route,
-                &mut breaking_changes,
-                &mut review_changes,
-                &mut additions,
-            );
-        }
-        for route in candidate_routes.keys() {
-            if !baseline_routes.contains_key(route) {
-                additions.push(api_change(
-                    "route-added",
-                    service_id,
-                    Some(route),
-                    None,
-                    None,
-                    None,
-                ));
-            }
-        }
-    }
-    for service_id in candidate_services.keys() {
-        if !baseline_services.contains_key(service_id) {
-            additions.push(api_change(
-                "service-added",
-                service_id,
-                None,
-                None,
-                None,
-                None,
-            ));
-        }
-    }
-
-    for changes in [&mut breaking_changes, &mut review_changes, &mut additions] {
-        changes.sort();
-        changes.dedup();
-    }
-    let compatible = breaking_changes.is_empty();
+    let compatibility = compare_public_api(&baseline.services, &candidate.services);
     ApiCompatibilityReport {
         schema_version: 1,
         plugin_id: baseline.plugin_id.clone(),
@@ -1859,337 +1759,17 @@ fn compare_api_contracts(
         baseline_package_sha256,
         candidate_source_sha256,
         trust_store_sha256,
-        compatible,
+        compatible: compatibility.compatible,
         baseline_service_count: baseline.services.len(),
         candidate_service_count: candidate.services.len(),
-        baseline_route_count: manifest_route_count(baseline),
-        candidate_route_count: manifest_route_count(candidate),
-        breaking_change_count: breaking_changes.len(),
-        review_change_count: review_changes.len(),
-        addition_count: additions.len(),
-        breaking_changes,
-        review_changes,
-        additions,
-    }
-}
-
-fn public_routes(service: &ServiceDefinition) -> BTreeMap<&str, &MethodDefinition> {
-    let mut routes = BTreeMap::new();
-    for method in &service.methods {
-        routes.insert(method.name.as_str(), method);
-        if let Some(alias) = method.alias.as_deref() {
-            routes.insert(alias, method);
-        }
-    }
-    routes
-}
-
-fn manifest_route_count(manifest: &PluginManifest) -> usize {
-    manifest
-        .services
-        .iter()
-        .map(|service| public_routes(service).len())
-        .sum()
-}
-
-fn compare_service_execution_contract(
-    baseline: &ServiceDefinition,
-    candidate: &ServiceDefinition,
-    review_changes: &mut Vec<ApiCompatibilityChange>,
-) {
-    let native_binding_changed = baseline.main_class != candidate.main_class
-        || !baseline
-            .resolved_main_type()
-            .eq_ignore_ascii_case(candidate.resolved_main_type())
-        || baseline.architecture != candidate.architecture
-        || !baseline
-            .charset
-            .trim()
-            .eq_ignore_ascii_case(candidate.charset.trim())
-        || !baseline
-            .calling_convention
-            .trim()
-            .eq_ignore_ascii_case(candidate.calling_convention.trim())
-        || baseline.cacheable != candidate.cacheable
-        || baseline.deps != candidate.deps
-        || baseline.extensions != candidate.extensions;
-    if native_binding_changed {
-        review_changes.push(api_change(
-            "service-native-binding-changed",
-            &baseline.service_id,
-            None,
-            None,
-            None,
-            None,
-        ));
-    }
-    if baseline.timeout != candidate.timeout {
-        review_changes.push(api_change(
-            "service-timeout-changed",
-            &baseline.service_id,
-            None,
-            None,
-            Some(baseline.timeout.to_string()),
-            Some(candidate.timeout.to_string()),
-        ));
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compare_method_contract(
-    baseline_service: &ServiceDefinition,
-    baseline: &MethodDefinition,
-    candidate_service: &ServiceDefinition,
-    candidate: &MethodDefinition,
-    route: &str,
-    breaking_changes: &mut Vec<ApiCompatibilityChange>,
-    review_changes: &mut Vec<ApiCompatibilityChange>,
-    additions: &mut Vec<ApiCompatibilityChange>,
-) {
-    let baseline_inputs = method_input_contract(baseline);
-    let candidate_inputs = method_input_contract(candidate);
-    for (field, baseline_type) in &baseline_inputs {
-        match candidate_inputs.get(field) {
-            None => breaking_changes.push(api_change(
-                "input-removed",
-                &baseline_service.service_id,
-                Some(route),
-                Some(field),
-                Some(baseline_type.clone()),
-                None,
-            )),
-            Some(candidate_type) if candidate_type != baseline_type => {
-                breaking_changes.push(api_change(
-                    "input-type-changed",
-                    &baseline_service.service_id,
-                    Some(route),
-                    Some(field),
-                    Some(baseline_type.clone()),
-                    Some(candidate_type.clone()),
-                ));
-            }
-            Some(_) => {}
-        }
-    }
-    for (field, candidate_type) in &candidate_inputs {
-        if !baseline_inputs.contains_key(field) {
-            breaking_changes.push(api_change(
-                "required-input-added",
-                &baseline_service.service_id,
-                Some(route),
-                Some(field),
-                None,
-                Some(candidate_type.clone()),
-            ));
-        }
-    }
-
-    let baseline_responses = method_response_contract(baseline_service, baseline);
-    let candidate_responses = method_response_contract(candidate_service, candidate);
-    for (field, baseline_type) in &baseline_responses {
-        match candidate_responses.get(field) {
-            None => breaking_changes.push(api_change(
-                "response-field-removed",
-                &baseline_service.service_id,
-                Some(route),
-                Some(field),
-                Some(baseline_type.clone()),
-                None,
-            )),
-            Some(candidate_type) if candidate_type != baseline_type => {
-                breaking_changes.push(api_change(
-                    "response-type-changed",
-                    &baseline_service.service_id,
-                    Some(route),
-                    Some(field),
-                    Some(baseline_type.clone()),
-                    Some(candidate_type.clone()),
-                ));
-            }
-            Some(_) => {}
-        }
-    }
-    for (field, candidate_type) in &candidate_responses {
-        if !baseline_responses.contains_key(field) {
-            additions.push(api_change(
-                "response-field-added",
-                &baseline_service.service_id,
-                Some(route),
-                Some(field),
-                None,
-                Some(candidate_type.clone()),
-            ));
-        }
-    }
-
-    if baseline.name != candidate.name {
-        review_changes.push(api_change(
-            "route-native-target-changed",
-            &baseline_service.service_id,
-            Some(route),
-            None,
-            Some(baseline.name.clone()),
-            Some(candidate.name.clone()),
-        ));
-    }
-    if baseline.timeout != candidate.timeout {
-        review_changes.push(api_change(
-            "method-timeout-changed",
-            &baseline_service.service_id,
-            Some(route),
-            None,
-            Some(baseline.timeout.to_string()),
-            Some(candidate.timeout.to_string()),
-        ));
-    }
-    let baseline_order = baseline
-        .parameters
-        .iter()
-        .map(|parameter| parameter.name())
-        .collect::<Vec<_>>();
-    let candidate_order = candidate
-        .parameters
-        .iter()
-        .map(|parameter| parameter.name())
-        .collect::<Vec<_>>();
-    if baseline_order != candidate_order {
-        let same_fields = baseline_order.len() == candidate_order.len()
-            && baseline_order.iter().collect::<BTreeSet<_>>()
-                == candidate_order.iter().collect::<BTreeSet<_>>();
-        review_changes.push(api_change(
-            if same_fields {
-                "native-parameter-order-changed"
-            } else {
-                "native-parameter-layout-changed"
-            },
-            &baseline_service.service_id,
-            Some(route),
-            None,
-            None,
-            None,
-        ));
-    }
-    if baseline_order == candidate_order
-        && baseline.parameters != candidate.parameters
-        && baseline_inputs == candidate_inputs
-        && baseline_responses == candidate_responses
-    {
-        review_changes.push(api_change(
-            "native-parameter-options-changed",
-            &baseline_service.service_id,
-            Some(route),
-            None,
-            None,
-            None,
-        ));
-    }
-    if baseline.props != candidate.props && baseline_responses == candidate_responses {
-        review_changes.push(api_change(
-            "native-property-order-changed",
-            &baseline_service.service_id,
-            Some(route),
-            None,
-            None,
-            None,
-        ));
-    }
-    if baseline.extensions != candidate.extensions {
-        review_changes.push(api_change(
-            "method-extension-changed",
-            &baseline_service.service_id,
-            Some(route),
-            None,
-            None,
-            None,
-        ));
-    }
-}
-
-fn method_input_contract(method: &MethodDefinition) -> BTreeMap<String, String> {
-    method
-        .parameters
-        .iter()
-        .filter(|parameter| !parameter.name().starts_with('$'))
-        .map(|parameter| {
-            (
-                parameter.name().to_owned(),
-                parameter_contract_type(parameter, false),
-            )
-        })
-        .collect()
-}
-
-fn method_response_contract(
-    service: &ServiceDefinition,
-    method: &MethodDefinition,
-) -> BTreeMap<String, String> {
-    let mut fields = BTreeMap::from([(
-        NATIVE_RETURN_VALUE_FIELD.to_owned(),
-        return_contract_type(service, &method.return_type),
-    )]);
-    for parameter in method
-        .parameters
-        .iter()
-        .filter(|parameter| parameter.name().starts_with('$'))
-    {
-        fields.insert(
-            parameter.name().trim_start_matches('$').to_owned(),
-            parameter_contract_type(parameter, true),
-        );
-    }
-    for property in &method.props {
-        fields.insert(property.clone(), "json".into());
-    }
-    fields
-}
-
-fn parameter_contract_type(parameter: &ParameterDefinition, output: bool) -> String {
-    let declared = match parameter {
-        ParameterDefinition::Name(_) => "inferred",
-        ParameterDefinition::Detailed(detail) => detail.parameter_type.trim(),
-    };
-    match declared.to_ascii_lowercase().as_str() {
-        "" | "inferred" if output => "string".into(),
-        "" | "inferred" => "inferred".into(),
-        "string" | "buffer" => "string".into(),
-        "bool" | "boolean" => "boolean".into(),
-        "int" | "int32" | "long" => "int32".into(),
-        "uint" | "uint32" | "dword" => "uint32".into(),
-        "float" | "double" => "number".into(),
-        other => other.to_owned(),
-    }
-}
-
-fn return_contract_type(service: &ServiceDefinition, declared: &str) -> String {
-    match declared.trim().to_ascii_lowercase().as_str() {
-        "" if service.resolved_main_type().eq_ignore_ascii_case("dll") => "int32".into(),
-        "" => "json".into(),
-        "void" => "null".into(),
-        "string" | "char*" | "pointer_string" => "string".into(),
-        "bool" | "boolean" => "boolean".into(),
-        "int" | "int32" | "long" => "int32".into(),
-        "uint" | "uint32" | "dword" => "uint32".into(),
-        "float" | "double" => "number".into(),
-        "pointer" | "uintptr" | "usize" => "pointer".into(),
-        other => other.to_owned(),
-    }
-}
-
-fn api_change(
-    code: &str,
-    service_id: &str,
-    route: Option<&str>,
-    field: Option<&str>,
-    baseline: Option<String>,
-    candidate: Option<String>,
-) -> ApiCompatibilityChange {
-    ApiCompatibilityChange {
-        code: code.into(),
-        service_id: service_id.into(),
-        route: route.map(str::to_owned),
-        field: field.map(str::to_owned),
-        baseline,
-        candidate,
+        baseline_route_count: compatibility.baseline_route_count,
+        candidate_route_count: compatibility.candidate_route_count,
+        breaking_change_count: compatibility.breaking_changes.len(),
+        review_change_count: compatibility.review_changes.len(),
+        addition_count: compatibility.additions.len(),
+        breaking_changes: compatibility.breaking_changes,
+        review_changes: compatibility.review_changes,
+        additions: compatibility.additions,
     }
 }
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -806,6 +806,457 @@ pub struct ParameterDetail {
     pub extensions: HashMap<String, Value>,
 }
 
+/// Stable, path-free description of one public Web Bridge contract change.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicApiChange {
+    pub code: String,
+    pub service_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<String>,
+}
+
+/// Compares every runtime-visible method name and alias without loading native
+/// code. Breaking changes remove or narrow an existing Web Bridge contract;
+/// review changes retain the public shape but alter native execution details.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicApiCompatibility {
+    pub compatible: bool,
+    pub baseline_route_count: usize,
+    pub candidate_route_count: usize,
+    pub breaking_changes: Vec<PublicApiChange>,
+    pub review_changes: Vec<PublicApiChange>,
+    pub additions: Vec<PublicApiChange>,
+}
+
+pub fn compare_public_api(
+    baseline: &[ServiceDefinition],
+    candidate: &[ServiceDefinition],
+) -> PublicApiCompatibility {
+    let baseline_services = baseline
+        .iter()
+        .map(|service| (service.service_id.as_str(), service))
+        .collect::<BTreeMap<_, _>>();
+    let candidate_services = candidate
+        .iter()
+        .map(|service| (service.service_id.as_str(), service))
+        .collect::<BTreeMap<_, _>>();
+    let mut changes = ApiComparisonChanges::default();
+
+    for (service_id, baseline_service) in &baseline_services {
+        let Some(candidate_service) = candidate_services.get(service_id) else {
+            changes.breaking.push(public_api_change(
+                "service-removed",
+                service_id,
+                None,
+                None,
+                None,
+                None,
+            ));
+            continue;
+        };
+        compare_service_execution_contract(
+            baseline_service,
+            candidate_service,
+            &mut changes.review,
+        );
+        let baseline_routes = public_routes(baseline_service);
+        let candidate_routes = public_routes(candidate_service);
+        for (route, baseline_method) in &baseline_routes {
+            let Some(candidate_method) = candidate_routes.get(route) else {
+                changes.breaking.push(public_api_change(
+                    "route-removed",
+                    service_id,
+                    Some(route),
+                    None,
+                    None,
+                    None,
+                ));
+                continue;
+            };
+            compare_method_contract(
+                baseline_service,
+                baseline_method,
+                candidate_service,
+                candidate_method,
+                route,
+                &mut changes,
+            );
+        }
+        for route in candidate_routes.keys() {
+            if !baseline_routes.contains_key(route) {
+                changes.additions.push(public_api_change(
+                    "route-added",
+                    service_id,
+                    Some(route),
+                    None,
+                    None,
+                    None,
+                ));
+            }
+        }
+    }
+    for service_id in candidate_services.keys() {
+        if !baseline_services.contains_key(service_id) {
+            changes.additions.push(public_api_change(
+                "service-added",
+                service_id,
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+    }
+
+    for items in [
+        &mut changes.breaking,
+        &mut changes.review,
+        &mut changes.additions,
+    ] {
+        items.sort();
+        items.dedup();
+    }
+    PublicApiCompatibility {
+        compatible: changes.breaking.is_empty(),
+        baseline_route_count: service_route_count(baseline),
+        candidate_route_count: service_route_count(candidate),
+        breaking_changes: changes.breaking,
+        review_changes: changes.review,
+        additions: changes.additions,
+    }
+}
+
+#[derive(Default)]
+struct ApiComparisonChanges {
+    breaking: Vec<PublicApiChange>,
+    review: Vec<PublicApiChange>,
+    additions: Vec<PublicApiChange>,
+}
+
+fn public_routes(service: &ServiceDefinition) -> BTreeMap<&str, &MethodDefinition> {
+    let mut routes = BTreeMap::new();
+    for method in &service.methods {
+        routes.insert(method.name.as_str(), method);
+        if let Some(alias) = method.alias.as_deref() {
+            routes.insert(alias, method);
+        }
+    }
+    routes
+}
+
+fn service_route_count(services: &[ServiceDefinition]) -> usize {
+    services
+        .iter()
+        .map(|service| public_routes(service).len())
+        .sum()
+}
+
+fn compare_service_execution_contract(
+    baseline: &ServiceDefinition,
+    candidate: &ServiceDefinition,
+    review: &mut Vec<PublicApiChange>,
+) {
+    let native_binding_changed = baseline.main_class != candidate.main_class
+        || !baseline
+            .resolved_main_type()
+            .eq_ignore_ascii_case(candidate.resolved_main_type())
+        || baseline.architecture != candidate.architecture
+        || !baseline
+            .charset
+            .trim()
+            .eq_ignore_ascii_case(candidate.charset.trim())
+        || !baseline
+            .calling_convention
+            .trim()
+            .eq_ignore_ascii_case(candidate.calling_convention.trim())
+        || baseline.cacheable != candidate.cacheable
+        || baseline.deps != candidate.deps
+        || baseline.extensions != candidate.extensions;
+    if native_binding_changed {
+        review.push(public_api_change(
+            "service-native-binding-changed",
+            &baseline.service_id,
+            None,
+            None,
+            None,
+            None,
+        ));
+    }
+    if baseline.timeout != candidate.timeout {
+        review.push(public_api_change(
+            "service-timeout-changed",
+            &baseline.service_id,
+            None,
+            None,
+            Some(baseline.timeout.to_string()),
+            Some(candidate.timeout.to_string()),
+        ));
+    }
+}
+
+fn compare_method_contract(
+    baseline_service: &ServiceDefinition,
+    baseline: &MethodDefinition,
+    candidate_service: &ServiceDefinition,
+    candidate: &MethodDefinition,
+    route: &str,
+    changes: &mut ApiComparisonChanges,
+) {
+    let baseline_inputs = method_input_contract(baseline);
+    let candidate_inputs = method_input_contract(candidate);
+    for (field, baseline_type) in &baseline_inputs {
+        match candidate_inputs.get(field) {
+            None => changes.breaking.push(public_api_change(
+                "input-removed",
+                &baseline_service.service_id,
+                Some(route),
+                Some(field),
+                Some(baseline_type.clone()),
+                None,
+            )),
+            Some(candidate_type) if candidate_type != baseline_type => {
+                changes.breaking.push(public_api_change(
+                    "input-type-changed",
+                    &baseline_service.service_id,
+                    Some(route),
+                    Some(field),
+                    Some(baseline_type.clone()),
+                    Some(candidate_type.clone()),
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for (field, candidate_type) in &candidate_inputs {
+        if !baseline_inputs.contains_key(field) {
+            changes.breaking.push(public_api_change(
+                "required-input-added",
+                &baseline_service.service_id,
+                Some(route),
+                Some(field),
+                None,
+                Some(candidate_type.clone()),
+            ));
+        }
+    }
+
+    let baseline_responses = method_response_contract(baseline_service, baseline);
+    let candidate_responses = method_response_contract(candidate_service, candidate);
+    for (field, baseline_type) in &baseline_responses {
+        match candidate_responses.get(field) {
+            None => changes.breaking.push(public_api_change(
+                "response-field-removed",
+                &baseline_service.service_id,
+                Some(route),
+                Some(field),
+                Some(baseline_type.clone()),
+                None,
+            )),
+            Some(candidate_type) if candidate_type != baseline_type => {
+                changes.breaking.push(public_api_change(
+                    "response-type-changed",
+                    &baseline_service.service_id,
+                    Some(route),
+                    Some(field),
+                    Some(baseline_type.clone()),
+                    Some(candidate_type.clone()),
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    for (field, candidate_type) in &candidate_responses {
+        if !baseline_responses.contains_key(field) {
+            changes.additions.push(public_api_change(
+                "response-field-added",
+                &baseline_service.service_id,
+                Some(route),
+                Some(field),
+                None,
+                Some(candidate_type.clone()),
+            ));
+        }
+    }
+
+    if baseline.name != candidate.name {
+        changes.review.push(public_api_change(
+            "route-native-target-changed",
+            &baseline_service.service_id,
+            Some(route),
+            None,
+            Some(baseline.name.clone()),
+            Some(candidate.name.clone()),
+        ));
+    }
+    if baseline.timeout != candidate.timeout {
+        changes.review.push(public_api_change(
+            "method-timeout-changed",
+            &baseline_service.service_id,
+            Some(route),
+            None,
+            Some(baseline.timeout.to_string()),
+            Some(candidate.timeout.to_string()),
+        ));
+    }
+    let baseline_order = baseline
+        .parameters
+        .iter()
+        .map(ParameterDefinition::name)
+        .collect::<Vec<_>>();
+    let candidate_order = candidate
+        .parameters
+        .iter()
+        .map(ParameterDefinition::name)
+        .collect::<Vec<_>>();
+    if baseline_order != candidate_order {
+        let same_fields = baseline_order.len() == candidate_order.len()
+            && baseline_order.iter().collect::<BTreeSet<_>>()
+                == candidate_order.iter().collect::<BTreeSet<_>>();
+        changes.review.push(public_api_change(
+            if same_fields {
+                "native-parameter-order-changed"
+            } else {
+                "native-parameter-layout-changed"
+            },
+            &baseline_service.service_id,
+            Some(route),
+            None,
+            None,
+            None,
+        ));
+    }
+    if baseline_order == candidate_order
+        && baseline.parameters != candidate.parameters
+        && baseline_inputs == candidate_inputs
+        && baseline_responses == candidate_responses
+    {
+        changes.review.push(public_api_change(
+            "native-parameter-options-changed",
+            &baseline_service.service_id,
+            Some(route),
+            None,
+            None,
+            None,
+        ));
+    }
+    if baseline.props != candidate.props && baseline_responses == candidate_responses {
+        changes.review.push(public_api_change(
+            "native-property-order-changed",
+            &baseline_service.service_id,
+            Some(route),
+            None,
+            None,
+            None,
+        ));
+    }
+    if baseline.extensions != candidate.extensions {
+        changes.review.push(public_api_change(
+            "method-extension-changed",
+            &baseline_service.service_id,
+            Some(route),
+            None,
+            None,
+            None,
+        ));
+    }
+}
+
+fn method_input_contract(method: &MethodDefinition) -> BTreeMap<String, String> {
+    method
+        .parameters
+        .iter()
+        .filter(|parameter| !parameter.name().starts_with('$'))
+        .map(|parameter| {
+            (
+                parameter.name().to_owned(),
+                parameter_contract_type(parameter, false),
+            )
+        })
+        .collect()
+}
+
+fn method_response_contract(
+    service: &ServiceDefinition,
+    method: &MethodDefinition,
+) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::from([(
+        NATIVE_RETURN_VALUE_FIELD.to_owned(),
+        return_contract_type(service, &method.return_type),
+    )]);
+    for parameter in method
+        .parameters
+        .iter()
+        .filter(|parameter| parameter.name().starts_with('$'))
+    {
+        fields.insert(
+            parameter.name().trim_start_matches('$').to_owned(),
+            parameter_contract_type(parameter, true),
+        );
+    }
+    for property in &method.props {
+        fields.insert(property.clone(), "json".into());
+    }
+    fields
+}
+
+fn parameter_contract_type(parameter: &ParameterDefinition, output: bool) -> String {
+    let declared = match parameter {
+        ParameterDefinition::Name(_) => "inferred",
+        ParameterDefinition::Detailed(detail) => detail.parameter_type.trim(),
+    };
+    match declared.to_ascii_lowercase().as_str() {
+        "" | "inferred" if output => "string".into(),
+        "" | "inferred" => "inferred".into(),
+        "string" | "buffer" => "string".into(),
+        "bool" | "boolean" => "boolean".into(),
+        "int" | "int32" | "long" => "int32".into(),
+        "uint" | "uint32" | "dword" => "uint32".into(),
+        "float" | "double" => "number".into(),
+        other => other.to_owned(),
+    }
+}
+
+fn return_contract_type(service: &ServiceDefinition, declared: &str) -> String {
+    match declared.trim().to_ascii_lowercase().as_str() {
+        "" if service.resolved_main_type().eq_ignore_ascii_case("dll") => "int32".into(),
+        "" => "json".into(),
+        "void" => "null".into(),
+        "string" | "char*" | "pointer_string" => "string".into(),
+        "bool" | "boolean" => "boolean".into(),
+        "int" | "int32" | "long" => "int32".into(),
+        "uint" | "uint32" | "dword" => "uint32".into(),
+        "float" | "double" => "number".into(),
+        "pointer" | "uintptr" | "usize" => "pointer".into(),
+        other => other.to_owned(),
+    }
+}
+
+fn public_api_change(
+    code: &str,
+    service_id: &str,
+    route: Option<&str>,
+    field: Option<&str>,
+    baseline: Option<String>,
+    candidate: Option<String>,
+) -> PublicApiChange {
+    PublicApiChange {
+        code: code.into(),
+        service_id: service_id.into(),
+        route: route.map(str::to_owned),
+        field: field.map(str::to_owned),
+        baseline,
+        candidate,
+    }
+}
+
 fn default_architecture() -> PluginArchitecture {
     PluginArchitecture::X86
 }
@@ -1266,6 +1717,90 @@ mod tests {
         assert!(source.contains("ReturnValue: null"));
         assert!(source.contains("invokePlugin<ReaderCardReadData>(\"reader.card\", \"read\""));
         assert!(!source.contains("$cardNo"));
+    }
+
+    #[test]
+    fn public_api_comparison_blocks_removed_aliases_and_shape_changes() {
+        let baseline: Vec<ServiceDefinition> = serde_json::from_value(serde_json::json!([{
+            "serviceId": "reader.card",
+            "mainClass": "reader.dll",
+            "mainType": "dll",
+            "methods": [{
+                "name": "ReadCard",
+                "alias": "read",
+                "parameters": ["timeout", {"name":"$cardNo","type":"string"}]
+            }]
+        }]))
+        .unwrap();
+        let candidate: Vec<ServiceDefinition> = serde_json::from_value(serde_json::json!([{
+            "serviceId": "reader.card",
+            "mainClass": "reader.dll",
+            "mainType": "dll",
+            "methods": [{
+                "name": "ReadCard",
+                "returnType": "string",
+                "parameters": [{"name":"timeout","type":"int32"}, {"name":"mode","type":"string"}]
+            }]
+        }]))
+        .unwrap();
+
+        let report = compare_public_api(&baseline, &candidate);
+        assert!(!report.compatible);
+        assert_eq!(report.baseline_route_count, 2);
+        assert_eq!(report.candidate_route_count, 1);
+        for code in [
+            "route-removed",
+            "input-type-changed",
+            "required-input-added",
+            "response-field-removed",
+            "response-type-changed",
+        ] {
+            assert!(report
+                .breaking_changes
+                .iter()
+                .any(|change| change.code == code));
+        }
+    }
+
+    #[test]
+    fn public_api_comparison_allows_additions_but_flags_native_review() {
+        let baseline: Vec<ServiceDefinition> = serde_json::from_value(serde_json::json!([{
+            "serviceId": "reader.card",
+            "mainClass": "reader.dll",
+            "mainType": "dll",
+            "methods": [{"name":"ReadCard","parameters":["timeout"]}]
+        }]))
+        .unwrap();
+        let candidate: Vec<ServiceDefinition> = serde_json::from_value(serde_json::json!([{
+            "serviceId": "reader.card",
+            "mainClass": "reader-v2.dll",
+            "mainType": "dll",
+            "methods": [{
+                "name": "ReadCard",
+                "alias": "read",
+                "parameters": [{"name":"timeout","type":"inferred"}, {"name":"$status","type":"int32"}]
+            }]
+        }]))
+        .unwrap();
+
+        let report = compare_public_api(&baseline, &candidate);
+        assert!(report.compatible);
+        assert!(report
+            .additions
+            .iter()
+            .any(|change| change.code == "route-added"));
+        assert!(report
+            .additions
+            .iter()
+            .any(|change| change.code == "response-field-added"));
+        assert!(report
+            .review_changes
+            .iter()
+            .any(|change| change.code == "service-native-binding-changed"));
+        assert!(report
+            .review_changes
+            .iter()
+            .any(|change| change.code == "native-parameter-layout-changed"));
     }
 
     #[test]
