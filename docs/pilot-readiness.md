@@ -19,7 +19,7 @@ schema 2 manifest 还必须填写 `migrationAuditBindings`，明确正式迁移�
 - `signed-origin-policy`：候选来源策略、旁签封套和发布信任库；
 - `plugin-release-set`：批准发布集合规范及其确定性插件包目录；
 - `organization-public-trust`：插件、策略、项目、应用更新和 Authenticode 所需的公钥、证书及流程说明。私钥、令牌和口令不得进入材料目录；工具会阻断常见私钥容器扩展名和 PEM 私钥标记，但这不是秘密扫描器，材料提供方仍需承担脱敏责任；
-- `previous-windows-release`：上一正式安装包及其 `release.json`；
+- `previous-windows-release`：上一正式版本的完整已验签 bundle 根目录，至少保留 `metadata/release.json`、`metadata/artifacts.json` 及其签名、NSIS 安装器和 updater 产物；不能只交一个安装器或从其他低版本临时补齐；
 - `windows-hardware-plan`：x86/x64、COM/OCX、硬件/驱动、院内网络/证书、升级、回退和卸载的责任人及执行环境计划。
 
 `legacy-keymap`、`legacy-processes` 和 `external-local-http-callers` 是条件类别。存在时提供输入；确认不存在时使用 `notApplicable`，同时填写只允许字母、数字、点、横线和下划线的审批引用。工具只在报告中保存该引用的 SHA-256，防止“不记得有没有”被当成零资产。

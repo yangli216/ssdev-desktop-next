@@ -14,8 +14,8 @@ use webplus_plugin_trust::{
 
 pub const EVIDENCE_SCHEMA_VERSION: u8 = 3;
 pub const PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION: u8 = 2;
-pub const WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION: u8 = 3;
-pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 5;
+pub const WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION: u8 = 4;
+pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 6;
 pub const CUTOVER_DECISION_SCHEMA_VERSION: u8 = 1;
 const MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
@@ -139,6 +139,7 @@ pub struct WindowsPackageEvidence {
     pub upgrade_verified: bool,
     pub previous_app_version: Option<String>,
     pub previous_release_metadata_sha256: Option<String>,
+    pub previous_artifact_manifest_sha256: Option<String>,
     pub passed: bool,
 }
 
@@ -161,8 +162,11 @@ pub struct ProductionCutoverPolicy {
     pub schema_version: u8,
     pub target_source_revision: String,
     pub expected_app_version: String,
+    pub expected_previous_app_version: String,
     pub maximum_evidence_age_seconds: u64,
     pub expected_windows_artifact_manifest_sha256: String,
+    pub expected_previous_windows_artifact_manifest_sha256: String,
+    pub expected_previous_release_metadata_sha256: String,
     pub expected_plugin_release_set_spec_sha256: String,
     pub expected_plugin_package_set_sha256: String,
     pub expected_plugin_trust_store_sha256: String,
@@ -184,9 +188,20 @@ impl ProductionCutoverPolicy {
             ));
         }
         validate_git_revision(&self.target_source_revision)?;
-        Version::parse(&self.expected_app_version).map_err(|_| {
+        let expected_version = Version::parse(&self.expected_app_version).map_err(|_| {
             EvidenceError::Invalid("expectedAppVersion must be a semantic version".into())
         })?;
+        let previous_version =
+            Version::parse(&self.expected_previous_app_version).map_err(|_| {
+                EvidenceError::Invalid(
+                    "expectedPreviousAppVersion must be a semantic version".into(),
+                )
+            })?;
+        if previous_version >= expected_version {
+            return Err(EvidenceError::Invalid(
+                "expectedPreviousAppVersion must be lower than expectedAppVersion".into(),
+            ));
+        }
         if !(60..=31 * 24 * 60 * 60).contains(&self.maximum_evidence_age_seconds) {
             return Err(EvidenceError::Invalid(
                 "maximumEvidenceAgeSeconds must be between 60 seconds and 31 days".into(),
@@ -194,6 +209,8 @@ impl ProductionCutoverPolicy {
         }
         if [
             &self.expected_windows_artifact_manifest_sha256,
+            &self.expected_previous_windows_artifact_manifest_sha256,
+            &self.expected_previous_release_metadata_sha256,
             &self.expected_plugin_release_set_spec_sha256,
             &self.expected_plugin_package_set_sha256,
             &self.expected_plugin_trust_store_sha256,
@@ -367,18 +384,21 @@ impl WindowsPackageEvidence {
             self.upgrade_verified,
             self.previous_app_version.as_deref(),
             self.previous_release_metadata_sha256.as_deref(),
+            self.previous_artifact_manifest_sha256.as_deref(),
         ) {
-            (false, None, None) => {}
-            (true, Some(previous), Some(previous_hash)) => {
+            (false, None, None, None) => {}
+            (true, Some(previous), Some(previous_metadata_hash), Some(previous_manifest_hash)) => {
                 let previous = Version::parse(previous).map_err(|_| {
                     EvidenceError::Invalid(
                         "previousAppVersion must be a valid semantic version".into(),
                     )
                 })?;
-                if previous >= app_version || !is_sha256(previous_hash) {
+                if previous >= app_version
+                    || !is_sha256(previous_metadata_hash)
+                    || !is_sha256(previous_manifest_hash)
+                {
                     return Err(EvidenceError::Invalid(
-                        "verified upgrade must bind a lower previous version and metadata hash"
-                            .into(),
+                        "verified upgrade must bind a lower previous version, metadata hash, and artifact manifest hash".into(),
                     ));
                 }
             }
@@ -855,8 +875,27 @@ pub fn evaluate_production_cutover(
     if windows.app_version != policy.expected_app_version {
         blockers.insert("windows-app-version-mismatch".into());
     }
+    if windows.previous_app_version.as_deref()
+        != Some(policy.expected_previous_app_version.as_str())
+    {
+        blockers.insert("windows-previous-app-version-mismatch".into());
+    }
     if windows.artifact_manifest_sha256 != policy.expected_windows_artifact_manifest_sha256 {
         blockers.insert("windows-artifact-manifest-mismatch".into());
+    }
+    if windows.previous_artifact_manifest_sha256.as_deref()
+        != Some(
+            policy
+                .expected_previous_windows_artifact_manifest_sha256
+                .as_str(),
+        )
+    {
+        blockers.insert("windows-previous-artifact-manifest-mismatch".into());
+    }
+    if windows.previous_release_metadata_sha256.as_deref()
+        != Some(policy.expected_previous_release_metadata_sha256.as_str())
+    {
+        blockers.insert("windows-previous-release-metadata-mismatch".into());
     }
     if windows.plugin_trust_store_sha256 != plugin.trust_store_sha256 {
         blockers.insert("windows-plugin-trust-store-mismatch".into());
@@ -1210,6 +1249,7 @@ mod tests {
             upgrade_verified: true,
             previous_app_version: Some("1.2.2".into()),
             previous_release_metadata_sha256: Some("9".repeat(64)),
+            previous_artifact_manifest_sha256: Some("d".repeat(64)),
             passed: true,
         }
     }
@@ -1219,8 +1259,11 @@ mod tests {
             schema_version: CUTOVER_POLICY_SCHEMA_VERSION,
             target_source_revision: revision,
             expected_app_version: "1.2.3".into(),
+            expected_previous_app_version: "1.2.2".into(),
             maximum_evidence_age_seconds: 3600,
             expected_windows_artifact_manifest_sha256: "8".repeat(64),
+            expected_previous_windows_artifact_manifest_sha256: "d".repeat(64),
+            expected_previous_release_metadata_sha256: "9".repeat(64),
             expected_plugin_release_set_spec_sha256: "0".repeat(64),
             expected_plugin_package_set_sha256: "9".repeat(64),
             expected_plugin_trust_store_sha256: "2".repeat(64),
@@ -1285,6 +1328,7 @@ mod tests {
         evidence.upgrade_verified = false;
         evidence.previous_app_version = None;
         evidence.previous_release_metadata_sha256 = None;
+        evidence.previous_artifact_manifest_sha256 = None;
         evidence.validate().unwrap();
 
         evidence.authenticode_required = false;
@@ -1293,7 +1337,7 @@ mod tests {
         evidence.validate().unwrap();
 
         let mut legacy = valid_windows_package();
-        legacy.schema_version = 2;
+        legacy.schema_version = 3;
         assert!(legacy.validate().is_err());
 
         let mut unbound = valid_windows_package();
@@ -1370,6 +1414,37 @@ mod tests {
                 "migration-origin-policy-mismatch",
                 "migration-pilot-material-set-mismatch",
                 "windows-origin-policy-mismatch",
+            ]
+        );
+
+        let mut different_previous_release = windows.clone();
+        different_previous_release.previous_app_version = Some("1.2.1".into());
+        different_previous_release.previous_release_metadata_sha256 = Some("e".repeat(64));
+        different_previous_release.previous_artifact_manifest_sha256 = Some("f".repeat(64));
+        let previous_release_drift = evaluate_production_cutover(
+            ProductionCutoverInputs {
+                policy: &policy,
+                policy_sha256: "1".repeat(64),
+                evidence_trust_store_sha256: "8".repeat(64),
+                plugin: &plugin,
+                plugin_sha256: "2".repeat(64),
+                plugin_attestation_sha256: "5".repeat(64),
+                migration: &migration,
+                migration_sha256: "3".repeat(64),
+                migration_attestation_sha256: "6".repeat(64),
+                windows: &different_previous_release,
+                windows_sha256: "4".repeat(64),
+                windows_attestation_sha256: "7".repeat(64),
+            },
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            previous_release_drift.blocker_codes,
+            [
+                "windows-previous-app-version-mismatch",
+                "windows-previous-artifact-manifest-mismatch",
+                "windows-previous-release-metadata-mismatch",
             ]
         );
 
@@ -1511,12 +1586,17 @@ mod tests {
         assert!(policy.validate().is_err());
 
         let mut legacy = valid_policy("d".repeat(40));
-        legacy.schema_version = 2;
+        legacy.schema_version = 5;
         assert!(legacy.validate().is_err());
 
         let mut malformed = valid_policy("d".repeat(40));
         malformed.expected_plugin_package_set_sha256 = "not-a-digest".into();
         assert!(malformed.validate().is_err());
+
+        let mut invalid_upgrade = valid_policy("d".repeat(40));
+        invalid_upgrade.expected_previous_app_version =
+            invalid_upgrade.expected_app_version.clone();
+        assert!(invalid_upgrade.validate().is_err());
     }
 
     #[test]

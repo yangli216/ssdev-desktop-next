@@ -654,6 +654,12 @@ fn inspect_provided(
             }
         }
     }
+    if blockers.is_empty()
+        && id == "previous-windows-release"
+        && !previous_windows_bundle_layout_is_valid(materials_root, &normalized_inputs)
+    {
+        blockers.insert(format!("{id}-layout-invalid"));
+    }
 
     let mut state = ScanState::default();
     if blockers.is_empty() {
@@ -785,6 +791,57 @@ fn resolve_binding_path(root: &Path, binding: &str) -> Result<PathBuf, PilotRead
     resolve_without_symlink(root, binding).map_err(|_| {
         PilotReadinessError::Invalid("a migration audit binding is unavailable or unsafe".into())
     })
+}
+
+fn previous_windows_bundle_layout_is_valid(
+    materials_root: &Path,
+    normalized_inputs: &BTreeSet<String>,
+) -> bool {
+    let Some(bundle_relative) = normalized_inputs.iter().next() else {
+        return false;
+    };
+    if normalized_inputs.len() != 1 {
+        return false;
+    }
+    let Ok(bundle) = resolve_without_symlink(materials_root, bundle_relative) else {
+        return false;
+    };
+    if !fs::symlink_metadata(&bundle).is_ok_and(|metadata| metadata.is_dir()) {
+        return false;
+    }
+    for required in [
+        "metadata/release.json",
+        "metadata/artifacts.json",
+        "metadata/artifacts.json.sig",
+        "metadata/app-update.json",
+    ] {
+        let relative = format!("{bundle_relative}/{required}");
+        let Ok(path) = resolve_without_symlink(materials_root, &relative) else {
+            return false;
+        };
+        if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+            return false;
+        }
+    }
+    let nsis_relative = format!("{bundle_relative}/nsis");
+    let Ok(nsis) = resolve_without_symlink(materials_root, &nsis_relative) else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(nsis) else {
+        return false;
+    };
+    let installers = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let Ok(name) = entry.file_name().into_string() else {
+                return false;
+            };
+            name.ends_with("-setup.exe")
+                && fs::symlink_metadata(entry.path())
+                    .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_file())
+        })
+        .count();
+    installers == 1
 }
 
 fn normalize_relative_path(raw: &str) -> Result<String, ScanFailure> {
@@ -985,7 +1042,7 @@ fn has_private_key_extension(path: &Path) -> bool {
 fn minimum_inputs(id: &str) -> usize {
     match id {
         "signed-origin-policy" => 3,
-        "plugin-release-set" | "previous-windows-release" => 2,
+        "plugin-release-set" => 2,
         _ => 1,
     }
 }
@@ -1072,6 +1129,7 @@ fn is_allowed_category_blocker(id: &str, code: &str) -> bool {
             | "private-material-forbidden"
             | "content-empty"
             | "identity-failed"
+            | "layout-invalid"
     )
 }
 
@@ -1138,6 +1196,21 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    fn write_previous_windows_bundle(root: &Path, relative: &str) {
+        let bundle = root.join(relative);
+        fs::create_dir_all(bundle.join("metadata")).unwrap();
+        fs::create_dir_all(bundle.join("nsis")).unwrap();
+        for file in [
+            "metadata/release.json",
+            "metadata/artifacts.json",
+            "metadata/artifacts.json.sig",
+            "metadata/app-update.json",
+            "nsis/ssdev-setup.exe",
+        ] {
+            fs::write(bundle.join(file), file).unwrap();
+        }
+    }
+
     fn complete_manifest(root: &Path) -> PilotMaterialManifest {
         let categories = CATEGORY_RULES
             .iter()
@@ -1151,14 +1224,23 @@ mod tests {
                         approval_reference: Some(format!("PILOT-{index}")),
                     }
                 } else {
-                    let inputs = (0..minimum_inputs(rule.id))
-                        .map(|input_index| {
-                            let file = format!("material-{index}-{input_index}.bin");
-                            fs::write(root.join(&file), format!("content-{index}-{input_index}"))
+                    let inputs = if rule.id == "previous-windows-release" {
+                        let relative = format!("material-{index}-bundle");
+                        write_previous_windows_bundle(root, &relative);
+                        vec![relative]
+                    } else {
+                        (0..minimum_inputs(rule.id))
+                            .map(|input_index| {
+                                let file = format!("material-{index}-{input_index}.bin");
+                                fs::write(
+                                    root.join(&file),
+                                    format!("content-{index}-{input_index}"),
+                                )
                                 .unwrap();
-                            file
-                        })
-                        .collect();
+                                file
+                            })
+                            .collect()
+                    };
                     MaterialCategory {
                         id: rule.id.into(),
                         status: MaterialStatus::Provided,
@@ -1259,6 +1341,29 @@ mod tests {
         assert!(incomplete_report
             .blocker_codes
             .contains(&"migration-audit-binding-mismatch".into()));
+    }
+
+    #[test]
+    fn previous_windows_release_requires_a_complete_bundle_layout() {
+        let temp = tempdir().unwrap();
+        let manifest = complete_manifest(temp.path());
+        let previous = manifest
+            .categories
+            .iter()
+            .find(|category| category.id == "previous-windows-release")
+            .unwrap();
+        fs::remove_file(
+            temp.path()
+                .join(&previous.inputs[0])
+                .join("metadata/artifacts.json.sig"),
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let report = inspect_materials(temp.path(), &manifest, &bytes).unwrap();
+        assert!(!report.intake_complete);
+        assert!(report
+            .blocker_codes
+            .contains(&"previous-windows-release-layout-invalid".into()));
     }
 
     #[test]

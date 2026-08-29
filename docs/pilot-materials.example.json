@@ -49,7 +49,7 @@
     {
       "id": "previous-windows-release",
       "status": "provided",
-      "inputs": ["previous/installer.exe", "previous/release.json"]
+      "inputs": ["previous/bundle"]
     },
     {
       "id": "windows-hardware-plan",

@@ -95,7 +95,22 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
         .transpose()?;
     if let Some(path) = &previous_metadata_path {
         require_file_name(path, "release.json")?;
+        let previous_bundle_root = release_bundle_root_from_metadata(path)?;
+        if output.starts_with(previous_bundle_root) {
+            return Err(invalid_input(
+                "evidence output must stay outside the previous release bundle",
+            ));
+        }
     }
+    let previous_artifact_manifest_path = previous_metadata_path
+        .as_ref()
+        .map(|path| {
+            path.parent()
+                .expect("canonical release metadata has a parent")
+                .join("artifacts.json")
+        })
+        .map(|path| canonical_regular_file(&path, "previous artifact manifest"))
+        .transpose()?;
 
     let source_before = capture_source_identity(&workspace)?;
     let release_metadata_before = sha256_file(&release_metadata_path)?;
@@ -109,6 +124,10 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
         .as_deref()
         .map(sha256_file)
         .transpose()?;
+    let previous_artifact_manifest_hash_before = previous_artifact_manifest_path
+        .as_deref()
+        .map(sha256_file)
+        .transpose()?;
     validate_previous_version(&current, previous.as_ref())?;
 
     let source_after = capture_source_identity(&workspace)?;
@@ -118,10 +137,15 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
         .as_deref()
         .map(sha256_file)
         .transpose()?;
+    let previous_artifact_manifest_hash_after = previous_artifact_manifest_path
+        .as_deref()
+        .map(sha256_file)
+        .transpose()?;
     if source_before != source_after
         || release_metadata_before != release_metadata_after
         || artifact_manifest_before != artifact_manifest_after
         || previous_hash_before != previous_hash_after
+        || previous_artifact_manifest_hash_before != previous_artifact_manifest_hash_after
     {
         return Err(invalid_input(
             "source or release evidence inputs changed during verification",
@@ -162,6 +186,7 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
             upgrade_verified: previous.is_some(),
             previous_app_version: previous.map(|metadata| metadata.app_version),
             previous_release_metadata_sha256: previous_hash_after,
+            previous_artifact_manifest_sha256: previous_artifact_manifest_hash_after,
             passed: true,
         },
     )?;
@@ -307,6 +332,24 @@ fn require_file_name(path: &Path, expected: &str) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
+fn release_bundle_root_from_metadata(path: &Path) -> Result<&Path, Box<dyn Error>> {
+    let metadata_directory = path
+        .parent()
+        .ok_or_else(|| invalid_input("previous release metadata has no parent directory"))?;
+    if metadata_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some("metadata")
+    {
+        return Err(invalid_input(
+            "previous release metadata must be inside the bundle metadata directory",
+        ));
+    }
+    metadata_directory
+        .parent()
+        .ok_or_else(|| invalid_input("previous release metadata has no bundle root"))
+}
+
 fn string_argument(value: Option<&OsString>, label: &str) -> Result<String, String> {
     value
         .and_then(|value| value.to_str())
@@ -336,4 +379,21 @@ fn invalid_input(message: &str) -> Box<dyn Error> {
 
 fn usage() -> &'static str {
     "usage:\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn previous_release_metadata_identifies_only_a_bundle_metadata_directory() {
+        let path = Path::new("verified/bundle/metadata/release.json");
+        assert_eq!(
+            release_bundle_root_from_metadata(path).unwrap(),
+            Path::new("verified/bundle")
+        );
+        assert!(
+            release_bundle_root_from_metadata(Path::new("verified/bundle/release.json")).is_err()
+        );
+    }
 }

@@ -1,9 +1,12 @@
 {
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "targetSourceRevision": "0123456789abcdef0123456789abcdef01234567",
   "expectedAppVersion": "1.0.0",
+  "expectedPreviousAppVersion": "0.9.0",
   "maximumEvidenceAgeSeconds": 604800,
   "expectedWindowsArtifactManifestSha256": "8888888888888888888888888888888888888888888888888888888888888888",
+  "expectedPreviousWindowsArtifactManifestSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "expectedPreviousReleaseMetadataSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
   "expectedPluginReleaseSetSpecSha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "expectedPluginPackageSetSha256": "9999999999999999999999999999999999999999999999999999999999999999",
   "expectedPluginTrustStoreSha256": "2222222222222222222222222222222222222222222222222222222222222222",

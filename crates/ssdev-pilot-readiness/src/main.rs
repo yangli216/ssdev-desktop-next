@@ -120,8 +120,22 @@ mod tests {
             .flat_map(|category| &category.inputs)
         {
             let path = materials.join(input);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, input.as_bytes()).unwrap();
+            if input == "previous/bundle" {
+                fs::create_dir_all(path.join("metadata")).unwrap();
+                fs::create_dir_all(path.join("nsis")).unwrap();
+                for file in [
+                    "metadata/release.json",
+                    "metadata/artifacts.json",
+                    "metadata/artifacts.json.sig",
+                    "metadata/app-update.json",
+                    "nsis/ssdev-setup.exe",
+                ] {
+                    fs::write(path.join(file), file).unwrap();
+                }
+            } else {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, input.as_bytes()).unwrap();
+            }
         }
         let manifest_path = temp.path().join("pilot-materials.json");
         let report_path = temp.path().join("pilot-readiness.json");

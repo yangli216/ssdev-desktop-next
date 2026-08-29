@@ -780,6 +780,18 @@ mod tests {
                     r#"{"serviceId":"reader","mainClass":"reader.dll","mainType":"dll","methods":[{"name":"read"}]}"#,
                 )
                 .unwrap();
+            } else if input == "previous/bundle" {
+                fs::create_dir_all(path.join("metadata")).unwrap();
+                fs::create_dir_all(path.join("nsis")).unwrap();
+                for file in [
+                    "metadata/release.json",
+                    "metadata/artifacts.json",
+                    "metadata/artifacts.json.sig",
+                    "metadata/app-update.json",
+                    "nsis/ssdev-setup.exe",
+                ] {
+                    fs::write(path.join(file), file).unwrap();
+                }
             } else {
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(path, b"{}\n").unwrap();
