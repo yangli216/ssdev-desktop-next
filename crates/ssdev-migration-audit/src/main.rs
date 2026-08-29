@@ -7,18 +7,38 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ssdev_cutover_evidence::{
-    prepare_new_output, sha256_bytes, write_migration_audit_evidence, write_new_bytes,
+    prepare_new_output, sha256_bytes, sha256_file, write_migration_audit_evidence, write_new_bytes,
     EvidenceType, HttpEvidenceLevel, MigrationAuditEvidence, EVIDENCE_SCHEMA_VERSION,
 };
 use ssdev_migration_audit::{
-    audit, AuditInputs, AuditReport, EvidenceLevel as AuditEvidenceLevel, Severity,
+    audit, audit_with_verified_origin_policy, AuditInputs, AuditReport,
+    EvidenceLevel as AuditEvidenceLevel, Severity,
 };
+use ssdev_origin_policy::OriginPolicy;
 use ssdev_release_manifest::capture_source_identity;
+use ssdev_release_signing::{verify, ArtifactKind};
+use webplus_plugin_trust::TrustStore;
 
 #[derive(Debug)]
 struct CliOptions {
     inputs: AuditInputs,
     formal: Option<FormalOutputs>,
+    origin_policy: Option<OriginPolicyInputs>,
+}
+
+#[derive(Debug)]
+struct OriginPolicyInputs {
+    document: PathBuf,
+    envelope: PathBuf,
+    trust_store: PathBuf,
+}
+
+struct VerifiedOriginPolicy {
+    policy: OriginPolicy,
+    document_sha256: String,
+    envelope_sha256: String,
+    trust_store_sha256: String,
+    inputs: OriginPolicyInputs,
 }
 
 #[derive(Debug)]
@@ -33,7 +53,7 @@ fn main() {
     match run() {
         Ok(()) => {}
         Err(error) => {
-            eprintln!("{error}\n\n用法: ssdev-migration-audit [--config FILE]... [--plugins DIR]... [--keymap FILE]... [--browser-assets FILE_OR_DIR]... [--browser-har FILE]... [--workspace DIR --report-output FILE --evidence-output FILE --evidence-environment LABEL]");
+            eprintln!("{error}\n\n用法: ssdev-migration-audit [--config FILE]... [--plugins DIR]... [--keymap FILE]... [--browser-assets FILE_OR_DIR]... [--browser-har FILE]... [--origin-policy FILE --origin-policy-envelope FILE --release-trust-store FILE] [--workspace DIR --report-output FILE --evidence-output FILE --evidence-environment LABEL]");
             std::process::exit(2);
         }
     }
@@ -42,16 +62,75 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     let options = parse_args(env::args().skip(1))
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let verified_policy = options
+        .origin_policy
+        .map(load_verified_origin_policy)
+        .transpose()?;
     match options.formal {
         None => {
-            println!("{}", serde_json::to_string_pretty(&audit(&options.inputs))?);
+            let report = match verified_policy.as_ref() {
+                Some(verified) => audit_with_verified_origin_policy(
+                    &options.inputs,
+                    &verified.policy,
+                    verified.document_sha256.clone(),
+                ),
+                None => audit(&options.inputs),
+            };
+            println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
-        Some(formal) => run_formal(&options.inputs, formal),
+        Some(formal) => run_formal(
+            &options.inputs,
+            formal,
+            verified_policy.ok_or_else(|| {
+                invalid_input("formal migration evidence requires a verified signed origin policy")
+            })?,
+        ),
     }
 }
 
-fn run_formal(inputs: &AuditInputs, formal: FormalOutputs) -> Result<(), Box<dyn Error>> {
+fn load_verified_origin_policy(
+    inputs: OriginPolicyInputs,
+) -> Result<VerifiedOriginPolicy, Box<dyn Error>> {
+    let document_sha256 = sha256_file(&inputs.document)?;
+    let envelope_sha256 = sha256_file(&inputs.envelope)?;
+    let trust_store_sha256 = sha256_file(&inputs.trust_store)?;
+    let signing_report = verify(
+        ArtifactKind::OriginPolicy,
+        &inputs.document,
+        &inputs.envelope,
+        &inputs.trust_store,
+        SystemTime::now(),
+    )?;
+    if !signing_report.verified || signing_report.document_sha256 != document_sha256 {
+        return Err(invalid_input(
+            "origin policy verification did not bind the current document",
+        ));
+    }
+    let trust_store = TrustStore::load(&inputs.trust_store)?;
+    let policy = OriginPolicy::load(&inputs.document, &inputs.envelope, &trust_store)?;
+    if document_sha256 != sha256_file(&inputs.document)?
+        || envelope_sha256 != sha256_file(&inputs.envelope)?
+        || trust_store_sha256 != sha256_file(&inputs.trust_store)?
+    {
+        return Err(invalid_input(
+            "origin policy inputs changed during signature verification",
+        ));
+    }
+    Ok(VerifiedOriginPolicy {
+        policy,
+        document_sha256,
+        envelope_sha256,
+        trust_store_sha256,
+        inputs,
+    })
+}
+
+fn run_formal(
+    inputs: &AuditInputs,
+    formal: FormalOutputs,
+    verified_policy: VerifiedOriginPolicy,
+) -> Result<(), Box<dyn Error>> {
     let workspace = fs::canonicalize(&formal.workspace)?;
     if !workspace.is_dir() {
         return Err(invalid_input("workspace must be an existing directory"));
@@ -70,14 +149,22 @@ fn run_formal(inputs: &AuditInputs, formal: FormalOutputs) -> Result<(), Box<dyn
     }
 
     let source_before = capture_source_identity(&workspace)?;
-    let report = audit(inputs);
+    let report = audit_with_verified_origin_policy(
+        inputs,
+        &verified_policy.policy,
+        verified_policy.document_sha256.clone(),
+    );
     let mut report_bytes = serde_json::to_vec_pretty(&report)?;
     report_bytes.push(b'\n');
     let report_sha256 = sha256_bytes(&report_bytes);
     let source_after = capture_source_identity(&workspace)?;
-    if source_before != source_after {
+    if source_before != source_after
+        || verified_policy.document_sha256 != sha256_file(&verified_policy.inputs.document)?
+        || verified_policy.envelope_sha256 != sha256_file(&verified_policy.inputs.envelope)?
+        || verified_policy.trust_store_sha256 != sha256_file(&verified_policy.inputs.trust_store)?
+    {
         return Err(invalid_input(
-            "source identity changed during migration audit",
+            "source identity or signed origin policy inputs changed during migration audit",
         ));
     }
 
@@ -139,6 +226,12 @@ fn build_evidence(
         runner_os: env::consts::OS.into(),
         runner_architecture: env::consts::ARCH.into(),
         report_sha256,
+        origin_policy_sha256: report
+            .origin_policy
+            .as_ref()
+            .ok_or_else(|| invalid_input("formal audit report is missing origin policy binding"))?
+            .document_sha256
+            .clone(),
         config_files: to_u32(report.summary.config_files, "config file count")?,
         plugin_directories: to_u32(report.summary.plugin_directories, "plugin directory count")?,
         service_count: to_u32(report.summary.services, "service count")?,
@@ -158,6 +251,20 @@ fn build_evidence(
         browser_har_requests_scanned: to_u32(
             report.browser_compatibility.har_requests_scanned,
             "browser HAR request count",
+        )?,
+        insecure_http_origin_count: to_u32(
+            report
+                .origin_policy
+                .as_ref()
+                .map_or(0, |policy| policy.insecure_http_origin_count),
+            "insecure HTTP origin count",
+        )?,
+        authorized_insecure_http_origin_count: to_u32(
+            report
+                .origin_policy
+                .as_ref()
+                .map_or(0, |policy| policy.authorized_insecure_http_origin_count),
+            "authorized insecure HTTP origin count",
         )?,
         webplus_http_evidence: map_http_evidence(
             report.browser_compatibility.webplus_http_evidence,
@@ -194,6 +301,9 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<CliOptions,
     let mut evidence_output = None;
     let mut evidence_environment = None;
     let mut workspace = None;
+    let mut origin_policy = None;
+    let mut origin_policy_envelope = None;
+    let mut release_trust_store = None;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         let value = arguments
@@ -209,6 +319,13 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<CliOptions,
             "--evidence-output" => set_once(&mut evidence_output, PathBuf::from(value), &argument)?,
             "--evidence-environment" => set_once(&mut evidence_environment, value, &argument)?,
             "--workspace" => set_once(&mut workspace, PathBuf::from(value), &argument)?,
+            "--origin-policy" => set_once(&mut origin_policy, PathBuf::from(value), &argument)?,
+            "--origin-policy-envelope" => {
+                set_once(&mut origin_policy_envelope, PathBuf::from(value), &argument)?
+            }
+            "--release-trust-store" => {
+                set_once(&mut release_trust_store, PathBuf::from(value), &argument)?
+            }
             _ => return Err(format!("未知参数 [{argument}]")),
         }
     }
@@ -241,7 +358,33 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<CliOptions,
             return Err("正式模式必须同时提供 --workspace、--report-output、--evidence-output 和 --evidence-environment".into())
         }
     };
-    Ok(CliOptions { inputs, formal })
+    let policy_count = [
+        origin_policy.is_some(),
+        origin_policy_envelope.is_some(),
+        release_trust_store.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    let origin_policy = match policy_count {
+        0 if formal.is_none() => None,
+        3 => Some(OriginPolicyInputs {
+            document: origin_policy.unwrap(),
+            envelope: origin_policy_envelope.unwrap(),
+            trust_store: release_trust_store.unwrap(),
+        }),
+        0 => {
+            return Err("正式模式必须提供 --origin-policy、--origin-policy-envelope 和 --release-trust-store".into())
+        }
+        _ => {
+            return Err("签名来源策略必须同时提供 --origin-policy、--origin-policy-envelope 和 --release-trust-store".into())
+        }
+    };
+    Ok(CliOptions {
+        inputs,
+        formal,
+        origin_policy,
+    })
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T, argument: &str) -> Result<(), String> {
@@ -254,6 +397,73 @@ fn set_once<T>(slot: &mut Option<T>, value: T, argument: &str) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    use tempfile::tempdir;
+
+    #[test]
+    fn verified_policy_loader_requires_and_binds_an_active_signature() {
+        let root = tempdir().unwrap();
+        let document = root.path().join("origin-policy.json");
+        let envelope = root.path().join("origin-policy.sig.json");
+        let trust_store = root.path().join("plugin-trust.json");
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schemaVersion": 2,
+            "businessGrants": [{
+                "origin": "http://10.17.5.57",
+                "services": [{"serviceId": "reader", "methods": ["read"]}]
+            }],
+            "allowInsecureHttp": true
+        }))
+        .unwrap();
+        fs::write(&document, &bytes).unwrap();
+        let signing_key = SigningKey::from_bytes(&[17; 32]);
+        let signature = signing_key.sign(&ssdev_origin_policy::signing_payload(&bytes));
+        fs::write(
+            &envelope,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 1,
+                "keyId": "origin-policy-test",
+                "algorithm": "ed25519",
+                "signature": STANDARD.encode(signature.to_bytes())
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &trust_store,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 2,
+                "keys": [{
+                    "keyId": "origin-policy-test",
+                    "algorithm": "ed25519",
+                    "publicKey": STANDARD.encode(signing_key.verifying_key().to_bytes()),
+                    "purposes": ["origin-policy"]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let verified = load_verified_origin_policy(OriginPolicyInputs {
+            document: document.clone(),
+            envelope: envelope.clone(),
+            trust_store: trust_store.clone(),
+        })
+        .unwrap();
+        assert_eq!(verified.document_sha256, sha256_bytes(&bytes));
+
+        let mut changed = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+        changed["allowInsecureHttp"] = serde_json::json!(false);
+        fs::write(&envelope, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(load_verified_origin_policy(OriginPolicyInputs {
+            document,
+            envelope,
+            trust_store,
+        })
+        .is_err());
+    }
 
     #[test]
     fn arguments_are_explicit_and_repeatable() {
@@ -313,8 +523,15 @@ mod tests {
             "evidence.json".into(),
             "--evidence-environment".into(),
             "production".into(),
+            "--origin-policy".into(),
+            "origin-policy.json".into(),
+            "--origin-policy-envelope".into(),
+            "origin-policy.sig.json".into(),
+            "--release-trust-store".into(),
+            "plugin-trust.json".into(),
         ])
         .unwrap();
         assert!(parsed.formal.is_some());
+        assert!(parsed.origin_policy.is_some());
     }
 }

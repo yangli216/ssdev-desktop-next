@@ -130,7 +130,7 @@ test("Windows package smoke requires a rendered frontend IPC signal", async () =
   assert.match(controlHtml, /SSDEV Desktop 正在启动/);
 });
 
-test("production matrix and package evidence bind the same delivery hosts", async () => {
+test("production evidence binds delivery hosts, trust store, and origin policy", async () => {
   const [matrixTest, packageTest] = await Promise.all([
     readFile(pluginMatrixTestUrl, "utf8"),
     readFile(packageTestUrl, "utf8"),
@@ -147,10 +147,13 @@ test("production matrix and package evidence bind the same delivery hosts", asyn
   assert.match(packageTest, /Capture-CandidateRuntimeHashes \$executable/);
   assert.match(packageTest, /Capture-CandidateRuntimeHashes \$candidateExecutable/);
   assert.match(packageTest, /\$pluginTrustStore = Join-Path[^\r\n]*plugin-trust\.json/);
+  assert.match(packageTest, /\$originPolicy = Join-Path[^\r\n]*origin-policy\.json/);
   assert.match(packageTest, /Get-FileHash -LiteralPath \$pluginTrustStore/);
+  assert.match(packageTest, /Get-FileHash -LiteralPath \$originPolicy/);
   assert.match(packageTest, /Get-FileHash -LiteralPath \$x86Host/);
   assert.match(packageTest, /Get-FileHash -LiteralPath \$x64Host/);
   assert.match(packageTest, /\$script:CandidatePluginTrustStoreSha256/);
+  assert.match(packageTest, /\$script:CandidateOriginPolicySha256/);
   assert.match(packageTest, /\$script:CandidateX86HostSha256/);
   assert.match(packageTest, /\$script:CandidateX64HostSha256/);
 });

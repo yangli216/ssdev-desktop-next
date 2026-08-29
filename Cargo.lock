@@ -4486,13 +4486,19 @@ dependencies = [
 name = "ssdev-migration-audit"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
  "serde",
  "serde_json",
+ "ssdev-config",
  "ssdev-cutover-evidence",
+ "ssdev-origin-policy",
  "ssdev-release-manifest",
+ "ssdev-release-signing",
  "tempfile",
  "url",
  "webplus-plugin-config",
+ "webplus-plugin-trust",
 ]
 
 [[package]]

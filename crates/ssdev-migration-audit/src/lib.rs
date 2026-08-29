@@ -4,6 +4,8 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::Value;
+use ssdev_config::DesktopConfig;
+use ssdev_origin_policy::OriginPolicy;
 use webplus_plugin_config::PluginManifest;
 
 const MAX_INPUT_BYTES: u64 = 4 * 1024 * 1024;
@@ -31,7 +33,17 @@ pub struct AuditReport {
     pub plugins: Vec<PluginAudit>,
     pub key_bindings: Vec<KeyBindingAudit>,
     pub browser_compatibility: BrowserCompatibilityAudit,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_policy: Option<OriginPolicyAudit>,
     pub findings: Vec<Finding>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OriginPolicyAudit {
+    pub document_sha256: String,
+    pub insecure_http_origin_count: usize,
+    pub authorized_insecure_http_origin_count: usize,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -85,6 +97,8 @@ pub struct ConfigAudit {
     pub environment_count: usize,
     pub legacy_process_count: usize,
     pub insecure_http_origin_count: usize,
+    pub authorized_insecure_http_origin_count: usize,
+    pub origin_policy_authorized: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -141,17 +155,37 @@ pub struct Finding {
 }
 
 pub fn audit(inputs: &AuditInputs) -> AuditReport {
+    audit_inner(inputs, None)
+}
+
+pub fn audit_with_verified_origin_policy(
+    inputs: &AuditInputs,
+    policy: &OriginPolicy,
+    document_sha256: String,
+) -> AuditReport {
+    audit_inner(inputs, Some((policy, document_sha256)))
+}
+
+fn audit_inner(
+    inputs: &AuditInputs,
+    verified_origin_policy: Option<(&OriginPolicy, String)>,
+) -> AuditReport {
     let mut report = AuditReport {
-        schema_version: 2,
+        schema_version: 3,
         summary: AuditSummary::default(),
         configs: Vec::new(),
         plugins: Vec::new(),
         key_bindings: Vec::new(),
         browser_compatibility: BrowserCompatibilityAudit::default(),
+        origin_policy: None,
         findings: Vec::new(),
     };
     for path in &inputs.configs {
-        audit_config(path, &mut report);
+        audit_config(
+            path,
+            verified_origin_policy.as_ref().map(|(policy, _)| *policy),
+            &mut report,
+        );
     }
     for root in &inputs.plugin_roots {
         audit_plugin_root(root, &mut report);
@@ -198,6 +232,21 @@ pub fn audit(inputs: &AuditInputs) -> AuditReport {
         .iter()
         .filter(|finding| finding.severity == Severity::Warning)
         .count();
+    if let Some((_, document_sha256)) = verified_origin_policy {
+        report.origin_policy = Some(OriginPolicyAudit {
+            document_sha256,
+            insecure_http_origin_count: report
+                .configs
+                .iter()
+                .map(|config| config.insecure_http_origin_count)
+                .sum(),
+            authorized_insecure_http_origin_count: report
+                .configs
+                .iter()
+                .map(|config| config.authorized_insecure_http_origin_count)
+                .sum(),
+        });
+    }
     report
 }
 
@@ -616,7 +665,7 @@ fn add_evidence_counts(counts: &mut BTreeMap<String, usize>, capabilities: BTree
     }
 }
 
-fn audit_config(path: &Path, report: &mut AuditReport) {
+fn audit_config(path: &Path, origin_policy: Option<&OriginPolicy>, report: &mut AuditReport) {
     let document = read_json(path);
     match document {
         Ok(document) => {
@@ -625,6 +674,18 @@ fn audit_config(path: &Path, report: &mut AuditReport) {
                 .and_then(Value::as_array)
                 .map_or(0, Vec::len);
             let insecure_http_origin_count = insecure_http_origin_count(&document);
+            let origin_policy_authorized = origin_policy.is_some_and(|policy| {
+                serde_json::from_value::<DesktopConfig>(document.clone())
+                    .ok()
+                    .filter(|config| config.validate().is_ok())
+                    .is_some_and(|config| policy.authorize(&config).is_ok())
+            });
+            let authorized_insecure_http_origin_count =
+                if insecure_http_origin_count > 0 && origin_policy_authorized {
+                    insecure_http_origin_count
+                } else {
+                    0
+                };
             report.configs.push(ConfigAudit {
                 source: path.to_path_buf(),
                 readable: true,
@@ -638,6 +699,8 @@ fn audit_config(path: &Path, report: &mut AuditReport) {
                     .map_or(0, Vec::len),
                 legacy_process_count: process_count,
                 insecure_http_origin_count,
+                authorized_insecure_http_origin_count,
+                origin_policy_authorized,
             });
             if process_count > 0 {
                 report.findings.push(Finding {
@@ -651,14 +714,34 @@ fn audit_config(path: &Path, report: &mut AuditReport) {
                 });
             }
             if insecure_http_origin_count > 0 {
+                if authorized_insecure_http_origin_count == insecure_http_origin_count {
+                    report.findings.push(Finding {
+                        severity: Severity::Info,
+                        code: "legacy-insecure-business-origin-authorized",
+                        source: path.to_path_buf(),
+                        message: format!(
+                            "发现 {insecure_http_origin_count} 个旧版 HTTP 业务来源，均已由当前签名来源策略授权；报告不会输出具体地址"
+                        ),
+                        remediation: "保留签名策略与本次迁移证据的摘要绑定，并在后续条件允许时迁移为 HTTPS",
+                    });
+                } else {
+                    report.findings.push(Finding {
+                        severity: Severity::Critical,
+                        code: "legacy-insecure-business-origin",
+                        source: path.to_path_buf(),
+                        message: format!(
+                            "发现 {insecure_http_origin_count} 个旧版 HTTP 业务来源，但当前签名来源策略未完整授权；报告不会输出具体地址"
+                        ),
+                        remediation: "优先迁移为 HTTPS；无法立即升级时，必须由发布方在签名来源策略中逐项批准 HTTP 例外",
+                    });
+                }
+            } else if origin_policy.is_some() && !origin_policy_authorized {
                 report.findings.push(Finding {
                     severity: Severity::Critical,
-                    code: "legacy-insecure-business-origin",
+                    code: "business-origin-policy-mismatch",
                     source: path.to_path_buf(),
-                    message: format!(
-                        "发现 {insecure_http_origin_count} 个旧版 HTTP 业务来源；报告不会输出具体地址"
-                    ),
-                    remediation: "优先迁移为 HTTPS；无法立即升级时，必须由发布方在签名来源策略中逐项批准 HTTP 例外",
+                    message: "当前签名来源策略未完整授权该配置中的业务、导航或外链来源；报告不会输出具体地址".into(),
+                    remediation: "使用候选安装包将携带的精确签名来源策略重新审计迁移配置",
                 });
             }
         }
@@ -670,6 +753,8 @@ fn audit_config(path: &Path, report: &mut AuditReport) {
                 environment_count: 0,
                 legacy_process_count: 0,
                 insecure_http_origin_count: 0,
+                authorized_insecure_http_origin_count: 0,
+                origin_policy_authorized: false,
             });
             push_read_error(path, error, report);
         }
@@ -940,6 +1025,68 @@ fn detect_pe_architecture(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn http_policy(origin: &str) -> OriginPolicy {
+        OriginPolicy::from_unsigned_bytes(
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "businessGrants": [{
+                    "origin": origin,
+                    "services": [{"serviceId": "reader", "methods": ["read"]}]
+                }],
+                "navigationOrigins": [],
+                "externalOrigins": [],
+                "allowInsecureHttp": true
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn signed_policy_coverage_resolves_only_the_exact_http_business_origin() {
+        let directory = tempdir().unwrap();
+        let config = directory.path().join("config.json");
+        fs::write(&config, r#"{"website":"http://10.17.5.57/project"}"#).unwrap();
+        let inputs = AuditInputs {
+            configs: vec![config],
+            ..AuditInputs::default()
+        };
+
+        let authorized = audit_with_verified_origin_policy(
+            &inputs,
+            &http_policy("http://10.17.5.57"),
+            "a".repeat(64),
+        );
+        assert_eq!(authorized.schema_version, 3);
+        assert_eq!(
+            authorized.configs[0].authorized_insecure_http_origin_count,
+            1
+        );
+        assert!(authorized.findings.iter().any(|finding| {
+            finding.code == "legacy-insecure-business-origin-authorized"
+                && finding.severity == Severity::Info
+        }));
+        assert!(!authorized
+            .findings
+            .iter()
+            .any(|finding| finding.code == "legacy-insecure-business-origin"));
+
+        let unauthorized = audit_with_verified_origin_policy(
+            &inputs,
+            &http_policy("http://10.17.5.58"),
+            "b".repeat(64),
+        );
+        assert_eq!(
+            unauthorized.configs[0].authorized_insecure_http_origin_count,
+            0
+        );
+        assert!(unauthorized.findings.iter().any(|finding| {
+            finding.code == "legacy-insecure-business-origin"
+                && finding.severity == Severity::Critical
+        }));
+    }
 
     #[test]
     fn reports_scripts_processes_and_install_run_without_exposing_values() {

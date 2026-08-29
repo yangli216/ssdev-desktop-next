@@ -8,10 +8,16 @@ version.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+ssdev-config.workspace = true
 ssdev-cutover-evidence.workspace = true
+ssdev-origin-policy.workspace = true
 ssdev-release-manifest.workspace = true
+ssdev-release-signing.workspace = true
 url.workspace = true
 webplus-plugin-config.workspace = true
+webplus-plugin-trust.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
 tempfile = "3"

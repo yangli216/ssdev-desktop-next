@@ -13,6 +13,9 @@ cargo run --locked -p ssdev-migration-audit -- \
   --keymap D:/HIS/file-sync/keymap.json \
   --browser-assets D:/HIS/business-web/dist \
   --browser-har D:/HIS/evidence/critical-workflows.har \
+  --origin-policy D:/release-inputs/origin-policy.json \
+  --origin-policy-envelope D:/release-inputs/origin-policy.sig.json \
+  --release-trust-store D:/release-inputs/plugin-trust.json \
   --workspace C:/src/ssdev-desktop/next \
   --report-output D:/cutover-evidence/migration-report.json \
   --evidence-output D:/cutover-evidence/migration-evidence.json \
@@ -24,8 +27,11 @@ cargo run --locked -p ssdev-migration-audit -- \
 - `--keymap`：旧 `keymap.json`，盘点启用状态和是否包含脚本。
 - `--browser-assets`：业务前端源码、构建目录或单个文本资源，检查是否静态引用 WebPlus `7711`、旧桌面 `45121` 及其已知端点。
 - `--browser-har`：Chrome/Edge 在真实业务流程中导出的 HAR。只读取请求 URL 做本地端点分类，不读取请求体、响应体、Cookie 或 Header。
+- 来源策略三项：用 active 发布密钥验证候选安装包将携带的精确策略，并以运行时相同规则核对配置来源；三项必须同时提供。
 
-不提供最后四个正式参数时，`schemaVersion: 2` 的完整 JSON 报告仍写到标准输出，适合探索性盘点。正式迁移评审必须同时提供源码工作区、报告输出、证据输出和环境标签；两份输出必须位于源码工作区之外、父目录必须已存在，并且只创建、不覆盖。工具在审计前后核对 Git 提交和 dirty 状态，证据绑定完整报告的 SHA-256、扫描覆盖、HTTP 证据级别及全部 finding 计数。报告可作为迁移评审输入，但它不是可直接安装的插件包、进程策略或新配置。
+不提供最后四个正式输出参数时，`schemaVersion: 3` 的完整 JSON 报告仍写到标准输出，适合探索性盘点；此时签名来源策略三项可以全部省略，也可以全部提供以提前验证覆盖。正式迁移评审必须提供候选签名策略三项以及源码工作区、报告输出、证据输出和环境标签。只有当前签名策略完整覆盖的 HTTP 业务来源才记录为信息项；缺少、错签、换策略或覆盖不完整仍是阻塞项。两份输出必须位于源码工作区之外、父目录必须已存在，并且只创建、不覆盖。
+
+正式 schema 2 迁移证据绑定完整报告和来源策略 SHA-256，同时记录发现与获准的 HTTP 来源计数。审计期间源码、策略、旁签或信任库变化都会失败。后续 schema 4 Go/No-Go 策略和 schema 3 Windows 包证据必须指向同一来源策略摘要，因此不能用一份策略通过审计、再把另一份策略装入候选包。报告可作为迁移评审输入，但它不是可直接安装的插件包、进程策略或新配置。
 
 ## 安全边界
 
@@ -43,6 +49,8 @@ cargo run --locked -p ssdev-migration-audit -- \
 
 - `legacy-arbitrary-processes`：逐项核对程序来源、固定参数和 SHA-256，再生成签名进程策略。
 - `legacy-insecure-business-origin`：优先把业务站点迁移到 HTTPS；暂时无法升级时，必须由发布方在签名来源策略中逐项批准 HTTP 例外。
+- `legacy-insecure-business-origin-authorized`：HTTP 来源已由本次候选签名策略覆盖，不再单独阻断；仍需保留策略摘要绑定并完成其他 HAR、插件和 Windows 门禁。
+- `business-origin-policy-mismatch`：即使配置只使用 HTTPS，候选签名策略也没有完整覆盖其业务、导航或外链来源；修正策略或配置后重跑正式审计。
 - `legacy-eval-shortcut`：只能人工映射为新客户端支持的声明式动作，不能复制脚本。
 - `legacy-install-run`：拆除安装后自动执行；确有需要时移入受控部署步骤。
 - `architecture-mismatch`：修正 `architecture`，再分别使用 x86/x64 宿主跑黄金矩阵。

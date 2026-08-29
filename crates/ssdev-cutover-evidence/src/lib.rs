@@ -12,10 +12,10 @@ use webplus_plugin_trust::{
     validate_signing_key_id, DetachedSignatureDocument, TrustPurpose, TrustStore,
 };
 
-pub const EVIDENCE_SCHEMA_VERSION: u8 = 1;
+pub const EVIDENCE_SCHEMA_VERSION: u8 = 2;
 pub const PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION: u8 = 2;
-pub const WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION: u8 = 2;
-pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 3;
+pub const WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION: u8 = 3;
+pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 4;
 pub const CUTOVER_DECISION_SCHEMA_VERSION: u8 = 1;
 const MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
@@ -93,6 +93,7 @@ pub struct MigrationAuditEvidence {
     pub runner_os: String,
     pub runner_architecture: String,
     pub report_sha256: String,
+    pub origin_policy_sha256: String,
     pub config_files: u32,
     pub plugin_directories: u32,
     pub service_count: u32,
@@ -101,6 +102,8 @@ pub struct MigrationAuditEvidence {
     pub browser_asset_files_scanned: u32,
     pub browser_har_files: u32,
     pub browser_har_requests_scanned: u32,
+    pub insecure_http_origin_count: u32,
+    pub authorized_insecure_http_origin_count: u32,
     pub webplus_http_evidence: HttpEvidenceLevel,
     pub desktop_callback_http_evidence: HttpEvidenceLevel,
     pub critical_findings: u32,
@@ -123,6 +126,7 @@ pub struct WindowsPackageEvidence {
     pub release_metadata_sha256: String,
     pub artifact_manifest_sha256: String,
     pub plugin_trust_store_sha256: String,
+    pub origin_policy_sha256: String,
     pub x86_host_sha256: String,
     pub x64_host_sha256: String,
     pub app_version: String,
@@ -162,6 +166,7 @@ pub struct ProductionCutoverPolicy {
     pub expected_plugin_package_set_sha256: String,
     pub expected_plugin_trust_store_sha256: String,
     pub expected_plugin_matrix_sha256: String,
+    pub expected_origin_policy_sha256: String,
     pub migration_coverage_minimums: MigrationCoverageMinimums,
     pub plugin_matrix_signer_key_id: String,
     pub migration_audit_signer_key_id: String,
@@ -191,6 +196,7 @@ impl ProductionCutoverPolicy {
             &self.expected_plugin_package_set_sha256,
             &self.expected_plugin_trust_store_sha256,
             &self.expected_plugin_matrix_sha256,
+            &self.expected_origin_policy_sha256,
         ]
         .into_iter()
         .any(|digest| !is_sha256(digest))
@@ -330,6 +336,7 @@ impl WindowsPackageEvidence {
             &self.release_metadata_sha256,
             &self.artifact_manifest_sha256,
             &self.plugin_trust_store_sha256,
+            &self.origin_policy_sha256,
             &self.x86_host_sha256,
             &self.x64_host_sha256,
         ]
@@ -403,9 +410,15 @@ impl MigrationAuditEvidence {
             &self.runner_os,
             &self.runner_architecture,
         )?;
-        if !is_sha256(&self.report_sha256) {
+        if !is_sha256(&self.report_sha256) || !is_sha256(&self.origin_policy_sha256) {
             return Err(EvidenceError::Invalid(
-                "reportSha256 must be a lowercase SHA-256 digest".into(),
+                "migration report and origin policy hashes must be lowercase SHA-256 digests"
+                    .into(),
+            ));
+        }
+        if self.authorized_insecure_http_origin_count > self.insecure_http_origin_count {
+            return Err(EvidenceError::Invalid(
+                "authorized HTTP origin count cannot exceed the audited HTTP origin count".into(),
             ));
         }
         if self.finding_code_counts.len() > 4096
@@ -756,6 +769,15 @@ pub fn evaluate_production_cutover(
     }
     if plugin.matrix_sha256 != policy.expected_plugin_matrix_sha256 {
         blockers.insert("plugin-matrix-mismatch".into());
+    }
+    if migration.origin_policy_sha256 != policy.expected_origin_policy_sha256 {
+        blockers.insert("migration-origin-policy-mismatch".into());
+    }
+    if windows.origin_policy_sha256 != policy.expected_origin_policy_sha256 {
+        blockers.insert("windows-origin-policy-mismatch".into());
+    }
+    if migration.authorized_insecure_http_origin_count != migration.insecure_http_origin_count {
+        blockers.insert("migration-http-origin-authorization-incomplete".into());
     }
     let minimums = &policy.migration_coverage_minimums;
     for (actual, minimum, blocker) in [
@@ -1131,6 +1153,7 @@ mod tests {
             runner_os: "windows".into(),
             runner_architecture: "x86_64".into(),
             report_sha256: "6".repeat(64),
+            origin_policy_sha256: "a".repeat(64),
             config_files: 1,
             plugin_directories: 2,
             service_count: 3,
@@ -1139,6 +1162,8 @@ mod tests {
             browser_asset_files_scanned: 50,
             browser_har_files: 1,
             browser_har_requests_scanned: 100,
+            insecure_http_origin_count: 2,
+            authorized_insecure_http_origin_count: 2,
             webplus_http_evidence: HttpEvidenceLevel::NotObserved,
             desktop_callback_http_evidence: HttpEvidenceLevel::StaticReferences,
             critical_findings: 0,
@@ -1164,6 +1189,7 @@ mod tests {
             release_metadata_sha256: "7".repeat(64),
             artifact_manifest_sha256: "8".repeat(64),
             plugin_trust_store_sha256: "2".repeat(64),
+            origin_policy_sha256: "a".repeat(64),
             x86_host_sha256: "4".repeat(64),
             x64_host_sha256: "5".repeat(64),
             app_version: "1.2.3".into(),
@@ -1190,6 +1216,7 @@ mod tests {
             expected_plugin_package_set_sha256: "9".repeat(64),
             expected_plugin_trust_store_sha256: "2".repeat(64),
             expected_plugin_matrix_sha256: "3".repeat(64),
+            expected_origin_policy_sha256: "a".repeat(64),
             migration_coverage_minimums: MigrationCoverageMinimums {
                 config_files: 1,
                 plugin_directories: 2,
@@ -1231,7 +1258,7 @@ mod tests {
         assert!(malformed.validate().is_err());
 
         let mut legacy = valid();
-        legacy.schema_version = EVIDENCE_SCHEMA_VERSION;
+        legacy.schema_version = 1;
         assert!(legacy.validate().is_err());
 
         let mut unbound = valid();
@@ -1301,6 +1328,38 @@ mod tests {
         .unwrap();
         assert!(decision.eligible);
         assert!(decision.blocker_codes.is_empty());
+
+        let mut policy_drift_migration = migration.clone();
+        policy_drift_migration.origin_policy_sha256 = "b".repeat(64);
+        policy_drift_migration.authorized_insecure_http_origin_count = 1;
+        let mut policy_drift_windows = windows.clone();
+        policy_drift_windows.origin_policy_sha256 = "c".repeat(64);
+        let drift = evaluate_production_cutover(
+            ProductionCutoverInputs {
+                policy: &policy,
+                policy_sha256: "1".repeat(64),
+                evidence_trust_store_sha256: "8".repeat(64),
+                plugin: &plugin,
+                plugin_sha256: "2".repeat(64),
+                plugin_attestation_sha256: "5".repeat(64),
+                migration: &policy_drift_migration,
+                migration_sha256: "3".repeat(64),
+                migration_attestation_sha256: "6".repeat(64),
+                windows: &policy_drift_windows,
+                windows_sha256: "4".repeat(64),
+                windows_attestation_sha256: "7".repeat(64),
+            },
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            drift.blocker_codes,
+            [
+                "migration-http-origin-authorization-incomplete",
+                "migration-origin-policy-mismatch",
+                "windows-origin-policy-mismatch",
+            ]
+        );
 
         windows.launch_verified = false;
         windows.source_dirty = true;

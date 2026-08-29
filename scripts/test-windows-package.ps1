@@ -399,14 +399,16 @@ function Capture-CandidateRuntimeHashes {
   param([Parameter(Mandatory = $true)][string]$Executable)
   $installRoot = Split-Path -Parent $Executable
   $pluginTrustStore = Join-Path $installRoot "plugin-trust.json"
+  $originPolicy = Join-Path $installRoot "origin-policy.json"
   $x86Host = Join-Path $installRoot "windows/webplus-plugin-host-x86.exe"
   $x64Host = Join-Path $installRoot "windows/webplus-plugin-host-x64.exe"
-  foreach ($runtimeFile in @($pluginTrustStore, $x86Host, $x64Host)) {
+  foreach ($runtimeFile in @($pluginTrustStore, $originPolicy, $x86Host, $x64Host)) {
     if (-not (Test-Path -LiteralPath $runtimeFile -PathType Leaf)) {
       throw "Installed runtime identity file disappeared before final evidence capture."
     }
   }
   $script:CandidatePluginTrustStoreSha256 = (Get-FileHash -LiteralPath $pluginTrustStore -Algorithm SHA256).Hash.ToLowerInvariant()
+  $script:CandidateOriginPolicySha256 = (Get-FileHash -LiteralPath $originPolicy -Algorithm SHA256).Hash.ToLowerInvariant()
   $script:CandidateX86HostSha256 = (Get-FileHash -LiteralPath $x86Host -Algorithm SHA256).Hash.ToLowerInvariant()
   $script:CandidateX64HostSha256 = (Get-FileHash -LiteralPath $x64Host -Algorithm SHA256).Hash.ToLowerInvariant()
 }
@@ -894,6 +896,7 @@ if (Test-Path -LiteralPath $EvidenceOutput) {
 }
 if (
   $script:CandidatePluginTrustStoreSha256 -notmatch '^[0-9a-f]{64}$' -or
+  $script:CandidateOriginPolicySha256 -notmatch '^[0-9a-f]{64}$' -or
   $script:CandidateX86HostSha256 -notmatch '^[0-9a-f]{64}$' -or
   $script:CandidateX64HostSha256 -notmatch '^[0-9a-f]{64}$'
 ) {
@@ -911,6 +914,7 @@ $evidenceArguments = @(
   (-not $SkipLaunch).ToString().ToLowerInvariant(),
   $RequireAuthenticode.ToString().ToLowerInvariant(),
   $script:CandidatePluginTrustStoreSha256,
+  $script:CandidateOriginPolicySha256,
   $script:CandidateX86HostSha256,
   $script:CandidateX64HostSha256
 )

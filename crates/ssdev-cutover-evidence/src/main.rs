@@ -39,7 +39,7 @@ fn run() -> Result<bool, Box<dyn Error>> {
 }
 
 fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
-    if !matches!(arguments.len(), 12 | 13) {
+    if !matches!(arguments.len(), 13 | 14) {
         return Err(usage().into());
     }
     if std::env::consts::OS != "windows" || std::env::consts::ARCH != "x86_64" {
@@ -83,10 +83,12 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
     let authenticode_verified = bool_argument(arguments.get(8), "Authenticode verified")?;
     let plugin_trust_store_sha256 =
         string_argument(arguments.get(9), "installed plugin trust store SHA-256")?;
-    let x86_host_sha256 = string_argument(arguments.get(10), "x86 host SHA-256")?;
-    let x64_host_sha256 = string_argument(arguments.get(11), "x64 host SHA-256")?;
+    let origin_policy_sha256 =
+        string_argument(arguments.get(10), "installed origin policy SHA-256")?;
+    let x86_host_sha256 = string_argument(arguments.get(11), "x86 host SHA-256")?;
+    let x64_host_sha256 = string_argument(arguments.get(12), "x64 host SHA-256")?;
     let previous_metadata_path = arguments
-        .get(12)
+        .get(13)
         .map(|value| path_argument(Some(value), "previous release metadata"))
         .transpose()?
         .map(|path| canonical_regular_file(&path, "previous release metadata"))
@@ -147,6 +149,7 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
             release_metadata_sha256: release_metadata_after,
             artifact_manifest_sha256: artifact_manifest_after,
             plugin_trust_store_sha256,
+            origin_policy_sha256,
             x86_host_sha256,
             x64_host_sha256,
             app_version: current.app_version,
@@ -332,5 +335,5 @@ fn invalid_input(message: &str) -> Box<dyn Error> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <x86-host-sha256> <x64-host-sha256> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
+    "usage:\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
 }
