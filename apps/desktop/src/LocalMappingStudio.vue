@@ -2,6 +2,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { mappingDeletionDiscardsDraft, mappingDraftTargetsPlugin } from './local-mapping-draft.js'
 
 type Architecture = 'x86' | 'x64'
 type MainType = 'dll' | 'com' | 'ocx' | 'exe' | 'bat'
@@ -227,8 +228,15 @@ function mappingForSave(): LocalMappingDefinition {
 
 const savedDraft = ref<LocalMappingDefinition>(clone(mappingForSave()))
 const draftDirty = computed(() => JSON.stringify(mappingForSave()) !== JSON.stringify(savedDraft.value))
+const savedMappingPluginId = computed(() => savedDraft.value.pluginId.trim())
 
-watch(draftDirty, (value) => emit('dirty', value), { immediate: true })
+watch(draftDirty, (value) => {
+  emit('dirty', value)
+  if (!value) return
+  debugResult.value = null
+  suggestedExpectedDataText.value = ''
+  regressionResults.value = []
+}, { immediate: true })
 
 function markDraftSaved() {
   savedDraft.value = clone(mappingForSave())
@@ -243,6 +251,41 @@ function markDebugCasesSaved(debugCases: DebugCaseDefinition[]) {
 
 function confirmDiscardDraft(): boolean {
   return !draftDirty.value || window.confirm('当前映射有未保存更改，继续将丢弃这些更改。确定继续吗？')
+}
+
+function targetHasUnsavedDraft(pluginId: string): boolean {
+  return mappingDraftTargetsPlugin({
+    dirty: draftDirty.value,
+    savedPluginId: savedMappingPluginId.value,
+    currentPluginId: draft.value.pluginId,
+  }, pluginId)
+}
+
+function deletionDiscardsCurrentDraft(pluginId: string): boolean {
+  return mappingDeletionDiscardsDraft({
+    dirty: draftDirty.value,
+    savedPluginId: savedMappingPluginId.value,
+    currentPluginId: draft.value.pluginId,
+  }, pluginId)
+}
+
+function requireSavedTargetMapping(pluginId: string, action: string): boolean {
+  if (!targetHasUnsavedDraft(pluginId)) return true
+  notice.value = ''
+  error.value = `当前映射有未保存更改。请先保存或放弃草稿，再${action}。`
+  return false
+}
+
+function requireActiveMappingSnapshot(action: string): boolean {
+  if (draftDirty.value) {
+    notice.value = ''
+    error.value = `当前映射有未保存更改。请先保存并热加载，再${action}。`
+    return false
+  }
+  if (mappingIsInstalled.value) return true
+  notice.value = ''
+  error.value = `请先保存并热加载映射，再${action}。`
+  return false
 }
 
 function beforeUnload(event: BeforeUnloadEvent) {
@@ -309,6 +352,12 @@ function replaceDraft(mapping: LocalMappingDefinition, editNotice = '') {
 function resetEditor(force = false) {
   if (!force && !confirmDiscardDraft()) return
   replaceDraft(newMapping())
+}
+
+function discardDraftChanges() {
+  if (!draftDirty.value) return
+  if (!window.confirm('确定放弃当前映射的全部未保存更改，并恢复到最近保存状态吗？')) return
+  replaceDraft(savedDraft.value, '已放弃未保存更改，恢复到最近保存状态。')
 }
 
 function editMapping(mapping: LocalMappingDefinition) {
@@ -480,6 +529,7 @@ async function saveMapping() {
 }
 
 async function deleteMapping(pluginId: string) {
+  if (deletionDiscardsCurrentDraft(pluginId) && !window.confirm(`本地映射「${pluginId}」有未保存更改。删除成功后这些草稿也会丢失，确定继续吗？`)) return
   if (!window.confirm(`确定删除本地映射「${pluginId}」吗？签名插件不会受影响。`)) return
   await run(async () => {
     await invoke('delete_local_mapping', { pluginId })
@@ -491,6 +541,7 @@ async function deleteMapping(pluginId: string) {
 }
 
 async function exportMapping(pluginId: string) {
+  if (!requireSavedTargetMapping(pluginId, '导出迁移包')) return
   const destination = await save({
     defaultPath: `${pluginId}.ssdev-mapping`,
     filters: [{ name: 'SSDEV 本地映射包', extensions: ['ssdev-mapping'] }],
@@ -503,6 +554,7 @@ async function exportMapping(pluginId: string) {
 }
 
 async function exportTypescript(pluginId: string) {
+  if (!requireSavedTargetMapping(pluginId, '导出 TypeScript 客户端')) return
   const destination = await save({
     defaultPath: `${pluginId}.client.ts`,
     filters: [{ name: 'TypeScript 客户端', extensions: ['ts'] }],
@@ -515,6 +567,7 @@ async function exportTypescript(pluginId: string) {
 }
 
 async function exportReleaseSource(pluginId: string) {
+  if (!requireSavedTargetMapping(pluginId, '导出发布源')) return
   const destinationParent = await open({
     multiple: false,
     directory: true,
@@ -621,6 +674,7 @@ function parsedExpectedResData(): unknown {
 }
 
 async function invokeDebug() {
+  if (!requireActiveMappingSnapshot('运行现场测试')) return
   if (!service.value || !method.value) return
   const serviceId = service.value.serviceId.trim()
   const methodName = (method.value.alias || method.value.name).trim()
@@ -643,10 +697,8 @@ async function invokeDebug() {
 }
 
 async function saveDebugCase() {
-  if (!service.value || !method.value || !mappingIsInstalled.value) {
-    error.value = '请先保存并热加载映射，再保存调试用例。'
-    return
-  }
+  if (!requireActiveMappingSnapshot('保存调试用例')) return
+  if (!service.value || !method.value) return
   const name = debugCaseName.value.trim()
   if (!name) {
     error.value = '请输入调试用例名称。'
@@ -719,7 +771,8 @@ async function deleteDebugCase(caseName: string) {
 }
 
 async function runDebugCases() {
-  if (!mappingIsInstalled.value || draft.value.debugCases.length === 0) return
+  if (!requireActiveMappingSnapshot('运行回归用例')) return
+  if (draft.value.debugCases.length === 0) return
   await run(async () => {
     regressionResults.value = await invoke<DebugCaseRunResult[]>('run_local_mapping_debug_cases', {
       pluginId: draft.value.pluginId,
@@ -762,7 +815,7 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
             <strong>{{ mapping.displayName || mapping.pluginId }}</strong>
             <small>{{ mapping.pluginId }} · {{ mapping.services.length }} 个服务</small>
           </button>
-          <span><button type="button" :disabled="busy || disabled" @click="exportTypescript(mapping.pluginId)">TS</button><button type="button" :disabled="busy || disabled" @click="exportReleaseSource(mapping.pluginId)">发布源</button><button type="button" :disabled="busy || disabled" @click="exportMapping(mapping.pluginId)">迁移包</button><button class="danger-link" type="button" :disabled="busy || disabled" @click="deleteMapping(mapping.pluginId)">删除</button></span>
+          <span><button type="button" :disabled="busy || disabled || targetHasUnsavedDraft(mapping.pluginId)" @click="exportTypescript(mapping.pluginId)">TS</button><button type="button" :disabled="busy || disabled || targetHasUnsavedDraft(mapping.pluginId)" @click="exportReleaseSource(mapping.pluginId)">发布源</button><button type="button" :disabled="busy || disabled || targetHasUnsavedDraft(mapping.pluginId)" @click="exportMapping(mapping.pluginId)">迁移包</button><button class="danger-link" type="button" :disabled="busy || disabled" @click="deleteMapping(mapping.pluginId)">删除</button></span>
         </article>
         <p v-if="inventory.mappings.length === 0" class="empty">尚未创建本地映射。</p>
       </div>
@@ -773,7 +826,7 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
     </div>
 
     <form class="mapping-editor" @submit.prevent="saveMapping">
-      <div v-if="draftDirty" class="draft-dirty" role="status">当前草稿有未保存更改</div>
+      <div v-if="draftDirty" class="draft-dirty" role="status">当前草稿有未保存更改；当前映射的调试、回归和导出已暂停</div>
       <div class="mapping-heading">
         <label><span>映射 ID</span><input v-model.trim="draft.pluginId" required pattern="[A-Za-z0-9._-]+" placeholder="hospital-device" /></label>
         <label><span>显示名称</span><input v-model.trim="draft.displayName" required placeholder="院内设备接口" /></label>
@@ -882,15 +935,15 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
             <label v-for="parameter in callableParameters" :key="parameter.name"><span>{{ parameter.name || '未命名参数' }} <small>{{ parameter.type }}</small></span><input v-model="debugValues[parameter.name]" :type="debugInputType(parameter.type)" /></label>
             <p v-if="callableParameters.length === 0">此方法没有输入参数。</p>
           </div>
-          <button type="button" :disabled="busy || disabled" @click="invokeDebug">运行测试</button>
-          <div v-if="debugResult" class="debug-result" :class="{ failed: debugResult.response.ResCode !== 0 }">
+          <button type="button" :disabled="busy || disabled || draftDirty || !mappingIsInstalled" @click="invokeDebug">运行测试</button>
+          <div v-if="debugResult && !draftDirty" class="debug-result" :class="{ failed: debugResult.response.ResCode !== 0 }">
             <strong>ResCode: {{ debugResult.response.ResCode }}</strong><small>{{ debugResult.elapsedMs }} ms</small>
             <pre>{{ JSON.stringify(debugResult.response.ResData, null, 2) }}</pre>
           </div>
           <div class="debug-case-editor">
             <label><span>用例名称</span><input v-model.trim="debugCaseName" maxlength="128" placeholder="例如：模拟设备正常返回" /></label>
             <label><span>期望 ResCode</span><input v-model.number="expectedResCode" type="number" /></label>
-            <button type="button" :disabled="busy || disabled || !mappingIsInstalled" @click="saveDebugCase">保存为回归用例</button>
+            <button type="button" :disabled="busy || disabled || draftDirty || !mappingIsInstalled" @click="saveDebugCase">保存为回归用例</button>
           </div>
           <div class="data-assertion-editor">
             <div>
@@ -902,7 +955,7 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
           <div class="debug-case-list">
             <div class="debug-case-heading">
               <strong>已保存回归用例（{{ draft.debugCases.length }}/32）</strong>
-              <button type="button" :disabled="busy || disabled || draft.debugCases.length === 0" @click="runDebugCases">顺序运行全部</button>
+              <button type="button" :disabled="busy || disabled || draftDirty || !mappingIsInstalled || draft.debugCases.length === 0" @click="runDebugCases">顺序运行全部</button>
             </div>
             <article v-for="item in draft.debugCases" :key="item.name">
               <button type="button" :disabled="busy || disabled" @click="loadDebugCase(item)">
@@ -912,7 +965,7 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
             </article>
             <p v-if="draft.debugCases.length === 0" class="empty">尚未保存合成回归用例。</p>
           </div>
-          <div v-if="regressionResults.length" class="regression-results">
+          <div v-if="regressionResults.length && !draftDirty" class="regression-results">
             <div v-for="item in regressionResults" :key="item.name" :class="{ failed: !item.passed }">
               <strong>{{ item.passed ? '通过' : '失败' }} · {{ item.name }}</strong>
               <small>{{ item.serviceId }} / {{ item.method }} · ResCode {{ item.actualResCode }} / {{ item.expectedResCode }} · {{ regressionDataSummary(item) }} · {{ item.elapsedMs }} ms</small>
@@ -922,6 +975,7 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
 
         <div class="editor-actions">
           <button class="primary" type="submit" :disabled="busy || disabled">保存、校验并热加载</button>
+          <button v-if="draftDirty" type="button" :disabled="busy || disabled" @click="discardDraftChanges">放弃更改</button>
           <button type="button" :disabled="busy || disabled" @click="removeService(serviceIndex)">删除当前服务</button>
         </div>
       </template>
