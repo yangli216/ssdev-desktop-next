@@ -462,9 +462,12 @@ impl WindowsPackageEvidence {
                 ));
             }
         }
-        if self.rollback_verified && !self.upgrade_verified {
+        if self.rollback_verified
+            && (!self.upgrade_verified || !self.launch_verified || !self.nsis_install_verified)
+        {
             return Err(EvidenceError::Invalid(
-                "rollback cannot be verified without a verified previous-version upgrade".into(),
+                "rollback requires verified NSIS, launch, and previous-version upgrade results"
+                    .into(),
             ));
         }
         let app_version = Version::parse(&self.app_version).map_err(|_| {
@@ -1658,6 +1661,15 @@ mod tests {
         evidence.authenticode_verified = false;
         evidence.validate().unwrap();
 
+        let mut rollback_without_launch = valid_windows_package();
+        rollback_without_launch.launch_verified = false;
+        assert!(rollback_without_launch.validate().is_err());
+
+        let mut rollback_without_nsis = valid_windows_package();
+        rollback_without_nsis.nsis_install_verified = false;
+        rollback_without_nsis.msi_install_verified = true;
+        assert!(rollback_without_nsis.validate().is_err());
+
         let mut legacy = valid_windows_package();
         legacy.schema_version = 5;
         assert!(legacy.validate().is_err());
@@ -1919,6 +1931,7 @@ mod tests {
         );
 
         windows.launch_verified = false;
+        windows.rollback_verified = false;
         windows.source_dirty = true;
         let decision = evaluate_production_cutover(
             ProductionCutoverInputs {
@@ -1945,7 +1958,8 @@ mod tests {
             decision.blocker_codes,
             [
                 "windows-launch-not-verified",
-                "windows-package-dirty-source"
+                "windows-package-dirty-source",
+                "windows-rollback-not-verified"
             ]
         );
         assert!(
