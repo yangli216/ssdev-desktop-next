@@ -249,6 +249,16 @@ test('fixture invoker rejects ambiguous definitions and unexpected calls without
     (error) => error instanceof InvalidPluginFixtureError
       && error.reason === 'invalid-response',
   )
+  assert.throws(
+    () => createPluginFixtureInvoker([{
+      serviceId: 'card.reader',
+      method: 'readCard',
+      parameters: { sequence: 9_007_199_254_740_992 },
+      response: { ResCode: 0, ResData: null },
+    }]),
+    (error) => error instanceof InvalidPluginFixtureError
+      && error.reason === 'invalid-parameters',
+  )
 
   const cyclicParameters = {}
   cyclicParameters.self = cyclicParameters

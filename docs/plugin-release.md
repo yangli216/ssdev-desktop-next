@@ -77,6 +77,19 @@ cargo run --locked -p ssdev-plugin-tool -- client `
 
 控制台本地映射工作台的“TS”按钮也调用同一个共享生成器，因此现场映射转成正式插件后不会产生另一套方法命名规则。生成文件依赖 `@bsoft/ssdev-web-bridge` 的公开 `PluginInvoker`，业务项目应把它作为受控代码制品提交并随 `api.json` 变更一起评审。业务前端单元测试可向生成客户端注入 SDK 的 `createPluginFixtureInvoker`；它严格匹配公开路由和完整 JSON 参数并隔离每次响应，但不会伪造桌面全局对象、持久调用或原生硬件语义，正式发布仍必须通过下方黄金矩阵。
 
+正式黄金矩阵完成实机复核后，可以避免再次手抄同一份请求/响应。以下命令先复用完整矩阵门禁，再生成可直接传给 `createPluginFixtureInvoker` 的 TypeScript 数组：
+
+```powershell
+cargo run --locked -p ssdev-plugin-tool -- web-fixtures `
+  --plugin-dir C:\secure-release\reader-2.3.1-stage `
+  --matrix C:\secure-release\reader-2.3.1-matrix.json `
+  --output C:\business-web\src\generated\reader-plugin-fixtures.ts
+```
+
+多插件联合矩阵把 `--plugin-dir` 换成已批准的 `--plugin-root`。生成器要求矩阵绑定精确插件 ID/版本、`draft=false`、启用用例全方法覆盖、输入完整，并拒绝任何 `reviewRequired` 或草稿占位符；禁用用例不会进入输出。native method 与 alias 会归一为类型化客户端实际调用的公开 route。同一路由和参数若对应多个设备状态会产生歧义，必须先拆成不同矩阵/fixture 模块，不能依赖调用顺序选择响应。
+
+生成模块包含矩阵中的精确输入和响应，工具不会自动脱敏。输出必须是插件输入目录之外尚不存在的 `.ts` 文件；报告和文件头同时记录源矩阵 SHA-256，生成期间矩阵变化会失败。超出 JavaScript 安全整数范围的 64 位值必须在插件契约和矩阵中使用字符串表达，工具不会生成已经发生精度丢失的数字字面量。发布人员应先确认矩阵只使用合成或已脱敏数据，再决定是否提交到业务仓库。结构门禁本身不能证明矩阵确实执行过硬件或获得组织审批；该模块既不进入插件签名载荷，也不替代实机证据。
+
 ## 1. 准备发布目录
 
 所有输出都必须是尚不存在的新路径，并位于旧插件目录之外：

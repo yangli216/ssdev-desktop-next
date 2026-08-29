@@ -551,6 +551,9 @@ function canonicalFixtureJson(
       return JSON.stringify(value)
     case 'number':
       if (!Number.isFinite(value)) throw new Error('fixture JSON number is not finite')
+      if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+        throw new Error('fixture JSON integer is outside the JavaScript safe range')
+      }
       return JSON.stringify(value)
     case 'object': {
       if (ancestors.has(value)) throw new Error('fixture JSON is cyclic')

@@ -29,7 +29,9 @@ const invoker = createPluginFixtureInvoker([{
 const reader = new ReaderPluginClient(invoker)
 ```
 
-fixture 按 service、method 和完整 JSON 参数精确匹配，对象键顺序不影响结果；省略参数与 `{}` 等价。重复定义、非 JSON 数据和未声明调用都会显式失败，错误不复制参数内容；每次调用返回独立副本，测试代码修改结果不会污染下一用例。该工具不会写入 `window.ssdevDesktop`，也不模拟持久操作 ID、超时、重试、DLL/COM 行为或硬件副作用，只用于业务前端单元测试，不能替代 Windows 插件黄金矩阵。
+fixture 按 service、method 和完整 JSON 参数精确匹配，对象键顺序不影响结果；省略参数与 `{}` 等价。重复定义、非 JSON 数据、超出 JavaScript 安全范围的整数和未声明调用都会显式失败，错误不复制参数内容；精确 64 位整数应按插件契约使用字符串。每次调用返回独立副本，测试代码修改结果不会污染下一用例。该工具不会写入 `window.ssdevDesktop`，也不模拟持久操作 ID、超时、重试、DLL/COM 行为或硬件副作用，只用于业务前端单元测试，不能替代 Windows 插件黄金矩阵。
+
+已经完成脱敏、精确响应复核并绑定插件版本的正式黄金矩阵，可以通过 `ssdev-plugin-tool web-fixtures` 生成上述数组，避免业务项目再次手抄 route 和数据。生成器拒绝草稿、占位符、未解除复核项和同输入多响应歧义；输出仍包含矩阵原始测试数据，提交前必须单独评审。
 
 `connectDesktop()` 会先读取并运行时校验最小系统声明，再检查协议版本。页面不在授权桌面窗口中时抛出 `DesktopBridgeUnavailableError`；系统声明损坏或与当前能力 schema 自相矛盾时抛出带稳定 `reason` 的 `InvalidDesktopDeclarationError`；协议不兼容时抛出 `UnsupportedDesktopProtocolError`。业务代码应显示客户端升级或修复提示，不要把这些错误静默切换到 HTTP。
 

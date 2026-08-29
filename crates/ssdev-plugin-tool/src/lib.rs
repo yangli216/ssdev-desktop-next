@@ -98,6 +98,14 @@ pub struct GenerateClientOptions<'a> {
 }
 
 #[derive(Debug, Clone)]
+pub struct GenerateWebFixturesOptions<'a> {
+    pub plugin_root: Option<&'a Path>,
+    pub plugin_dir: Option<&'a Path>,
+    pub matrix: &'a Path,
+    pub output: &'a Path,
+}
+
+#[derive(Debug, Clone)]
 pub struct InitDllPluginOptions<'a> {
     pub destination: &'a Path,
     pub plugin_id: &'a str,
@@ -267,6 +275,19 @@ pub struct GenerateClientReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GenerateWebFixturesReport {
+    pub schema_version: u8,
+    pub plugin_count: usize,
+    pub service_count: usize,
+    pub method_count: usize,
+    pub fixture_count: usize,
+    pub matrix_sha256: String,
+    pub output: PathBuf,
+    pub output_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitDllPluginReport {
     pub schema_version: u8,
     pub plugin_id: String,
@@ -419,6 +440,15 @@ struct CatalogVerifiedPackage {
     version: Version,
     size: u64,
     sha256: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeneratedWebFixture {
+    service_id: String,
+    method: String,
+    parameters: Map<String, Value>,
+    response: InvokeResponse,
 }
 
 /// Creates a minimal, buildable Windows DLL plugin workspace for the common
@@ -842,6 +872,146 @@ pub fn generate_client(
         output,
         output_sha256: sha256_hex(client.as_bytes()),
     })
+}
+
+/// Generates strict business-frontend fixtures from the same structurally
+/// complete executable matrix used by release and hardware gates. Disabled
+/// scenarios are intentionally omitted. Passing this check does not prove that
+/// hardware execution or organizational approval occurred. Public aliases are
+/// normalized to the route emitted by the typed client generator.
+pub fn generate_web_fixtures(
+    options: &GenerateWebFixturesOptions<'_>,
+) -> Result<GenerateWebFixturesReport, ToolError> {
+    ensure_fresh_output(options.output, "Web fixture output")?;
+    if options.output.extension().and_then(|value| value.to_str()) != Some("ts") {
+        return Err(ToolError::Invalid(
+            "Web fixture output must use the .ts extension".into(),
+        ));
+    }
+    let output = normalized_new_path(options.output)?;
+    let (input_root, manifests) = match (options.plugin_root, options.plugin_dir) {
+        (Some(plugin_root), None) => {
+            let input_root = canonical_real_directory(plugin_root)?;
+            let manifests = discover_clean_plugin_root(&input_root)?;
+            (input_root, manifests)
+        }
+        (None, Some(plugin_dir)) => {
+            let input_root = canonical_real_directory(plugin_dir)?;
+            let metadata = PluginMetadata::load_optional(&input_root)?.ok_or_else(|| {
+                ToolError::Invalid(
+                    "Web fixture plugin directory must contain normalized plugin.json".into(),
+                )
+            })?;
+            let manifest = PluginManifest::load(metadata.plugin_id, &input_root)?;
+            (input_root, vec![manifest])
+        }
+        _ => {
+            return Err(ToolError::Invalid(
+                "Web fixture generation requires exactly one plugin root or plugin directory"
+                    .into(),
+            ))
+        }
+    };
+    if output.starts_with(&input_root) {
+        return Err(ToolError::Invalid(
+            "Web fixture output must stay outside the verified plugin input".into(),
+        ));
+    }
+
+    let matrix_sha256 = sha256_file(options.matrix)?;
+    let (matrix, matrix_report) = validate_executable_matrix(options.matrix, &manifests)?;
+    if sha256_file(options.matrix)? != matrix_sha256 {
+        return Err(ToolError::Invalid(
+            "executable matrix changed while Web fixtures were being generated".into(),
+        ));
+    }
+    if !matrix_report.identity_bound {
+        return Err(ToolError::Invalid(
+            "Web fixture matrix must bind the exact plugin identities and versions".into(),
+        ));
+    }
+    let services = manifests
+        .iter()
+        .flat_map(|manifest| manifest.services.iter())
+        .map(|service| (service.service_id.as_str(), service))
+        .collect::<BTreeMap<_, _>>();
+    let mut identities = BTreeSet::new();
+    let mut fixtures = Vec::with_capacity(matrix_report.enabled_case_count);
+    for case in matrix.cases.into_iter().filter(|case| case.enabled) {
+        let service = services
+            .get(case.request.service_id.as_str())
+            .copied()
+            .ok_or_else(|| ToolError::Invalid("validated matrix service disappeared".into()))?;
+        let method = service
+            .method(&case.request.method)
+            .ok_or_else(|| ToolError::Invalid("validated matrix method disappeared".into()))?;
+        let public_method = method.alias.as_deref().unwrap_or(&method.name).to_owned();
+        if case
+            .request
+            .parameters
+            .values()
+            .any(|value| !web_fixture_value_is_javascript_safe(value))
+            || !web_fixture_value_is_javascript_safe(&case.expected.res_data)
+        {
+            return Err(ToolError::Invalid(format!(
+                "executable matrix route [{}/{}] contains an integer outside the JavaScript safe range; encode exact 64-bit values as strings",
+                case.request.service_id, public_method
+            )));
+        }
+        let identity = serde_json::to_vec(&(
+            case.request.service_id.as_str(),
+            public_method.as_str(),
+            &case.request.parameters,
+        ))?;
+        if !identities.insert(identity) {
+            return Err(ToolError::Invalid(format!(
+                "executable matrix contains duplicate Web fixture input for route [{}/{}]; split alternative device states into separate fixture modules",
+                case.request.service_id, public_method
+            )));
+        }
+        fixtures.push(GeneratedWebFixture {
+            service_id: case.request.service_id,
+            method: public_method,
+            parameters: case.request.parameters,
+            response: case.expected,
+        });
+    }
+
+    let fixtures_json = serde_json::to_string_pretty(&fixtures)?;
+    let source = format!(
+        "// Generated from a structurally valid SSDEV executable matrix.\n\
+// Matrix SHA-256: {matrix_sha256}\n\
+// This does not prove hardware approval. Review exact data before committing.\n\
+import type {{ PluginInvocationFixture }} from '@bsoft/ssdev-web-bridge'\n\n\
+export const pluginFixtures = {fixtures_json} satisfies readonly PluginInvocationFixture[]\n"
+    );
+    write_new_bytes(&output, source.as_bytes())?;
+    Ok(GenerateWebFixturesReport {
+        schema_version: 1,
+        plugin_count: matrix_report.plugin_count,
+        service_count: matrix_report.service_count,
+        method_count: matrix_report.method_count,
+        fixture_count: fixtures.len(),
+        matrix_sha256,
+        output,
+        output_sha256: sha256_hex(source.as_bytes()),
+    })
+}
+
+fn web_fixture_value_is_javascript_safe(value: &Value) -> bool {
+    const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+    match value {
+        Value::Null | Value::Bool(_) | Value::String(_) => true,
+        Value::Number(number) if number.is_i64() => number
+            .as_i64()
+            .is_some_and(|value| (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&value)),
+        Value::Number(number) if number.is_u64() => number
+            .as_u64()
+            .is_some_and(|value| value <= MAX_SAFE_INTEGER as u64),
+        Value::Number(number) => number.as_f64().is_some_and(f64::is_finite),
+        Value::Array(values) => values.iter().all(web_fixture_value_is_javascript_safe),
+        Value::Object(values) => values.values().all(web_fixture_value_is_javascript_safe),
+    }
 }
 
 pub fn prepare(options: &PrepareOptions<'_>) -> Result<PrepareReport, ToolError> {
@@ -3437,6 +3607,229 @@ mod tests {
             check_executable_matrix_plugin(&staging, &matrix).unwrap(),
             report
         );
+    }
+
+    #[test]
+    fn web_fixtures_use_public_aliases_and_only_enabled_bound_cases() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_dir = root.path().join("reader-plugin");
+        fs::create_dir(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("api.json"),
+            r#"{"serviceId":"reader","mainClass":"reader.dll","architecture":"x86","methods":[{"name":"read","alias":"readCard","parameters":["timeout"]}]}"#,
+        )
+        .unwrap();
+        fs::write(plugin_dir.join("reader.dll"), pe(0x014c, &["read"])).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "pluginId": "reader-plugin",
+                "version": "1.0.0",
+                "displayName": "Reader"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let matrix = matrix_file(
+            root.path(),
+            "web-fixture-matrix.json",
+            json!({
+                "schemaVersion": 1,
+                "draft": false,
+                "plugins": [{
+                    "pluginId": "reader-plugin",
+                    "version": "1.0.0"
+                }],
+                "cases": [{
+                    "name": "reviewed-success",
+                    "request": {
+                        "serviceId": "reader",
+                        "method": "read",
+                        "parameters": { "timeout": 5 }
+                    },
+                    "expected": {
+                        "ResCode": 0,
+                        "ResData": { "ReturnValue": 0, "cardNumber": "TEST-001" }
+                    }
+                }, {
+                    "name": "disabled-draft-scenario",
+                    "enabled": false,
+                    "reviewRequired": true,
+                    "request": {
+                        "serviceId": "reader",
+                        "method": "readCard",
+                        "parameters": { "timeout": 9 }
+                    },
+                    "expected": {
+                        "ResCode": 0,
+                        "ResData": DRAFT_RESPONSE_PLACEHOLDER
+                    }
+                }]
+            }),
+        );
+        let output = root.path().join("reader-fixtures.ts");
+
+        let report = generate_web_fixtures(&GenerateWebFixturesOptions {
+            plugin_root: None,
+            plugin_dir: Some(&plugin_dir),
+            matrix: &matrix,
+            output: &output,
+        })
+        .unwrap();
+        let generated = fs::read_to_string(&output).unwrap();
+        assert_eq!(report.plugin_count, 1);
+        assert_eq!(report.service_count, 1);
+        assert_eq!(report.method_count, 1);
+        assert_eq!(report.fixture_count, 1);
+        assert_eq!(report.matrix_sha256, sha256_file(&matrix).unwrap());
+        assert_eq!(report.output_sha256, sha256_hex(generated.as_bytes()));
+        assert!(generated.contains(&format!("Matrix SHA-256: {}", report.matrix_sha256)));
+        assert!(generated.contains("import type { PluginInvocationFixture }"));
+        assert!(generated.contains("\"method\": \"readCard\""));
+        assert!(!generated.contains("\"method\": \"read\""));
+        assert!(!generated.contains(DRAFT_RESPONSE_PLACEHOLDER));
+        assert!(!generated.contains("reviewed-success"));
+        assert!(generate_web_fixtures(&GenerateWebFixturesOptions {
+            plugin_root: None,
+            plugin_dir: Some(&plugin_dir),
+            matrix: &matrix,
+            output: &output,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("already exists"));
+
+        let unbound_matrix = matrix_file(
+            root.path(),
+            "unbound-web-fixture-matrix.json",
+            executable_matrix(executable_case()),
+        );
+        let unbound_output = root.path().join("unbound-fixtures.ts");
+        assert!(generate_web_fixtures(&GenerateWebFixturesOptions {
+            plugin_root: None,
+            plugin_dir: Some(&plugin_dir),
+            matrix: &unbound_matrix,
+            output: &unbound_output,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("bind the exact plugin"));
+        assert!(!unbound_output.exists());
+
+        let unsafe_number_matrix = matrix_file(
+            root.path(),
+            "unsafe-number-web-fixture-matrix.json",
+            json!({
+                "schemaVersion": 1,
+                "draft": false,
+                "plugins": [{
+                    "pluginId": "reader-plugin",
+                    "version": "1.0.0"
+                }],
+                "cases": [{
+                    "name": "unsafe-javascript-integer",
+                    "request": {
+                        "serviceId": "reader",
+                        "method": "readCard",
+                        "parameters": { "timeout": 5 }
+                    },
+                    "expected": {
+                        "ResCode": 0,
+                        "ResData": { "sequence": 9_007_199_254_740_992_u64 }
+                    }
+                }]
+            }),
+        );
+        let unsafe_number_output = root.path().join("unsafe-number-fixtures.ts");
+        assert!(generate_web_fixtures(&GenerateWebFixturesOptions {
+            plugin_root: None,
+            plugin_dir: Some(&plugin_dir),
+            matrix: &unsafe_number_matrix,
+            output: &unsafe_number_output,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("outside the JavaScript safe range"));
+        assert!(!unsafe_number_output.exists());
+
+        let inside_output = plugin_dir.join("fixtures.ts");
+        assert!(generate_web_fixtures(&GenerateWebFixturesOptions {
+            plugin_root: None,
+            plugin_dir: Some(&plugin_dir),
+            matrix: &matrix,
+            output: &inside_output,
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("outside the verified plugin input"));
+        assert!(!inside_output.exists());
+    }
+
+    #[test]
+    fn web_fixtures_reject_ambiguous_device_states_after_alias_normalization() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_dir = root.path().join("reader-plugin");
+        fs::create_dir(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("api.json"),
+            r#"{"serviceId":"reader","mainClass":"reader.dll","architecture":"x86","methods":[{"name":"read","alias":"readCard","parameters":["timeout"]}]}"#,
+        )
+        .unwrap();
+        fs::write(plugin_dir.join("reader.dll"), pe(0x014c, &["read"])).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "pluginId": "reader-plugin",
+                "version": "1.0.0",
+                "displayName": "Reader"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let matrix = matrix_file(
+            root.path(),
+            "ambiguous-web-fixture-matrix.json",
+            json!({
+                "schemaVersion": 1,
+                "draft": false,
+                "plugins": [{
+                    "pluginId": "reader-plugin",
+                    "version": "1.0.0"
+                }],
+                "cases": [{
+                    "name": "native-route",
+                    "request": {
+                        "serviceId": "reader",
+                        "method": "read",
+                        "parameters": { "timeout": 5 }
+                    },
+                    "expected": { "ResCode": 0, "ResData": { "ReturnValue": 0 } }
+                }, {
+                    "name": "alias-route-same-input",
+                    "request": {
+                        "serviceId": "reader",
+                        "method": "readCard",
+                        "parameters": { "timeout": 5 }
+                    },
+                    "expected": { "ResCode": 1, "ResData": { "ReturnValue": 1 } }
+                }]
+            }),
+        );
+        let output = root.path().join("ambiguous-fixtures.ts");
+
+        let error = generate_web_fixtures(&GenerateWebFixturesOptions {
+            plugin_root: None,
+            plugin_dir: Some(&plugin_dir),
+            matrix: &matrix,
+            output: &output,
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("duplicate Web fixture input for route [reader/readCard]"));
+        assert!(!output.exists());
     }
 
     #[test]
