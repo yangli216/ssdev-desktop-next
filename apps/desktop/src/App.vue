@@ -7,9 +7,11 @@ import LocalMappingStudio from './LocalMappingStudio.vue'
 import {
   initialRuntimeStatusHealth,
   updateRuntimeStatusHealth,
-  withRuntimeStatusTimeout,
+  withBoundedTimeout,
   type RuntimeStatusHealthEvent,
 } from './runtime-status.js'
+
+const CONTROL_BOOTSTRAP_TIMEOUT_MS = 15_000
 
 type BridgeStatus = {
   mode: string
@@ -351,6 +353,9 @@ const ssoActive = ref(false)
 const ssoError = ref('')
 const notice = ref('')
 const busy = ref(false)
+const controlLoadActive = ref(false)
+const controlLoadFailed = ref(false)
+const deploymentCheckUnavailable = ref(false)
 const runtimeStatusHealth = ref(initialRuntimeStatusHealth())
 const runtimeStatusRecovered = ref(false)
 const mappingDraftDirty = ref(false)
@@ -359,6 +364,12 @@ type ConsoleSection = 'overview' | 'configuration' | 'native' | 'plugins' | 'sec
 const activeSection = ref<ConsoleSection>('overview')
 const runtimeStatusStale = computed(() => runtimeStatusHealth.value.stale)
 const deploymentReadiness = computed(() => {
+  if (controlLoadFailed.value) {
+    return {
+      label: '初始化失败',
+      detail: '控制台尚未取得完整项目状态，请重新加载',
+    }
+  }
   if (runtimeStatusStale.value) {
     return {
       label: '状态未知',
@@ -366,6 +377,12 @@ const deploymentReadiness = computed(() => {
     }
   }
   const report = deploymentCheck.value
+  if (deploymentCheckUnavailable.value) {
+    return {
+      label: '检查不可用',
+      detail: '控制台已加载；请在安全与诊断中重新检查',
+    }
+  }
   if (!report) {
     return {
       label: '检查中',
@@ -401,6 +418,7 @@ const needsDeepDeploymentCheck = computed(() => (
   && !deploymentCheck.value.deliveryReady
 ))
 const businessFrontendReadiness = computed(() => {
+  if (controlLoadFailed.value) return { label: '状态未知', detail: '控制台初始化失败，无法确认业务页面状态' }
   if (runtimeStatusStale.value) return { label: '状态未知', detail: '桌面核心通信中断，无法确认业务页面状态' }
   const current = status.value
   if (!current) return { label: '检查中', detail: '正在读取业务窗口状态' }
@@ -438,6 +456,8 @@ const withdrawalReasonLabels = {
   'publisher-withdrawn': '发布方撤回',
 } as const
 let unlistenSsoStatus: UnlistenFn | undefined
+let ssoStatusListenerPromise: Promise<void> | undefined
+let controlConsoleMounted = false
 let ssoStatusEventSeen = false
 let statusRefreshTimer: number | undefined
 let runtimeStatusRecoveryTimer: number | undefined
@@ -496,7 +516,9 @@ async function refreshRuntimeStatus(force = false) {
   if (busy.value || statusRefreshActive || (runtimeStatusStale.value && !force)) return
   statusRefreshActive = true
   try {
-    status.value = await withRuntimeStatusTimeout(invoke<BridgeStatus>('bridge_status'))
+    const next = await withBoundedTimeout(invoke<BridgeStatus>('bridge_status'))
+    status.value = next
+    if (!ssoStatusEventSeen) applySsoStatus(next.ssoError, next.ssoActive)
     recordRuntimeStatusEvent('success')
   } catch {
     recordRuntimeStatusEvent('failure')
@@ -540,35 +562,80 @@ function applySsoStatus(code?: string, active = false) {
   }
 }
 
-onMounted(async () => {
+async function ensureSsoStatusListener() {
+  if (unlistenSsoStatus) return
+  if (ssoStatusListenerPromise) return ssoStatusListenerPromise
+  ssoStatusListenerPromise = (async () => {
+    try {
+      const unlisten = await listen<SsoStatusEvent>('desktop://sso-status', (event) => {
+        ssoStatusEventSeen = true
+        applySsoStatus(event.payload.code, event.payload.active)
+      })
+      if (controlConsoleMounted) unlistenSsoStatus = unlisten
+      else unlisten()
+    } catch {
+      // bridge_status polling remains the bounded fallback for SSO status.
+    } finally {
+      ssoStatusListenerPromise = undefined
+    }
+  })()
+  return ssoStatusListenerPromise
+}
+
+async function loadControlConsole() {
+  if (controlLoadActive.value) return
+  controlLoadActive.value = true
   try {
-    await invoke('frontend_ready')
-    unlistenSsoStatus = await listen<SsoStatusEvent>('desktop://sso-status', (event) => {
-      ssoStatusEventSeen = true
-      applySsoStatus(event.payload.code, event.payload.active)
-    })
-    const deploymentPromise = invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }).catch((reason) => {
-      error.value = `部署自检不可用：${reason instanceof Error ? reason.message : String(reason)}`
-      return null
-    })
-    const [bridge, config, plugins, deployment] = await Promise.all([
-      invoke<BridgeStatus>('bridge_status'),
-      invoke<ConfigSnapshot>('desktop_config'),
-      invoke<PluginInventory>('plugin_inventory'),
-      deploymentPromise,
-    ])
+    const bootstrap = (async () => {
+      await invoke('frontend_ready')
+      void ensureSsoStatusListener()
+      const deploymentPromise = withBoundedTimeout(
+        invoke<DeploymentCheckReport>('run_deployment_check', { deep: false }),
+      ).catch(() => {
+        deploymentCheckUnavailable.value = true
+        return null
+      })
+      return Promise.all([
+        invoke<BridgeStatus>('bridge_status'),
+        invoke<ConfigSnapshot>('desktop_config'),
+        invoke<PluginInventory>('plugin_inventory'),
+        deploymentPromise,
+      ])
+    })()
+    const [bridge, config, plugins, deployment] = await withBoundedTimeout(
+      bootstrap,
+      CONTROL_BOOTSTRAP_TIMEOUT_MS,
+    )
+    if (!controlConsoleMounted) return
     status.value = bridge
     snapshot.value = config
     inventory.value = plugins
     deploymentCheck.value = deployment
+    if (deployment) deploymentCheckUnavailable.value = false
     if (!ssoStatusEventSeen) applySsoStatus(bridge.ssoError, bridge.ssoActive)
-    statusRefreshTimer = window.setInterval(() => void refreshRuntimeStatus(), 5_000)
-  } catch (reason) {
-    error.value = reason instanceof Error ? reason.message : String(reason)
+    controlLoadFailed.value = false
+    recordRuntimeStatusEvent('success')
+    if (statusRefreshTimer == null) {
+      statusRefreshTimer = window.setInterval(() => void refreshRuntimeStatus(), 5_000)
+    }
+  } catch {
+    if (controlConsoleMounted) controlLoadFailed.value = true
+  } finally {
+    controlLoadActive.value = false
   }
+}
+
+function retryControlLoad() {
+  void loadControlConsole()
+}
+
+onMounted(() => {
+  controlConsoleMounted = true
+  void loadControlConsole()
 })
 
 onUnmounted(() => {
+  controlConsoleMounted = false
   unlistenSsoStatus?.()
   if (statusRefreshTimer != null) window.clearInterval(statusRefreshTimer)
   if (runtimeStatusRecoveryTimer != null) window.clearTimeout(runtimeStatusRecoveryTimer)
@@ -596,6 +663,7 @@ async function saveConfig() {
     async () => {
       await invoke('save_desktop_config', { config: snapshot.value?.config })
       deploymentCheck.value = await invoke<DeploymentCheckReport>('run_deployment_check', { deep: false })
+      deploymentCheckUnavailable.value = false
       configImportPreview.value = null
       selectedConfigImport.value = ''
     },
@@ -632,6 +700,7 @@ async function confirmConfigImport() {
       expectedPlanId,
     })
     deploymentCheck.value = await invoke<DeploymentCheckReport>('run_deployment_check', { deep: false })
+    deploymentCheckUnavailable.value = false
     configImportPreview.value = null
     selectedConfigImport.value = ''
   }, changed ? '配置已按确认计划导入；已有业务窗口已关闭。' : '导入配置与当前配置一致，未执行替换。')
@@ -998,6 +1067,7 @@ async function runDeploymentCheck() {
   await run(async () => {
     result = await invoke<DeploymentCheckReport>('run_deployment_check', { deep: true })
     deploymentCheck.value = result
+    deploymentCheckUnavailable.value = false
     status.value = await invoke<BridgeStatus>('bridge_status')
   }, '')
   if (result) {
@@ -1017,6 +1087,7 @@ async function exportDeploymentCheck() {
   await run(async () => {
     result = await invoke<{ bytes: number; report: DeploymentCheckReport }>('export_deployment_check', { destination })
     deploymentCheck.value = result.report
+    deploymentCheckUnavailable.value = false
     status.value = await invoke<BridgeStatus>('bridge_status')
   }, '')
   if (result) {
@@ -1047,15 +1118,16 @@ async function exportDeploymentCheck() {
         </button>
       </nav>
       <div class="sidebar-status">
-        <span :class="['status-dot', { ready: Boolean(status) && !runtimeStatusStale, warning: Boolean(error || ssoError || runtimeStatusStale) }]" />
-        <span><strong>{{ runtimeStatusStale ? '桌面通信中断' : error || ssoError ? '需要处理' : status ? '桌面服务正常' : '正在连接' }}</strong><small>{{ runtimeStatusStale ? `状态连续 ${runtimeStatusHealth.consecutiveFailures} 次刷新失败` : `${status?.serviceCount ?? '—'} 个原生服务可用` }}</small></span>
+        <span :class="['status-dot', { ready: Boolean(status) && !controlLoadFailed && !runtimeStatusStale, warning: Boolean(controlLoadFailed || error || ssoError || runtimeStatusStale) }]" />
+        <span><strong>{{ controlLoadFailed ? '控制台初始化失败' : runtimeStatusStale ? '桌面通信中断' : error || ssoError ? '需要处理' : status ? '桌面服务正常' : '正在连接' }}</strong><small>{{ controlLoadFailed ? '请重新加载核心项目状态' : runtimeStatusStale ? `状态连续 ${runtimeStatusHealth.consecutiveFailures} 次刷新失败` : `${status?.serviceCount ?? '—'} 个原生服务可用` }}</small></span>
       </div>
     </aside>
 
     <main class="workspace">
-      <div v-if="notice || ssoError || error || runtimeStatusStale || runtimeStatusRecovered" class="message-stack" aria-live="polite">
+      <div v-if="notice || ssoError || error || controlLoadFailed || runtimeStatusStale || runtimeStatusRecovered" class="message-stack" aria-live="polite">
         <p v-if="notice" class="notice" role="status">{{ notice }}</p>
         <p v-if="runtimeStatusRecovered" class="notice" role="status">桌面核心通信已经恢复，运行状态已重新验证。</p>
+        <div v-if="controlLoadFailed" class="runtime-status-alert" role="alert"><span>控制台未能读取完整项目状态。请重新加载；仍失败时重启客户端并查看日志。</span><button type="button" :disabled="controlLoadActive" @click="retryControlLoad">{{ controlLoadActive ? '正在加载…' : '重新加载' }}</button></div>
         <div v-if="runtimeStatusStale" class="runtime-status-alert" role="alert"><span>桌面核心状态连续刷新失败，当前页面显示的数据可能已经过期。请立即重试；仍失败时重启客户端并查看日志。</span><button type="button" :disabled="busy || statusRefreshActive" @click="retryRuntimeStatus">立即重试</button></div>
         <p v-if="ssoError" class="error" role="alert">{{ ssoError }}</p>
         <p v-if="error" class="error" role="alert">操作失败：{{ error }}</p>
@@ -1068,7 +1140,7 @@ async function exportDeploymentCheck() {
             <h1 id="overview-title">本地能力控制台</h1>
             <p class="lede">集中查看运行状态，并快速进入当前项目或专业配置工作区。</p>
           </div>
-          <span class="phase">{{ runtimeStatusStale ? '状态不可用' : status?.acceptingPluginInvocations ? '服务就绪' : '正在初始化' }}</span>
+          <span class="phase">{{ controlLoadFailed ? '初始化失败' : runtimeStatusStale ? '状态不可用' : status?.acceptingPluginInvocations ? '服务就绪' : '正在初始化' }}</span>
         </header>
 
         <section class="summary-grid" aria-label="关键运行状态">
@@ -1085,13 +1157,13 @@ async function exportDeploymentCheck() {
               <h2>进入业务系统</h2>
               <p>{{ snapshot?.config.website || '尚未配置默认业务地址' }}</p>
             </div>
-            <button class="primary large" type="button" :disabled="busy || runtimeStatusStale || !snapshot?.config.website" @click="openBusiness">启动默认环境</button>
+            <button class="primary large" type="button" :disabled="busy || controlLoadFailed || runtimeStatusStale || !snapshot?.config.website" @click="openBusiness">启动默认环境</button>
             <div v-if="snapshot?.config.allowSwitch && snapshot.config.environments.length" class="environment-shortcuts">
               <button
                 v-for="environment in snapshot.config.environments"
                 :key="`${environment.name}:${environment.url}`"
                 type="button"
-                :disabled="busy || runtimeStatusStale || !environment.name || !environment.url"
+                :disabled="busy || controlLoadFailed || runtimeStatusStale || !environment.name || !environment.url"
                 @click="openEnvironment(environment)"
               >{{ environment.name || '未命名环境' }}</button>
             </div>
@@ -1108,9 +1180,10 @@ async function exportDeploymentCheck() {
           </section>
         </div>
 
-        <section v-if="runtimeStatusStale || needsDeepDeploymentCheck || deploymentCheck?.failures || status?.businessTimedOutWindows || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
+        <section v-if="controlLoadFailed || runtimeStatusStale || needsDeepDeploymentCheck || deploymentCheck?.failures || status?.businessTimedOutWindows || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
           <div><p class="eyebrow">ATTENTION</p><h2>待处理事项</h2></div>
           <ul>
+            <li v-if="controlLoadFailed"><strong>控制台初始化未完成，不能确认当前项目和原生能力状态</strong><button type="button" :disabled="controlLoadActive" @click="retryControlLoad">重新加载</button></li>
             <li v-if="runtimeStatusStale"><strong>桌面核心通信中断，所有运行状态和部署结论均已标记为未知</strong><button type="button" :disabled="busy || statusRefreshActive" @click="retryRuntimeStatus">重新连接</button></li>
             <li v-if="needsDeepDeploymentCheck"><strong>快速检查已通过，正式交付前还需验证当前 x86/x64 插件宿主</strong><button type="button" :disabled="busy" @click="runDeploymentCheck">立即深度自检</button></li>
             <li v-if="deploymentCheck?.failures"><strong>部署自检存在 {{ deploymentCheck.failures }} 项阻塞问题</strong><button type="button" @click="activeSection = 'security'">查看自检</button></li>
@@ -1197,7 +1270,7 @@ async function exportDeploymentCheck() {
                 <label class="environment-default" title="设为默认环境"><input v-model="snapshot.config.website" type="radio" :value="environment.url" /><span>默认</span></label>
                 <input v-model.trim="environment.name" type="text" maxlength="128" placeholder="环境名称" />
                 <input :value="environment.url" type="url" maxlength="4096" placeholder="http://project.internal" @input="changeEnvironmentUrl(environment, ($event.target as HTMLInputElement).value)" />
-                <button type="button" :disabled="busy || runtimeStatusStale || !snapshot.config.allowSwitch || !environment.name || !environment.url" @click="openEnvironment(environment)">打开</button>
+                <button type="button" :disabled="busy || controlLoadFailed || runtimeStatusStale || !snapshot.config.allowSwitch || !environment.name || !environment.url" @click="openEnvironment(environment)">打开</button>
                 <button type="button" :disabled="busy" aria-label="删除环境" @click="removeEnvironment(index)">删除</button>
               </div>
               <button class="environment-add" type="button" :disabled="busy || snapshot.config.environments.length >= 32" @click="addEnvironment">新增环境</button>
@@ -1212,7 +1285,7 @@ async function exportDeploymentCheck() {
               <label><span>仓库索引签名</span><input v-model.trim="snapshot.config.pluginCatalogSignatureUrl" type="url" placeholder="https://plugins.example/catalog.sig.json" /></label>
             </details>
             <div class="toggles"><label><input v-model="snapshot.config.allowSwitch" type="checkbox" />允许环境切换</label><label><input v-model="snapshot.config.autoClose" type="checkbox" />关闭前确认</label><label><input v-model="snapshot.config.autoStart" type="checkbox" />开机自动启动</label></div>
-            <div class="actions"><button class="primary" type="submit" :disabled="busy">保存配置</button><button type="button" :disabled="busy || runtimeStatusStale" @click="openBusiness">进入业务系统</button></div>
+            <div class="actions"><button class="primary" type="submit" :disabled="busy">保存配置</button><button type="button" :disabled="busy || controlLoadFailed || runtimeStatusStale" @click="openBusiness">进入业务系统</button></div>
             <small class="config-path">配置位置：{{ snapshot.path }}</small>
           </form>
         </section>
@@ -1259,8 +1332,8 @@ async function exportDeploymentCheck() {
       </section>
 
       <section v-show="activeSection === 'security'" class="page" aria-labelledby="security-title">
-        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>快速检查用于日常状态刷新；正式交付前执行深度自检，实际启动当前插件宿主完成 Health 验证。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy || runtimeStatusStale" @click="runDeploymentCheck">深度自检</button><button type="button" :disabled="busy || runtimeStatusStale" @click="exportDeploymentCheck">导出深度自检记录</button><button type="button" :disabled="busy" @click="openDiagnosticsDirectory">打开日志目录</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
-        <section v-if="deploymentCheck" :class="['deployment-check', { ready: deploymentCheck.ready && !runtimeStatusStale }]" aria-label="部署自检结果">
+        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>快速检查用于日常状态刷新；正式交付前执行深度自检，实际启动当前插件宿主完成 Health 验证。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy || controlLoadFailed || runtimeStatusStale" @click="runDeploymentCheck">深度自检</button><button type="button" :disabled="busy || controlLoadFailed || runtimeStatusStale" @click="exportDeploymentCheck">导出深度自检记录</button><button type="button" :disabled="busy" @click="openDiagnosticsDirectory">打开日志目录</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
+        <section v-if="deploymentCheck" :class="['deployment-check', { ready: deploymentCheck.ready && !controlLoadFailed && !runtimeStatusStale }]" aria-label="部署自检结果">
           <header>
             <div><p class="eyebrow">{{ deploymentCheck.deep ? 'DEEP DEPLOYMENT CHECK' : 'QUICK DEPLOYMENT CHECK' }}</p><h2>{{ runtimeStatusStale ? '桌面核心通信中断，当前自检结论已过期' : deploymentCheck.ready ? (deploymentCheck.deep ? '当前机器通过深度交付检查' : '快速检查未发现阻塞') : '部署条件尚未满足' }}</h2><p>{{ deploymentCheck.passed }} 项正常 · {{ deploymentCheck.warnings }} 项提醒 · {{ deploymentCheck.failures }} 项阻塞</p></div>
             <span>{{ runtimeStatusStale ? 'STATUS UNKNOWN' : deploymentCheck.ready ? (deploymentCheck.deep ? 'READY' : 'QUICK PASS') : 'ACTION REQUIRED' }}</span>

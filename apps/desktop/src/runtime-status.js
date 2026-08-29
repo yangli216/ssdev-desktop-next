@@ -28,7 +28,7 @@ export function updateRuntimeStatusHealth(current, event) {
   }
 }
 
-export async function withRuntimeStatusTimeout(
+export async function withBoundedTimeout(
   request,
   timeoutMs = RUNTIME_STATUS_REQUEST_TIMEOUT_MS,
 ) {

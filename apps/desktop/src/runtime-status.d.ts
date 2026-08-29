@@ -20,7 +20,7 @@ export function updateRuntimeStatusHealth(
   event: RuntimeStatusHealthEvent,
 ): RuntimeStatusHealthTransition
 
-export function withRuntimeStatusTimeout<T>(
+export function withBoundedTimeout<T>(
   request: Promise<T>,
   timeoutMs?: number,
 ): Promise<T>
