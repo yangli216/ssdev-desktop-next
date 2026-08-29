@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { appendFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
@@ -8,6 +9,7 @@ import { fileURLToPath } from 'node:url'
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const script = join(repositoryRoot, 'scripts', 'web-bridge-package.mjs')
+const consumerScript = join(repositoryRoot, 'scripts', 'web-integration-consumer.mjs')
 const artifactManifestName = 'ssdev-web-bridge-sdk.json'
 const workflow = join(repositoryRoot, '.github', 'workflows', 'ci.yml')
 
@@ -16,6 +18,101 @@ function run(...arguments_) {
     cwd: repositoryRoot,
     encoding: 'utf8',
   })
+}
+
+function sha256(bytes) {
+  return createHash('sha256').update(bytes).digest('hex')
+}
+
+function x86PeWithExport(name) {
+  const bytes = Buffer.alloc(1536)
+  bytes.write('MZ', 0, 'ascii')
+  const peOffset = 0x80
+  bytes.writeUInt32LE(peOffset, 0x3c)
+  bytes.write('PE\0\0', peOffset, 'binary')
+  const coff = peOffset + 4
+  bytes.writeUInt16LE(0x014c, coff)
+  bytes.writeUInt16LE(1, coff + 2)
+  const optionalSize = 224
+  bytes.writeUInt16LE(optionalSize, coff + 16)
+  const optional = coff + 20
+  bytes.writeUInt16LE(0x10b, optional)
+  bytes.writeUInt32LE(1, optional + 92)
+  bytes.writeUInt32LE(0x1000, optional + 96)
+  const section = optional + optionalSize
+  bytes.writeUInt32LE(0x1000, section + 8)
+  bytes.writeUInt32LE(0x1000, section + 12)
+  bytes.writeUInt32LE(0x400, section + 16)
+  bytes.writeUInt32LE(0x200, section + 20)
+  const exportDirectory = 0x200
+  bytes.writeUInt32LE(1, exportDirectory + 24)
+  bytes.writeUInt32LE(0x1040, exportDirectory + 32)
+  bytes.writeUInt32LE(0x1080, 0x240)
+  bytes.write(name, 0x280, 'ascii')
+  return bytes
+}
+
+async function createGeneratedWebKit(root) {
+  const plugin = join(root, 'reader-plugin')
+  const kit = join(root, 'reader-web-kit')
+  const matrix = join(root, 'reader-matrix.json')
+  await mkdir(plugin)
+  await writeFile(
+    join(plugin, 'api.json'),
+    '{"serviceId":"reader","mainClass":"reader.dll","architecture":"x86","methods":[{"name":"read","alias":"readCard","parameters":["timeout"]}]}',
+  )
+  await writeFile(join(plugin, 'reader.dll'), x86PeWithExport('read'))
+  await writeFile(join(plugin, 'plugin.json'), JSON.stringify({
+    schemaVersion: 1,
+    pluginId: 'reader-plugin',
+    version: '2.3.1',
+    displayName: 'Patient Reader',
+  }))
+  await writeFile(matrix, JSON.stringify({
+    schemaVersion: 1,
+    draft: false,
+    plugins: [{ pluginId: 'reader-plugin', version: '2.3.1' }],
+    cases: [{
+      name: 'reviewed-read',
+      request: {
+        serviceId: 'reader',
+        method: 'read',
+        parameters: { timeout: 5 },
+      },
+      expected: {
+        ResCode: 0,
+        ResData: { ReturnValue: 0, cardNumber: 'TEST-001' },
+      },
+    }],
+  }))
+  const generated = spawnSync('cargo', [
+    'run',
+    '--quiet',
+    '--locked',
+    '-p',
+    'ssdev-plugin-tool',
+    '--',
+    'web-kit',
+    '--plugin-dir',
+    plugin,
+    '--matrix',
+    matrix,
+    '--destination',
+    kit,
+  ], { cwd: repositoryRoot, encoding: 'utf8' })
+  assert.equal(generated.status, 0, generated.stderr)
+  return kit
+}
+
+function runConsumer(kit, sdkDirectory) {
+  return spawnSync(process.execPath, [
+    consumerScript,
+    'verify',
+    '--kit',
+    kit,
+    '--sdk-directory',
+    sdkDirectory,
+  ], { cwd: repositoryRoot, encoding: 'utf8' })
 }
 
 test('builds and verifies a reproducible bounded Web Bridge SDK artifact', async (context) => {
@@ -47,6 +144,34 @@ test('builds and verifies a reproducible bounded Web Bridge SDK artifact', async
   assert.equal(report.sha256, firstManifest.sha256)
   assert.equal(Object.hasOwn(report, 'directory'), false)
   assert.equal(Object.hasOwn(report, 'output'), false)
+
+  const kit = await createGeneratedWebKit(root)
+  const consumed = runConsumer(kit, first)
+  assert.equal(consumed.status, 0, consumed.stderr)
+  const consumerReport = JSON.parse(consumed.stdout)
+  assert.equal(consumerReport.pluginId, 'reader-plugin')
+  assert.equal(consumerReport.pluginVersion, '2.3.1')
+  assert.equal(consumerReport.sdkPackageName, '@bsoft/ssdev-web-bridge')
+  assert.equal(consumerReport.sdkPackageVersion, '0.1.0')
+  assert.equal(consumerReport.sdkArchiveSha256, firstManifest.sha256)
+  assert.equal(consumerReport.offlineInstallVerified, true)
+  assert.equal(consumerReport.typescriptCompileVerified, true)
+  assert.equal(consumerReport.runtimeRoutesVerified, true)
+  assert.equal(consumerReport.verified, true)
+  assert.equal(Object.hasOwn(consumerReport, 'kit'), false)
+  assert.equal(Object.hasOwn(consumerReport, 'sdkDirectory'), false)
+
+  const kitClientPath = join(kit, 'client.ts')
+  const kitManifestPath = join(kit, 'ssdev-web-kit.json')
+  const kitClient = await readFile(kitClientPath, 'utf8')
+  const incompatibleClient = `${kitClient}\nexport type MissingSdkContract = import('@bsoft/ssdev-web-bridge').DefinitelyMissingSdkType\n`
+  await writeFile(kitClientPath, incompatibleClient)
+  const kitManifest = JSON.parse(await readFile(kitManifestPath, 'utf8'))
+  kitManifest.files.client.sha256 = sha256(incompatibleClient)
+  await writeFile(kitManifestPath, `${JSON.stringify(kitManifest, null, 2)}\n`)
+  const incompatible = runConsumer(kit, first)
+  assert.notEqual(incompatible.status, 0)
+  assert.match(incompatible.stderr, /TypeScript consumer compile failed/)
 
   const existingTarget = run('build', '--output', second)
   assert.notEqual(existingTarget.status, 0)

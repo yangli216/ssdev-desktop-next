@@ -235,7 +235,7 @@ void consume()
   }
 }
 
-async function verifyArtifactDirectory(directory) {
+export async function verifyArtifactDirectory(directory) {
   await realDirectory(directory, 'SDK artifact directory')
   const entries = (await readdir(directory)).sort()
   if (entries.length !== 2 || !entries.includes(artifactManifestName)) {
@@ -344,7 +344,9 @@ async function main() {
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`)
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
-  process.exitCode = 1
-})
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
+    process.exitCode = 1
+  })
+}

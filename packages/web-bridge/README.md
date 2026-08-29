@@ -35,6 +35,16 @@ fixture 按 service、method 和完整 JSON 参数精确匹配，对象键顺序
 
 单插件正式交接优先使用 `ssdev-plugin-tool web-kit`，一次生成同版本的 `client.ts`、`fixtures.ts` 和 `ssdev-web-kit.json`。清单绑定插件 ID/版本、API、元数据、矩阵和两个 TypeScript 文件摘要，生成失败不会留下部分目录，避免业务项目把新版客户端与旧版 fixture 混用。业务 CI 使用 `ssdev-plugin-tool web-kit-check --kit <目录>` 拒绝缺失、额外、链接或摘要漂移文件；该检查只验证未签名目录相对自身清单的一致性。接入包是待代码评审的源码制品，不包含原生组件，也不替代插件签名或 Windows 实机验收。
 
+接收 Web 接入包和 SDK 制品后，还应在二者对应的 SSDEV 源码提交中执行组合门禁：
+
+```bash
+node scripts/web-integration-consumer.mjs verify \
+  --kit vendor/reader-2.3.1-web-kit \
+  --sdk-directory artifacts/ssdev-web-bridge-sdk
+```
+
+该命令先复核 Web kit 固定文件集、摘要和来源头，再复核 SDK `.tgz`、当前锁定源码摘要及其已有消费者冒烟证据；随后只使用已校验的内存快照，在临时业务项目中禁用生命周期脚本并离线安装 SDK，以严格 NodeNext 配置编译 `client.ts + fixtures.ts`，最后通过 SDK fixture invoker 实际覆盖生成客户端的每个公开方法和每条 fixture route。成功报告绑定插件版本、kit 清单摘要、SDK 版本、归档/源码摘要与覆盖计数，不返回本机路径。它证明这两份精确制品当前可以组合消费，但二者仍是未签名的前端交接物，不能替代受保护分支评审、插件签名或 Windows 硬件矩阵。
+
 `connectDesktop()` 会先读取并运行时校验最小系统声明，再检查协议版本。页面不在授权桌面窗口中时抛出 `DesktopBridgeUnavailableError`；系统声明损坏或与当前能力 schema 自相矛盾时抛出带稳定 `reason` 的 `InvalidDesktopDeclarationError`；协议不兼容时抛出 `UnsupportedDesktopProtocolError`。业务代码应显示客户端升级或修复提示，不要把这些错误静默切换到 HTTP。
 
 能力 schema 与桥接协议独立演进。SDK 对当前 schema 严格检查布尔状态、错误码和全部容量边界；遇到更高的未知 schema 时保留并冻结原声明，但 `getTrackedInvocationCapabilities()` 返回 `null`，不会仅因可选 JavaScript 方法存在就误报持久调用可用。升级 SDK 后才能使用新 schema 的能力。
