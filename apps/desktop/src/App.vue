@@ -387,6 +387,7 @@ const configDraftDirty = computed(() => (
   snapshot.value != null
   && configFingerprint(snapshot.value.config) !== savedConfigFingerprint.value
 ))
+const projectDeliveryDraftDirty = computed(() => configDraftDirty.value || mappingDraftDirty.value)
 const controlStateUnverified = computed(() => (
   controlLoadFailed.value || controlRefreshIncomplete.value || runtimeStatusStale.value
 ))
@@ -407,6 +408,12 @@ const deploymentReadiness = computed(() => {
     return {
       label: '配置未保存',
       detail: '当前自检结论仅对应磁盘中的有效配置',
+    }
+  }
+  if (mappingDraftDirty.value) {
+    return {
+      label: '映射未保存',
+      detail: '当前自检结论不包含原生映射工作台草稿',
     }
   }
   if (runtimeStatusStale.value) {
@@ -620,6 +627,18 @@ function requireSavedConfig(action: string): boolean {
   error.value = `项目配置有未保存更改。请先保存或放弃更改，再${action}。`
   activeSection.value = 'configuration'
   return false
+}
+
+function requireSavedMapping(action: string): boolean {
+  if (!mappingDraftDirty.value) return true
+  notice.value = ''
+  error.value = `原生映射工作台有未保存更改。请先保存或放弃映射草稿，再${action}。`
+  activeSection.value = 'native'
+  return false
+}
+
+function requireCleanProjectDrafts(action: string): boolean {
+  return requireSavedConfig(action) && requireSavedMapping(action)
 }
 
 function preventConfigDraftUnload(event: BeforeUnloadEvent) {
@@ -928,7 +947,7 @@ async function exportConfig() {
 }
 
 async function exportProjectBundle() {
-  if (!requireSavedConfig('导出项目部署包')) return
+  if (!requireCleanProjectDrafts('导出项目部署包')) return
   const destination = await save({
     defaultPath: 'ssdev-project.ssdev-project',
     filters: [{ name: 'SSDEV 项目部署包', extensions: ['ssdev-project'] }],
@@ -944,7 +963,7 @@ async function exportProjectBundle() {
 }
 
 async function inspectProjectBundle() {
-  if (!requireSavedConfig('预检项目部署包')) return
+  if (!requireCleanProjectDrafts('预检项目部署包')) return
   const source = await open({
     multiple: false,
     directory: false,
@@ -1076,6 +1095,7 @@ async function selectPluginPackage() {
 }
 
 async function confirmPluginPackageInstall() {
+  if (!requireCleanProjectDrafts('安装签名插件')) return
   if (!pluginPackagePreview.value || !selectedPluginPackage.value) {
     error.value = '请先选择并预检签名插件包。'
     return
@@ -1111,6 +1131,7 @@ function cancelPluginPackageInstall() {
 }
 
 async function uninstallSignedPlugin(pluginId: string, displayName: string) {
+  if (!requireCleanProjectDrafts('卸载签名插件')) return
   if (!window.confirm(`确定卸载签名插件「${displayName}」(${pluginId}) 吗？对应原生服务将立即停止。`)) return
   const outcome = await runPrimaryThenRefresh(async () => {
     await invoke('uninstall_signed_plugin', { pluginId })
@@ -1123,6 +1144,7 @@ async function uninstallSignedPlugin(pluginId: string, displayName: string) {
 }
 
 async function reloadPlugins() {
+  if (!requireCleanProjectDrafts('重新扫描插件目录')) return
   const outcome = await runPrimaryThenRefresh(async () => {
     await invoke('reload_plugins')
     pluginUpdates.value = null
@@ -1175,6 +1197,7 @@ async function checkPluginUpdates(requestedPluginId?: string) {
 }
 
 async function installFromCatalog(pluginId: string, version?: string, installPlanId?: string, action: CatalogInstallAction = 'upgrade') {
+  if (!requireCleanProjectDrafts('变更签名插件版本')) return
   if (!pluginId.trim() || !version || !installPlanId) {
     error.value = '请先检查仓库并选择明确的插件版本。'
     return
@@ -1220,6 +1243,7 @@ async function checkAppUpdate() {
 }
 
 async function installAppUpdate() {
+  if (!requireCleanProjectDrafts('安装应用更新')) return
   if (!appUpdate.value?.available || !appUpdate.value.compatible || !appUpdate.value.installPlanId) {
     error.value = appUpdate.value?.available
       ? appUpdate.value.compatible
@@ -1282,6 +1306,7 @@ async function openDiagnosticsDirectory() {
 }
 
 async function runDeploymentCheck() {
+  if (!requireCleanProjectDrafts('执行深度部署自检')) return
   let result: DeploymentCheckReport | undefined
   const outcome = await runPrimaryThenRefresh(async () => {
     result = await invoke<DeploymentCheckReport>('run_deployment_check', { deep: true })
@@ -1297,6 +1322,7 @@ async function runDeploymentCheck() {
 }
 
 async function exportDeploymentCheck() {
+  if (!requireCleanProjectDrafts('导出深度部署自检记录')) return
   const destination = await save({
     defaultPath: `ssdev-deployment-check-${new Date().toISOString().slice(0, 10)}.json`,
     filters: [{ name: 'SSDEV 部署自检记录', extensions: ['json'] }],
@@ -1402,14 +1428,15 @@ async function exportDeploymentCheck() {
           </section>
         </div>
 
-        <section v-if="controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || configDraftDirty || needsDeepDeploymentCheck || deploymentCheck?.failures || status?.businessTimedOutWindows || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
+        <section v-if="controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || projectDeliveryDraftDirty || needsDeepDeploymentCheck || deploymentCheck?.failures || status?.businessTimedOutWindows || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
           <div><p class="eyebrow">ATTENTION</p><h2>待处理事项</h2></div>
           <ul>
             <li v-if="controlLoadFailed"><strong>控制台初始化未完成，不能确认当前项目和原生能力状态</strong><button type="button" :disabled="controlLoadActive" @click="retryControlLoad">重新加载</button></li>
             <li v-if="controlRefreshIncomplete"><strong>已完成的操作仍有 {{ controlRefreshMissing.length }} 类页面状态待刷新，请勿重复执行</strong><button type="button" :disabled="busy || controlRefreshActive" @click="retryControlStateRefresh">刷新状态</button></li>
             <li v-if="runtimeStatusStale"><strong>桌面核心通信中断，所有运行状态和部署结论均已标记为未知</strong><button type="button" :disabled="busy || statusRefreshActive" @click="retryRuntimeStatus">重新连接</button></li>
             <li v-if="configDraftDirty"><strong>项目配置有未保存更改，业务启动、原生能力变更和项目交付操作已暂停</strong><button type="button" @click="activeSection = 'configuration'">处理配置</button></li>
-            <li v-if="needsDeepDeploymentCheck"><strong>快速检查已通过，正式交付前还需验证当前 x86/x64 插件宿主</strong><button type="button" :disabled="busy || controlStateUnverified || configDraftDirty" @click="runDeploymentCheck">立即深度自检</button></li>
+            <li v-if="mappingDraftDirty"><strong>原生映射工作台有未保存更改，插件变更、应用更新和项目交付操作已暂停</strong><button type="button" @click="activeSection = 'native'">处理映射</button></li>
+            <li v-if="needsDeepDeploymentCheck"><strong>快速检查已通过，正式交付前还需验证当前 x86/x64 插件宿主</strong><button type="button" :disabled="busy || controlStateUnverified || projectDeliveryDraftDirty" @click="runDeploymentCheck">立即深度自检</button></li>
             <li v-if="deploymentCheck?.failures"><strong>部署自检存在 {{ deploymentCheck.failures }} 项阻塞问题</strong><button type="button" @click="activeSection = 'security'">查看自检</button></li>
             <li v-if="status?.businessTimedOutWindows"><strong>{{ status.businessTimedOutWindows }} 个业务页面加载失败或未到达原生 IPC</strong><button type="button" :disabled="busy || controlStateUnverified" @click="retryTimedOutBusinessWindows">仅重试失败窗口</button></li>
             <li v-if="inventory?.quarantined.length"><strong>{{ inventory.quarantined.length }} 个插件已隔离</strong><button type="button" @click="activeSection = 'plugins'">查看插件</button></li>
@@ -1449,7 +1476,7 @@ async function exportDeploymentCheck() {
         </section>
         <section class="project-bundle-panel">
           <div class="project-bundle-copy"><p class="eyebrow">PROJECT DELIVERY</p><h2>项目部署包</h2><p>将当前配置、签名插件和本地映射作为一个交付单元迁移到目标 Windows 机器；正式导入要求同目录组织签名旁签。</p></div>
-          <div class="project-bundle-actions"><button type="button" :disabled="busy || controlStateUnverified || configDraftDirty" @click="exportProjectBundle">导出当前项目</button><button class="primary" type="button" :disabled="busy || controlStateUnverified || configDraftDirty" @click="inspectProjectBundle">选择项目包并预检</button></div>
+          <div class="project-bundle-actions"><button type="button" :disabled="busy || controlStateUnverified || projectDeliveryDraftDirty" @click="exportProjectBundle">导出当前项目</button><button class="primary" type="button" :disabled="busy || controlStateUnverified || projectDeliveryDraftDirty" @click="inspectProjectBundle">选择项目包并预检</button></div>
           <div v-if="projectBundlePreview" class="project-bundle-preview">
             <header><div><strong>变更计划已验证，可以导入</strong><small>由客户端 {{ projectBundlePreview.createdByVersion }} 创建 · schema {{ projectBundlePreview.schemaVersion }} · {{ projectBundlePreview.signatureVerified ? `组织签名 ${projectBundlePreview.signatureKeyId}` : '调试态未签名' }}</small></div><button class="primary" type="button" :disabled="busy || controlStateUnverified" @click="importSelectedProjectBundle">确认计划并切换项目</button></header>
             <div class="bundle-summary"><span><strong>{{ projectBundlePreview.businessOrigins }}</strong>业务来源</span><span><strong>{{ projectBundlePreview.signedPlugins }}</strong>签名插件</span><span><strong>{{ projectBundlePreview.localMappings }}</strong>本地映射</span><span><strong>{{ projectBundlePreview.serviceCount }}</strong>原生服务</span><span><strong>{{ projectBundlePreview.preflightedHosts }}</strong>宿主预检</span></div>
@@ -1526,7 +1553,7 @@ async function exportDeploymentCheck() {
         />
       </section>
 
-      <section v-show="activeSection === 'plugins'" class="page" aria-labelledby="plugins-title" :inert="controlStateUnverified || configDraftDirty">
+      <section v-show="activeSection === 'plugins'" class="page" aria-labelledby="plugins-title" :inert="controlStateUnverified || projectDeliveryDraftDirty">
         <header class="section-header"><div><p class="eyebrow">PLUGIN MANAGEMENT</p><h1 id="plugins-title">插件管理</h1><p>管理签名插件包、本机动态映射和仓库更新。</p></div><div class="header-actions"><button type="button" :disabled="busy" @click="selectPluginPackage">选择签名插件</button><button type="button" :disabled="busy || controlStateUnverified" @click="reloadPlugins">重新扫描</button></div></header>
         <section v-if="pluginPackagePreview" class="plugin-package-preview" aria-label="签名插件安装预览">
           <header>
@@ -1556,11 +1583,11 @@ async function exportDeploymentCheck() {
       </section>
 
       <section v-show="activeSection === 'security'" class="page" aria-labelledby="security-title">
-        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>快速检查用于日常状态刷新；正式交付前执行深度自检，实际启动当前插件宿主完成 Health 验证。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || configDraftDirty" @click="runDeploymentCheck">深度自检</button><button type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || configDraftDirty" @click="exportDeploymentCheck">导出深度自检记录</button><button type="button" :disabled="busy" @click="openDiagnosticsDirectory">打开日志目录</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
-        <section v-if="deploymentCheck" :class="['deployment-check', { ready: deploymentCheck.ready && !controlLoadFailed && !controlRefreshIncomplete && !runtimeStatusStale && !configDraftDirty }]" aria-label="部署自检结果">
+        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>快速检查用于日常状态刷新；正式交付前执行深度自检，实际启动当前插件宿主完成 Health 验证。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || projectDeliveryDraftDirty" @click="runDeploymentCheck">深度自检</button><button type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || projectDeliveryDraftDirty" @click="exportDeploymentCheck">导出深度自检记录</button><button type="button" :disabled="busy" @click="openDiagnosticsDirectory">打开日志目录</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
+        <section v-if="deploymentCheck" :class="['deployment-check', { ready: deploymentCheck.ready && !controlLoadFailed && !controlRefreshIncomplete && !runtimeStatusStale && !projectDeliveryDraftDirty }]" aria-label="部署自检结果">
           <header>
-            <div><p class="eyebrow">{{ deploymentCheck.deep ? 'DEEP DEPLOYMENT CHECK' : 'QUICK DEPLOYMENT CHECK' }}</p><h2>{{ controlRefreshIncomplete ? '操作后的项目状态尚未完整刷新' : runtimeStatusStale ? '桌面核心通信中断，当前自检结论已过期' : configDraftDirty ? '项目配置草稿尚未保存，当前结论只对应有效配置' : deploymentCheck.ready ? (deploymentCheck.deep ? '当前机器通过深度交付检查' : '快速检查未发现阻塞') : '部署条件尚未满足' }}</h2><p>{{ deploymentCheck.passed }} 项正常 · {{ deploymentCheck.warnings }} 项提醒 · {{ deploymentCheck.failures }} 项阻塞</p></div>
-            <span>{{ controlRefreshIncomplete || runtimeStatusStale ? 'STATUS UNKNOWN' : configDraftDirty ? 'DRAFT NOT CHECKED' : deploymentCheck.ready ? (deploymentCheck.deep ? 'READY' : 'QUICK PASS') : 'ACTION REQUIRED' }}</span>
+            <div><p class="eyebrow">{{ deploymentCheck.deep ? 'DEEP DEPLOYMENT CHECK' : 'QUICK DEPLOYMENT CHECK' }}</p><h2>{{ controlRefreshIncomplete ? '操作后的项目状态尚未完整刷新' : runtimeStatusStale ? '桌面核心通信中断，当前自检结论已过期' : configDraftDirty ? '项目配置草稿尚未保存，当前结论只对应有效配置' : mappingDraftDirty ? '原生映射草稿尚未保存，当前结论只对应已激活映射' : deploymentCheck.ready ? (deploymentCheck.deep ? '当前机器通过深度交付检查' : '快速检查未发现阻塞') : '部署条件尚未满足' }}</h2><p>{{ deploymentCheck.passed }} 项正常 · {{ deploymentCheck.warnings }} 项提醒 · {{ deploymentCheck.failures }} 项阻塞</p></div>
+            <span>{{ controlRefreshIncomplete || runtimeStatusStale ? 'STATUS UNKNOWN' : projectDeliveryDraftDirty ? 'DRAFT NOT CHECKED' : deploymentCheck.ready ? (deploymentCheck.deep ? 'READY' : 'QUICK PASS') : 'ACTION REQUIRED' }}</span>
           </header>
           <div class="check-list">
             <article v-for="item in deploymentCheck.items" :key="item.id" :class="`check-${item.status}`">
@@ -1593,7 +1620,7 @@ async function exportDeploymentCheck() {
             </article>
           </div>
         </details>
-        <section class="maintenance-panel"><div><p class="eyebrow">CLIENT MAINTENANCE</p><h2>客户端维护</h2><p>{{ status?.appUpdateError ?? (status?.appUpdateConfigured ? '应用更新包必须通过签名验证，并与当前插件及本地映射兼容。' : '当前构建未配置生产更新端点。') }}</p></div><div class="maintenance-actions"><button type="button" :disabled="busy || !status?.appUpdateConfigured" @click="checkAppUpdate">检查应用更新</button><button class="primary" type="button" :disabled="busy || controlStateUnverified || !appUpdate?.available || !appUpdate.compatible || !appUpdate.installPlanId" @click="installAppUpdate">安装签名更新</button></div><details v-if="appUpdate?.available" class="update-details" open><summary>版本 {{ appUpdate.version }}{{ appUpdate.date ? ` · ${appUpdate.date}` : '' }}</summary><p v-if="!appUpdate.compatible">{{ appUpdate.capabilityBlockers }} 个插件或本地映射阻止升级；请先修复对应能力。</p><p>{{ appUpdate.notes || '此版本未提供发布说明。' }}</p><small v-if="updateProgress">{{ updateProgress }}</small></details></section>
+        <section class="maintenance-panel"><div><p class="eyebrow">CLIENT MAINTENANCE</p><h2>客户端维护</h2><p>{{ status?.appUpdateError ?? (status?.appUpdateConfigured ? '应用更新包必须通过签名验证，并与当前插件及本地映射兼容。' : '当前构建未配置生产更新端点。') }}</p></div><div class="maintenance-actions"><button type="button" :disabled="busy || !status?.appUpdateConfigured" @click="checkAppUpdate">检查应用更新</button><button class="primary" type="button" :disabled="busy || controlStateUnverified || projectDeliveryDraftDirty || !appUpdate?.available || !appUpdate.compatible || !appUpdate.installPlanId" @click="installAppUpdate">安装签名更新</button></div><details v-if="appUpdate?.available" class="update-details" open><summary>版本 {{ appUpdate.version }}{{ appUpdate.date ? ` · ${appUpdate.date}` : '' }}</summary><p v-if="!appUpdate.compatible">{{ appUpdate.capabilityBlockers }} 个插件或本地映射阻止升级；请先修复对应能力。</p><p>{{ appUpdate.notes || '此版本未提供发布说明。' }}</p><small v-if="updateProgress">{{ updateProgress }}</small></details></section>
         <section class="boundary"><div><p class="eyebrow">TRUST BOUNDARY</p><h2>第三方 DLL 永不进入主进程</h2></div><ol><li><b>业务 WebView</b><span>只调用受限的业务命令</span></li><li><b>Rust Controller</b><span>执行路由、策略、超时和监督</span></li><li><b>Plugin Host</b><span>加载 DLL、COM、OCX、EXE 或 BAT</span></li></ol></section>
       </section>
     </main>

@@ -53,7 +53,7 @@ test('control console exposes stale status and blocks new business launches', as
   assert.match(source, /runtimeStatusStale[^\n]+部署状态无法确认/)
   assert.match(source, /busy \|\| controlLoadFailed \|\| controlRefreshIncomplete \|\| runtimeStatusStale \|\| configDraftDirty \|\| !snapshot\?\.config\.website/)
   assert.match(source, /桌面核心状态连续刷新失败/)
-  assert.match(source, /ready: deploymentCheck\.ready && !controlLoadFailed && !controlRefreshIncomplete && !runtimeStatusStale && !configDraftDirty/)
+  assert.match(source, /ready: deploymentCheck\.ready && !controlLoadFailed && !controlRefreshIncomplete && !runtimeStatusStale && !projectDeliveryDraftDirty/)
   assert.match(source, /controlRefreshIncomplete \|\| runtimeStatusStale \? 'STATUS UNKNOWN'/)
   assert.match(source, /以下明细尚未在最近操作后全部复核，仅供定位/)
   assert.match(source, /withBoundedTimeout\(invoke<BridgeStatus>\('bridge_status'\)\)/)

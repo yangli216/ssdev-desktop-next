@@ -34,7 +34,7 @@ test('post-action refresh is bounded, field-isolated, and does not expose read e
   assert.match(source, /const controlStateUnverified = computed/)
   assert.match(source, /type="submit" :disabled="busy \|\| controlStateUnverified \|\| !configDraftDirty">保存配置/)
   assert.match(source, /:disabled="busy \|\| controlStateUnverified" @click="confirmPluginPackageInstall"/)
-  assert.match(source, /:disabled="busy \|\| controlStateUnverified \|\| !appUpdate\?\.available/)
+  assert.match(source, /:disabled="busy \|\| controlStateUnverified \|\| projectDeliveryDraftDirty \|\| !appUpdate\?\.available/)
   assert.match(source, /pluginUpdates\.value = null\s+appUpdate\.value = null/)
   assert.match(source, /runPrimaryThenRefresh\([\s\S]+invoke\('retry_plugin_host'/)
 })
