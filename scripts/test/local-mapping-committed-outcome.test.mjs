@@ -21,6 +21,7 @@ test('committed mapping actions are not reported as failed by a follow-up invent
   const refresh = committed.indexOf('await refreshCommittedMapping(plan)')
 
   assert.ok(primary >= 0 && changed > primary && refresh > changed)
+  assert.equal(committed.match(/result = await action\(\)/g)?.length, 1)
   assert.match(source, /async function refreshCommittedMapping[\s\S]+操作已经完成，请勿重复执行，重新读取后再继续/)
   assert.match(source, /pendingInventoryRefresh\.value = plan[\s\S]+inventoryUnverified\.value = true/)
   assert.match(source, /MAPPING_INVENTORY_REFRESH_TIMEOUT_MS = 15_000/)

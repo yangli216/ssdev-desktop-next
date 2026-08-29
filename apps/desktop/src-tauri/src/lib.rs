@@ -3861,6 +3861,7 @@ async fn save_local_mapping(
     caller: WebviewWindow,
     state: State<'_, BridgeState>,
     definition: local_mappings::LocalMappingDefinition,
+    expected_existing: bool,
 ) -> Result<LocalMappingSaveResult, String> {
     desktop::require_control(&caller)?;
     let _install = state.install_lock.lock().await;
@@ -3869,6 +3870,10 @@ async fn save_local_mapping(
         return Err(format!(
             "映射 ID [{plugin_id}] 与签名插件冲突，请使用其他 ID"
         ));
+    }
+    let existing = local_mappings::mapping_target_exists(&state.local_mapping_root, &plugin_id)?;
+    if existing != expected_existing {
+        return Err("映射目标状态已变化，请重新读取映射清单后再保存".to_owned());
     }
     let root = state.local_mapping_root.clone();
     let prepared = tokio::task::spawn_blocking(move || local_mappings::prepare(&root, definition))

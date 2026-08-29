@@ -2,7 +2,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { mappingDeletionDiscardsDraft, mappingDraftTargetsPlugin } from './local-mapping-draft.js'
+import { mappingDeletionDiscardsDraft, mappingDraftTargetsPlugin, sameMappingPluginId } from './local-mapping-draft.js'
 
 type Architecture = 'x86' | 'x64'
 type MainType = 'dll' | 'com' | 'ocx' | 'exe' | 'bat'
@@ -168,7 +168,6 @@ const callableParameters = computed(() => (method.value?.parameters ?? []).filte
 const returnTypeOptions = computed(() => service.value?.mainType === 'dll'
   ? ['void', 'string', 'bool', 'int', 'uint', 'pointer']
   : ['void', 'string', 'bool', 'int', 'uint', 'pointer', 'float', 'double'])
-const mappingIsInstalled = computed(() => inventory.value.mappings.some((item) => item.pluginId === draft.value.pluginId))
 const editingStoredCase = computed(() => draft.value.debugCases.some((item) => item.name === debugCaseName.value.trim()))
 
 function newMethod(name = ''): MethodDefinition {
@@ -243,6 +242,11 @@ function mappingForSave(): LocalMappingDefinition {
 const savedDraft = ref<LocalMappingDefinition>(clone(mappingForSave()))
 const draftDirty = computed(() => JSON.stringify(mappingForSave()) !== JSON.stringify(savedDraft.value))
 const savedMappingPluginId = computed(() => savedDraft.value.pluginId.trim())
+const mappingIsInstalled = computed(() => inventory.value.mappings.some((item) => sameMappingPluginId(item.pluginId, draft.value.pluginId)))
+const editingInstalledMapping = computed(() => (
+  savedMappingPluginId.value !== ''
+  && inventory.value.mappings.some((item) => sameMappingPluginId(item.pluginId, savedMappingPluginId.value))
+))
 
 watch(draftDirty, (value) => {
   emit('dirty', value)
@@ -634,9 +638,14 @@ function useExport(name: string) {
 
 async function saveMapping() {
   const definition = mappingForSave()
+  const existingTarget = inventory.value.mappings.find((item) => sameMappingPluginId(item.pluginId, definition.pluginId))
+  const editingTarget = sameMappingPluginId(savedMappingPluginId.value, definition.pluginId)
+  if (existingTarget && !editingTarget && !window.confirm(`映射 ID「${definition.pluginId}」已经属于「${existingTarget.displayName || existingTarget.pluginId}」。继续将替换其原生组件、服务、方法和调试用例，确定继续吗？`)) return
+  if (existingTarget) definition.pluginId = existingTarget.pluginId
   await runCommittedMappingAction(
     () => invoke<{ pluginId: string; serviceCount: number; preflightedHosts: number }>('save_local_mapping', {
       definition,
+      expectedExisting: Boolean(existingTarget),
     }),
     (result) => ({
       action: 'upsert',
@@ -952,9 +961,10 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
     <form class="mapping-editor" :inert="busy || inventoryUnverified" @submit.prevent="saveMapping">
       <div v-if="draftDirty" class="draft-dirty" role="status">当前草稿有未保存更改；当前映射的调试、回归和导出已暂停</div>
       <div class="mapping-heading">
-        <label><span>映射 ID</span><input v-model.trim="draft.pluginId" required pattern="[A-Za-z0-9._-]+" placeholder="hospital-device" /></label>
+        <label><span>映射 ID</span><input v-model.trim="draft.pluginId" :disabled="editingInstalledMapping" required pattern="[A-Za-z0-9._-]+" placeholder="hospital-device" /></label>
         <label><span>显示名称</span><input v-model.trim="draft.displayName" required placeholder="院内设备接口" /></label>
       </div>
+      <p v-if="editingInstalledMapping" class="field-hint">已保存映射的 ID 是稳定路由身份，不能直接改名；需要新身份时请新建映射，验证后再单独删除旧映射。</p>
 
       <div class="service-tabs">
         <button

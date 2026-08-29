@@ -1138,6 +1138,36 @@ pub(crate) fn bounded_plugin_target(root: &Path, plugin_id: &str) -> Result<Path
     Ok(root.join(plugin_id))
 }
 
+pub(crate) fn mapping_target_exists(root: &Path, plugin_id: &str) -> Result<bool, String> {
+    validate_plugin_id(plugin_id)?;
+    match fs::read_dir(root) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|error| format!("无法检查本地映射目录: {error}"))?;
+                let Some(existing_id) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if existing_id != plugin_id && existing_id.eq_ignore_ascii_case(plugin_id) {
+                    return Err(format!(
+                        "映射 ID [{plugin_id}] 与现有映射 [{existing_id}] 仅大小写不同，请重新读取映射清单"
+                    ));
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("无法检查本地映射目录: {error}")),
+    }
+    let target = bounded_plugin_target(root, plugin_id)?;
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => Ok(true),
+        Ok(_) => Err(format!("本地映射 [{plugin_id}] 的目标不是安全的真实目录")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "无法检查本地映射 [{plugin_id}] 的目标状态: {error}"
+        )),
+    }
+}
+
 fn validate_plugin_id(plugin_id: &str) -> Result<(), String> {
     let path = Path::new(plugin_id);
     if plugin_id.trim().is_empty()
@@ -1802,6 +1832,19 @@ mod tests {
         assert!(bounded_plugin_target(Path::new("root"), "reader.local").is_ok());
         assert!(bounded_plugin_target(Path::new("root"), "../reader").is_err());
         assert!(bounded_plugin_target(Path::new("root"), ".hidden").is_err());
+    }
+
+    #[test]
+    fn mapping_target_state_distinguishes_missing_real_and_unsafe_targets() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(!mapping_target_exists(root.path(), "reader.local").unwrap());
+
+        fs::create_dir(root.path().join("reader.local")).unwrap();
+        assert!(mapping_target_exists(root.path(), "reader.local").unwrap());
+        assert!(mapping_target_exists(root.path(), "Reader.Local").is_err());
+
+        fs::write(root.path().join("not-a-directory"), b"unsafe").unwrap();
+        assert!(mapping_target_exists(root.path(), "not-a-directory").is_err());
     }
 
     #[test]

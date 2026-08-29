@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   mappingDeletionDiscardsDraft,
   mappingDraftTargetsPlugin,
+  sameMappingPluginId,
 } from '../../apps/desktop/src/local-mapping-draft.js'
 
 const studioVue = new URL('../../apps/desktop/src/LocalMappingStudio.vue', import.meta.url)
@@ -43,6 +44,14 @@ test('draft identity guards both the saved and edited plugin IDs without overblo
   assert.equal(mappingDeletionDiscardsDraft(renamedDraft, 'device-a'), false)
   assert.equal(mappingDeletionDiscardsDraft(renamedDraft, 'device-b'), true)
   assert.equal(mappingDeletionDiscardsDraft({ ...renamedDraft, dirty: false }, 'device-b'), false)
+})
+
+test('mapping identities use Windows-compatible ASCII case-insensitive comparison', () => {
+  assert.equal(sameMappingPluginId('Reader.Local', 'reader.local'), true)
+  assert.equal(sameMappingPluginId(' reader.local ', 'READER.LOCAL'), true)
+  assert.equal(sameMappingPluginId('', ''), false)
+  assert.equal(sameMappingPluginId('reader.local', 'reader-other.local'), false)
+  assert.equal(mappingDraftTargetsPlugin({ dirty: true, savedPluginId: 'Reader.Local', currentPluginId: '' }, 'reader.local'), true)
 })
 
 test('editing a mapping invalidates results produced by the previous activated snapshot', async () => {
