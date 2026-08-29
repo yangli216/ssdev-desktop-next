@@ -53,7 +53,9 @@ pub(crate) struct DeploymentPreflightFailure {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DeploymentCheckReport {
     pub(crate) deep: bool,
+    pub(crate) deep_available: bool,
     pub(crate) ready: bool,
+    pub(crate) delivery_ready: bool,
     pub(crate) passed: usize,
     pub(crate) warnings: usize,
     pub(crate) failures: usize,
@@ -523,9 +525,12 @@ pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
         .iter()
         .filter(|check| check.status == DeploymentCheckStatus::Fail)
         .count();
+    let ready = failures == 0;
     DeploymentCheckReport {
         deep: facts.deep_preflight,
-        ready: failures == 0,
+        deep_available: facts.is_windows,
+        ready,
+        delivery_ready: facts.is_windows && facts.deep_preflight && ready,
         passed,
         warnings,
         failures,
@@ -619,7 +624,9 @@ mod tests {
     fn healthy_offline_windows_deployment_is_ready() {
         let report = evaluate(&healthy_facts());
         assert!(report.deep);
+        assert!(report.deep_available);
         assert!(report.ready);
+        assert!(report.delivery_ready);
         assert_eq!(report.failures, 0);
         assert!(report.passed >= 8);
         assert_eq!(report.warnings, 0);
@@ -634,6 +641,7 @@ mod tests {
 
         let report = evaluate(&facts);
         assert!(!report.ready);
+        assert!(!report.delivery_ready);
         assert_eq!(report.failures, 3);
         assert!(report.items.iter().any(|item| {
             item.id == "plugin-hosts" && item.status == DeploymentCheckStatus::Fail
@@ -654,6 +662,7 @@ mod tests {
 
         let report = evaluate(&facts);
         assert!(report.ready);
+        assert!(!report.delivery_ready);
         assert_eq!(report.failures, 0);
         assert_eq!(report.warnings, 3);
     }
@@ -662,11 +671,15 @@ mod tests {
     fn non_windows_development_skips_host_file_gate() {
         let mut facts = healthy_facts();
         facts.is_windows = false;
+        facts.deep_preflight = false;
+        facts.deep_preflighted_hosts = 0;
         facts.x86_host_available = false;
         facts.x64_host_available = false;
 
         let report = evaluate(&facts);
         assert!(report.ready);
+        assert!(!report.deep_available);
+        assert!(!report.delivery_ready);
         assert!(report.items.iter().any(|item| {
             item.id == "plugin-hosts" && item.status == DeploymentCheckStatus::Info
         }));
@@ -681,7 +694,9 @@ mod tests {
         let report = evaluate(&facts);
 
         assert!(!report.deep);
+        assert!(report.deep_available);
         assert!(report.ready);
+        assert!(!report.delivery_ready);
         assert!(report.items.iter().any(|item| {
             item.id == "plugin-preflight"
                 && item.status == DeploymentCheckStatus::Info
@@ -703,6 +718,7 @@ mod tests {
 
         assert!(report.deep);
         assert!(!report.ready);
+        assert!(!report.delivery_ready);
         assert!(report.items.iter().any(|item| {
             item.id == "plugin-preflight"
                 && item.status == DeploymentCheckStatus::Fail
@@ -771,6 +787,8 @@ mod tests {
         assert_eq!(value["evidenceLevel"], "unsigned-local-record");
         assert_eq!(value["desktopVersion"], "0.1.0");
         assert_eq!(value["report"]["ready"], false);
+        assert_eq!(value["report"]["deliveryReady"], false);
+        assert_eq!(value["report"]["deepAvailable"], true);
         assert!(bytes.len() < MAX_EXPORT_BYTES);
         assert!(!String::from_utf8(bytes)
             .unwrap()

@@ -2,7 +2,7 @@
 import { Channel, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import { onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import LocalMappingStudio from './LocalMappingStudio.vue'
 
 type BridgeStatus = {
@@ -87,7 +87,9 @@ type PluginHostStatus = BridgeStatus['pluginHosts'][number]
 
 type DeploymentCheckReport = {
   deep: boolean
+  deepAvailable: boolean
   ready: boolean
+  deliveryReady: boolean
   passed: number
   warnings: number
   failures: number
@@ -332,6 +334,42 @@ const mappingDraftDirty = ref(false)
 const mappingWorkspaceRevision = ref(0)
 type ConsoleSection = 'overview' | 'configuration' | 'native' | 'plugins' | 'security'
 const activeSection = ref<ConsoleSection>('overview')
+const deploymentReadiness = computed(() => {
+  const report = deploymentCheck.value
+  if (!report) {
+    return {
+      label: '检查中',
+      detail: '正在执行环境快速检查',
+    }
+  }
+  if (!report.ready) {
+    return {
+      label: '需要处理',
+      detail: `${report.failures} 项阻塞 · ${report.warnings} 项提醒`,
+    }
+  }
+  if (report.deliveryReady) {
+    return {
+      label: '可以交付',
+      detail: `${report.passed} 项深度检查通过 · ${report.warnings} 项提醒`,
+    }
+  }
+  if (report.deepAvailable) {
+    return {
+      label: '待深度检查',
+      detail: `${report.passed} 项快速检查通过 · 正式交付前需验证宿主`,
+    }
+  }
+  return {
+    label: '开发预览',
+    detail: '当前平台不提供 Windows 宿主交付检查',
+  }
+})
+const needsDeepDeploymentCheck = computed(() => (
+  deploymentCheck.value?.ready === true
+  && deploymentCheck.value.deepAvailable
+  && !deploymentCheck.value.deliveryReady
+))
 const sections: Array<{ id: ConsoleSection; label: string; description: string }> = [
   { id: 'overview', label: '运行概览', description: '状态与常用操作' },
   { id: 'configuration', label: '项目配置', description: '环境、来源与启动项' },
@@ -950,7 +988,7 @@ async function exportDeploymentCheck() {
           <article><span>桌面通信</span><strong>{{ status?.transport ?? '连接中' }}</strong><small>不开放 localhost 端口</small></article>
           <article><span>原生服务</span><strong>{{ status?.serviceCount ?? '—' }}</strong><small>{{ status?.pluginCount ?? '—' }} 个插件 · x86 / x64 隔离</small></article>
           <article><span>当前调用</span><strong>{{ status ? `${status.inFlightInvocations} / ${status.maxInFlightInvocations}` : '—' }}</strong><small>{{ status?.acceptingPluginInvocations ? '正在接受新调用' : '暂不接受新调用' }}</small></article>
-          <article><span>部署状态</span><strong>{{ deploymentCheck ? deploymentCheck.ready ? '可以交付' : '需要处理' : '检查中' }}</strong><small>{{ deploymentCheck ? `${deploymentCheck.failures} 项阻塞 · ${deploymentCheck.warnings} 项提醒` : '正在执行环境自检' }}</small></article>
+          <article><span>部署状态</span><strong>{{ deploymentReadiness.label }}</strong><small>{{ deploymentReadiness.detail }}</small></article>
         </section>
 
         <div class="overview-layout">
@@ -983,9 +1021,10 @@ async function exportDeploymentCheck() {
           </section>
         </div>
 
-        <section v-if="deploymentCheck?.failures || status?.pluginPreflightFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
+        <section v-if="needsDeepDeploymentCheck || deploymentCheck?.failures || status?.pluginPreflightFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
           <div><p class="eyebrow">ATTENTION</p><h2>待处理事项</h2></div>
           <ul>
+            <li v-if="needsDeepDeploymentCheck"><strong>快速检查已通过，正式交付前还需验证当前 x86/x64 插件宿主</strong><button type="button" :disabled="busy" @click="runDeploymentCheck">立即深度自检</button></li>
             <li v-if="deploymentCheck?.failures"><strong>部署自检存在 {{ deploymentCheck.failures }} 项阻塞问题</strong><button type="button" @click="activeSection = 'security'">查看自检</button></li>
             <li v-if="inventory?.quarantined.length"><strong>{{ inventory.quarantined.length }} 个插件已隔离</strong><button type="button" @click="activeSection = 'plugins'">查看插件</button></li>
             <li v-if="status?.pluginPreflightFailures"><strong>{{ status.pluginPreflightFailures }} 次宿主预检失败</strong><button type="button" @click="activeSection = 'security'">查看诊断</button></li>

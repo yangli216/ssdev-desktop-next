@@ -705,7 +705,9 @@ async fn run_deployment_check(
     tracing::info!(
         event_code = "deployment-check-completed",
         deep,
+        deep_available = report.deep_available,
         ready = report.ready,
+        delivery_ready = report.delivery_ready,
         passed = report.passed,
         warnings = report.warnings,
         failures = report.failures,
@@ -763,6 +765,7 @@ async fn export_deployment_check(
     tracing::info!(
         event_code = "deployment-check-exported",
         ready = report.ready,
+        delivery_ready = report.delivery_ready,
         passed = report.passed,
         warnings = report.warnings,
         failures = report.failures,
