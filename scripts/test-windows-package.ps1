@@ -5,6 +5,8 @@ param(
   [string]$DesktopTarget = "x86_64-pc-windows-msvc",
   [ValidateSet("OfflineInstaller", "DownloadBootstrapper")]
   [string]$ExpectedWebViewInstallMode = "OfflineInstaller",
+  [ValidateSet("OfflineInstaller", "DownloadBootstrapper")]
+  [string]$PreviousExpectedWebViewInstallMode,
   [string]$ProductName = "SSDEV Desktop",
   [string]$MainExecutableName = "ssdev-desktop-core.exe",
   [string]$ApplicationIdentifier = "com.bsoft.ssdev.desktop",
@@ -23,6 +25,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+if (-not $PreviousExpectedWebViewInstallMode) {
+  $PreviousExpectedWebViewInstallMode = $ExpectedWebViewInstallMode
+}
 
 $workspace = Split-Path -Parent $PSScriptRoot
 if (-not $BundleRoot) {
@@ -499,7 +505,8 @@ function Test-ReleaseArtifactManifest {
   param(
     [Parameter(Mandatory = $true)][string]$ReleaseBundleRoot,
     [Parameter(Mandatory = $true)][string]$ReleaseMetadataDirectory,
-    [Parameter(Mandatory = $true)][string]$ExpectedPublicKeyText
+    [Parameter(Mandatory = $true)][string]$ExpectedPublicKeyText,
+    [Parameter(Mandatory = $true)][string]$ExpectedProfileWebViewInstallMode
   )
   $policy = Join-Path $ReleaseMetadataDirectory "app-update.json"
   $manifestRelative = "metadata/artifacts.json"
@@ -535,7 +542,7 @@ function Test-ReleaseArtifactManifest {
     $packageProfile.schemaVersion -ne 1 -or
     $packageProfile.desktopTarget -ne $DesktopTarget -or
     $packageProfile.installerKind -ne "Nsis" -or
-    $packageProfile.webviewInstallMode -ne $ExpectedWebViewInstallMode
+    $packageProfile.webviewInstallMode -ne $ExpectedProfileWebViewInstallMode
   ) {
     throw "Release package profile does not match the requested architecture, installer kind, or WebView2 mode."
   }
@@ -888,14 +895,14 @@ $script:CandidateRelease = $null
 $script:CandidatePluginTrustStoreSha256 = $null
 $script:CandidateX86HostSha256 = $null
 $script:CandidateX64HostSha256 = $null
-Test-ReleaseArtifactManifest $BundleRoot $metadataDirectory $script:ExpectedUpdatePublicKeyText
+Test-ReleaseArtifactManifest $BundleRoot $metadataDirectory $script:ExpectedUpdatePublicKeyText $ExpectedWebViewInstallMode
 Test-ReleaseTrustPolicies $metadataDirectory
 $script:CandidateRelease = Get-ReleaseMetadata $BundleRoot -VerifyCurrentSource
 Test-UpdaterSignatures $BundleRoot $metadataDirectory $script:ExpectedUpdatePublicKeyText
 
 if ($PreviousBundleRoot) {
   $previousMetadataDirectory = Join-Path $PreviousBundleRoot "metadata"
-  Test-ReleaseArtifactManifest $PreviousBundleRoot $previousMetadataDirectory $script:PreviousExpectedUpdatePublicKeyText
+  Test-ReleaseArtifactManifest $PreviousBundleRoot $previousMetadataDirectory $script:PreviousExpectedUpdatePublicKeyText $PreviousExpectedWebViewInstallMode
   Test-ReleaseTrustPolicies $previousMetadataDirectory
   $script:PreviousRelease = Get-ReleaseMetadata $PreviousBundleRoot
   $previousVersion = [version]([string]$script:PreviousRelease.appVersion)

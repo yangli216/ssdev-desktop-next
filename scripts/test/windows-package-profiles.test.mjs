@@ -55,8 +55,9 @@ test("Windows package smoke verifies the selected package profile", async () => 
   assert.doesNotMatch(script, /\bmsiexec\b/i);
   assert.match(
     script,
-    /packageProfile\.webviewInstallMode -ne \$ExpectedWebViewInstallMode/,
+    /packageProfile\.webviewInstallMode -ne \$ExpectedProfileWebViewInstallMode/,
   );
+  assert.match(script, /PreviousExpectedWebViewInstallMode/);
 });
 
 test("Windows production bundles require project delivery signing trust", async () => {
@@ -93,6 +94,27 @@ test("CI publishes separate offline and online-light NSIS packages", async () =>
   assert.match(
     workflow.slice(onlineBuild, onlineUpload),
     /-ExpectedWebViewInstallMode DownloadBootstrapper/,
+  );
+  assert.match(
+    workflow.slice(onlineBuild, onlineUpload),
+    /-PreviousBundleRoot \$env:SSDEV_CI_PREVIOUS_BUNDLE/,
+  );
+  assert.match(
+    workflow.slice(onlineBuild, onlineUpload),
+    /-PreviousExpectedWebViewInstallMode OfflineInstaller/,
+  );
+});
+
+test("Windows upgrade gate permits a verified WebView2 package-profile transition", async () => {
+  const packageTest = await readFile(packageTestUrl, "utf8");
+
+  assert.match(
+    packageTest,
+    /Test-ReleaseArtifactManifest \$BundleRoot \$metadataDirectory \$script:ExpectedUpdatePublicKeyText \$ExpectedWebViewInstallMode/,
+  );
+  assert.match(
+    packageTest,
+    /Test-ReleaseArtifactManifest \$PreviousBundleRoot \$previousMetadataDirectory \$script:PreviousExpectedUpdatePublicKeyText \$PreviousExpectedWebViewInstallMode/,
   );
 });
 

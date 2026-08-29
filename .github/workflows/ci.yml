@@ -210,15 +210,17 @@ jobs:
           -WebViewInstallMode DownloadBootstrapper
           -AllowUnsignedTestBuild
           -SkipTests
-      - name: Install, launch, and uninstall online-light NSIS package
+      - name: Upgrade offline release to online-light, roll back, and uninstall
         shell: powershell
         run: >-
           ./scripts/test-windows-package.ps1
           -DesktopTarget ${{ matrix.target }}
+          -PreviousBundleRoot $env:SSDEV_CI_PREVIOUS_BUNDLE
           -ExpectedAppUpdatePublicKey $env:SSDEV_CI_UPDATE_PUBLIC_KEY
           -EvidenceOutput (Join-Path $env:RUNNER_TEMP "ssdev-windows-${{ matrix.arch }}-online-light-evidence.json")
           -EvidenceEnvironment github-windows-${{ matrix.arch }}-online-light-smoke
           -ExpectedWebViewInstallMode DownloadBootstrapper
+          -PreviousExpectedWebViewInstallMode OfflineInstaller
       - name: Upload unsigned online-light Windows test package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

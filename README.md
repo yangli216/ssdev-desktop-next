@@ -22,7 +22,7 @@ business webview -> narrow Tauri command -> Rust controller
 - controller 最多接受 8 个在途插件调用；容量饱和时在进入原生宿主前快速拒绝，不建立无界等待队列。
 - localhost HTTP 仅作为可关闭的旧浏览器兼容网关，不是新架构内部依赖。
 
-每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归；Windows 门禁还会实际生成并构建两种架构的最小 DLL 插件脚手架，用公开 RFC 8032 测试向量制作两个仅供 CI 的签名包，经过正式发布集合检查和物化后，由生产黄金矩阵包装器分别拉起已经构建的 Release x86/x64 宿主完成调用并核对 schema 2 证据。随后分别为 x64 与 x86 桌面构建 `0.0.1` 合成旧版本和当前候选版本，对离线 NSIS 执行原位升级、配置保留、布局/架构检查、候选启动、候选卸载、精确旧版回装、旧版启动和最终卸载；再额外构建在线轻量 NSIS 并执行安装、启动和卸载冒烟。Linux DEB/AppImage 和 macOS DMG 仅在手动选择 `all` 平台时构建。CI 测试签名密钥、临时更新密钥均非生产信任材料，平台代码签名也被明确跳过，产物不能分发；生产硬件矩阵仍必须输入候选安装包构建留下的已签名宿主原文件，CI Release 宿主不能替代该身份门禁。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
+每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归；Windows 门禁还会实际生成并构建两种架构的最小 DLL 插件脚手架，用公开 RFC 8032 测试向量制作两个仅供 CI 的签名包，经过正式发布集合检查和物化后，由生产黄金矩阵包装器分别拉起已经构建的 Release x86/x64 宿主完成调用并核对 schema 2 证据。随后分别为 x64 与 x86 桌面构建 `0.0.1` 离线合成旧版本和当前候选版本，对离线 NSIS 执行原位升级、配置保留、布局/架构检查、候选启动、候选卸载、精确旧版回装、旧版启动和最终卸载；再额外构建在线轻量候选，并从同一离线旧版重复跨 WebView2 供给模式的完整升级与回退链。Linux DEB/AppImage 和 macOS DMG 仅在手动选择 `all` 平台时构建。CI 测试签名密钥、临时更新密钥均非生产信任材料，平台代码签名也被明确跳过，产物不能分发；生产硬件矩阵仍必须输入候选安装包构建留下的已签名宿主原文件，CI Release 宿主不能替代该身份门禁。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
 
 架构决策和迁移门槛见 [docs/adr/0001-target-architecture.md](docs/adr/0001-target-architecture.md)。
 
@@ -196,10 +196,12 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
   -RequireAuthenticode `
   -ExpectedSignerSubject "<当前完整证书主题 DN>" `
   -PreviousExpectedSignerSubject "<上一版本完整证书主题 DN>" `
-  -PreviousExpectedAppUpdatePublicKey C:\release-inputs\previous\app-update.pub
+  -PreviousExpectedAppUpdatePublicKey C:\release-inputs\previous\app-update.pub `
+  -ExpectedWebViewInstallMode DownloadBootstrapper `
+  -PreviousExpectedWebViewInstallMode OfflineInstaller
 ```
 
-脚本要求旧版本号严格低于候选版本；它只在确认测试账户没有既有应用数据后，向 Windows 标准应用配置目录写入升级哨兵。候选升级后验证新版本启动和未知配置字段保留，再卸载候选、回装输入 bundle 中的精确上一版本，重新验证上一版本的 Authenticode、安装布局、启动事件和配置保留，最后卸载上一版本并清理由测试创建的数据。`upgradeVerified` 与 `rollbackVerified` 是两个独立证据字段；跳过启动或没有上一版本时不能得到回退通过。若未指定上一版本的证书主题或更新公钥，旧包默认必须与候选包使用相同信任材料；轮换时可分别通过 `-PreviousExpectedSignerSubject` 和 `-PreviousExpectedAppUpdatePublicKey` 显式提供旧信任锚。这是客户端安装层的受控回退演练，不声称能够逆转已经发生的硬件操作或业务系统副作用。
+脚本要求旧版本号严格低于候选版本；它只在确认测试账户没有既有应用数据后，向 Windows 标准应用配置目录写入升级哨兵。候选升级后验证新版本启动和未知配置字段保留，再卸载候选、回装输入 bundle 中的精确上一版本，重新验证上一版本的 Authenticode、安装布局、启动事件和配置保留，最后卸载上一版本并清理由测试创建的数据。`upgradeVerified` 与 `rollbackVerified` 是两个独立证据字段；跳过启动或没有上一版本时不能得到回退通过。上一版与候选的 WebView2 安装模式分别验证：未传 `-PreviousExpectedWebViewInstallMode` 时默认与候选相同；从历史离线版迁移到在线轻量版时按示例明确指定 `OfflineInstaller` → `DownloadBootstrapper`。两份 bundle 仍必须使用相同桌面架构，WebView2 模式差异只表示安装期运行时供给方式。若未指定上一版本的证书主题或更新公钥，旧包默认必须与候选包使用相同信任材料；轮换时可分别通过 `-PreviousExpectedSignerSubject` 和 `-PreviousExpectedAppUpdatePublicKey` 显式提供旧信任锚。这是客户端安装层的受控回退演练，不声称能够逆转已经发生的硬件操作或业务系统副作用。
 
 ## 真实插件黄金矩阵
 
