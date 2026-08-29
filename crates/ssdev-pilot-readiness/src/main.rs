@@ -1,6 +1,6 @@
 use ssdev_pilot_readiness::{
     inspect_materials, load_manifest, load_report, prepare_new_output, verify_materials,
-    write_report, PilotReadinessError,
+    write_report, PilotReadinessError, PilotReadinessReport,
 };
 use std::env;
 use std::ffi::OsString;
@@ -52,15 +52,7 @@ fn run_create(arguments: &[OsString]) -> Result<bool, PilotReadinessError> {
         ));
     }
     write_report(&output, &report)?;
-    println!(
-        "pilot material intake: {} ({} blockers)",
-        if report.intake_complete {
-            "COMPLETE"
-        } else {
-            "INCOMPLETE"
-        },
-        report.blocker_codes.len()
-    );
+    println!("{}", render_report_summary(&report, false));
     Ok(report.intake_complete)
 }
 
@@ -85,16 +77,49 @@ fn run_verify(arguments: &[OsString]) -> Result<bool, PilotReadinessError> {
             "manifest or report changed during verification".into(),
         ));
     }
-    println!(
-        "pilot material report verified: {} ({} blockers)",
-        if report.intake_complete {
-            "COMPLETE"
-        } else {
-            "INCOMPLETE"
-        },
-        report.blocker_codes.len()
-    );
+    println!("{}", render_report_summary(&report, true));
     Ok(report.intake_complete)
+}
+
+fn render_report_summary(report: &PilotReadinessReport, verified: bool) -> String {
+    let operation = if verified {
+        "pilot material report verified"
+    } else {
+        "pilot material intake"
+    };
+    let state = if report.intake_complete {
+        "COMPLETE"
+    } else {
+        "INCOMPLETE"
+    };
+    let mut lines = vec![format!(
+        "{operation}: {state} ({} blockers)",
+        report.blocker_codes.len()
+    )];
+    if report.intake_complete {
+        lines.push(format!(
+            "material set sha256: {}",
+            report.material_set_sha256
+        ));
+        lines.push(if verified {
+            "next: run the migration audit from this verified materials set before hardware and Windows package validation".into()
+        } else {
+            "next: transfer the same materials root, manifest, and report; the receiver must run verify before migration audit".into()
+        });
+    } else {
+        lines.extend(
+            report
+                .blocker_codes
+                .iter()
+                .map(|code| format!("blocker: {code}")),
+        );
+        lines.push(if verified {
+            "next: this incomplete report is authentic; resolve its blocker codes and create a new non-overwriting report".into()
+        } else {
+            "next: resolve the blocker codes, then run create again with a new report output path".into()
+        });
+    }
+    lines.join("\n")
 }
 
 fn usage() -> &'static str {
@@ -104,7 +129,7 @@ fn usage() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ssdev_pilot_readiness::PilotMaterialManifest;
+    use ssdev_pilot_readiness::{PilotMaterialManifest, REPORT_SCHEMA_VERSION};
     use tempfile::tempdir;
 
     #[test]
@@ -154,5 +179,43 @@ mod tests {
             report_path.as_os_str().into(),
         ])
         .unwrap());
+    }
+
+    #[test]
+    fn console_summary_exposes_only_stable_blockers_or_the_material_set_digest() {
+        let digest = "a".repeat(64);
+        let incomplete = PilotReadinessReport {
+            schema_version: REPORT_SCHEMA_VERSION,
+            report_type: "pilot-material-readiness".into(),
+            manifest_sha256: "b".repeat(64),
+            project_label_sha256: "c".repeat(64),
+            migration_audit_bindings_sha256: "d".repeat(64),
+            material_set_sha256: digest.clone(),
+            intake_complete: false,
+            downstream_validation_required: true,
+            categories: Vec::new(),
+            blocker_codes: vec![
+                "business-hars-missing".into(),
+                "migration-audit-binding-mismatch".into(),
+            ],
+        };
+        let summary = render_report_summary(&incomplete, false);
+        assert!(summary.contains("pilot material intake: INCOMPLETE (2 blockers)"));
+        assert!(summary.contains("blocker: business-hars-missing"));
+        assert!(summary.contains("blocker: migration-audit-binding-mismatch"));
+        assert!(!summary.contains(&digest));
+        assert!(!summary.contains("hospital-a-pilot"));
+        assert!(!summary.contains("D:\\ssdev-pilot"));
+
+        let complete = PilotReadinessReport {
+            intake_complete: true,
+            blocker_codes: Vec::new(),
+            ..incomplete
+        };
+        let summary = render_report_summary(&complete, true);
+        assert!(summary.contains("pilot material report verified: COMPLETE (0 blockers)"));
+        assert!(summary.contains(&format!("material set sha256: {digest}")));
+        assert!(summary.contains("run the migration audit"));
+        assert!(!summary.contains("blocker:"));
     }
 }
