@@ -85,6 +85,7 @@ pub(crate) struct BusinessWindowReloadResult {
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BusinessSurfaceCloseResult {
+    pub(crate) reset_required: bool,
     pub(crate) requested_windows: usize,
     pub(crate) closed_windows: usize,
     pub(crate) failed_windows: usize,
@@ -470,6 +471,7 @@ pub(crate) struct ConfigImportEnvironmentPreview {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConfigChangePreview {
     pub(crate) config_changed: bool,
+    pub(crate) business_surface_reset_required: bool,
     pub(crate) default_website_changed: bool,
     pub(crate) tenant_changed: bool,
     pub(crate) allow_switch_changed: bool,
@@ -542,8 +544,13 @@ pub(crate) async fn save_desktop_config(
     require_control(&caller)?;
     let _install = bridge_state.install_lock.lock().await;
     crate::validate_config_signed_plugin_route_change(&state, &bridge_state, &config).await?;
+    let reset_required = business_surface_reset_required(&state.config.snapshot(), &config);
     replace_desktop_config(&app, &state, config)?;
-    Ok(force_close_business_surfaces(&app))
+    Ok(if reset_required {
+        force_close_business_surfaces(&app)
+    } else {
+        BusinessSurfaceCloseResult::default()
+    })
 }
 
 #[tauri::command]
@@ -561,6 +568,7 @@ pub(crate) async fn inspect_desktop_config_import(
     tracing::info!(
         event_code = "desktop-config-import-inspected",
         config_changed = preview.change.config_changed,
+        business_surface_reset_required = preview.change.business_surface_reset_required,
         business_origins = preview.change.candidate_business_origin_count,
         environments = preview.change.candidate_environment_count,
         managed_processes = preview.change.candidate_managed_process_count,
@@ -645,10 +653,15 @@ pub(crate) async fn import_desktop_config(
         });
     }
     replace_desktop_config(&app, &state, candidate)?;
-    let closed_surfaces = force_close_business_surfaces(&app);
+    let closed_surfaces = if preview.change.business_surface_reset_required {
+        force_close_business_surfaces(&app)
+    } else {
+        BusinessSurfaceCloseResult::default()
+    };
     tracing::info!(
         event_code = "desktop-config-imported",
         config_changed = preview.change.config_changed,
+        business_surface_reset_required = preview.change.business_surface_reset_required,
         business_origins = preview.change.candidate_business_origin_count,
         environments = preview.change.candidate_environment_count,
         managed_processes = preview.change.candidate_managed_process_count,
@@ -685,6 +698,7 @@ pub(crate) fn build_config_change_preview(
         .len();
     Ok(ConfigChangePreview {
         config_changed: current != candidate,
+        business_surface_reset_required: business_surface_reset_required(current, candidate),
         default_website_changed: current.website != candidate.website,
         tenant_changed: current.tenant_id != candidate.tenant_id,
         allow_switch_changed: current.allow_switch != candidate.allow_switch,
@@ -717,6 +731,27 @@ pub(crate) fn build_config_change_preview(
         current_enabled_shortcut_count: enabled_shortcut_count(current),
         candidate_enabled_shortcut_count: enabled_shortcut_count(candidate),
     })
+}
+
+fn business_surface_reset_required(current: &DesktopConfig, candidate: &DesktopConfig) -> bool {
+    let mut normalized_candidate = candidate.clone();
+    normalized_candidate.allow_switch = current.allow_switch;
+    normalized_candidate.auto_close = current.auto_close;
+    normalized_candidate.auto_start = current.auto_start;
+    normalized_candidate
+        .processes
+        .clone_from(&current.processes);
+    normalized_candidate
+        .key_bindings
+        .clone_from(&current.key_bindings);
+    normalized_candidate
+        .plugin_catalog_url
+        .clone_from(&current.plugin_catalog_url);
+    normalized_candidate
+        .plugin_catalog_signature_url
+        .clone_from(&current.plugin_catalog_signature_url);
+    normalized_candidate.feedback = current.feedback;
+    normalized_candidate != *current
 }
 
 fn enabled_shortcut_count(config: &DesktopConfig) -> usize {
@@ -1964,7 +1999,10 @@ pub(crate) fn force_close_business_surfaces<R: Runtime>(
     app: &AppHandle<R>,
 ) -> BusinessSurfaceCloseResult {
     let state = app.state::<DesktopState>();
-    let mut result = BusinessSurfaceCloseResult::default();
+    let mut result = BusinessSurfaceCloseResult {
+        reset_required: true,
+        ..BusinessSurfaceCloseResult::default()
+    };
     for (label, window) in app.webview_windows() {
         let business = label.starts_with(BUSINESS_LABEL_PREFIX);
         let floating = label.starts_with(FLOATING_LABEL_PREFIX);
@@ -2224,6 +2262,7 @@ mod tests {
 
         let closed = force_close_business_surfaces(app.handle());
 
+        assert!(closed.reset_required);
         assert_eq!(closed.requested_windows, 2);
         assert_eq!(closed.closed_windows, 2);
         assert_eq!(closed.failed_windows, 0);
@@ -2301,6 +2340,7 @@ mod tests {
         let preview = build_config_change_preview(&current, &candidate).unwrap();
 
         assert!(preview.config_changed);
+        assert!(preview.business_surface_reset_required);
         assert!(preview.default_website_changed);
         assert!(preview.tenant_changed);
         assert!(preview.allow_switch_changed);
@@ -2315,6 +2355,55 @@ mod tests {
         assert_eq!(preview.candidate_trusted_origin_count, 1);
         assert_eq!(preview.candidate_external_origin_count, 1);
         assert_eq!(preview.candidate_environments[0].name, "验收环境");
+    }
+
+    #[test]
+    fn desktop_only_settings_do_not_interrupt_open_business_surfaces() {
+        let current = DesktopConfig {
+            website: Some("https://business.example.test/app".into()),
+            tenant_id: "tenant-a".into(),
+            ..DesktopConfig::default()
+        };
+        let desktop_only = DesktopConfig {
+            allow_switch: false,
+            auto_close: true,
+            auto_start: true,
+            plugin_catalog_url: Some("https://plugins.example.test/catalog.json".into()),
+            plugin_catalog_signature_url: Some(
+                "https://plugins.example.test/catalog.sig.json".into(),
+            ),
+            ..current.clone()
+        };
+
+        assert!(!business_surface_reset_required(&current, &desktop_only));
+
+        let mut changed_entry = desktop_only.clone();
+        changed_entry.website = Some("https://business.example.test/next".into());
+        assert!(business_surface_reset_required(&current, &changed_entry));
+
+        let mut changed_origin = desktop_only.clone();
+        changed_origin
+            .trusted_origins
+            .push("https://sso.example.test".into());
+        assert!(business_surface_reset_required(&current, &changed_origin));
+
+        let mut changed_processes = desktop_only.clone();
+        changed_processes
+            .managed_processes
+            .push("reader-agent".into());
+        assert!(business_surface_reset_required(
+            &current,
+            &changed_processes
+        ));
+
+        let mut changed_extension = desktop_only;
+        changed_extension
+            .extensions
+            .insert("futureBusinessMode".into(), serde_json::json!(true));
+        assert!(business_surface_reset_required(
+            &current,
+            &changed_extension
+        ));
     }
 
     #[test]

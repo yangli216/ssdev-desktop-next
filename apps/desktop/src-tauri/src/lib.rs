@@ -880,6 +880,7 @@ struct ProjectBundleImportResult {
     local_mappings: usize,
     service_count: usize,
     preflighted_hosts: usize,
+    reset_required: bool,
     requested_windows: usize,
     closed_windows: usize,
     failed_windows: usize,
@@ -1207,6 +1208,10 @@ async fn inspect_project_bundle(
         service_count = prepared.preview.service_count,
         preflighted_hosts = prepared.preview.preflighted_hosts,
         config_changed = prepared.preview.config_preview.config_changed,
+        business_surface_reset_required = prepared
+            .preview
+            .config_preview
+            .business_surface_reset_required,
         installs = prepared.preview.install_count,
         upgrades = prepared.preview.upgrade_count,
         replacements = prepared.preview.replace_count,
@@ -1409,6 +1414,7 @@ async fn import_project_bundle(
         local_mappings,
         service_count,
         preflighted_hosts,
+        reset_required: closed_surfaces.reset_required,
         requested_windows: closed_surfaces.requested_windows,
         closed_windows: closed_surfaces.closed_windows,
         failed_windows: closed_surfaces.failed_windows,
@@ -6945,6 +6951,7 @@ mod tests {
 
         assert!(value.get("configChanged").is_none());
         assert_eq!(value["configPreview"]["configChanged"], true);
+        assert_eq!(value["configPreview"]["businessSurfaceResetRequired"], true);
         assert_eq!(
             value["configPreview"]["candidateDefaultWebsite"],
             "https://candidate.example.test/app"
