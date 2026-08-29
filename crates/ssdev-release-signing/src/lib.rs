@@ -177,6 +177,7 @@ pub enum ArtifactSummary {
         launch_verified: bool,
         upgrade_verified: bool,
         rollback_verified: bool,
+        application_state_preservation_verified: bool,
     },
 }
 
@@ -534,6 +535,8 @@ fn prepare_material(
                     launch_verified: evidence.launch_verified,
                     upgrade_verified: evidence.upgrade_verified,
                     rollback_verified: evidence.rollback_verified,
+                    application_state_preservation_verified: evidence
+                        .application_state_preservation_verified,
                 },
             )
         }
@@ -903,6 +906,7 @@ mod tests {
                     "launchVerified": true,
                     "upgradeVerified": true,
                     "rollbackVerified": true,
+                    "applicationStatePreservationVerified": true,
                     "previousAppVersion": "1.2.2",
                     "previousReleaseMetadataSha256": "99".repeat(32),
                     "previousArtifactManifestSha256": "dd".repeat(32),
@@ -1055,6 +1059,15 @@ mod tests {
             assert!(!prepared.verified);
             let request_document: SigningRequest =
                 serde_json::from_slice(&fs::read(&request).unwrap()).unwrap();
+            if kind == ArtifactKind::WindowsPackageEvidence {
+                assert!(matches!(
+                    &request_document.summary,
+                    ArtifactSummary::WindowsPackageEvidence {
+                        application_state_preservation_verified: true,
+                        ..
+                    }
+                ));
+            }
             let payload = BASE64.decode(request_document.payload_base64).unwrap();
             fs::write(
                 &signature,

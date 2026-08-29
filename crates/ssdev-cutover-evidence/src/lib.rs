@@ -14,7 +14,7 @@ use webplus_plugin_trust::{
 
 pub const EVIDENCE_SCHEMA_VERSION: u8 = 3;
 pub const PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION: u8 = 2;
-pub const WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION: u8 = 6;
+pub const WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION: u8 = 7;
 pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 7;
 pub const CUTOVER_DECISION_SCHEMA_VERSION: u8 = 3;
 const MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
@@ -142,6 +142,7 @@ pub struct WindowsPackageEvidence {
     pub launch_verified: bool,
     pub upgrade_verified: bool,
     pub rollback_verified: bool,
+    pub application_state_preservation_verified: bool,
     pub previous_app_version: Option<String>,
     pub previous_release_metadata_sha256: Option<String>,
     pub previous_artifact_manifest_sha256: Option<String>,
@@ -467,6 +468,14 @@ impl WindowsPackageEvidence {
         {
             return Err(EvidenceError::Invalid(
                 "rollback requires verified NSIS, launch, and previous-version upgrade results"
+                    .into(),
+            ));
+        }
+        if self.application_state_preservation_verified
+            && (!self.upgrade_verified || !self.nsis_install_verified)
+        {
+            return Err(EvidenceError::Invalid(
+                "application state preservation requires verified NSIS and previous-version upgrade results"
                     .into(),
             ));
         }
@@ -1179,6 +1188,9 @@ pub fn evaluate_production_cutover(
     if !windows.rollback_verified {
         blockers.insert("windows-rollback-not-verified".into());
     }
+    if !windows.application_state_preservation_verified {
+        blockers.insert("windows-application-state-preservation-not-verified".into());
+    }
     let decision = CutoverDecision {
         schema_version: CUTOVER_DECISION_SCHEMA_VERSION,
         target_source_revision: policy.target_source_revision.clone(),
@@ -1521,6 +1533,7 @@ mod tests {
             launch_verified: true,
             upgrade_verified: true,
             rollback_verified: true,
+            application_state_preservation_verified: true,
             previous_app_version: Some("1.2.2".into()),
             previous_release_metadata_sha256: Some("9".repeat(64)),
             previous_artifact_manifest_sha256: Some("d".repeat(64)),
@@ -1647,6 +1660,7 @@ mod tests {
         evidence.launch_verified = false;
         evidence.upgrade_verified = false;
         evidence.rollback_verified = false;
+        evidence.application_state_preservation_verified = false;
         evidence.previous_app_version = None;
         evidence.previous_release_metadata_sha256 = None;
         evidence.previous_artifact_manifest_sha256 = None;
@@ -1670,8 +1684,16 @@ mod tests {
         rollback_without_nsis.msi_install_verified = true;
         assert!(rollback_without_nsis.validate().is_err());
 
+        let mut preservation_without_upgrade = valid_windows_package();
+        preservation_without_upgrade.upgrade_verified = false;
+        preservation_without_upgrade.rollback_verified = false;
+        preservation_without_upgrade.previous_app_version = None;
+        preservation_without_upgrade.previous_release_metadata_sha256 = None;
+        preservation_without_upgrade.previous_artifact_manifest_sha256 = None;
+        assert!(preservation_without_upgrade.validate().is_err());
+
         let mut legacy = valid_windows_package();
-        legacy.schema_version = 5;
+        legacy.schema_version = 6;
         assert!(legacy.validate().is_err());
 
         let mut unbound = valid_windows_package();
@@ -1928,6 +1950,33 @@ mod tests {
         assert_eq!(
             no_recovery_evidence.blocker_codes,
             ["windows-rollback-not-verified"]
+        );
+
+        let mut no_state_preservation = windows.clone();
+        no_state_preservation.application_state_preservation_verified = false;
+        let no_state_preservation_evidence = evaluate_production_cutover(
+            ProductionCutoverInputs {
+                policy: &policy,
+                policy_sha256: "1".repeat(64),
+                policy_attestation_sha256: "0".repeat(64),
+                evidence_trust_store_sha256: "8".repeat(64),
+                approval_trust_store_sha256: "2".repeat(64),
+                plugin: &plugin,
+                plugin_sha256: "2".repeat(64),
+                plugin_attestation_sha256: "5".repeat(64),
+                migration: &migration,
+                migration_sha256: "3".repeat(64),
+                migration_attestation_sha256: "6".repeat(64),
+                windows: &no_state_preservation,
+                windows_sha256: "4".repeat(64),
+                windows_attestation_sha256: "7".repeat(64),
+            },
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            no_state_preservation_evidence.blocker_codes,
+            ["windows-application-state-preservation-not-verified"]
         );
 
         windows.launch_verified = false;

@@ -243,7 +243,7 @@ fn run() -> Result<bool, Box<dyn Error>> {
 }
 
 fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
-    if !matches!(arguments.len(), 14 | 15) {
+    if !matches!(arguments.len(), 15 | 16) {
         return Err(usage().into());
     }
     if std::env::consts::OS != "windows" || std::env::consts::ARCH != "x86_64" {
@@ -292,6 +292,8 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
     let x86_host_sha256 = string_argument(arguments.get(11), "x86 host SHA-256")?;
     let x64_host_sha256 = string_argument(arguments.get(12), "x64 host SHA-256")?;
     let deployment_check_argument = string_argument(arguments.get(13), "deployment check")?;
+    let application_state_preservation_verified =
+        bool_argument(arguments.get(14), "application state preservation verified")?;
     let deployment_check_path = if deployment_check_argument == "none" {
         None
     } else {
@@ -307,7 +309,7 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
         Some(path)
     };
     let previous_metadata_path = arguments
-        .get(14)
+        .get(15)
         .map(|value| path_argument(Some(value), "previous release metadata"))
         .transpose()?
         .map(|path| canonical_regular_file(&path, "previous release metadata"))
@@ -430,6 +432,7 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
             launch_verified,
             upgrade_verified: previous.is_some(),
             rollback_verified: previous.is_some() && launch_verified,
+            application_state_preservation_verified,
             previous_app_version: previous.map(|metadata| metadata.app_version),
             previous_release_metadata_sha256: previous_hash_after,
             previous_artifact_manifest_sha256: previous_artifact_manifest_hash_after,
@@ -819,7 +822,7 @@ fn invalid_input(message: &str) -> Box<dyn Error> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ssdev-cutover-evidence prepare-policy <workspace> <pilot-materials-root> <pilot-manifest.json> <pilot-report.json> <candidate-bundle-root> <evidence-trust.json> <policy-approval-inputs.json> <policy-output.json>\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> <deployment-check.json|none> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
+    "usage:\n  ssdev-cutover-evidence prepare-policy <workspace> <pilot-materials-root> <pilot-manifest.json> <pilot-report.json> <candidate-bundle-root> <evidence-trust.json> <policy-approval-inputs.json> <policy-output.json>\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> <deployment-check.json|none> <application-state-preservation-verified> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
 }
 
 #[cfg(test)]

@@ -911,6 +911,7 @@ function Test-Upgrade {
     Uninstall-ApplicationPackage $rollbackExecutable $previousSignerSubject
     $activeExecutable = $null
     Assert-UpgradeStatePreserved $dataPaths $sentinel "Final previous-version uninstall"
+    $script:ApplicationStatePreservationVerified = $true
     Write-Host "PASS NSIS upgrade, configuration/plugin/mapping state preservation, candidate launch, rollback reinstall, previous-version launch, and final uninstall"
   } finally {
     if ($activeExecutable -and @(Get-AppRegistrations).Count -gt 0) {
@@ -929,6 +930,7 @@ $script:CandidateRelease = $null
 $script:CandidatePluginTrustStoreSha256 = $null
 $script:CandidateX86HostSha256 = $null
 $script:CandidateX64HostSha256 = $null
+$script:ApplicationStatePreservationVerified = $false
 Test-ReleaseArtifactManifest $BundleRoot $metadataDirectory $script:ExpectedUpdatePublicKeyText $ExpectedWebViewInstallMode
 Test-ReleaseTrustPolicies $metadataDirectory
 $script:CandidateRelease = Get-ReleaseMetadata $BundleRoot -VerifyCurrentSource
@@ -966,6 +968,9 @@ if (
 ) {
   throw "Candidate installed runtime identity hashes were not captured during package verification."
 }
+if ($PreviousBundleRoot -and -not $script:ApplicationStatePreservationVerified) {
+  throw "Windows upgrade completed without verified application state preservation."
+}
 $deploymentCheckEvidenceArgument = if ($DeploymentCheckRecord) { $DeploymentCheckRecord } else { "none" }
 $evidenceArguments = @(
   "run", "--quiet", "--locked", "--manifest-path", (Join-Path $workspace "Cargo.toml"),
@@ -982,7 +987,8 @@ $evidenceArguments = @(
   $script:CandidateOriginPolicySha256,
   $script:CandidateX86HostSha256,
   $script:CandidateX64HostSha256,
-  $deploymentCheckEvidenceArgument
+  $deploymentCheckEvidenceArgument,
+  $script:ApplicationStatePreservationVerified.ToString().ToLowerInvariant()
 )
 if ($PreviousBundleRoot) {
   $evidenceArguments += (Join-Path $previousMetadataDirectory "release.json")

@@ -191,6 +191,14 @@ test("Windows upgrade and rollback preserve configuration and native capability 
   assert.match(packageTest, /"Candidate uninstall"/);
   assert.match(packageTest, /"NSIS rollback reinstall"/);
   assert.match(packageTest, /"Final previous-version uninstall"/);
+  assert.match(
+    packageTest,
+    /\$script:ApplicationStatePreservationVerified = \$true/,
+  );
+  assert.match(
+    packageTest,
+    /\$script:ApplicationStatePreservationVerified\.ToString\(\)\.ToLowerInvariant\(\)/,
+  );
   assert.equal(
     (
       packageTest.match(
@@ -247,4 +255,5 @@ test("production evidence binds delivery hosts, trust store, and origin policy",
   assert.match(packageTest, /\[string\]\$DeploymentCheckRecord/);
   assert.match(packageTest, /DeploymentCheckRecord.*deep deployment-check JSON file/);
   assert.match(packageTest, /else \{ "none" \}/);
+  assert.match(cutoverEvidenceMain, /application_state_preservation_verified/);
 });

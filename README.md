@@ -183,7 +183,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
   -ExpectedSignerSubject "<完整证书主题 DN>"
 ```
 
-该门禁先要求包内更新公钥与独立输入的组织公钥逐字节一致，再验证签名的全产物 SHA-256 清单、源码提交/锁文件/工具链溯源、Rust/npm CycloneDX SBOM、updater Minisign、信任密钥生命周期以及来源/可选进程策略的 active 密钥签名；随后安装 NSIS，验证 x64 主程序、x86/x64 宿主、注入策略及 Authenticode 发布者，启动到 `app-started` 诊断事件，最后静默卸载并确认程序与注册项清理完成。机器证据生成器还会在自身读取前后重新按 `artifacts.json` 扫描候选及上一版本的完整 bundle；安装器、updater、策略、宿主、SBOM 或其他清单文件发生漂移时不写证据。只有全部请求项成功后，才会以不覆盖方式在源码和 bundle 之外写出绑定发布元数据、产物清单、版本、实际安装插件信任库、来源策略与双宿主摘要、安装器覆盖、启动、升级、回退和签名结果的 schema 6 Windows 包证据；使用上一生产 bundle 时还绑定其版本、`release.json` 和 `artifacts.json` 摘要。正式验收另传 `-DeploymentCheckRecord`，把一小时内由同版本客户端导出的 Windows 深度检查摘要写入证据；普通 CI 不伪造真实业务页面结果，因此该字段为空且不能用于生产 GO。
+该门禁先要求包内更新公钥与独立输入的组织公钥逐字节一致，再验证签名的全产物 SHA-256 清单、源码提交/锁文件/工具链溯源、Rust/npm CycloneDX SBOM、updater Minisign、信任密钥生命周期以及来源/可选进程策略的 active 密钥签名；随后安装 NSIS，验证 x64 主程序、x86/x64 宿主、注入策略及 Authenticode 发布者，启动到 `app-started` 诊断事件，最后静默卸载并确认程序与注册项清理完成。机器证据生成器还会在自身读取前后重新按 `artifacts.json` 扫描候选及上一版本的完整 bundle；安装器、updater、策略、宿主、SBOM 或其他清单文件发生漂移时不写证据。只有全部请求项成功后，才会以不覆盖方式在源码和 bundle 之外写出绑定发布元数据、产物清单、版本、实际安装插件信任库、来源策略与双宿主摘要、安装器覆盖、启动、升级、回退、应用状态保留和签名结果的 schema 7 Windows 包证据；使用上一生产 bundle 时还绑定其版本、`release.json` 和 `artifacts.json` 摘要。正式验收另传 `-DeploymentCheckRecord`，把一小时内由同版本客户端导出的 Windows 深度检查摘要写入证据；普通 CI 不伪造真实业务页面结果，因此该字段为空且不能用于生产 GO。
 
 若要验证覆盖升级，将上一正式版本解包目录作为额外输入：
 
@@ -221,7 +221,7 @@ powershell -ExecutionPolicy Bypass -File scripts/test-plugin-matrix.ps1 `
   -EvidenceEnvironment hospital-a-reader-lab
 ```
 
-矩阵运行器不会自行编译方便但不同字节的 Debug 宿主；`X86Host` 与 `X64Host` 必须是本次候选安装包构建留下的精确 Release/签名文件。运行器会在启动 controller 和接触硬件前拒绝草稿、尚未解除的 `reviewRequired`、生成器保留占位符、无效或不完整输入、重复名称、未知路由，或未覆盖任一已声明 service/method 的矩阵；还会把插件根目录中的每个已安装插件重新确定性封包，要求插件身份、版本、签名 keyId 和包 SHA-256 与批准的发布集合逐项一致。随后由 x64 控制器分别拉起这两个待交付宿主，逐项对 `ResCode` 和 `ResData` 做精确黄金比对。全部通过且源码、发布集合、插件、信任库、矩阵和两个宿主在执行前后保持一致时，才以不覆盖方式写出绑定这些 SHA-256、源码提交、环境标签和覆盖计数的 schema 2 机器证据。Windows 包验收的 schema 6 证据会从实际安装目录记录同一对宿主摘要，并绑定目标网络中真实业务页面已到达 Rust IPC 的深度部署记录；最终 Go/No-Go 要求宿主逐字节一致且该记录存在。任何无效插件、签名问题、输入变化、宿主不一致、崩溃、超时或结果差异都会使门禁失败。
+矩阵运行器不会自行编译方便但不同字节的 Debug 宿主；`X86Host` 与 `X64Host` 必须是本次候选安装包构建留下的精确 Release/签名文件。运行器会在启动 controller 和接触硬件前拒绝草稿、尚未解除的 `reviewRequired`、生成器保留占位符、无效或不完整输入、重复名称、未知路由，或未覆盖任一已声明 service/method 的矩阵；还会把插件根目录中的每个已安装插件重新确定性封包，要求插件身份、版本、签名 keyId 和包 SHA-256 与批准的发布集合逐项一致。随后由 x64 控制器分别拉起这两个待交付宿主，逐项对 `ResCode` 和 `ResData` 做精确黄金比对。全部通过且源码、发布集合、插件、信任库、矩阵和两个宿主在执行前后保持一致时，才以不覆盖方式写出绑定这些 SHA-256、源码提交、环境标签和覆盖计数的 schema 2 机器证据。Windows 包验收的 schema 7 证据会从实际安装目录记录同一对宿主摘要，并绑定目标网络中真实业务页面已到达 Rust IPC 的深度部署记录及应用状态保留结果；最终 Go/No-Go 要求宿主逐字节一致、业务握手存在且状态保留通过。任何无效插件、签名问题、输入变化、宿主不一致、崩溃、超时或结果差异都会使门禁失败。
 
 ## 生产切换判定
 
