@@ -48,6 +48,8 @@ type BridgeStatus = {
   preflightedPluginHosts: number
   pluginPreflightFailures: number
   pluginTrustMode: string
+  pluginApiBaselineCount: number
+  pluginApiBaselineFailures: number
   trustKeyCount: number
   activeTrustKeyCount: number
   retiredTrustKeyCount: number
@@ -1027,13 +1029,14 @@ async function exportDeploymentCheck() {
           </section>
         </div>
 
-        <section v-if="needsDeepDeploymentCheck || deploymentCheck?.failures || status?.pluginPreflightFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
+        <section v-if="needsDeepDeploymentCheck || deploymentCheck?.failures || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
           <div><p class="eyebrow">ATTENTION</p><h2>待处理事项</h2></div>
           <ul>
             <li v-if="needsDeepDeploymentCheck"><strong>快速检查已通过，正式交付前还需验证当前 x86/x64 插件宿主</strong><button type="button" :disabled="busy" @click="runDeploymentCheck">立即深度自检</button></li>
             <li v-if="deploymentCheck?.failures"><strong>部署自检存在 {{ deploymentCheck.failures }} 项阻塞问题</strong><button type="button" @click="activeSection = 'security'">查看自检</button></li>
             <li v-if="inventory?.quarantined.length"><strong>{{ inventory.quarantined.length }} 个插件已隔离</strong><button type="button" @click="activeSection = 'plugins'">查看插件</button></li>
             <li v-if="status?.pluginPreflightFailures"><strong>{{ status.pluginPreflightFailures }} 次宿主预检失败</strong><button type="button" @click="activeSection = 'security'">查看诊断</button></li>
+            <li v-if="status?.pluginApiBaselineFailures"><strong>签名插件契约基线有 {{ status.pluginApiBaselineFailures }} 次持久化失败</strong><button type="button" @click="activeSection = 'security'">查看诊断</button></li>
             <li v-if="status?.pluginHosts.some(pluginHostNeedsAttention)"><strong>{{ status.pluginHosts.filter(pluginHostNeedsAttention).length }} 个插件宿主等待恢复</strong><button type="button" @click="activeSection = 'security'">定位宿主</button></li>
             <li v-if="ssoError"><strong>最近一次 SSO 登录失败</strong><button type="button" @click="activeSection = 'security'">查看详情</button></li>
           </ul>
@@ -1192,7 +1195,7 @@ async function exportDeploymentCheck() {
           <article><span>插件调用背压</span><strong v-if="status?.globalPluginMaintenanceActive">全局维护中</strong><strong v-else>{{ status ? `${status.inFlightInvocations} / ${status.maxInFlightInvocations}` : '—' }}</strong><small>容量拒绝 {{ status?.rejectedInvocations ?? '—' }} · 槽超时 {{ status?.executionLaneTimeouts ?? '—' }} · 维护拒绝 {{ status?.maintenanceRejectedInvocations ?? '—' }}</small></article>
           <article><span>隔离宿主监督</span><strong>{{ status?.activePluginHosts ?? '—' }} 个活动宿主</strong><small>累计启动 {{ status?.pluginHostStarts ?? '—' }} · 失败 {{ status?.pluginHostStartFailures ?? '—' }}</small></article>
           <article><span>原生操作防重放</span><strong>{{ status?.trackedInvocationsAvailable ? (status.trackedInvocationsAccepting ? '持久协调可用' : '正在排空') : '不可用' }}</strong><small>{{ status?.trackedInvocationsAvailable ? `等待 ${status.trackedPendingOperations} · 可找回 ${status.trackedRetainedResults} · 落盘异常 ${status.trackedPersistenceFailures}` : status?.trackedInvocationsError ?? '状态尚未加载' }}</small></article>
-          <article><span>插件信任</span><strong>{{ status?.pluginTrustMode === 'ed25519-strict' ? '严格签名' : '开发模式' }}</strong><small :title="status?.pluginRoot">{{ status ? `${status.trustKeyCount} 把密钥 · 启用 ${status.activeTrustKeyCount} · 吊销 ${status.revokedTrustKeyCount}` : '完整清单与 SHA-256 校验' }}</small></article>
+          <article><span>插件信任</span><strong>{{ status?.pluginTrustMode === 'ed25519-strict' ? '严格签名' : '开发模式' }}</strong><small :title="status?.pluginRoot">{{ status ? `${status.trustKeyCount} 把密钥 · ${status.pluginApiBaselineCount} 个契约基线 · 基线写入失败 ${status.pluginApiBaselineFailures}` : '完整清单与 SHA-256 校验' }}</small></article>
           <article><span>安装事务</span><strong>{{ status?.recoveredPluginTransactions ? '已自动恢复' : '状态正常' }}</strong><small>已清理或回滚 {{ status?.recoveredPluginTransactions ?? '—' }} 项</small></article>
           <article><span>宿主预检</span><strong>{{ status?.pluginPreflightFailures ? '存在失败' : '状态正常' }}</strong><small>通过 {{ status?.preflightedPluginHosts ?? '—' }} · 失败 {{ status?.pluginPreflightFailures ?? '—' }}</small></article>
           <article><span>受控进程策略</span><strong>{{ status?.processPolicyEntries ?? '—' }} 项</strong><small>启动失败 {{ status?.managedProcessFailures ?? '—' }} · 不经过 Shell</small></article>

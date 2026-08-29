@@ -934,6 +934,16 @@ pub fn compare_public_api(
     }
 }
 
+/// Validates a persisted or generated service contract without requiring a
+/// plugin directory. Runtime baselines use this before trusting serialized
+/// API declarations that were written by an earlier desktop process.
+pub fn validate_plugin_services(
+    plugin_id: &str,
+    services: &[ServiceDefinition],
+) -> Result<(), ConfigError> {
+    validate_manifest(plugin_id, services)
+}
+
 #[derive(Default)]
 struct ApiComparisonChanges {
     breaking: Vec<PublicApiChange>,

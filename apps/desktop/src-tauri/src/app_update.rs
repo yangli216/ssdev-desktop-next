@@ -254,7 +254,9 @@ pub(crate) async fn check_app_update(
         bridge.trust_store.as_deref(),
         &target_version,
     )?;
-    let capability_blockers = inspected.failures.len();
+    let api_baseline_blocked =
+        crate::validate_signed_plugin_api_baseline(&bridge, &inspected.manifests).is_err();
+    let capability_blockers = inspected.failures.len() + usize::from(api_baseline_blocked);
     let install_plan_id = if capability_blockers == 0 {
         let capability_state_sha256 =
             app_update_capability_state_digest(&inspected.manifests, &bridge.local_mapping_root)?;
@@ -326,7 +328,9 @@ pub(crate) async fn install_app_update(
         bridge.trust_store.as_deref(),
         &target_version,
     )?;
-    let capability_blockers = inspected.failures.len();
+    let api_baseline_blocked =
+        crate::validate_signed_plugin_api_baseline(&bridge, &inspected.manifests).is_err();
+    let capability_blockers = inspected.failures.len() + usize::from(api_baseline_blocked);
     if capability_blockers > 0 {
         return Err(format!(
             "有 {capability_blockers} 个插件或本地映射未声明支持 SSDEV Desktop {target_version}，或未通过完整性检查；请先修复对应能力"
@@ -365,6 +369,7 @@ pub(crate) async fn install_app_update(
         bridge.trust_store.as_deref(),
         &target_version,
     )?;
+    crate::validate_signed_plugin_api_baseline(&bridge, &current_plugins.manifests)?;
     if !current_plugins.failures.is_empty() {
         return Err(
             "下载期间插件或本地映射的兼容性、完整性发生变化，请重新检查应用更新".to_owned(),

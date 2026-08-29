@@ -12,6 +12,7 @@ mod deployment_check;
 mod desktop;
 mod invocations;
 mod local_mappings;
+mod plugin_api_baseline;
 mod project_activation;
 mod shortcuts;
 mod sso;
@@ -66,6 +67,7 @@ use invocations::{
     InvocationCoordinator, TrackedInvocationStatus, MAX_RETAINED_RESPONSE_BYTES,
     MAX_RUNTIME_OPERATIONS, RUNTIME_RESULT_RETENTION,
 };
+use plugin_api_baseline::PluginApiBaselineStore;
 
 const FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_FAILURE_FILE_NAME: &str = "startup-failure.json";
@@ -197,6 +199,7 @@ struct BridgeState {
     recovered_plugin_transactions: AtomicUsize,
     preflighted_plugin_hosts: AtomicUsize,
     plugin_preflight_failures: AtomicUsize,
+    plugin_api_baseline_failures: AtomicUsize,
     plugin_trust_mode: &'static str,
     x86_host: PathBuf,
     x64_host: PathBuf,
@@ -205,6 +208,7 @@ struct BridgeState {
     project_transaction_root: PathBuf,
     config_path: PathBuf,
     trust_store: Option<Arc<TrustStore>>,
+    plugin_api_baseline: std::sync::Mutex<PluginApiBaselineStore>,
     install_lock: tokio::sync::Mutex<()>,
     process_policy_entries: usize,
     managed_process_failures: usize,
@@ -372,6 +376,8 @@ struct BridgeStatus {
     preflighted_plugin_hosts: usize,
     plugin_preflight_failures: usize,
     plugin_trust_mode: &'static str,
+    plugin_api_baseline_count: usize,
+    plugin_api_baseline_failures: usize,
     trust_key_count: usize,
     active_trust_key_count: usize,
     retired_trust_key_count: usize,
@@ -456,6 +462,11 @@ async fn bridge_status(
         Some(coordinator) => Some(coordinator.stats().await),
         None => None,
     };
+    let plugin_api_baseline_count = state
+        .plugin_api_baseline
+        .lock()
+        .map_err(|_| "签名插件契约基线锁已损坏".to_owned())?
+        .entry_count();
     Ok(BridgeStatus {
         mode: "native-ipc",
         protocol_version: BRIDGE_PROTOCOL_VERSION,
@@ -492,6 +503,8 @@ async fn bridge_status(
         preflighted_plugin_hosts: state.preflighted_plugin_hosts.load(Ordering::Acquire),
         plugin_preflight_failures: state.plugin_preflight_failures.load(Ordering::Acquire),
         plugin_trust_mode: state.plugin_trust_mode,
+        plugin_api_baseline_count,
+        plugin_api_baseline_failures: state.plugin_api_baseline_failures.load(Ordering::Acquire),
         trust_key_count: trust_keys.total,
         active_trust_key_count: trust_keys.active,
         retired_trust_key_count: trust_keys.retired,
@@ -1203,6 +1216,11 @@ async fn import_project_bundle(
     if !previous_plugins.failures.is_empty() {
         return Err("当前插件清单在项目预检后发生变化，请处理隔离项后重试".into());
     }
+    let previous_active_plugins = state
+        .controller
+        .active_manifests()
+        .await
+        .map_err(|error| format!("无法读取当前插件运行状态 ({})", error.diagnostic_code()))?;
     let members = prepared
         .components
         .iter()
@@ -1271,7 +1289,7 @@ async fn import_project_bundle(
     }
     if let Err(error) = desktop::replace_desktop_config(&app, &desktop_state, prepared.config) {
         let route_restore = maintenance
-            .replace_manifests(&previous_plugins.manifests)
+            .replace_manifests(&previous_active_plugins)
             .await;
         let rollback = rollback_project_components(transaction, activated);
         return Err(match (route_restore, rollback) {
@@ -1292,7 +1310,7 @@ async fn import_project_bundle(
     if let Err(error) = transaction.mark_committed() {
         let config_restore = desktop::replace_desktop_config(&app, &desktop_state, previous_config);
         let route_restore = maintenance
-            .replace_manifests(&previous_plugins.manifests)
+            .replace_manifests(&previous_active_plugins)
             .await;
         let rollback = rollback_project_components(transaction, activated);
         return Err(format!(
@@ -1322,6 +1340,7 @@ async fn import_project_bundle(
     } else {
         drop(transaction);
     }
+    record_signed_plugin_api_baseline(&state, &installed.manifests);
     let service_count = state.controller.service_count().await;
     state
         .plugin_load_failures
@@ -1445,12 +1464,18 @@ async fn prepare_project_bundle(
                     manifest.plugin_id == declared_id
                         && !is_local_manifest(manifest, &state.local_mapping_root)
                 });
-                let current_version = current_manifest
-                    .and_then(|manifest| manifest.metadata.as_ref())
-                    .map(|metadata| &metadata.version);
+                let baseline_version = signed_plugin_baseline_version(state, &declared_id)?;
+                let current_version = baseline_version.as_ref().or_else(|| {
+                    current_manifest
+                        .and_then(|manifest| manifest.metadata.as_ref())
+                        .map(|metadata| &metadata.version)
+                });
                 ensure_upgrade_allowed(current_version, &metadata.version)?;
-                let api_changes =
-                    signed_plugin_api_change_summary(current_manifest, prepared.manifest())?;
+                let api_changes = signed_plugin_api_change_summary_for_state(
+                    state,
+                    current_manifest,
+                    prepared.manifest(),
+                )?;
                 let action = classify_project_component_action(
                     project_bundle::ProjectComponentKind::SignedPlugin,
                     current_manifest.is_some(),
@@ -1565,6 +1590,7 @@ async fn prepare_project_bundle(
             .iter()
             .map(|component| component.manifest().clone()),
     );
+    validate_signed_plugin_api_baseline(state, &candidates)?;
     validate_signed_plugin_api_changes(&current.manifests, &candidates, &state.local_mapping_root)?;
     validate_project_delivery_routes(desktop_state, &opened.config, &candidates)?;
     let project_manifests = components
@@ -1753,13 +1779,38 @@ fn signed_plugin_api_change_summary(
     previous: Option<&PluginManifest>,
     candidate: &PluginManifest,
 ) -> Result<SignedPluginApiChangeSummary, String> {
+    if previous.is_some_and(|manifest| manifest.plugin_id != candidate.plugin_id) {
+        return Err("候选插件身份与当前签名插件不一致".into());
+    }
+    signed_plugin_api_change_summary_from_services(
+        previous.map(|manifest| manifest.services.as_slice()),
+        candidate,
+    )
+}
+
+fn signed_plugin_api_change_summary_for_state(
+    state: &BridgeState,
+    fallback_previous: Option<&PluginManifest>,
+    candidate: &PluginManifest,
+) -> Result<SignedPluginApiChangeSummary, String> {
+    let baseline = state
+        .plugin_api_baseline
+        .lock()
+        .map_err(|_| "签名插件契约基线锁已损坏".to_owned())?;
+    let previous = baseline
+        .baseline_services(&candidate.plugin_id)
+        .or_else(|| fallback_previous.map(|manifest| manifest.services.as_slice()));
+    signed_plugin_api_change_summary_from_services(previous, candidate)
+}
+
+fn signed_plugin_api_change_summary_from_services(
+    previous: Option<&[ServiceDefinition]>,
+    candidate: &PluginManifest,
+) -> Result<SignedPluginApiChangeSummary, String> {
     let Some(previous) = previous else {
         return Ok(SignedPluginApiChangeSummary::default());
     };
-    if previous.plugin_id != candidate.plugin_id {
-        return Err("候选插件身份与当前签名插件不一致".into());
-    }
-    let comparison = compare_public_api(&previous.services, &candidate.services);
+    let comparison = compare_public_api(previous, &candidate.services);
     if !comparison.compatible {
         tracing::warn!(
             event_code = "plugin-api-compatibility-blocked",
@@ -1780,6 +1831,59 @@ fn signed_plugin_api_change_summary(
         addition_count: comparison.additions.len(),
         review_change_count: comparison.review_changes.len(),
     })
+}
+
+fn validate_signed_plugin_api_baseline(
+    state: &BridgeState,
+    candidates: &[PluginManifest],
+) -> Result<(), String> {
+    let blocked = state
+        .plugin_api_baseline
+        .lock()
+        .map_err(|_| "签名插件契约基线锁已损坏".to_owned())?
+        .breaking_plugin_ids_for_manifests(candidates, &state.local_mapping_root)?;
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    tracing::warn!(
+        event_code = "plugin-api-compatibility-blocked",
+        error_code = "plugin-api-breaking-change",
+        plugin_count = blocked.len(),
+        "candidate signed plugin set violates the last accepted API baseline"
+    );
+    Err(format!(
+        "候选插件集合中有 {} 个签名插件会破坏上次已激活的 Web Bridge API；请恢复兼容版本或使用新的插件 ID",
+        blocked.len()
+    ))
+}
+
+fn record_signed_plugin_api_baseline(state: &BridgeState, manifests: &[PluginManifest]) {
+    let result = match state.plugin_api_baseline.lock() {
+        Ok(mut baseline) => baseline.replace_with_manifests(manifests, &state.local_mapping_root),
+        Err(_) => Err("签名插件契约基线锁已损坏".to_owned()),
+    };
+    if result.is_err() {
+        state
+            .plugin_api_baseline_failures
+            .fetch_add(1, Ordering::AcqRel);
+        tracing::error!(
+            event_code = "plugin-api-baseline-persist-failed",
+            error_code = "plugin-api-baseline-io",
+            "accepted signed plugin API baseline could not be persisted"
+        );
+    }
+}
+
+fn signed_plugin_baseline_version(
+    state: &BridgeState,
+    plugin_id: &str,
+) -> Result<Option<semver::Version>, String> {
+    Ok(state
+        .plugin_api_baseline
+        .lock()
+        .map_err(|_| "签名插件契约基线锁已损坏".to_owned())?
+        .baseline_version(plugin_id)
+        .cloned())
 }
 
 fn validate_signed_plugin_api_changes(
@@ -3024,9 +3128,24 @@ async fn local_plugin_install_context(
         Some(trust_store),
         &state.desktop_version,
     )?;
+    let offline_breaking_plugins = state
+        .plugin_api_baseline
+        .lock()
+        .map_err(|_| "签名插件契约基线锁已损坏".to_owned())?
+        .breaking_plugin_ids_for_manifests(&before.manifests, &state.local_mapping_root)?;
+    let active_candidate_manifests = before
+        .manifests
+        .iter()
+        .filter(|manifest| {
+            !offline_breaking_plugins
+                .iter()
+                .any(|plugin_id| plugin_id.eq_ignore_ascii_case(&manifest.plugin_id))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let active_matches = state
         .controller
-        .manifests_match_active_routes(&before.manifests)
+        .manifests_match_active_routes(&active_candidate_manifests)
         .await
         .map_err(|error| format!("无法核对当前插件运行状态 ({})", error.diagnostic_code()))?;
     if !active_matches {
@@ -3045,13 +3164,18 @@ async fn local_plugin_install_context(
                 && !is_local_manifest(manifest, &state.local_mapping_root)
         })
         .cloned();
-    let current_version = previous_manifest
-        .as_ref()
-        .and_then(|manifest| manifest.metadata.as_ref())
-        .map(|metadata| metadata.version.clone());
+    let current_version = signed_plugin_baseline_version(state, plugin_id)?.or_else(|| {
+        previous_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.metadata.as_ref())
+            .map(|metadata| metadata.version.clone())
+    });
     ensure_upgrade_allowed(current_version.as_ref(), &prepared.metadata().version)?;
-    let api_changes =
-        signed_plugin_api_change_summary(previous_manifest.as_ref(), prepared.manifest())?;
+    let api_changes = signed_plugin_api_change_summary_for_state(
+        state,
+        previous_manifest.as_ref(),
+        prepared.manifest(),
+    )?;
 
     let current_state_sha256 = plugin_update_installed_state_digest(
         &state.plugin_root,
@@ -3061,6 +3185,7 @@ async fn local_plugin_install_context(
     let mut candidates = before.manifests;
     candidates.retain(|manifest| manifest.plugin_id != *plugin_id);
     candidates.push(prepared.manifest().clone());
+    validate_signed_plugin_api_baseline(state, &candidates)?;
     validate_signed_plugin_activation_routes(
         desktop_state,
         &candidates,
@@ -3148,7 +3273,18 @@ async fn activate_prepared_plugin(
                 && !is_local_manifest(manifest, &state.local_mapping_root)
         })
         .cloned();
-    signed_plugin_api_change_summary(previous_manifest.as_ref(), prepared.manifest())?;
+    let previous_active_manifest = state
+        .controller
+        .active_manifests()
+        .await
+        .map_err(|error| format!("无法读取当前插件运行状态 ({})", error.diagnostic_code()))?
+        .into_iter()
+        .find(|manifest| manifest.plugin_id == plugin_id);
+    signed_plugin_api_change_summary_for_state(
+        state,
+        previous_manifest.as_ref(),
+        prepared.manifest(),
+    )?;
     if let Some(expected) = expected_current_state_sha256 {
         let actual = plugin_update_installed_state_digest(
             &plugin_root,
@@ -3162,15 +3298,19 @@ async fn activate_prepared_plugin(
             "签名插件 ID [{plugin_id}] 与现有本地映射冲突，请先删除或重命名本地映射"
         ));
     }
-    let current_version = previous_manifest
-        .as_ref()
-        .and_then(|manifest| manifest.metadata.as_ref())
-        .map(|metadata| &metadata.version);
+    let baseline_version = signed_plugin_baseline_version(state, &plugin_id)?;
+    let current_version = baseline_version.as_ref().or_else(|| {
+        previous_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.metadata.as_ref())
+            .map(|metadata| &metadata.version)
+    });
     ensure_plugin_version_change_allowed(current_version, &plugin_version, install_source)?;
     let replaced_existing = plugin_root.join(&plugin_id).exists();
     let mut candidates = before.manifests.clone();
     candidates.retain(|manifest| manifest.plugin_id != plugin_id);
     candidates.push(prepared.manifest().clone());
+    validate_signed_plugin_api_baseline(state, &candidates)?;
     validate_signed_plugin_activation_routes(
         desktop_state,
         &candidates,
@@ -3217,7 +3357,7 @@ async fn activate_prepared_plugin(
                 .rollback()
                 .map_err(|rollback| format!("{error}; 插件回滚同时失败: {rollback}"))?;
             maintenance
-                .replace_manifest(previous_manifest.as_ref())
+                .replace_manifest(previous_active_manifest.as_ref())
                 .await
                 .map_err(|reload| format!("{error}; 恢复旧路由失败: {reload}"))?;
             return Err(error);
@@ -3236,7 +3376,7 @@ async fn activate_prepared_plugin(
             .rollback()
             .map_err(|rollback| format!("新插件未进入已验证清单；插件回滚同时失败: {rollback}"))?;
         maintenance
-            .replace_manifest(previous_manifest.as_ref())
+            .replace_manifest(previous_active_manifest.as_ref())
             .await
             .map_err(|reload| format!("新插件未进入已验证清单；恢复旧路由失败: {reload}"))?;
         return Err("新插件未进入已验证清单，已恢复旧插件".into());
@@ -3249,18 +3389,19 @@ async fn activate_prepared_plugin(
             .rollback()
             .map_err(|rollback| format!("新插件路由无效: {error}; 插件回滚同时失败: {rollback}"))?;
         maintenance
-            .replace_manifest(previous_manifest.as_ref())
+            .replace_manifest(previous_active_manifest.as_ref())
             .await
             .map_err(|reload| format!("新插件路由无效: {error}; 恢复旧路由失败: {reload}"))?;
         return Err(format!("新插件路由无效: {error}"));
     }
     if let Err(error) = activation.commit() {
         maintenance
-            .replace_manifest(previous_manifest.as_ref())
+            .replace_manifest(previous_active_manifest.as_ref())
             .await
             .map_err(|reload| format!("插件事务提交失败: {error}; 恢复旧路由失败: {reload}"))?;
         return Err(format!("插件事务提交失败，已恢复旧插件: {error}"));
     }
+    record_signed_plugin_api_baseline(state, &installed.manifests);
     state
         .plugin_load_failures
         .store(installed.failures.len(), Ordering::Release);
@@ -3308,15 +3449,22 @@ async fn uninstall_signed_plugin(
         &state.desktop_version,
     )?;
     let baseline_failures = before.failures.clone();
-    let previous_manifest = before
+    before
         .manifests
         .iter()
-        .find(|manifest| {
+        .any(|manifest| {
             manifest.plugin_id == plugin_id
                 && !is_local_manifest(manifest, &state.local_mapping_root)
         })
-        .cloned()
+        .then_some(())
         .ok_or_else(|| format!("签名插件 [{plugin_id}] 不存在"))?;
+    let previous_active_manifest = state
+        .controller
+        .active_manifests()
+        .await
+        .map_err(|error| format!("无法读取当前插件运行状态 ({})", error.diagnostic_code()))?
+        .into_iter()
+        .find(|manifest| manifest.plugin_id == plugin_id);
     let maintenance = state
         .controller
         .begin_plugin_maintenance(&plugin_id)
@@ -3355,23 +3503,30 @@ async fn uninstall_signed_plugin(
             return Err(format!("无法验证卸载后的插件清单，已恢复原插件: {error}"));
         }
     };
+    if let Err(error) = validate_signed_plugin_api_baseline(&state, &installed.manifests) {
+        removal
+            .rollback()
+            .map_err(|rollback| format!("{error}; 恢复原插件同时失败: {rollback}"))?;
+        return Err(format!("{error}；已恢复原插件"));
+    }
     if let Err(error) = maintenance.replace_manifest(None).await {
         removal
             .rollback()
             .map_err(|rollback| format!("卸载路由失败: {error}; 恢复原插件同时失败: {rollback}"))?;
         maintenance
-            .replace_manifest(Some(&previous_manifest))
+            .replace_manifest(previous_active_manifest.as_ref())
             .await
             .map_err(|restore| format!("卸载路由失败: {error}; 恢复原路由失败: {restore}"))?;
         return Err(format!("卸载路由失败，已恢复原插件: {error}"));
     }
     if let Err(error) = removal.commit() {
         maintenance
-            .replace_manifest(Some(&previous_manifest))
+            .replace_manifest(previous_active_manifest.as_ref())
             .await
             .map_err(|restore| format!("卸载事务提交失败: {error}; 恢复原路由失败: {restore}"))?;
         return Err(format!("卸载事务提交失败，已恢复原插件: {error}"));
     }
+    record_signed_plugin_api_baseline(&state, &installed.manifests);
     state
         .plugin_load_failures
         .store(installed.failures.len(), Ordering::Release);
@@ -3406,6 +3561,7 @@ async fn reload_plugins(
         state.trust_store.as_deref(),
         &state.desktop_version,
     )?;
+    validate_signed_plugin_api_baseline(&state, &plugins.manifests)?;
     validate_signed_plugin_api_changes(&current, &plugins.manifests, &state.local_mapping_root)?;
     validate_signed_plugin_activation_routes(
         &desktop_state,
@@ -3419,6 +3575,7 @@ async fn reload_plugins(
         .replace_manifests(&plugins.manifests)
         .await
         .map_err(|error| error.to_string())?;
+    record_signed_plugin_api_baseline(&state, &plugins.manifests);
     state
         .plugin_load_failures
         .store(plugins.failures.len(), Ordering::Release);
@@ -3451,12 +3608,29 @@ async fn plugin_inventory(
     desktop::require_control(&caller)?;
     let _install = state.install_lock.lock().await;
     recover_plugin_store(&state)?;
-    let inspected = inspect_all_plugins(
+    let mut inspected = inspect_all_plugins(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
         &state.desktop_version,
     )?;
+    let offline_breaking_plugins = state
+        .plugin_api_baseline
+        .lock()
+        .map_err(|_| "签名插件契约基线锁已损坏".to_owned())?
+        .breaking_plugin_ids_for_manifests(&inspected.manifests, &state.local_mapping_root)?;
+    if !offline_breaking_plugins.is_empty() {
+        inspected.manifests.retain(|manifest| {
+            !offline_breaking_plugins
+                .iter()
+                .any(|plugin_id| plugin_id.eq_ignore_ascii_case(&manifest.plugin_id))
+        });
+        inspected
+            .failures
+            .extend(offline_breaking_plugins.into_iter().map(|plugin_id| {
+                format!("签名插件 [{plugin_id}] 相对上次已激活版本存在破坏性 Web Bridge API 变更")
+            }));
+    }
     let plugins = inspected
         .manifests
         .into_iter()
@@ -4528,13 +4702,38 @@ pub fn run() {
             })?;
             let desktop_version = semver::Version::parse(&app.package_info().version.to_string())
                 .map_err(std::io::Error::other)?;
-            let plugins = inspect_all_plugins(
+            let mut plugins = inspect_all_plugins(
                 &plugin_root,
                 &local_mapping_root,
                 trust_store.as_deref(),
                 &desktop_version,
             )
                 .map_err(std::io::Error::other)?;
+            let (plugin_api_baseline, offline_breaking_plugins) =
+                PluginApiBaselineStore::open(
+                    local_data_dir.join("plugin-api-baseline.json"),
+                    &plugins.manifests,
+                    &local_mapping_root,
+                )
+                .map_err(std::io::Error::other)?;
+            if !offline_breaking_plugins.is_empty() {
+                plugins.manifests.retain(|manifest| {
+                    !offline_breaking_plugins
+                        .iter()
+                        .any(|plugin_id| plugin_id.eq_ignore_ascii_case(&manifest.plugin_id))
+                });
+                plugins.failures.extend(offline_breaking_plugins.iter().map(|plugin_id| {
+                    format!(
+                        "签名插件 [{plugin_id}] 相对上次已激活版本存在破坏性 Web Bridge API 变更"
+                    )
+                }));
+                tracing::warn!(
+                    event_code = "plugin-api-offline-replacement-blocked",
+                    error_code = "plugin-api-breaking-change",
+                    plugin_count = offline_breaking_plugins.len(),
+                    "signed plugins changed incompatibly while the desktop was not running"
+                );
+            }
             if !plugins.failures.is_empty() {
                 tracing::warn!(
                     event_code = "plugins-quarantined",
@@ -4581,6 +4780,7 @@ pub fn run() {
                 recovered_plugin_transactions: AtomicUsize::new(recovery.total()),
                 preflighted_plugin_hosts: AtomicUsize::new(0),
                 plugin_preflight_failures: AtomicUsize::new(0),
+                plugin_api_baseline_failures: AtomicUsize::new(0),
                 plugin_trust_mode: if allow_unsigned_plugins {
                     "debug-unsigned"
                 } else {
@@ -4593,6 +4793,7 @@ pub fn run() {
                 project_transaction_root,
                 config_path,
                 trust_store,
+                plugin_api_baseline: std::sync::Mutex::new(plugin_api_baseline),
                 install_lock: tokio::sync::Mutex::new(()),
                 process_policy_entries,
                 managed_process_failures,
