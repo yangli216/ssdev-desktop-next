@@ -26,6 +26,9 @@ business webview -> narrow Tauri command -> Rust controller
 架构决策和迁移门槛见 [docs/adr/0001-target-architecture.md](docs/adr/0001-target-architecture.md)。
 
 产品定位、迭代优先级和明确不投入的方向见 [docs/product-direction.md](docs/product-direction.md)。新能力进入核心运行时前应先符合其中的工作选择规则。
+
+真实项目开始前可使用 [试点材料预检](docs/pilot-readiness.md) 收齐生产组件、黄金用例、业务 HAR、签名公钥材料、上一 Windows 安装包和实机计划。预检报告只输出摘要与稳定缺项，不复制路径或材料内容，也不替代后续迁移审计、硬件矩阵和 Go/No-Go。
+
 业务页面从 localhost HTTP 切换到窄桥接接口的方式见 [docs/web-bridge-migration.md](docs/web-bridge-migration.md)。
 业务前端应通过 [packages/web-bridge](packages/web-bridge/README.md) 的类型化协议适配层接入，不直接依赖 Tauri 内部 API。SDK 会运行时校验系统声明并提供稳定错误分类；当前能力 schema 严格验证，未来未知 schema 保留但不会被误判为已经支持。主分支 CI 还会生成并自检固定 `.tgz + 摘要清单` 的平台无关 SDK 制品，并在离线临时消费者中验证安装、ESM 运行和 TypeScript 类型，业务项目不再需要从源码目录人工打包。
 打印、写卡等非幂等调用的持久操作 ID、防重放和崩溃后对账语义见 [docs/tracked-invocations.md](docs/tracked-invocations.md)。

@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "projectLabel": "hospital-a-pilot",
+  "categories": [
+    {
+      "id": "legacy-config",
+      "status": "provided",
+      "inputs": ["legacy/config"]
+    },
+    {
+      "id": "production-native-assets",
+      "status": "provided",
+      "inputs": ["native/components"]
+    },
+    {
+      "id": "golden-cases",
+      "status": "provided",
+      "inputs": ["native/golden-cases.json"]
+    },
+    {
+      "id": "business-assets",
+      "status": "provided",
+      "inputs": ["business/dist"]
+    },
+    {
+      "id": "business-hars",
+      "status": "provided",
+      "inputs": ["business/representative.har"]
+    },
+    {
+      "id": "signed-origin-policy",
+      "status": "provided",
+      "inputs": [
+        "policy/origin-policy.json",
+        "policy/origin-policy.sig.json",
+        "policy/release-trust.json"
+      ]
+    },
+    {
+      "id": "plugin-release-set",
+      "status": "provided",
+      "inputs": ["plugins/release-set.json", "plugins/packages"]
+    },
+    {
+      "id": "organization-public-trust",
+      "status": "provided",
+      "inputs": ["trust/public-material"]
+    },
+    {
+      "id": "previous-windows-release",
+      "status": "provided",
+      "inputs": ["previous/installer.exe", "previous/release.json"]
+    },
+    {
+      "id": "windows-hardware-plan",
+      "status": "provided",
+      "inputs": ["windows/hardware-plan.json"]
+    },
+    {
+      "id": "legacy-keymap",
+      "status": "notApplicable",
+      "approvalReference": "PILOT-KEYMAP-001"
+    },
+    {
+      "id": "legacy-processes",
+      "status": "provided",
+      "inputs": ["legacy/processes"]
+    },
+    {
+      "id": "external-local-http-callers",
+      "status": "notApplicable",
+      "approvalReference": "PILOT-HTTP-001"
+    }
+  ]
+}
