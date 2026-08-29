@@ -45,6 +45,8 @@ Release 构建不显示终端窗口，因此初始化错误不能只写标准错
 启动期检测到离线替换造成公共 API 破坏时记录 `plugin-api-offline-replacement-blocked`，只包含被隔离插件数量；崩溃后完成或撤销 pending 时记录 `plugin-api-baseline-transition-recovered`。准备、提交后收尾或回滚清理无法落盘时分别记录 `plugin-api-baseline-prepare-failed`、`plugin-api-baseline-commit-deferred`、`plugin-api-baseline-abort-deferred`，统一使用稳定错误码 `plugin-api-baseline-io`。这些事件都不记录插件 ID、route、路径、候选契约或原始 I/O 文本。控制台插件清单会以本地可见的插件 ID 标记隔离项，方便用受控安装、仓库回退或显式卸载恢复。
 
 持久调用工作流任务在发布结果前异常终止时记录 `tracked-invocation-workflow-terminated`；随后无法读取账本状态时另记 `tracked-invocation-workflow-reconcile-failed`。两类事件只带稳定错误码，不记录 operation ID、来源、路由、参数、响应、任务错误原文或账本路径。监督层会同步释放等待者和退出排空计数，避免调用永久显示处理中。
+
+SSO 登录任务在发布结果前异常终止时记录 `sso-login-task-failed`，并把运行状态复位为通用 `sso-login-failed`；应用退出排空任务异常终止时记录 `app-exit-drain-task-failed`，随后标记最终退出就绪并执行受控强制退出。两类事件都不记录任务错误原文、身份字段、URL、调用内容或本机路径。
 - `logs/ssdev.log*`：上述有界结构化事件，未压缩读取总量最多 32 MiB。
 
 导出只读取应用管理目录内的固定日志文件名，并拒绝符号链接、目录或其他非普通文件，防止把任意本机文件夹带进诊断包。导出命令只接受本地控制窗口调用，业务 WebView 和截图遮罩没有该能力。诊断包仍可能包含内部插件 ID 和版本，因此应通过组织批准的支持渠道传输，并按内部运维数据处理。

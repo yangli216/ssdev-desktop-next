@@ -14,7 +14,8 @@ use tauri::menu::{Menu, MenuBuilder, SubmenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::{
-    AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Manager, Runtime, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
@@ -283,6 +284,38 @@ impl DesktopState {
 struct ExitLifecycle {
     drain_started: AtomicBool,
     ready: AtomicBool,
+}
+
+struct ExitDrainGuard<F: FnOnce()> {
+    finalize: Option<F>,
+}
+
+impl<F: FnOnce()> ExitDrainGuard<F> {
+    fn new(finalize: F) -> Self {
+        Self {
+            finalize: Some(finalize),
+        }
+    }
+
+    fn complete(mut self) {
+        if let Some(finalize) = self.finalize.take() {
+            finalize();
+        }
+    }
+}
+
+impl<F: FnOnce()> Drop for ExitDrainGuard<F> {
+    fn drop(&mut self) {
+        let Some(finalize) = self.finalize.take() else {
+            return;
+        };
+        tracing::error!(
+            event_code = "app-exit-drain-task-failed",
+            error_code = "app-exit-drain-task-failed",
+            "application exit drain task terminated unexpectedly"
+        );
+        finalize();
+    }
 }
 
 impl ExitLifecycle {
@@ -1188,8 +1221,15 @@ pub(crate) fn intercept_exit_request(app: &AppHandle, exit_code: i32) -> bool {
     true
 }
 
-pub(crate) fn mark_exit_ready(app: &AppHandle) {
-    app.state::<DesktopState>().exit_lifecycle.mark_ready();
+pub(crate) fn mark_exit_ready<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(state) = app.try_state::<DesktopState>() {
+        state.exit_lifecycle.mark_ready();
+    }
+}
+
+fn finalize_exit<R: Runtime>(app: &AppHandle<R>, exit_code: i32) {
+    mark_exit_ready(app);
+    app.exit(exit_code);
 }
 
 fn request_graceful_exit(app: &AppHandle, exit_code: i32) {
@@ -1207,6 +1247,8 @@ fn request_graceful_exit(app: &AppHandle, exit_code: i32) {
             bridge.invocation_coordinator.clone(),
         )
     };
+    let exit_app = app.clone();
+    let exit = ExitDrainGuard::new(move || finalize_exit(&exit_app, exit_code));
     tauri::async_runtime::spawn(async move {
         let drain = async {
             if let Some(coordinator) = &invocation_coordinator {
@@ -1227,8 +1269,7 @@ fn request_graceful_exit(app: &AppHandle, exit_code: i32) {
                 "application exit forced after native invocation and durable ledger drain timeout"
             );
         }
-        mark_exit_ready(&app);
-        app.exit(exit_code);
+        exit.complete();
     });
 }
 
@@ -1905,6 +1946,19 @@ mod tests {
         lifecycle.mark_ready();
         assert!(lifecycle.is_ready());
         assert!(!lifecycle.begin_drain());
+    }
+
+    #[test]
+    fn terminated_exit_drain_task_still_allows_the_final_exit() {
+        let lifecycle = Arc::new(ExitLifecycle::new());
+        assert!(lifecycle.begin_drain());
+        let finalizer_lifecycle = Arc::clone(&lifecycle);
+
+        drop(ExitDrainGuard::new(move || {
+            finalizer_lifecycle.mark_ready();
+        }));
+
+        assert!(lifecycle.is_ready());
     }
 
     #[test]

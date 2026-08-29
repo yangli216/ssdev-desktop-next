@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use url::Url;
 
 use crate::desktop::{self, DesktopState};
@@ -103,6 +103,39 @@ struct SsoStatusEvent {
     active: bool,
 }
 
+struct SsoTaskGuard<R: Runtime> {
+    app: AppHandle<R>,
+    completed: bool,
+}
+
+impl<R: Runtime> SsoTaskGuard<R> {
+    fn new(app: AppHandle<R>) -> Self {
+        Self {
+            app,
+            completed: false,
+        }
+    }
+
+    fn complete(mut self, error: Option<&'static str>, event: &'static str) {
+        self.completed = true;
+        finish(&self.app, error, event);
+    }
+}
+
+impl<R: Runtime> Drop for SsoTaskGuard<R> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        finish(&self.app, Some("sso-login-failed"), "sso-login-failed");
+        tracing::warn!(
+            event_code = "sso-login-task-failed",
+            error_code = "sso-login-failed",
+            "SSO login task terminated before publishing a result"
+        );
+    }
+}
+
 pub(crate) fn start_from_process_arguments(app: &AppHandle) {
     start_from_arguments(app, std::env::args());
 }
@@ -131,36 +164,37 @@ pub(crate) fn start_from_arguments(app: &AppHandle, arguments: impl IntoIterator
     }
     emit_status(app, "sso-login-started");
     let app = app.clone();
+    let task = SsoTaskGuard::new(app.clone());
     tauri::async_runtime::spawn(async move {
         match perform(&app, arguments).await {
-            Ok(()) => finish(&app, None, "sso-login-succeeded"),
+            Ok(()) => task.complete(None, "sso-login-succeeded"),
             Err(_) => {
-                finish(&app, Some("sso-login-failed"), "sso-login-failed");
+                task.complete(Some("sso-login-failed"), "sso-login-failed");
                 tracing::warn!(event_code = "sso-login-failed", "SSO login failed");
             }
         }
     });
 }
 
-fn try_begin(app: &AppHandle) -> bool {
+fn try_begin<R: Runtime>(app: &AppHandle<R>) -> bool {
     app.try_state::<SsoRuntimeState>()
         .is_none_or(|state| state.try_begin())
 }
 
-fn record_error(app: &AppHandle, error: &'static str) {
+fn record_error<R: Runtime>(app: &AppHandle<R>, error: &'static str) {
     if let Some(state) = app.try_state::<SsoRuntimeState>() {
         state.record_error(error);
     }
 }
 
-fn finish(app: &AppHandle, error: Option<&'static str>, event: &'static str) {
+fn finish<R: Runtime>(app: &AppHandle<R>, error: Option<&'static str>, event: &'static str) {
     if let Some(state) = app.try_state::<SsoRuntimeState>() {
         state.finish(error);
     }
     emit_status(app, event);
 }
 
-fn emit_status(app: &AppHandle, status: &'static str) {
+fn emit_status<R: Runtime>(app: &AppHandle<R>, status: &'static str) {
     let active = app
         .try_state::<SsoRuntimeState>()
         .is_some_and(|state| state.active());
@@ -447,5 +481,28 @@ mod tests {
         assert_eq!(state.status(), (false, Some("sso-login-failed")));
         assert!(state.try_begin());
         assert_eq!(state.status(), (true, None));
+    }
+
+    #[tokio::test]
+    async fn terminated_sso_task_restores_admission_with_a_generic_error() {
+        let app = tauri::test::mock_builder()
+            .manage(SsoRuntimeState::default())
+            .build(crate::app_context())
+            .unwrap();
+        let handle = app.handle().clone();
+        assert!(try_begin(&handle));
+        let guard = SsoTaskGuard::new(handle.clone());
+
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            panic!("synthetic SSO task failure");
+        });
+        assert!(task.await.is_err());
+
+        assert_eq!(
+            app.state::<SsoRuntimeState>().status(),
+            (false, Some("sso-login-failed"))
+        );
+        assert!(try_begin(&handle));
     }
 }
