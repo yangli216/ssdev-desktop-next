@@ -52,36 +52,51 @@ function x86PeWithExport(name) {
   return bytes
 }
 
-async function createGeneratedWebKit(root) {
-  const plugin = join(root, 'reader-plugin')
-  const kit = join(root, 'reader-web-kit')
-  const matrix = join(root, 'reader-matrix.json')
+async function createGeneratedWebKit(root, options = {}) {
+  const {
+    fixtureName = 'reader',
+    pluginId = 'reader-plugin',
+    pluginVersion = '2.3.1',
+    displayName = 'Patient Reader',
+    serviceId = 'reader',
+    nativeMethod = 'read',
+    publicMethod = 'readCard',
+  } = options
+  const plugin = join(root, `${fixtureName}-plugin-source`)
+  const kit = join(root, `${fixtureName}-web-kit`)
+  const matrix = join(root, `${fixtureName}-matrix.json`)
+  const nativeLibrary = `${fixtureName}.dll`
   await mkdir(plugin)
   await writeFile(
     join(plugin, 'api.json'),
-    '{"serviceId":"reader","mainClass":"reader.dll","architecture":"x86","methods":[{"name":"read","alias":"readCard","parameters":["timeout"]}]}',
+    JSON.stringify({
+      serviceId,
+      mainClass: nativeLibrary,
+      architecture: 'x86',
+      methods: [{ name: nativeMethod, alias: publicMethod, parameters: ['timeout'] }],
+    }),
   )
-  await writeFile(join(plugin, 'reader.dll'), x86PeWithExport('read'))
+  await writeFile(join(plugin, nativeLibrary), x86PeWithExport(nativeMethod))
   await writeFile(join(plugin, 'plugin.json'), JSON.stringify({
     schemaVersion: 1,
-    pluginId: 'reader-plugin',
-    version: '2.3.1',
-    displayName: 'Patient Reader',
+    pluginId,
+    version: pluginVersion,
+    displayName,
   }))
   await writeFile(matrix, JSON.stringify({
     schemaVersion: 1,
     draft: false,
-    plugins: [{ pluginId: 'reader-plugin', version: '2.3.1' }],
+    plugins: [{ pluginId, version: pluginVersion }],
     cases: [{
-      name: 'reviewed-read',
+      name: `reviewed-${nativeMethod}`,
       request: {
-        serviceId: 'reader',
-        method: 'read',
+        serviceId,
+        method: nativeMethod,
         parameters: { timeout: 5 },
       },
       expected: {
         ResCode: 0,
-        ResData: { ReturnValue: 0, cardNumber: 'TEST-001' },
+        ResData: { ReturnValue: 0, fixture: fixtureName },
       },
     }],
   }))
@@ -110,6 +125,16 @@ function runConsumer(kit, sdkDirectory) {
     'verify',
     '--kit',
     kit,
+    '--sdk-directory',
+    sdkDirectory,
+  ], { cwd: repositoryRoot, encoding: 'utf8' })
+}
+
+function runConsumerSet(kits, sdkDirectory) {
+  return spawnSync(process.execPath, [
+    consumerScript,
+    'verify-set',
+    ...kits.flatMap((kit) => ['--kit', kit]),
     '--sdk-directory',
     sdkDirectory,
   ], { cwd: repositoryRoot, encoding: 'utf8' })
@@ -160,6 +185,59 @@ test('builds and verifies a reproducible bounded Web Bridge SDK artifact', async
   assert.equal(consumerReport.verified, true)
   assert.equal(Object.hasOwn(consumerReport, 'kit'), false)
   assert.equal(Object.hasOwn(consumerReport, 'sdkDirectory'), false)
+
+  const writerKit = await createGeneratedWebKit(root, {
+    fixtureName: 'writer',
+    pluginId: 'writer-plugin',
+    pluginVersion: '1.4.0',
+    displayName: 'Patient Writer',
+    serviceId: 'writer',
+    nativeMethod: 'write',
+    publicMethod: 'writeCard',
+  })
+  const consumedSet = runConsumerSet([writerKit, kit], first)
+  assert.equal(consumedSet.status, 0, consumedSet.stderr)
+  const setReport = JSON.parse(consumedSet.stdout)
+  assert.equal(setReport.kitCount, 2)
+  assert.equal(setReport.pluginCount, 2)
+  assert.equal(setReport.serviceCount, 2)
+  assert.equal(setReport.methodCount, 2)
+  assert.equal(setReport.fixtureCount, 2)
+  assert.deepEqual(setReport.kits.map((entry) => entry.pluginId), [
+    'reader-plugin',
+    'writer-plugin',
+  ])
+  assert.match(setReport.kitSetSha256, /^[0-9a-f]{64}$/)
+  assert.equal(setReport.sdkArchiveSha256, firstManifest.sha256)
+  assert.equal(setReport.runtimeRoutesVerified, true)
+  assert.equal(setReport.verified, true)
+  assert.equal(Object.hasOwn(setReport, 'sdkDirectory'), false)
+
+  const duplicateIdentityKit = await createGeneratedWebKit(root, {
+    fixtureName: 'reader-duplicate',
+    pluginId: 'READER-PLUGIN',
+    pluginVersion: '2.4.0',
+    displayName: 'Duplicate Reader',
+    serviceId: 'duplicate-reader',
+    nativeMethod: 'readDuplicate',
+    publicMethod: 'readDuplicateCard',
+  })
+  const duplicateIdentity = runConsumerSet([kit, duplicateIdentityKit], first)
+  assert.notEqual(duplicateIdentity.status, 0)
+  assert.match(duplicateIdentity.stderr, /duplicate plugin identity/)
+
+  const conflictingRouteKit = await createGeneratedWebKit(root, {
+    fixtureName: 'reader-route-conflict',
+    pluginId: 'reader-route-conflict-plugin',
+    pluginVersion: '1.0.0',
+    displayName: 'Reader Route Conflict',
+    serviceId: 'reader',
+    nativeMethod: 'read',
+    publicMethod: 'readCard',
+  })
+  const conflictingRoute = runConsumerSet([kit, conflictingRouteKit], first)
+  assert.notEqual(conflictingRoute.status, 0)
+  assert.match(conflictingRoute.stderr, /duplicate public route across Web kits/)
 
   const kitClientPath = join(kit, 'client.ts')
   const kitManifestPath = join(kit, 'ssdev-web-kit.json')

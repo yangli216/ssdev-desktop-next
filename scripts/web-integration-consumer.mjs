@@ -20,24 +20,43 @@ const kitFixturesName = 'fixtures.ts'
 const expectedSdkPackage = '@bsoft/ssdev-web-bridge'
 const maxKitManifestBytes = 64 * 1024
 const maxKitTypescriptBytes = 4 * 1024 * 1024
+const maxCombinedTypescriptBytes = 32 * 1024 * 1024
 const maxCoverageCount = 1024 * 1024
+const maxCombinedFixtureCount = 1024
+const maxKitCount = 64
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 function usage() {
-  return 'usage: node scripts/web-integration-consumer.mjs verify --kit DIR --sdk-directory DIR'
+  return 'usage: node scripts/web-integration-consumer.mjs verify --kit DIR --sdk-directory DIR | verify-set --kit DIR --kit DIR... --sdk-directory DIR'
 }
 
 function parseArguments(argv) {
-  const [command, kitFlag, kit, sdkFlag, sdkDirectory, ...extra] = argv
-  if (command !== 'verify'
-      || kitFlag !== '--kit'
-      || sdkFlag !== '--sdk-directory'
-      || !kit
+  const [command, ...arguments_] = argv
+  if (command !== 'verify' && command !== 'verify-set') throw new Error(usage())
+  const kits = []
+  let sdkDirectory
+  for (let index = 0; index < arguments_.length; index += 2) {
+    const flag = arguments_[index]
+    const value = arguments_[index + 1]
+    if (!value) throw new Error(usage())
+    if (flag === '--kit' && sdkDirectory === undefined) {
+      kits.push(resolve(value))
+    } else if (flag === '--sdk-directory' && sdkDirectory === undefined
+        && index + 2 === arguments_.length) {
+      sdkDirectory = resolve(value)
+    } else {
+      throw new Error(usage())
+    }
+  }
+  const expectedKitMinimum = command === 'verify-set' ? 2 : 1
+  const expectedKitMaximum = command === 'verify-set' ? maxKitCount : 1
+  if (kits.length < expectedKitMinimum
+      || kits.length > expectedKitMaximum
       || !sdkDirectory
-      || extra.length !== 0) {
+      || new Set(kits).size !== kits.length) {
     throw new Error(usage())
   }
-  return { kit: resolve(kit), sdkDirectory: resolve(sdkDirectory) }
+  return { command, kits, sdkDirectory }
 }
 
 function npmExecutable() {
@@ -60,6 +79,10 @@ function runProcess(executable, arguments_, options) {
 
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex')
+}
+
+function asciiFold(value) {
+  return value.replace(/[A-Z]/g, (character) => character.toLowerCase())
 }
 
 function isLowercaseSha256(value) {
@@ -185,14 +208,57 @@ async function readWebKit(kit) {
   })
 }
 
-async function verifyConsumer(options) {
-  const [kit, sdk] = await Promise.all([
-    readWebKit(options.kit),
+async function verifyConsumers(options) {
+  const [sdk, ...kits] = await Promise.all([
     verifyArtifactDirectory(options.sdkDirectory),
+    ...options.kits.map(readWebKit),
   ])
   if (sdk.packageName !== expectedSdkPackage || sdk.consumerSmokeVerified !== true) {
     throw new Error('Web Bridge SDK artifact is not an approved consumer-smoked package')
   }
+  kits.sort((left, right) => {
+    const leftIdentity = asciiFold(left.manifest.pluginId)
+    const rightIdentity = asciiFold(right.manifest.pluginId)
+    if (leftIdentity < rightIdentity) return -1
+    if (leftIdentity > rightIdentity) return 1
+    if (left.manifest.pluginVersion < right.manifest.pluginVersion) return -1
+    if (left.manifest.pluginVersion > right.manifest.pluginVersion) return 1
+    return 0
+  })
+  const pluginIdentities = new Set()
+  let serviceCount = 0
+  let methodCount = 0
+  let fixtureCount = 0
+  let typescriptBytes = 0
+  for (const kit of kits) {
+    const identity = asciiFold(kit.manifest.pluginId)
+    if (pluginIdentities.has(identity)) {
+      throw new Error(`Web kit set contains duplicate plugin identity [${kit.manifest.pluginId}]`)
+    }
+    pluginIdentities.add(identity)
+    serviceCount += kit.manifest.serviceCount
+    methodCount += kit.manifest.methodCount
+    fixtureCount += kit.manifest.fixtureCount
+    typescriptBytes += kit.clientBytes.length + kit.fixturesBytes.length
+  }
+  if (!Number.isSafeInteger(serviceCount)
+      || !Number.isSafeInteger(methodCount)
+      || !Number.isSafeInteger(fixtureCount)
+      || serviceCount > maxCoverageCount
+      || methodCount > maxCoverageCount
+      || fixtureCount > maxCombinedFixtureCount
+      || typescriptBytes > maxCombinedTypescriptBytes) {
+    throw new Error('Web kit set exceeds the combined consumer bounds')
+  }
+  const kitSummaries = kits.map((kit) => Object.freeze({
+    pluginId: kit.manifest.pluginId,
+    pluginVersion: kit.manifest.pluginVersion,
+    manifestSha256: kit.manifestSha256,
+  }))
+  const kitSetSha256 = sha256(Buffer.from(
+    kitSummaries.map((kit) => JSON.stringify(kit)).join('\n'),
+    'utf8',
+  ))
 
   const typescriptCompiler = join(
     repositoryRoot,
@@ -227,8 +293,18 @@ async function verifyConsumer(options) {
       '--package-lock=false',
       sdkArchiveSnapshot,
     ], { cwd: consumer, role: 'offline Web integration SDK install' })
-    await writeFile(join(consumer, kitClientName), kit.clientBytes, { flag: 'wx' })
-    await writeFile(join(consumer, kitFixturesName), kit.fixturesBytes, { flag: 'wx' })
+    const kitFiles = kits.map((kit, index) => {
+      const prefix = `kit-${String(index).padStart(2, '0')}`
+      return Object.freeze({
+        kit,
+        clientName: `${prefix}-client.ts`,
+        fixturesName: `${prefix}-fixtures.ts`,
+      })
+    })
+    for (const entry of kitFiles) {
+      await writeFile(join(consumer, entry.clientName), entry.kit.clientBytes, { flag: 'wx' })
+      await writeFile(join(consumer, entry.fixturesName), entry.kit.fixturesBytes, { flag: 'wx' })
+    }
     await writeFile(join(consumer, 'tsconfig.json'), `${JSON.stringify({
       compilerOptions: {
         target: 'ES2022',
@@ -242,38 +318,55 @@ async function verifyConsumer(options) {
         noUncheckedIndexedAccess: true,
         skipLibCheck: false,
       },
-      files: [kitClientName, kitFixturesName],
+      files: kitFiles.flatMap((entry) => [entry.clientName, entry.fixturesName]),
     }, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' })
     runProcess(process.execPath, [typescriptCompiler, '--project', join(consumer, 'tsconfig.json')], {
       cwd: consumer,
       role: 'Web kit and SDK TypeScript consumer compile',
     })
 
+    const runtimeImports = kitFiles.map((entry, index) => `import * as clientModule${index} from './dist/${entry.clientName.replace(/\.ts$/, '.js')}'\nimport { pluginFixtures as pluginFixtures${index} } from './dist/${entry.fixturesName.replace(/\.ts$/, '.js')}'`).join('\n')
+    const runtimeIntegrations = kitFiles.map((entry, index) => `  {
+    pluginId: ${JSON.stringify(entry.kit.manifest.pluginId)},
+    methodCount: ${entry.kit.manifest.methodCount},
+    fixtureCount: ${entry.kit.manifest.fixtureCount},
+    clientModule: clientModule${index},
+    fixtures: pluginFixtures${index},
+  }`).join(',\n')
     const runtimePath = join(consumer, 'runtime-smoke.mjs')
     await writeFile(runtimePath, `import {
   UnexpectedPluginInvocationError,
   createPluginFixtureInvoker,
 } from '@bsoft/ssdev-web-bridge'
-import * as clientModule from './dist/client.js'
-import { pluginFixtures } from './dist/fixtures.js'
 
-const clientExports = Object.entries(clientModule)
-  .filter(([name, value]) => name.endsWith('Client') && typeof value === 'function')
-if (clientExports.length !== 1) throw new Error('Web kit must export exactly one generated client')
-if (!Array.isArray(pluginFixtures) || pluginFixtures.length === 0) {
-  throw new Error('Web kit must export non-empty plugin fixtures')
-}
-const invoker = createPluginFixtureInvoker(pluginFixtures)
-const Client = clientExports[0][1]
-const client = new Client(invoker)
-const methods = Object.getOwnPropertyNames(Client.prototype)
-  .filter((name) => name !== 'constructor' && typeof client[name] === 'function')
+${runtimeImports}
+
+const integrations = [
+${runtimeIntegrations}
+]
 const routeKey = (fixture) => JSON.stringify([fixture.serviceId, fixture.method])
-const fixtureRoutes = new Set(pluginFixtures.map(routeKey))
-if (methods.length === 0 || methods.length !== fixtureRoutes.size) {
-  throw new Error('generated client methods do not match fixture route coverage')
+const routeOwners = new Map()
+const allFixtures = []
+for (const integration of integrations) {
+  if (!Array.isArray(integration.fixtures)
+      || integration.fixtures.length !== integration.fixtureCount) {
+    throw new Error(\`Web kit [\${integration.pluginId}] fixture count does not match its manifest\`)
+  }
+  const fixtureRoutes = new Set(integration.fixtures.map(routeKey))
+  if (fixtureRoutes.size !== integration.methodCount) {
+    throw new Error(\`Web kit [\${integration.pluginId}] routes do not match its manifest method coverage\`)
+  }
+  for (const route of fixtureRoutes) {
+    const owner = routeOwners.get(route)
+    if (owner !== undefined) {
+      throw new Error(\`duplicate public route across Web kits [\${owner}] and [\${integration.pluginId}]\`)
+    }
+    routeOwners.set(route, integration.pluginId)
+  }
+  allFixtures.push(...integration.fixtures)
 }
-for (const fixture of pluginFixtures) {
+const invoker = createPluginFixtureInvoker(allFixtures)
+for (const fixture of allFixtures) {
   const response = await invoker.invokePlugin(
     fixture.serviceId,
     fixture.method,
@@ -283,26 +376,41 @@ for (const fixture of pluginFixtures) {
     throw new Error('fixture invoker changed an expected response')
   }
 }
-const matchedRoutes = new Set()
-for (const method of methods) {
-  let matched = false
-  for (const fixture of pluginFixtures) {
-    try {
-      const response = await client[method](fixture.parameters ?? {})
-      if (JSON.stringify(response) !== JSON.stringify(fixture.response)) {
-        throw new Error('generated client returned an unexpected fixture response')
-      }
-      matchedRoutes.add(routeKey(fixture))
-      matched = true
-      break
-    } catch (error) {
-      if (!(error instanceof UnexpectedPluginInvocationError)) throw error
-    }
+for (const integration of integrations) {
+  const clientExports = Object.entries(integration.clientModule)
+    .filter(([name, value]) => name.endsWith('Client') && typeof value === 'function')
+  if (clientExports.length !== 1) {
+    throw new Error(\`Web kit [\${integration.pluginId}] must export exactly one generated client\`)
   }
-  if (!matched) throw new Error(\`generated client method [\${method}] has no matching fixture\`)
-}
-if (matchedRoutes.size !== fixtureRoutes.size) {
-  throw new Error('generated client does not cover every fixture route')
+  const Client = clientExports[0][1]
+  const client = new Client(invoker)
+  const methods = Object.getOwnPropertyNames(Client.prototype)
+    .filter((name) => name !== 'constructor' && typeof client[name] === 'function')
+  const fixtureRoutes = new Set(integration.fixtures.map(routeKey))
+  if (methods.length !== integration.methodCount) {
+    throw new Error(\`Web kit [\${integration.pluginId}] client method count does not match its manifest\`)
+  }
+  const matchedRoutes = new Set()
+  for (const method of methods) {
+    let matched = false
+    for (const fixture of integration.fixtures) {
+      try {
+        const response = await client[method](fixture.parameters ?? {})
+        if (JSON.stringify(response) !== JSON.stringify(fixture.response)) {
+          throw new Error('generated client returned an unexpected fixture response')
+        }
+        matchedRoutes.add(routeKey(fixture))
+        matched = true
+        break
+      } catch (error) {
+        if (!(error instanceof UnexpectedPluginInvocationError)) throw error
+      }
+    }
+    if (!matched) throw new Error(\`generated client method [\${method}] has no matching fixture\`)
+  }
+  if (matchedRoutes.size !== fixtureRoutes.size) {
+    throw new Error(\`Web kit [\${integration.pluginId}] client does not cover every fixture route\`)
+  }
 }
 `, { encoding: 'utf8', flag: 'wx' })
     runProcess(process.execPath, [runtimePath], {
@@ -313,14 +421,13 @@ if (matchedRoutes.size !== fixtureRoutes.size) {
     await rm(consumer, { recursive: true, force: true })
   }
 
-  return Object.freeze({
+  const sharedReport = {
     schemaVersion: 1,
-    pluginId: kit.manifest.pluginId,
-    pluginVersion: kit.manifest.pluginVersion,
-    serviceCount: kit.manifest.serviceCount,
-    methodCount: kit.manifest.methodCount,
-    fixtureCount: kit.manifest.fixtureCount,
-    kitManifestSha256: kit.manifestSha256,
+    kitCount: kits.length,
+    serviceCount,
+    methodCount,
+    fixtureCount,
+    kitSetSha256,
     sdkPackageName: sdk.packageName,
     sdkPackageVersion: sdk.packageVersion,
     sdkArchiveSha256: sdk.sha256,
@@ -329,11 +436,24 @@ if (matchedRoutes.size !== fixtureRoutes.size) {
     typescriptCompileVerified: true,
     runtimeRoutesVerified: true,
     verified: true,
+  }
+  if (options.command === 'verify') {
+    return Object.freeze({
+      ...sharedReport,
+      pluginId: kitSummaries[0].pluginId,
+      pluginVersion: kitSummaries[0].pluginVersion,
+      kitManifestSha256: kitSummaries[0].manifestSha256,
+    })
+  }
+  return Object.freeze({
+    ...sharedReport,
+    pluginCount: kitSummaries.length,
+    kits: kitSummaries,
   })
 }
 
 async function main() {
-  const report = await verifyConsumer(parseArguments(process.argv.slice(2)))
+  const report = await verifyConsumers(parseArguments(process.argv.slice(2)))
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`)
 }
 

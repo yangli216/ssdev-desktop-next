@@ -45,6 +45,17 @@ node scripts/web-integration-consumer.mjs verify \
 
 该命令先复核 Web kit 固定文件集、摘要和来源头，再复核 SDK `.tgz`、当前锁定源码摘要及其已有消费者冒烟证据；随后只使用已校验的内存快照，在临时业务项目中禁用生命周期脚本并离线安装 SDK，以严格 NodeNext 配置编译 `client.ts + fixtures.ts`，最后通过 SDK fixture invoker 实际覆盖生成客户端的每个公开方法和每条 fixture route。成功报告绑定插件版本、kit 清单摘要、SDK 版本、归档/源码摘要与覆盖计数，不返回本机路径。它证明这两份精确制品当前可以组合消费，但二者仍是未签名的前端交接物，不能替代受保护分支评审、插件签名或 Windows 硬件矩阵。
 
+真实业务项目包含多个插件时，不需要建立另一种集合制品；对同一 SDK 重复传入经过评审的 kit：
+
+```bash
+node scripts/web-integration-consumer.mjs verify-set \
+  --kit vendor/reader-2.3.1-web-kit \
+  --kit vendor/writer-1.4.0-web-kit \
+  --sdk-directory artifacts/ssdev-web-bridge-sdk
+```
+
+联合门禁固定排序最多 64 个 kit，拒绝重复路径、ASCII 大小写归一后重复的插件 ID、超出总量边界以及跨插件重复 `serviceId/method`；全部源码在一个临时项目中用同一 SDK 编译，并由一个共享 fixture invoker 覆盖所有客户端。报告包含无路径的 kit 身份/版本/清单摘要列表及确定性集合摘要，可直接作为业务 CI 的精确依赖证据。
+
 `connectDesktop()` 会先读取并运行时校验最小系统声明，再检查协议版本。页面不在授权桌面窗口中时抛出 `DesktopBridgeUnavailableError`；系统声明损坏或与当前能力 schema 自相矛盾时抛出带稳定 `reason` 的 `InvalidDesktopDeclarationError`；协议不兼容时抛出 `UnsupportedDesktopProtocolError`。业务代码应显示客户端升级或修复提示，不要把这些错误静默切换到 HTTP。
 
 能力 schema 与桥接协议独立演进。SDK 对当前 schema 严格检查布尔状态、错误码和全部容量边界；遇到更高的未知 schema 时保留并冻结原声明，但 `getTrackedInvocationCapabilities()` 返回 `null`，不会仅因可选 JavaScript 方法存在就误报持久调用可用。升级 SDK 后才能使用新 schema 的能力。

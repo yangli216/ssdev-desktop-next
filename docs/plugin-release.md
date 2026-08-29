@@ -114,6 +114,8 @@ Web 接入包是便于代码评审和版本控制的源码制品，不是新的�
 
 业务仓库接收目标提交的 Web Bridge SDK `.tgz` 后，继续运行 `node scripts/web-integration-consumer.mjs verify --kit <接入包目录> --sdk-directory <SDK制品目录>`。组合门禁会在无网络、无生命周期脚本的临时消费者中严格编译两份生成源码，并使用 fixture invoker 实际调用生成客户端的全部公开方法；报告绑定精确 kit 清单、SDK 归档和锁定源码摘要。这样可以阻止 Web kit 和 SDK 分别通过各自检查、组合后才暴露导出或类型不兼容。该报告仍不认证未签名 kit 的发布者，也不扩展任何业务来源或原生权限。
 
+多插件业务使用 `verify-set --kit <A> --kit <B> ... --sdk-directory <SDK制品目录>`，不再创建一份容易漂移的新集合清单。命令最多接受 64 个不重复目录，按 ASCII 大小写归一身份拒绝重复插件，并在安装 SDK 前固定排序和计算无路径集合摘要；联合运行还会拒绝不同 kit 暴露相同公开 route。所有生成客户端与 fixture 必须在同一个严格 TypeScript 项目和同一个共享 invoker 中通过，逐 kit 成功不能替代该联合结果。
+
 ## 1. 准备发布目录
 
 所有输出都必须是尚不存在的新路径，并位于旧插件目录之外：
