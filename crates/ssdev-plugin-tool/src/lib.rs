@@ -15,7 +15,7 @@ use thiserror::Error;
 pub use webplus_plugin_config::PublicApiChange as ApiCompatibilityChange;
 use webplus_plugin_config::{
     compare_public_api, discover_plugins, generate_typescript_client, PluginManifest,
-    PluginMetadata, ServiceDefinition,
+    PluginMetadata, ServiceDefinition, API_FILENAME,
 };
 use webplus_plugin_package::{create_deterministic_package, PreparedPlugin};
 use webplus_plugin_repository::{
@@ -46,6 +46,9 @@ const MAX_PE_OPTIONAL_HEADER_BYTES: usize = 4096;
 const MAX_PE_SECTIONS: usize = 96;
 const MAX_PE_EXPORT_NAME_BYTES: usize = 1024;
 const PLUGIN_METADATA_FILENAME: &str = "plugin.json";
+const WEB_KIT_CLIENT_FILENAME: &str = "client.ts";
+const WEB_KIT_FIXTURES_FILENAME: &str = "fixtures.ts";
+const WEB_KIT_MANIFEST_FILENAME: &str = "ssdev-web-kit.json";
 const LEGACY_LICENSE_FILENAME: &str = "license.dat";
 const RELEASE_SET_MATERIALIZATION_MARKER: &str = ".release-set-materializing.json";
 
@@ -103,6 +106,13 @@ pub struct GenerateWebFixturesOptions<'a> {
     pub plugin_dir: Option<&'a Path>,
     pub matrix: &'a Path,
     pub output: &'a Path,
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerateWebKitOptions<'a> {
+    pub plugin_dir: &'a Path,
+    pub matrix: &'a Path,
+    pub destination: &'a Path,
 }
 
 #[derive(Debug, Clone)]
@@ -288,6 +298,25 @@ pub struct GenerateWebFixturesReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GenerateWebKitReport {
+    pub schema_version: u8,
+    pub plugin_id: String,
+    pub plugin_version: String,
+    pub service_count: usize,
+    pub method_count: usize,
+    pub fixture_count: usize,
+    pub file_count: usize,
+    pub api_sha256: String,
+    pub plugin_metadata_sha256: String,
+    pub matrix_sha256: String,
+    pub client_sha256: String,
+    pub fixtures_sha256: String,
+    pub manifest_sha256: String,
+    pub destination: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitDllPluginReport {
     pub schema_version: u8,
     pub plugin_id: String,
@@ -449,6 +478,36 @@ struct GeneratedWebFixture {
     method: String,
     parameters: Map<String, Value>,
     response: InvokeResponse,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebKitManifest<'a> {
+    schema_version: u8,
+    plugin_id: &'a str,
+    plugin_version: &'a str,
+    display_name: &'a str,
+    api_sha256: &'a str,
+    plugin_metadata_sha256: &'a str,
+    matrix_sha256: &'a str,
+    service_count: usize,
+    method_count: usize,
+    fixture_count: usize,
+    files: WebKitFiles<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebKitFiles<'a> {
+    client: WebKitFile<'a>,
+    fixtures: WebKitFile<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebKitFile<'a> {
+    path: &'a str,
+    sha256: &'a str,
 }
 
 /// Creates a minimal, buildable Windows DLL plugin workspace for the common
@@ -631,7 +690,7 @@ fn scaffold_readme(
         PluginArchitecture::X64 => "x64",
     };
     format!(
-        "# {display_name}\n\nSSDEV DLL 插件脚手架。插件 ID：`{plugin_id}`；服务：`{service_id}`；架构：`{architecture}`。\n\n## 1. 构建 DLL\n\n在 Windows PowerShell 中运行：\n\n```powershell\n./build.ps1\n```\n\n脚本使用锁定依赖构建 `native` crate，并把 `{native_library}` 复制到 `release-source/bin`。修改导出函数后必须同步评审 `release-source/api.json`。\n\n## 2. 检查和本地调试\n\n先运行 `ssdev-plugin-tool source-check --source release-source --plugin-id {plugin_id}`。该命令不加载 DLL、不执行方法，也不需要签名密钥；它会用正式准备流程的同一规则检查文件边界、PE 位数、声明导出和 ABI。随后在 SSDEV Desktop 的“原生映射”工作台中选择 `release-source/bin/{native_library}`，按照 `release-source/api.json` 配置 `SsdevEcho`，然后使用输入 `SSDEV_TEST` 调用 `echo`。不要把生产账号、患者数据或不可逆设备操作放入调试用例。\n\n## 3. Web 接入\n\n`web/client.ts` 由共享清单生成器产生，依赖 `@bsoft/ssdev-web-bridge`。业务代码创建桌面连接后，把 `connection.bridge` 传给生成的客户端；`api.json` 变化后重新运行 `ssdev-plugin-tool client`，输出到一个新的临时文件，评审差异后替换业务制品。\n\n## 4. 签名发布\n\n先运行 `ssdev-plugin-tool prepare --source release-source ... --matrix-seed matrix-seed.json`。矩阵种子保持 `draft: true` 和 `reviewRequired: true`；必须在 Windows 测试环境核对完整响应后才可解除这两项门禁。随后由组织 KMS/HSM 签名，并使用 `finalize` 生成 `.ssdev-plugin`。私钥、真实硬件数据和业务 Web 源码都不能放入 `release-source`。\n\n此模板只覆盖 UTF-8 字符串输入和 1 KiB 调用方输出缓冲区。结构体、回调、浮点 ABI、厂商内存释放或线程绑定组件需要单独设计 Rust 适配器，不能通过修改 JSON 猜测。\n"
+        "# {display_name}\n\nSSDEV DLL 插件脚手架。插件 ID：`{plugin_id}`；服务：`{service_id}`；架构：`{architecture}`。\n\n## 1. 构建 DLL\n\n在 Windows PowerShell 中运行：\n\n```powershell\n./build.ps1\n```\n\n脚本使用锁定依赖构建 `native` crate，并把 `{native_library}` 复制到 `release-source/bin`。修改导出函数后必须同步评审 `release-source/api.json`。\n\n## 2. 检查和本地调试\n\n先运行 `ssdev-plugin-tool source-check --source release-source --plugin-id {plugin_id}`。该命令不加载 DLL、不执行方法，也不需要签名密钥；它会用正式准备流程的同一规则检查文件边界、PE 位数、声明导出和 ABI。随后在 SSDEV Desktop 的“原生映射”工作台中选择 `release-source/bin/{native_library}`，按照 `release-source/api.json` 配置 `SsdevEcho`，然后使用输入 `SSDEV_TEST` 调用 `echo`。不要把生产账号、患者数据或不可逆设备操作放入调试用例。\n\n## 3. Web 接入\n\n`web/client.ts` 由共享清单生成器产生，依赖 `@bsoft/ssdev-web-bridge`。业务代码创建桌面连接后，把 `connection.bridge` 传给生成的客户端；`api.json` 变化后重新运行 `ssdev-plugin-tool client`，输出到一个新的临时文件，评审差异后替换业务制品。正式矩阵完成脱敏和实机复核后，使用 `ssdev-plugin-tool web-kit --plugin-dir <规范插件目录> --matrix <定稿矩阵> --destination <新目录>` 原子生成客户端、fixture 和摘要清单，再把整个接入包交给业务项目。\n\n## 4. 签名发布\n\n先运行 `ssdev-plugin-tool prepare --source release-source ... --matrix-seed matrix-seed.json`。矩阵种子保持 `draft: true` 和 `reviewRequired: true`；必须在 Windows 测试环境核对完整响应后才可解除这两项门禁。随后由组织 KMS/HSM 签名，并使用 `finalize` 生成 `.ssdev-plugin`。私钥、真实硬件数据和业务 Web 源码都不能放入 `release-source`。\n\n此模板只覆盖 UTF-8 字符串输入和 1 KiB 调用方输出缓冲区。结构体、回调、浮点 ABI、厂商内存释放或线程绑定组件需要单独设计 Rust 适配器，不能通过修改 JSON 猜测。\n"
     )
 }
 
@@ -995,6 +1054,124 @@ export const pluginFixtures = {fixtures_json} satisfies readonly PluginInvocatio
         matrix_sha256,
         output,
         output_sha256: sha256_hex(source.as_bytes()),
+    })
+}
+
+/// Atomically creates the version-bound handoff consumed by a business Web
+/// project. The client and fixtures are generated from one plugin snapshot and
+/// a complete executable matrix, while the manifest binds every source and
+/// generated file digest. This remains a source artifact and does not prove
+/// that hardware approval occurred.
+pub fn generate_web_kit(
+    options: &GenerateWebKitOptions<'_>,
+) -> Result<GenerateWebKitReport, ToolError> {
+    let plugin_dir = canonical_real_directory(options.plugin_dir)?;
+    let destination = normalized_new_path(options.destination)?;
+    if destination.starts_with(&plugin_dir) {
+        return Err(ToolError::Invalid(
+            "Web kit destination must stay outside the verified plugin input".into(),
+        ));
+    }
+
+    let api_path = plugin_dir.join(API_FILENAME);
+    let plugin_metadata_path = plugin_dir.join(PLUGIN_METADATA_FILENAME);
+    let api_sha256 = sha256_file(&api_path)?;
+    let plugin_metadata_sha256 = sha256_file(&plugin_metadata_path)?;
+    let matrix_sha256 = sha256_file_bounded(options.matrix, MAX_MATRIX_BYTES)?;
+    let metadata = PluginMetadata::load_optional(&plugin_dir)?.ok_or_else(|| {
+        ToolError::Invalid("Web kit plugin directory must contain normalized plugin.json".into())
+    })?;
+    let manifest = PluginManifest::load(metadata.plugin_id.clone(), &plugin_dir)?;
+    let plugin_id = metadata.plugin_id;
+    let plugin_version = metadata.version.to_string();
+    let display_name = if metadata.display_name.trim().is_empty() {
+        plugin_id.clone()
+    } else {
+        metadata.display_name
+    };
+    let service_count = manifest.services.len();
+    let method_count = manifest
+        .services
+        .iter()
+        .map(|service| service.methods.len())
+        .sum();
+    let generated_client = generate_typescript_client(&display_name, &manifest.services)?;
+    let client = format!(
+        "// Web kit plugin: {plugin_id}@{plugin_version}\n\
+// API SHA-256: {api_sha256}\n\
+{generated_client}"
+    );
+
+    with_fresh_directory(&destination, "Web kit destination", |destination| {
+        let fixtures_path = destination.join(WEB_KIT_FIXTURES_FILENAME);
+        let fixtures = generate_web_fixtures(&GenerateWebFixturesOptions {
+            plugin_root: None,
+            plugin_dir: Some(&plugin_dir),
+            matrix: options.matrix,
+            output: &fixtures_path,
+        })?;
+        if fixtures.plugin_count != 1 || fixtures.matrix_sha256 != matrix_sha256 {
+            return Err(ToolError::Invalid(
+                "Web kit fixture generation no longer matches the checked plugin snapshot".into(),
+            ));
+        }
+
+        let client_path = destination.join(WEB_KIT_CLIENT_FILENAME);
+        write_new_bytes(&client_path, client.as_bytes())?;
+        let client_sha256 = sha256_hex(client.as_bytes());
+        let fixtures_sha256 = fixtures.output_sha256;
+        let kit_manifest = WebKitManifest {
+            schema_version: 1,
+            plugin_id: &plugin_id,
+            plugin_version: &plugin_version,
+            display_name: &display_name,
+            api_sha256: &api_sha256,
+            plugin_metadata_sha256: &plugin_metadata_sha256,
+            matrix_sha256: &matrix_sha256,
+            service_count,
+            method_count,
+            fixture_count: fixtures.fixture_count,
+            files: WebKitFiles {
+                client: WebKitFile {
+                    path: WEB_KIT_CLIENT_FILENAME,
+                    sha256: &client_sha256,
+                },
+                fixtures: WebKitFile {
+                    path: WEB_KIT_FIXTURES_FILENAME,
+                    sha256: &fixtures_sha256,
+                },
+            },
+        };
+        let manifest_path = destination.join(WEB_KIT_MANIFEST_FILENAME);
+        write_new_json(&manifest_path, &kit_manifest)?;
+        let manifest_sha256 = sha256_file(&manifest_path)?;
+
+        if sha256_file(&api_path)? != api_sha256
+            || sha256_file(&plugin_metadata_path)? != plugin_metadata_sha256
+            || sha256_file_bounded(options.matrix, MAX_MATRIX_BYTES)? != matrix_sha256
+        {
+            return Err(ToolError::Invalid(
+                "plugin API, metadata, or executable matrix changed while the Web kit was generated"
+                    .into(),
+            ));
+        }
+
+        Ok(GenerateWebKitReport {
+            schema_version: 1,
+            plugin_id: plugin_id.clone(),
+            plugin_version: plugin_version.clone(),
+            service_count,
+            method_count,
+            fixture_count: fixtures.fixture_count,
+            file_count: 3,
+            api_sha256: api_sha256.clone(),
+            plugin_metadata_sha256: plugin_metadata_sha256.clone(),
+            matrix_sha256: matrix_sha256.clone(),
+            client_sha256,
+            fixtures_sha256,
+            manifest_sha256,
+            destination: destination.to_path_buf(),
+        })
     })
 }
 
@@ -3254,6 +3431,8 @@ mod tests {
         let build = fs::read_to_string(destination.join("build.ps1")).unwrap();
         assert!(build.contains("x86_64-pc-windows-msvc"));
         assert!(build.contains("cargo build --locked --release"));
+        let readme = fs::read_to_string(destination.join("README.md")).unwrap();
+        assert!(readme.contains("ssdev-plugin-tool web-kit"));
         let matrix: PluginMatrix =
             serde_json::from_slice(&fs::read(destination.join("matrix-seed.json")).unwrap())
                 .unwrap();
@@ -3830,6 +4009,171 @@ mod tests {
             .to_string()
             .contains("duplicate Web fixture input for route [reader/readCard]"));
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn web_kit_atomically_binds_client_fixtures_and_source_digests() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_dir = root.path().join("reader-plugin");
+        fs::create_dir(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("api.json"),
+            r#"{"serviceId":"reader","mainClass":"reader.dll","architecture":"x86","methods":[{"name":"read","alias":"readCard","parameters":["timeout"]}]}"#,
+        )
+        .unwrap();
+        fs::write(plugin_dir.join("reader.dll"), pe(0x014c, &["read"])).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "pluginId": "reader-plugin",
+                "version": "2.3.1",
+                "displayName": "Patient Reader"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let matrix = matrix_file(
+            root.path(),
+            "web-kit-matrix.json",
+            bound_executable_matrix(
+                json!({
+                    "name": "reviewed-read",
+                    "request": {
+                        "serviceId": "reader",
+                        "method": "read",
+                        "parameters": { "timeout": 5 }
+                    },
+                    "expected": {
+                        "ResCode": 0,
+                        "ResData": { "ReturnValue": 0, "cardNumber": "TEST-001" }
+                    }
+                }),
+                "reader-plugin",
+                "2.3.1",
+            ),
+        );
+        let destination = root.path().join("reader-web-kit");
+
+        let report = generate_web_kit(&GenerateWebKitOptions {
+            plugin_dir: &plugin_dir,
+            matrix: &matrix,
+            destination: &destination,
+        })
+        .unwrap();
+        assert_eq!(report.plugin_id, "reader-plugin");
+        assert_eq!(report.plugin_version, "2.3.1");
+        assert_eq!(report.service_count, 1);
+        assert_eq!(report.method_count, 1);
+        assert_eq!(report.fixture_count, 1);
+        assert_eq!(report.file_count, 3);
+        assert_eq!(
+            report.api_sha256,
+            sha256_file(&plugin_dir.join("api.json")).unwrap()
+        );
+        assert_eq!(
+            report.plugin_metadata_sha256,
+            sha256_file(&plugin_dir.join("plugin.json")).unwrap()
+        );
+        assert_eq!(report.matrix_sha256, sha256_file(&matrix).unwrap());
+        assert_eq!(report.destination, destination.canonicalize().unwrap());
+
+        let client = fs::read_to_string(destination.join(WEB_KIT_CLIENT_FILENAME)).unwrap();
+        let fixtures = fs::read_to_string(destination.join(WEB_KIT_FIXTURES_FILENAME)).unwrap();
+        assert!(client.contains("Web kit plugin: reader-plugin@2.3.1"));
+        assert!(client.contains(&format!("API SHA-256: {}", report.api_sha256)));
+        assert!(client.contains("export class PatientReaderClient"));
+        assert!(client.contains("invokePlugin<ReadCardData>(\"reader\", \"readCard\""));
+        assert!(fixtures.contains("\"method\": \"readCard\""));
+        assert_eq!(report.client_sha256, sha256_hex(client.as_bytes()));
+        assert_eq!(report.fixtures_sha256, sha256_hex(fixtures.as_bytes()));
+
+        let kit_manifest: Value =
+            serde_json::from_slice(&fs::read(destination.join(WEB_KIT_MANIFEST_FILENAME)).unwrap())
+                .unwrap();
+        assert_eq!(kit_manifest["pluginId"], "reader-plugin");
+        assert_eq!(kit_manifest["pluginVersion"], "2.3.1");
+        assert_eq!(kit_manifest["matrixSha256"], report.matrix_sha256);
+        assert_eq!(
+            kit_manifest["files"]["client"]["path"],
+            WEB_KIT_CLIENT_FILENAME
+        );
+        assert_eq!(
+            kit_manifest["files"]["client"]["sha256"],
+            report.client_sha256
+        );
+        assert_eq!(
+            kit_manifest["files"]["fixtures"]["sha256"],
+            report.fixtures_sha256
+        );
+        assert_eq!(
+            report.manifest_sha256,
+            sha256_file(&destination.join(WEB_KIT_MANIFEST_FILENAME)).unwrap()
+        );
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 3);
+        assert!(!client.contains(plugin_dir.to_string_lossy().as_ref()));
+        assert!(!fixtures.contains(plugin_dir.to_string_lossy().as_ref()));
+        assert!(!serde_json::to_string(&kit_manifest)
+            .unwrap()
+            .contains(plugin_dir.to_string_lossy().as_ref()));
+
+        let error = generate_web_kit(&GenerateWebKitOptions {
+            plugin_dir: &plugin_dir,
+            matrix: &matrix,
+            destination: &destination,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+
+        let inside_destination = plugin_dir.join("web-kit");
+        let error = generate_web_kit(&GenerateWebKitOptions {
+            plugin_dir: &plugin_dir,
+            matrix: &matrix,
+            destination: &inside_destination,
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("outside the verified plugin input"));
+        assert!(!inside_destination.exists());
+    }
+
+    #[test]
+    fn failed_web_kit_generation_leaves_no_partial_handoff() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_dir = root.path().join("reader-plugin");
+        fs::create_dir(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("api.json"),
+            r#"{"serviceId":"reader","mainClass":"reader.dll","architecture":"x86","methods":[{"name":"read","parameters":["timeout"]}]}"#,
+        )
+        .unwrap();
+        fs::write(plugin_dir.join("reader.dll"), pe(0x014c, &["read"])).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"schemaVersion":1,"pluginId":"reader-plugin","version":"1.0.0","displayName":"Reader"}"#,
+        )
+        .unwrap();
+        let draft_matrix = matrix_file(
+            root.path(),
+            "draft-web-kit-matrix.json",
+            json!({
+                "schemaVersion": 1,
+                "draft": true,
+                "plugins": [{ "pluginId": "reader-plugin", "version": "1.0.0" }],
+                "cases": [executable_case()]
+            }),
+        );
+        let destination = root.path().join("incomplete-web-kit");
+
+        let error = generate_web_kit(&GenerateWebKitOptions {
+            plugin_dir: &plugin_dir,
+            matrix: &draft_matrix,
+            destination: &destination,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("still marked as draft"));
+        assert!(!destination.exists());
     }
 
     #[test]

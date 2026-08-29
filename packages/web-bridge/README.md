@@ -33,6 +33,8 @@ fixture 按 service、method 和完整 JSON 参数精确匹配，对象键顺序
 
 已经完成脱敏、精确响应复核并绑定插件版本的正式黄金矩阵，可以通过 `ssdev-plugin-tool web-fixtures` 生成上述数组，避免业务项目再次手抄 route 和数据。生成器拒绝草稿、占位符、未解除复核项和同输入多响应歧义；输出仍包含矩阵原始测试数据，提交前必须单独评审。
 
+单插件正式交接优先使用 `ssdev-plugin-tool web-kit`，一次生成同版本的 `client.ts`、`fixtures.ts` 和 `ssdev-web-kit.json`。清单绑定插件 ID/版本、API、元数据、矩阵和两个 TypeScript 文件摘要，生成失败不会留下部分目录，避免业务项目把新版客户端与旧版 fixture 混用。接入包是待代码评审的源码制品，不包含原生组件，也不替代插件签名或 Windows 实机验收。
+
 `connectDesktop()` 会先读取并运行时校验最小系统声明，再检查协议版本。页面不在授权桌面窗口中时抛出 `DesktopBridgeUnavailableError`；系统声明损坏或与当前能力 schema 自相矛盾时抛出带稳定 `reason` 的 `InvalidDesktopDeclarationError`；协议不兼容时抛出 `UnsupportedDesktopProtocolError`。业务代码应显示客户端升级或修复提示，不要把这些错误静默切换到 HTTP。
 
 能力 schema 与桥接协议独立演进。SDK 对当前 schema 严格检查布尔状态、错误码和全部容量边界；遇到更高的未知 schema 时保留并冻结原声明，但 `getTrackedInvocationCapabilities()` 返回 `null`，不会仅因可选 JavaScript 方法存在就误报持久调用可用。升级 SDK 后才能使用新 schema 的能力。

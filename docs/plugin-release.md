@@ -90,6 +90,19 @@ cargo run --locked -p ssdev-plugin-tool -- web-fixtures `
 
 生成模块包含矩阵中的精确输入和响应，工具不会自动脱敏。输出必须是插件输入目录之外尚不存在的 `.ts` 文件；报告和文件头同时记录源矩阵 SHA-256，生成期间矩阵变化会失败。超出 JavaScript 安全整数范围的 64 位值必须在插件契约和矩阵中使用字符串表达，工具不会生成已经发生精度丢失的数字字面量。发布人员应先确认矩阵只使用合成或已脱敏数据，再决定是否提交到业务仓库。结构门禁本身不能证明矩阵确实执行过硬件或获得组织审批；该模块既不进入插件签名载荷，也不替代实机证据。
 
+单插件向业务前端正式交接时，推荐不要分别传递客户端和 fixture。使用同一份已规范化插件目录与定稿矩阵一次生成原子 Web 接入包：
+
+```powershell
+cargo run --locked -p ssdev-plugin-tool -- web-kit `
+  --plugin-dir C:\secure-release\reader-2.3.1-stage `
+  --matrix C:\secure-release\reader-2.3.1-matrix.json `
+  --destination C:\business-web\vendor\reader-2.3.1-web-kit
+```
+
+目标必须是插件目录之外尚不存在的新目录。成功后固定只包含 `client.ts`、`fixtures.ts` 和 `ssdev-web-kit.json`：客户端使用同一清单生成，fixture 复用上述完整矩阵门禁，清单绑定插件 ID/版本、`api.json`、`plugin.json`、矩阵以及两份生成文件的 SHA-256。任一步失败或输入在生成期间变化都会删除整个半成品目录，避免业务仓库收到不同插件版本的客户端与测试数据。多插件项目仍按插件分别生成接入包，或只需要联合测试数组时继续使用 `web-fixtures --plugin-root`。
+
+Web 接入包是便于代码评审和版本控制的源码制品，不是新的插件包或签名封套。它不包含 DLL/COM 文件，不授予业务页面额外权限，也不证明清单摘要对应的插件已通过实机运行；发布负责人仍须先完成签名包、发布集合和黄金矩阵验收。`fixtures.ts` 继续含有矩阵原始数据，因此整个接入包都必须在提交业务仓库前完成脱敏复核。
+
 ## 1. 准备发布目录
 
 所有输出都必须是尚不存在的新路径，并位于旧插件目录之外：
