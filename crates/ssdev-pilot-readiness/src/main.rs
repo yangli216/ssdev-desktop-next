@@ -1,6 +1,7 @@
 use ssdev_pilot_readiness::{
     blocker_remediation, inspect_materials, load_manifest, load_report, prepare_new_output,
-    verify_materials, write_report, PilotReadinessError, PilotReadinessReport,
+    verify_materials, write_manifest_template, write_report, PilotReadinessError,
+    PilotReadinessReport,
 };
 use std::env;
 use std::ffi::OsString;
@@ -25,12 +26,25 @@ fn run() -> Result<bool, PilotReadinessError> {
 
 fn run_with_arguments(arguments: &[OsString]) -> Result<bool, PilotReadinessError> {
     match arguments.first().and_then(|value| value.to_str()) {
+        Some("init") if arguments.len() == 3 => run_init(&arguments[1..]),
         Some("create") if arguments.len() == 4 => run_create(&arguments[1..]),
         Some("verify") if arguments.len() == 4 => run_verify(&arguments[1..]),
         // Retained for the initial schema 1 CLI shipped before named operations existed.
         _ if arguments.len() == 3 => run_create(arguments),
         _ => Err(PilotReadinessError::Invalid(usage().into())),
     }
+}
+
+fn run_init(arguments: &[OsString]) -> Result<bool, PilotReadinessError> {
+    let output = PathBuf::from(&arguments[0]);
+    let project_label = arguments[1].to_str().ok_or_else(|| {
+        PilotReadinessError::Invalid("project label must be portable UTF-8".into())
+    })?;
+    write_manifest_template(&output, project_label)?;
+    println!(
+        "pilot material manifest initialized\nnext: collect reviewed real materials at the declared relative paths; use notApplicable only with an approved non-sensitive reference, then run create"
+    );
+    Ok(true)
 }
 
 fn run_create(arguments: &[OsString]) -> Result<bool, PilotReadinessError> {
@@ -123,7 +137,7 @@ fn render_report_summary(report: &PilotReadinessReport, verified: bool) -> Strin
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ssdev-pilot-readiness create <materials-root> <manifest.json> <report-output.json>\n  ssdev-pilot-readiness verify <materials-root> <manifest.json> <report.json>"
+    "usage:\n  ssdev-pilot-readiness init <manifest-output.json> <project-label>\n  ssdev-pilot-readiness create <materials-root> <manifest.json> <report-output.json>\n  ssdev-pilot-readiness verify <materials-root> <manifest.json> <report.json>"
 }
 
 #[cfg(test)]
@@ -131,6 +145,67 @@ mod tests {
     use super::*;
     use ssdev_pilot_readiness::{PilotMaterialManifest, REPORT_SCHEMA_VERSION};
     use tempfile::tempdir;
+
+    #[test]
+    fn init_writes_a_complete_safe_manifest_without_inventing_approvals() {
+        let temp = tempdir().unwrap();
+        let output = temp.path().join("pilot-materials.json");
+        assert!(run_with_arguments(&[
+            "init".into(),
+            output.as_os_str().into(),
+            "hospital-a-pilot".into(),
+        ])
+        .unwrap());
+
+        let (manifest, bytes) = load_manifest(&output).unwrap();
+        assert_eq!(manifest.project_label, "hospital-a-pilot");
+        assert_eq!(
+            manifest
+                .categories
+                .iter()
+                .map(|category| category.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "legacy-config",
+                "production-native-assets",
+                "golden-cases",
+                "business-assets",
+                "business-hars",
+                "signed-origin-policy",
+                "plugin-release-set",
+                "organization-public-trust",
+                "previous-windows-release",
+                "windows-hardware-plan",
+                "legacy-keymap",
+                "legacy-processes",
+                "external-local-http-callers",
+            ]
+        );
+        assert!(manifest.categories.iter().all(|category| {
+            category.status == ssdev_pilot_readiness::MaterialStatus::Provided
+                && category.approval_reference.is_none()
+                && !category.inputs.is_empty()
+        }));
+        let materials = temp.path().join("materials");
+        fs::create_dir(&materials).unwrap();
+        let report = inspect_materials(&materials, &manifest, &bytes).unwrap();
+        assert!(!report.intake_complete);
+        assert!(report.blocker_codes.iter().all(|code| {
+            code != "unknown-material-category"
+                && code != "duplicate-material-category"
+                && code != "migration-audit-binding-mismatch"
+                && !code.ends_with("-missing")
+        }));
+
+        assert!(matches!(
+            run_with_arguments(&[
+                "init".into(),
+                output.as_os_str().into(),
+                "hospital-a-pilot".into(),
+            ]),
+            Err(PilotReadinessError::OutputExists)
+        ));
+    }
 
     #[test]
     fn named_create_and_verify_operations_round_trip_the_documented_manifest() {

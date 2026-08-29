@@ -218,7 +218,7 @@ pub enum PilotReadinessError {
     Io(#[from] io::Error),
     #[error("pilot readiness JSON failed: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("pilot readiness report already exists")]
+    #[error("pilot readiness output already exists")]
     OutputExists,
     #[error("pilot readiness report does not match the current manifest and material set")]
     VerificationFailed,
@@ -481,14 +481,78 @@ pub fn prepare_new_output(path: &Path) -> Result<PathBuf, PilotReadinessError> {
     let metadata = fs::symlink_metadata(parent)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(PilotReadinessError::Invalid(
-            "report output parent must be a real existing directory".into(),
+            "output parent must be a real existing directory".into(),
         ));
     }
     let parent = fs::canonicalize(parent)?;
-    let file_name = path.file_name().ok_or_else(|| {
-        PilotReadinessError::Invalid("report output must include a file name".into())
-    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| PilotReadinessError::Invalid("output must include a file name".into()))?;
     Ok(parent.join(file_name))
+}
+
+pub fn write_manifest_template(
+    path: &Path,
+    project_label: &str,
+) -> Result<(), PilotReadinessError> {
+    validate_label(project_label, "project label")?;
+    let output = prepare_new_output(path)?;
+    let template = PilotMaterialManifest {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        project_label: project_label.into(),
+        categories: vec![
+            provided_category("legacy-config", &["legacy/config"]),
+            provided_category("production-native-assets", &["native/components"]),
+            provided_category("golden-cases", &["native/golden-cases.json"]),
+            provided_category("business-assets", &["business/dist"]),
+            provided_category("business-hars", &["business/representative.har"]),
+            provided_category(
+                "signed-origin-policy",
+                &[
+                    "policy/origin-policy.json",
+                    "policy/origin-policy.sig.json",
+                    "policy/release-trust.json",
+                ],
+            ),
+            provided_category(
+                "plugin-release-set",
+                &["plugins/release-set.json", "plugins/packages"],
+            ),
+            provided_category("organization-public-trust", &["trust/public-material"]),
+            provided_category("previous-windows-release", &["previous/bundle"]),
+            provided_category("windows-hardware-plan", &["windows/hardware-plan.json"]),
+            provided_category("legacy-keymap", &["legacy/keymap.json"]),
+            provided_category("legacy-processes", &["legacy/processes.json"]),
+            provided_category(
+                "external-local-http-callers",
+                &["legacy/external-local-http-callers.json"],
+            ),
+        ],
+        migration_audit_bindings: MigrationAuditBindings {
+            configs: vec!["legacy/config".into()],
+            plugin_roots: vec!["native/components".into()],
+            keymaps: vec!["legacy/keymap.json".into()],
+            browser_asset_roots: vec!["business/dist".into()],
+            browser_hars: vec!["business/representative.har".into()],
+            origin_policy: "policy/origin-policy.json".into(),
+            origin_policy_envelope: "policy/origin-policy.sig.json".into(),
+            release_trust_store: "policy/release-trust.json".into(),
+        },
+    };
+    let mut file = File::options().write(true).create_new(true).open(output)?;
+    serde_json::to_writer_pretty(&mut file, &template)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn provided_category(id: &str, inputs: &[&str]) -> MaterialCategory {
+    MaterialCategory {
+        id: id.into(),
+        status: MaterialStatus::Provided,
+        inputs: inputs.iter().map(|input| (*input).into()).collect(),
+        approval_reference: None,
+    }
 }
 
 pub fn write_report(path: &Path, report: &PilotReadinessReport) -> Result<(), PilotReadinessError> {

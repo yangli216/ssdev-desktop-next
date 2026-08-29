@@ -28,7 +28,7 @@ business webview -> narrow Tauri command -> Rust controller
 
 产品定位、迭代优先级和明确不投入的方向见 [docs/product-direction.md](docs/product-direction.md)。新能力进入核心运行时前应先符合其中的工作选择规则。
 
-真实项目开始前可使用 [试点材料预检](docs/pilot-readiness.md) 收齐生产组件、黄金用例、业务 HAR、签名公钥材料、上一 Windows 安装包和实机计划。schema 2 manifest 还会把正式迁移审计的配置、插件、HAR 和签名策略角色精确绑定到这些材料；预检命令直接列出脱敏稳定缺项及处理动作，完整时输出材料集合摘要并指向接收方复验，不复制路径或材料内容，也不替代后续迁移审计、硬件矩阵和 Go/No-Go。
+真实项目开始前可使用 [试点材料预检](docs/pilot-readiness.md) 收齐生产组件、黄金用例、业务 HAR、签名公钥材料、上一 Windows 安装包和实机计划。`init` 会生成不可覆盖的固定类别与审计绑定，但不会伪造条件类别的“不适用”审批；schema 2 manifest 再把正式迁移审计的配置、插件、HAR 和签名策略角色精确绑定到这些材料。预检命令直接列出脱敏稳定缺项及处理动作，完整时输出材料集合摘要并指向接收方复验，不复制路径或材料内容，也不替代后续迁移审计、硬件矩阵和 Go/No-Go。
 
 业务页面从 localhost HTTP 切换到窄桥接接口的方式见 [docs/web-bridge-migration.md](docs/web-bridge-migration.md)。
 业务前端应通过 [packages/web-bridge](packages/web-bridge/README.md) 的类型化协议适配层接入，不直接依赖 Tauri 内部 API。SDK 会运行时校验系统声明并提供稳定错误分类；当前能力 schema 严格验证，未来未知 schema 保留但不会被误判为已经支持。主分支 CI 还会生成并自检固定 `.tgz + 摘要清单` 的平台无关 SDK 制品，并在离线临时消费者中验证安装、ESM 运行和 TypeScript 类型，业务项目不再需要从源码目录人工打包。

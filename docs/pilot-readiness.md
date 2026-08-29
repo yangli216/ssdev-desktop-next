@@ -6,7 +6,18 @@
 
 ## 1. 建立材料目录
 
-复制 [试点材料清单示例](pilot-materials.example.json)，并把所有 `inputs` 写成材料根目录下的正斜杠相对路径。禁止绝对路径、`..`、反斜杠、符号链接和特殊文件。工具递归散列声明目录，但报告不会保存文件名、目录、项目标签或审批引用原文。
+先在已经存在的输出目录生成一份不可覆盖的固定清单：
+
+```powershell
+cargo run --locked -p ssdev-pilot-readiness -- `
+  init `
+  D:\ssdev-pilot\pilot-materials.json `
+  hospital-a-pilot
+```
+
+项目标签只能使用不超过 128 字节的字母、数字、点、横线和下划线。`init` 固定生成全部十三个类别、可移植相对路径和彼此一致的正式迁移审计绑定，但不会创建材料目录、复制样本或生成审批。三个条件类别也默认要求提供材料；只有项目确认不存在对应旧资产时，实施人员才可以把该类别改为 `notApplicable`、删除 `inputs` 并填写真实批准的非敏感审批引用；若是 `legacy-keymap`，还要同步把 `migrationAuditBindings.keymaps` 改为空数组。这样不会把示例中的演示审批号误当成项目事实。
+
+[试点材料清单示例](pilot-materials.example.json) 只用于解释最终结构。按项目调整所有 `inputs` 时仍必须使用材料根目录下的正斜杠相对路径；禁止绝对路径、`..`、反斜杠、符号链接和特殊文件。工具递归散列声明目录，但报告不会保存文件名、目录、项目标签或审批引用原文。
 
 schema 2 manifest 还必须填写 `migrationAuditBindings`，明确正式迁移审计使用哪些配置、插件根目录、快捷键、业务前端、HAR，以及签名来源策略三件套。五类列表必须分别与 `legacy-config`、`production-native-assets`、`legacy-keymap`、`business-assets` 和 `business-hars` 的 `inputs` 精确相等；策略三件套必须与 `signed-origin-policy` 的三个输入精确相等。不能只交付一个更大的材料目录，再在正式审计时人工挑选较小或不同的样本。
 
