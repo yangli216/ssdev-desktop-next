@@ -360,6 +360,38 @@ function pluginHostNeedsAttention(host: PluginHostStatus) {
   return host.state === 'restart-backoff' || host.state === 'retry-ready'
 }
 
+function pluginHostAdvice(host: PluginHostStatus) {
+  switch (host.lastFailureCode) {
+    case 'native-component-missing':
+      return '重新验签或安装插件，并确认入口及依赖文件完整。'
+    case 'native-path-escape':
+      return '原生路径越过插件目录；请修正映射或重新打包，重复重试不会修复。'
+    case 'native-dll-preflight-failed':
+      return '核对 DLL 位数、依赖文件和声明导出，并在原生映射工作台重新预检。'
+    case 'native-com-preflight-failed':
+      return '核对对应位数的 COM/OCX 注册，以及类和成员声明。'
+    case 'native-process-preflight-failed':
+      return '核对 EXE/BAT 入口完整性；文件发生变化时应重新打包或安装。'
+    case 'native-operation-unsupported':
+      return '检查组件类型、目标架构和静态 ABI 声明。'
+    case 'host-architecture-mismatch':
+      return '服务架构与宿主不一致；请修正 x86/x64 映射并重新发布。'
+    case 'host-protocol-version-mismatch':
+    case 'protocol-version-mismatch':
+      return '客户端与插件宿主版本不一致；请修复或重新安装当前 Desktop。'
+    case 'host-spawn-failed':
+      return '确认客户端安装完整，并检查终端防护是否阻止插件宿主启动。'
+    case 'host-exited':
+    case 'host-pipe-missing':
+    case 'host-transport-failed':
+    case 'windows-job-failed':
+    case 'native-worker-unavailable':
+      return '可先恢复宿主；若重复失败，请执行深度自检并导出脱敏诊断包。'
+    default:
+      return '可先恢复宿主；若重复失败，请执行深度自检并查看稳定错误码。'
+  }
+}
+
 async function retryPluginHost(host: PluginHostStatus) {
   await run(async () => {
     try {
@@ -1130,7 +1162,7 @@ async function exportDeploymentCheck() {
           <div class="host-health-list">
             <article v-for="host in status.pluginHosts" :key="`${host.pluginId}:${host.architecture}`" :class="`host-${host.state}`">
               <span><strong>{{ host.pluginId }}</strong><small>{{ host.architecture.toUpperCase() }} · {{ host.serviceCount }} 个服务</small></span>
-              <div class="host-health-runtime"><span><b>{{ host.state === 'ready' ? '运行中' : host.state === 'restart-backoff' ? '启动退避' : host.state === 'retry-ready' ? '等待重试' : '按需待机' }}</b><small>累计失败 {{ host.failureCount }}<template v-if="host.lastFailureCode"> · {{ host.lastFailureCode }}</template></small></span><button v-if="pluginHostNeedsAttention(host)" type="button" :disabled="busy" title="只重新启动隔离宿主并完成 Health，不调用 DLL、COM 或进程业务方法" @click="retryPluginHost(host)">恢复宿主</button></div>
+              <div class="host-health-runtime"><span><b>{{ host.state === 'ready' ? '运行中' : host.state === 'restart-backoff' ? '启动退避' : host.state === 'retry-ready' ? '等待重试' : '按需待机' }}</b><small>累计失败 {{ host.failureCount }}<template v-if="host.lastFailureCode"> · {{ host.lastFailureCode }}</template></small><small v-if="pluginHostNeedsAttention(host)" class="host-health-advice">建议：{{ pluginHostAdvice(host) }}</small></span><button v-if="pluginHostNeedsAttention(host)" type="button" :disabled="busy" title="只重新启动隔离宿主并完成 Health，不调用 DLL、COM 或进程业务方法" @click="retryPluginHost(host)">恢复宿主</button></div>
             </article>
           </div>
         </details>

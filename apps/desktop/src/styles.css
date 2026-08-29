@@ -273,6 +273,7 @@ button:disabled { cursor: wait !important; opacity: .5; }
 .host-health-list strong { color: #294738; font-size: 12px; }
 .host-health-list b { color: #496457; font-size: 11px; }
 .host-health-list small { margin-top: 4px; color: #7b867f; font-size: 10px; overflow-wrap: anywhere; }
+.host-health-list .host-health-advice { max-width: 520px; color: #684f42; line-height: 1.5; }
 .host-health-list .host-ready b { color: #2f654b; }
 .host-health-list .host-restart-backoff, .host-health-list .host-retry-ready { background: #fff7f3; }
 .host-health-list .host-restart-backoff b, .host-health-list .host-restart-backoff small, .host-health-list .host-retry-ready b, .host-health-list .host-retry-ready small { color: #8a4438; }

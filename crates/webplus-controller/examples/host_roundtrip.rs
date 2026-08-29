@@ -26,6 +26,33 @@ async fn main() {
         })
         .expect("invalid invocation admission configuration"),
     );
+    let architecture = if cfg!(target_arch = "x86") {
+        PluginArchitecture::X86
+    } else {
+        PluginArchitecture::X64
+    };
+    let architecture_name = if cfg!(target_arch = "x86") {
+        "x86"
+    } else {
+        "x64"
+    };
+
+    let broken_plugin_dir = tempfile::tempdir().expect("failed to create broken smoke plugin");
+    fs::write(
+        broken_plugin_dir.path().join("api.json"),
+        format!(
+            r#"{{"serviceId":"broken.service","mainClass":"missing.dll","mainType":"dll","architecture":"{architecture_name}","methods":[{{"name":"MissingExport"}}]}}"#
+        ),
+    )
+    .expect("failed to write broken smoke manifest");
+    let broken_manifest = PluginManifest::load("broken-smoke-plugin", broken_plugin_dir.path())
+        .expect("failed to load broken smoke manifest");
+    let broken = controller
+        .preflight_candidate_manifest(&broken_manifest)
+        .await
+        .expect_err("missing native component unexpectedly passed preflight");
+    assert_eq!(broken.diagnostic_code(), "native-component-missing");
+
     let plugin_dir = tempfile::tempdir().expect("failed to create smoke plugin directory");
     fs::copy(fixture, plugin_dir.path().join("fixture.dll"))
         .expect("failed to copy smoke fixture DLL");
@@ -49,14 +76,9 @@ async fn main() {
     )
     .expect("failed to write smoke manifest");
     let api_path = plugin_dir.path().join("api.json");
-    let api = fs::read_to_string(&api_path).unwrap().replace(
-        "ARCHITECTURE",
-        if cfg!(target_arch = "x86") {
-            "x86"
-        } else {
-            "x64"
-        },
-    );
+    let api = fs::read_to_string(&api_path)
+        .unwrap()
+        .replace("ARCHITECTURE", architecture_name);
     fs::write(&api_path, api).unwrap();
     let manifest = PluginManifest::load("smoke-plugin", plugin_dir.path())
         .expect("failed to load smoke manifest");
@@ -74,11 +96,6 @@ async fn main() {
     assert_eq!(controller.plugin_host_stats().active_hosts, 0);
     assert_eq!(controller.plugin_host_stats().successful_starts, 1);
 
-    let architecture = if cfg!(target_arch = "x86") {
-        PluginArchitecture::X86
-    } else {
-        PluginArchitecture::X64
-    };
     controller
         .retry_plugin_host("smoke-plugin", architecture)
         .await
@@ -110,7 +127,7 @@ async fn main() {
     let stats = controller.plugin_host_stats();
     assert_eq!(stats.active_hosts, 1);
     assert_eq!(stats.successful_starts, 2);
-    assert_eq!(stats.failed_starts, 0);
+    assert_eq!(stats.failed_starts, 1);
     println!("plugin host single-flight round-trip succeeded: {stats:?}");
     controller.shutdown().await;
     assert_eq!(controller.plugin_host_stats().active_hosts, 0);

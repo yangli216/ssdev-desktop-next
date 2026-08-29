@@ -80,8 +80,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|service| service.architecture == arguments.architecture)
         .map(|service| service.service_id.clone())
         .collect::<HashSet<_>>();
-    let mut native_worker =
-        NativeWorker::spawn(manifest, arguments.architecture, verified_files).ok();
+    let (mut native_worker, native_preflight_code) =
+        match NativeWorker::spawn(manifest, arguments.architecture, verified_files) {
+            Ok(worker) => (Some(worker), None),
+            Err(code) => (None, Some(code)),
+        };
 
     while let Some(request) = read_frame_async::<_, HostRequest>(&mut input).await? {
         let request_id = request.request_id;
@@ -104,7 +107,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 HostCommand::Health => HostResponse::error(
                     request_id,
-                    "native_preflight",
+                    native_preflight_code.unwrap_or("native_preflight"),
                     "native component preflight failed",
                 ),
                 HostCommand::Invoke {
@@ -135,7 +138,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ..
                 } if requested_plugin == arguments.plugin_id => HostResponse::error(
                     request_id,
-                    "native_preflight",
+                    native_preflight_code.unwrap_or("native_preflight"),
                     "native component preflight failed",
                 ),
                 HostCommand::Invoke {
@@ -392,7 +395,7 @@ impl NativeWorker {
         manifest: PluginManifest,
         architecture: PluginArchitecture,
         verified_files: Option<std::collections::BTreeMap<String, String>>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, &'static str> {
         let (sender, receiver) = mpsc::channel();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
@@ -405,12 +408,12 @@ impl NativeWorker {
                 let mut plugin = match plugin {
                     Ok(plugin) => plugin,
                     Err(error) => {
-                        let _ = ready_sender.send(Err(error));
+                        let _ = ready_sender.send(Err(error.diagnostic_code()));
                         return;
                     }
                 };
                 if let Err(error) = plugin.preflight(architecture) {
-                    let _ = ready_sender.send(Err(error));
+                    let _ = ready_sender.send(Err(error.diagnostic_code()));
                     return;
                 }
                 if ready_sender.send(Ok(())).is_err() {
@@ -426,16 +429,16 @@ impl NativeWorker {
                     }
                 }
             })
-            .map_err(|_| "failed to start native worker thread".to_owned())?;
+            .map_err(|_| "native_worker_unavailable")?;
         match ready_receiver.recv() {
             Ok(Ok(())) => {}
-            Ok(Err(_)) => {
+            Ok(Err(code)) => {
                 let _ = thread.join();
-                return Err("native component preflight failed".into());
+                return Err(code);
             }
             Err(_) => {
                 let _ = thread.join();
-                return Err("native worker stopped during preflight".into());
+                return Err("native_worker_unavailable");
             }
         }
         Ok(Self {
@@ -604,18 +607,27 @@ mod tests {
         let manifest = PluginManifest::load("process-probe", root.path()).unwrap();
         let mut mismatched_inventory = std::collections::BTreeMap::new();
         mismatched_inventory.insert("probe.exe".into(), "0".repeat(64));
-        assert!(NativeWorker::spawn(
-            manifest.clone(),
-            PluginArchitecture::X86,
-            Some(mismatched_inventory),
-        )
-        .is_err());
+        assert_eq!(
+            NativeWorker::spawn(
+                manifest.clone(),
+                PluginArchitecture::X86,
+                Some(mismatched_inventory),
+            )
+            .err()
+            .unwrap(),
+            "native_process"
+        );
         let mut worker =
             NativeWorker::spawn(manifest.clone(), PluginArchitecture::X86, None).unwrap();
         worker.shutdown().unwrap();
 
         std::fs::remove_file(root.path().join("probe.exe")).unwrap();
-        assert!(NativeWorker::spawn(manifest, PluginArchitecture::X86, None).is_err());
+        assert_eq!(
+            NativeWorker::spawn(manifest, PluginArchitecture::X86, None)
+                .err()
+                .unwrap(),
+            "native_component_missing"
+        );
     }
 
     #[test]

@@ -152,6 +152,23 @@ pub enum NativeError {
 }
 
 impl NativeError {
+    /// Returns a bounded, path-free category for the trusted plugin host.
+    /// The detailed error remains inside the native process boundary.
+    pub const fn diagnostic_code(&self) -> &'static str {
+        match self {
+            Self::InvalidRequest(_) => "native_invalid_request",
+            Self::ServiceNotFound(_) => "native_service_not_found",
+            Self::MethodNotFound { .. } => "native_method_not_found",
+            Self::PathEscape(_) => "native_path_escape",
+            Self::MissingComponent(_) => "native_component_missing",
+            Self::InvalidParameter { .. } => "native_parameter_invalid",
+            Self::Unsupported(_) => "native_unsupported",
+            Self::Dll(_) => "native_dll",
+            Self::Com(_) => "native_com",
+            Self::Process(_) => "native_process",
+        }
+    }
+
     fn code(&self) -> i32 {
         match self {
             Self::InvalidRequest(_) | Self::InvalidParameter { .. } => -32602,
@@ -233,5 +250,30 @@ mod tests {
         assert_eq!(plugin.preflight(PluginArchitecture::X64).unwrap(), 1);
         assert!(!marker.exists());
         assert!(plugin.preflight(PluginArchitecture::X86).is_err());
+    }
+
+    #[test]
+    fn native_diagnostic_codes_discard_sensitive_details() {
+        let cases = [
+            (
+                NativeError::MissingComponent("patient/path".into()),
+                "native_component_missing",
+            ),
+            (
+                NativeError::Dll("vendor export and path".into()),
+                "native_dll",
+            ),
+            (NativeError::Com("secret ProgID".into()), "native_com"),
+            (
+                NativeError::Process("secret command".into()),
+                "native_process",
+            ),
+        ];
+        for (failure, expected) in cases {
+            assert_eq!(failure.diagnostic_code(), expected);
+            assert!(!failure.diagnostic_code().contains("patient"));
+            assert!(!failure.diagnostic_code().contains("vendor"));
+            assert!(!failure.diagnostic_code().contains("secret"));
+        }
     }
 }

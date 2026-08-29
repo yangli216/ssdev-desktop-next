@@ -6432,12 +6432,12 @@ mod tests {
             service_count: 2,
             state: webplus_controller::PluginHostRuntimeState::RestartBackoff,
             failure_count: 3,
-            last_failure_code: Some("host-spawn-failed"),
+            last_failure_code: Some("native-dll-preflight-failed"),
         });
 
         let json = serde_json::to_string(&health).unwrap();
         assert!(json.contains("reader-plugin"));
-        assert!(json.contains("host-spawn-failed"));
+        assert!(json.contains("native-dll-preflight-failed"));
         assert!(json.contains("restart-backoff"));
         assert!(!json.contains("path"));
         assert!(!json.contains("message"));

@@ -1288,6 +1288,27 @@ fn public_host_failure(error: &ControllerError) -> String {
     format!("native plugin host failed ({})", error.diagnostic_code())
 }
 
+fn trusted_host_diagnostic_code(code: &str) -> &'static str {
+    match code {
+        "protocol_version" => "host-protocol-version-mismatch",
+        "architecture_mismatch" => "host-architecture-mismatch",
+        "plugin_mismatch" => "host-plugin-mismatch",
+        "native_preflight" => "native-preflight-failed",
+        "native_worker_unavailable" => "native-worker-unavailable",
+        "native_invalid_request" => "native-request-invalid",
+        "native_service_not_found" => "native-service-not-found",
+        "native_method_not_found" => "native-method-not-found",
+        "native_path_escape" => "native-path-escape",
+        "native_component_missing" => "native-component-missing",
+        "native_parameter_invalid" => "native-parameter-invalid",
+        "native_unsupported" => "native-operation-unsupported",
+        "native_dll" => "native-dll-preflight-failed",
+        "native_com" => "native-com-preflight-failed",
+        "native_process" => "native-process-preflight-failed",
+        _ => "native-host-error",
+    }
+}
+
 type HostReader = Box<dyn AsyncRead + Unpin + Send>;
 type HostWriter = Box<dyn AsyncWrite + Unpin + Send>;
 
@@ -1672,7 +1693,7 @@ impl ControllerError {
             Self::ProtocolVersion { .. } => "protocol-version-mismatch",
             Self::RequestId { .. } => "request-id-mismatch",
             Self::UnexpectedPayload(_) => "unexpected-host-payload",
-            Self::HostError { .. } => "native-host-error",
+            Self::HostError { code, .. } => trusted_host_diagnostic_code(code),
             #[cfg(windows)]
             Self::WindowsJob(_) => "windows-job-failed",
             #[cfg(windows)]
@@ -2307,6 +2328,29 @@ mod tests {
         assert_eq!(public, "native plugin host failed (native-host-error)");
         assert!(!public.contains("vendor"));
         assert!(!public.contains("patient"));
+    }
+
+    #[test]
+    fn trusted_native_preflight_categories_are_stable_and_path_free() {
+        let cases = [
+            ("native_component_missing", "native-component-missing"),
+            ("native_path_escape", "native-path-escape"),
+            ("native_unsupported", "native-operation-unsupported"),
+            ("native_dll", "native-dll-preflight-failed"),
+            ("native_com", "native-com-preflight-failed"),
+            ("native_process", "native-process-preflight-failed"),
+            ("native_worker_unavailable", "native-worker-unavailable"),
+        ];
+        for (host_code, expected) in cases {
+            let failure = ControllerError::HostError {
+                code: host_code.into(),
+                message: "patient path and vendor detail".into(),
+            };
+            assert_eq!(failure.diagnostic_code(), expected);
+            let public = public_host_failure(&failure);
+            assert!(!public.contains("patient"));
+            assert!(!public.contains("vendor"));
+        }
     }
 
     #[test]
