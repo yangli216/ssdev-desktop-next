@@ -171,10 +171,33 @@ test("Windows upgrade gate reinstalls and launches the exact previous release", 
     packageTest,
     /Invoke-ApplicationSmoke \$rollbackExecutable \$script:PreviousRelease\.appVersion/,
   );
-  assert.match(packageTest, /rollback reinstall did not preserve/);
+  assert.match(
+    packageTest,
+    /Assert-UpgradeStatePreserved \$dataPaths \$sentinel "NSIS rollback reinstall"/,
+  );
   assert.match(
     packageTest,
     /Uninstall-ApplicationPackage \$rollbackExecutable \$previousSignerSubject/,
+  );
+});
+
+test("Windows upgrade and rollback preserve configuration and native capability state", async () => {
+  const packageTest = await readFile(packageTestUrl, "utf8");
+
+  assert.match(packageTest, /function Write-UpgradeStateSentinels/);
+  assert.match(packageTest, /function Assert-UpgradeStatePreserved/);
+  assert.match(packageTest, /PluginStateSentinel/);
+  assert.match(packageTest, /LocalMappingStateSentinel/);
+  assert.match(packageTest, /"Candidate uninstall"/);
+  assert.match(packageTest, /"NSIS rollback reinstall"/);
+  assert.match(packageTest, /"Final previous-version uninstall"/);
+  assert.equal(
+    (
+      packageTest.match(
+        /Assert-UpgradeStatePreserved \$dataPaths \$sentinel "/g,
+      ) ?? []
+    ).length,
+    7,
   );
 });
 

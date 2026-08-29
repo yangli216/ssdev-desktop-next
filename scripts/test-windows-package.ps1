@@ -625,13 +625,62 @@ function Get-ApplicationDataPaths {
   }
   $configRoot = [System.IO.Path]::GetFullPath((Join-Path $env:APPDATA $ApplicationIdentifier))
   $localDataRoot = [System.IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA $ApplicationIdentifier))
+  $pluginRoot = Join-Path $localDataRoot "plugins"
+  $localMappingRoot = Join-Path $localDataRoot "local-mappings"
   return [pscustomobject]@{
     ConfigRoot = $configRoot
     ConfigPath = (Join-Path $configRoot "config.json")
     LocalDataRoot = $localDataRoot
-    PluginRoot = (Join-Path $localDataRoot "plugins")
+    PluginRoot = $pluginRoot
+    PluginStateSentinel = (Join-Path $pluginRoot ".package-upgrade-sentinel")
+    LocalMappingRoot = $localMappingRoot
+    LocalMappingStateSentinel = (Join-Path $localMappingRoot ".package-upgrade-sentinel")
     DiagnosticLog = (Join-Path $localDataRoot "logs/ssdev.log")
     StartupFailure = (Join-Path $localDataRoot "logs/startup-failure.json")
+  }
+}
+
+function Write-UpgradeStateSentinels {
+  param(
+    [Parameter(Mandatory = $true)]$Paths,
+    [Parameter(Mandatory = $true)][string]$Sentinel
+  )
+  foreach ($directory in @($Paths.ConfigRoot, $Paths.PluginRoot, $Paths.LocalMappingRoot)) {
+    New-Item -ItemType Directory -Force -Path $directory | Out-Null
+  }
+  [System.IO.File]::WriteAllText(
+    $Paths.ConfigPath,
+    ([ordered]@{ upgradeSentinel = $Sentinel } | ConvertTo-Json),
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  foreach ($path in @($Paths.PluginStateSentinel, $Paths.LocalMappingStateSentinel)) {
+    [System.IO.File]::WriteAllText($path, $Sentinel, [System.Text.UTF8Encoding]::new($false))
+  }
+}
+
+function Assert-UpgradeStatePreserved {
+  param(
+    [Parameter(Mandatory = $true)]$Paths,
+    [Parameter(Mandatory = $true)][string]$Sentinel,
+    [Parameter(Mandatory = $true)][string]$Stage
+  )
+  if (-not (Test-Path -LiteralPath $Paths.ConfigPath -PathType Leaf)) {
+    throw "$Stage removed the existing desktop configuration."
+  }
+  $preserved = Get-Content -Raw -LiteralPath $Paths.ConfigPath | ConvertFrom-Json
+  if ((Get-OptionalProperty $preserved "upgradeSentinel") -ne $Sentinel) {
+    throw "$Stage did not preserve unknown desktop configuration fields."
+  }
+  foreach ($state in @(
+    [pscustomobject]@{ Path = $Paths.PluginStateSentinel; Label = "plugin data" },
+    [pscustomobject]@{ Path = $Paths.LocalMappingStateSentinel; Label = "local mapping data" }
+  )) {
+    if (
+      -not (Test-Path -LiteralPath $state.Path -PathType Leaf) -or
+      -not [String]::Equals((Get-Content -Raw -LiteralPath $state.Path), $Sentinel, [StringComparison]::Ordinal)
+    ) {
+      throw "$Stage did not preserve existing $($state.Label)."
+    }
   }
 }
 
@@ -832,52 +881,37 @@ function Test-Upgrade {
   $activeInstaller = $PreviousInstaller
   $previousSignerSubject = if ($PreviousExpectedSignerSubject) { $PreviousExpectedSignerSubject } else { $ExpectedSignerSubject }
   try {
-    New-Item -ItemType Directory -Force -Path $dataPaths.ConfigRoot | Out-Null
-    New-Item -ItemType Directory -Force -Path $dataPaths.PluginRoot | Out-Null
-    [System.IO.File]::WriteAllText(
-      $dataPaths.ConfigPath,
-      ([ordered]@{ upgradeSentinel = $sentinel } | ConvertTo-Json),
-      [System.Text.UTF8Encoding]::new($false)
-    )
+    Write-UpgradeStateSentinels $dataPaths $sentinel
     $previousExecutable = Install-ApplicationPackage $PreviousInstaller $previousSignerSubject
     $activeExecutable = $previousExecutable
     Assert-InstalledLayout $previousExecutable $PreviousMetadataDirectory $previousSignerSubject
     Invoke-ApplicationSmoke $previousExecutable $script:PreviousRelease.appVersion
+    Assert-UpgradeStatePreserved $dataPaths $sentinel "Previous-version startup"
 
     $candidateExecutable = Install-ApplicationPackage $CandidateInstaller $ExpectedSignerSubject -AllowExisting
     $activeExecutable = $candidateExecutable
     $activeInstaller = $CandidateInstaller
     Assert-InstalledLayout $candidateExecutable $metadataDirectory
-    $preserved = Get-Content -Raw -LiteralPath $dataPaths.ConfigPath | ConvertFrom-Json
-    if ((Get-OptionalProperty $preserved "upgradeSentinel") -ne $sentinel) {
-      throw "NSIS upgrade did not preserve the existing desktop configuration."
-    }
+    Assert-UpgradeStatePreserved $dataPaths $sentinel "NSIS candidate upgrade"
     Invoke-ApplicationSmoke $candidateExecutable $script:CandidateRelease.appVersion
-    $preserved = Get-Content -Raw -LiteralPath $dataPaths.ConfigPath | ConvertFrom-Json
-    if ((Get-OptionalProperty $preserved "upgradeSentinel") -ne $sentinel) {
-      throw "NSIS candidate startup did not preserve unknown configuration fields."
-    }
+    Assert-UpgradeStatePreserved $dataPaths $sentinel "Candidate startup"
     Capture-CandidateRuntimeHashes $candidateExecutable
 
     Uninstall-ApplicationPackage $candidateExecutable
     $activeExecutable = $null
+    Assert-UpgradeStatePreserved $dataPaths $sentinel "Candidate uninstall"
 
     $rollbackExecutable = Install-ApplicationPackage $PreviousInstaller $previousSignerSubject
     $activeExecutable = $rollbackExecutable
     $activeInstaller = $PreviousInstaller
     Assert-InstalledLayout $rollbackExecutable $PreviousMetadataDirectory $previousSignerSubject
-    $preserved = Get-Content -Raw -LiteralPath $dataPaths.ConfigPath | ConvertFrom-Json
-    if ((Get-OptionalProperty $preserved "upgradeSentinel") -ne $sentinel) {
-      throw "NSIS rollback reinstall did not preserve the existing desktop configuration."
-    }
+    Assert-UpgradeStatePreserved $dataPaths $sentinel "NSIS rollback reinstall"
     Invoke-ApplicationSmoke $rollbackExecutable $script:PreviousRelease.appVersion
-    $preserved = Get-Content -Raw -LiteralPath $dataPaths.ConfigPath | ConvertFrom-Json
-    if ((Get-OptionalProperty $preserved "upgradeSentinel") -ne $sentinel) {
-      throw "NSIS rolled-back application startup did not preserve unknown configuration fields."
-    }
+    Assert-UpgradeStatePreserved $dataPaths $sentinel "Rolled-back application startup"
     Uninstall-ApplicationPackage $rollbackExecutable $previousSignerSubject
     $activeExecutable = $null
-    Write-Host "PASS NSIS upgrade, configuration preservation, candidate launch, rollback reinstall, previous-version launch, and final uninstall"
+    Assert-UpgradeStatePreserved $dataPaths $sentinel "Final previous-version uninstall"
+    Write-Host "PASS NSIS upgrade, configuration/plugin/mapping state preservation, candidate launch, rollback reinstall, previous-version launch, and final uninstall"
   } finally {
     if ($activeExecutable -and @(Get-AppRegistrations).Count -gt 0) {
       try {
