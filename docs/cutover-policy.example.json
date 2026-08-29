@@ -1,8 +1,20 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "targetSourceRevision": "0123456789abcdef0123456789abcdef01234567",
   "expectedAppVersion": "1.0.0",
   "maximumEvidenceAgeSeconds": 604800,
+  "expectedPluginReleaseSetSpecSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "expectedPluginPackageSetSha256": "9999999999999999999999999999999999999999999999999999999999999999",
+  "migrationCoverageMinimums": {
+    "configFiles": 1,
+    "pluginDirectories": 2,
+    "services": 3,
+    "keyBindings": 4,
+    "browserAssetRoots": 1,
+    "browserAssetFilesScanned": 50,
+    "browserHarFiles": 1,
+    "browserHarRequestsScanned": 100
+  },
   "pluginMatrixSignerKeyId": "hospital-a-plugin-matrix-qa-2026",
   "migrationAuditSignerKeyId": "hospital-a-migration-audit-qa-2026",
   "windowsPackageSignerKeyId": "hospital-a-windows-package-qa-2026",

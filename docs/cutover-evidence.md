@@ -2,15 +2,15 @@
 
 生产切换不以人工汇总日志中的 `PASS` 为依据。`ssdev-cutover-evidence` 严格读取三份不可覆盖且经 QA 环境签名的机器证据，绑定证据、签名封套、信任库和策略的 SHA-256，并生成一个确定的 `GO` 或 `NO-GO` 决策：
 
-- 真实插件黄金矩阵证据：必须由 Windows x64 运行器产生，覆盖全部已声明 service/method；schema 2 同时绑定批准的发布集合规范、确定性包集合、实际插件载荷、信任库、矩阵和 x86/x64 宿主。现场插件根目录必须能逐包重建出发布集合中的相同 SHA-256。
-- 迁移审计证据：必须同时扫描业务前端静态资源和代表性真实 HAR；旧 WebPlus `7711` 与桌面回调 `45121` 均不得有静态或运行时证据，且不能留有 critical 或 warning finding。
+- 真实插件黄金矩阵证据：必须由 Windows x64 运行器产生，覆盖全部已声明 service/method；schema 2 同时绑定批准的发布集合规范、确定性包集合、实际插件载荷、信任库、矩阵和 x86/x64 宿主。现场插件根目录必须能逐包重建出发布集合中的相同 SHA-256，证据中的发布集合规范及包集合摘要还必须精确匹配生产策略，不能用另一套较小但内部自洽的插件集合替代。
+- 迁移审计证据：必须同时扫描业务前端静态资源和代表性真实 HAR；旧 WebPlus `7711` 与桌面回调 `45121` 均不得有静态或运行时证据，且不能留有 critical 或 warning finding。配置文件、插件目录、服务、快捷键、前端资源和 HAR 的八类计数还必须达到项目策略批准的最低覆盖，避免漏交整类旧资产。
 - Windows 包证据：必须验证 Authenticode、NSIS、实际启动事件，以及从更低正式版本升级并保留配置。历史证据中的 MSI 字段仅为格式兼容保留，不参与新发布判定。
 
-三份证据必须指向策略指定的同一 Git 提交、全部为 clean source，并且不超过策略允许的年龄。正式要求固化在 schema 1 判定器里，策略只能指定目标提交、预期 SemVer、60 秒至 31 天的证据有效期，以及三类证据和最终审批各自预期的签名 `keyId`，不能关闭上述门禁。四个职责的 `keyId` 必须互不相同。
+三份证据必须指向策略指定的同一 Git 提交、全部为 clean source，并且不超过策略允许的年龄。schema 2 策略还绑定批准的发布集合规范 SHA-256、确定性插件包集合 SHA-256，以及项目级迁移覆盖下限；它可以为项目确实不存在的旧资产类别显式填 `0`，但不能省略字段或用旧 schema 绕过确认。策略只能指定这些项目事实、目标提交、预期 SemVer、60 秒至 31 天的证据有效期，以及三类证据和最终审批各自预期的签名 `keyId`，不能关闭其他固化门禁。四个职责的 `keyId` 必须互不相同。
 
 ## 1. 准备策略
 
-复制 [cutover-policy.example.json](cutover-policy.example.json)，把 `targetSourceRevision` 替换为待发布 clean commit 的完整小写 Git object ID，把 `expectedAppVersion` 替换为 Windows 包内 `release.json` 的版本，并填写实际负责三种验证环境及最终发布审批的四个不同签名 `keyId`。策略文件本身也会按原始字节计算 SHA-256 并写入最终决策。
+复制 [cutover-policy.example.json](cutover-policy.example.json)，把 `targetSourceRevision` 替换为待发布 clean commit 的完整小写 Git object ID，把 `expectedAppVersion` 替换为 Windows 包内 `release.json` 的版本。`expectedPluginReleaseSetSpecSha256` 和 `expectedPluginPackageSetSha256` 必须来自本次批准的发布集合检查结果，不能照抄示例占位值。根据切换前冻结的旧资产清单填写 `migrationCoverageMinimums`；这些是最低覆盖而不是期望结果，某类资产确实不存在时显式填 `0` 并在审批记录中说明。最后填写实际负责三种验证环境及最终发布审批的四个不同签名 `keyId`。策略文件本身也会按原始字节计算 SHA-256 并写入最终决策。
 
 ## 2. 签署执行证据
 
@@ -44,7 +44,7 @@ cargo run --locked -p ssdev-cutover-evidence -- decide `
 
 输入必须是有大小上限的普通文件，决策输出的父目录必须预先存在且目标不能已存在。工具先按策略指定 `keyId` 和 `cutover-evidence` 用途验证三个 active-key 封套，再在读取前后重新计算全部摘要，拒绝执行中变化。插件矩阵证据只接受当前 schema 2；旧 schema 1 证据必须以批准发布集合重新执行。`GO` 返回 0；`NO-GO` 仍以不覆盖方式写出排序后的稳定阻塞码，随后返回 3，便于 CI 阻断发布；输入损坏、签名/用途/keyId 不匹配、schema 不匹配或 I/O 失败返回 1。
 
-常见阻塞码包括 dirty/source mismatch、证据过期或未来时间、静态资源/HAR 未覆盖、旧 HTTP 仍被观察到、迁移 warning/critical 未清零，以及 Windows 签名、双安装器、启动或升级未验证。
+常见阻塞码包括 dirty/source mismatch、证据过期或未来时间、插件发布集合不匹配、迁移资产计数低于策略、静态资源/HAR 未覆盖、旧 HTTP 仍被观察到、迁移 warning/critical 未清零，以及 Windows 签名、NSIS 安装、启动或升级未验证。
 
 ## 4. 独立审批签名
 

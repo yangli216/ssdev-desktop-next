@@ -14,7 +14,7 @@ use webplus_plugin_trust::{
 
 pub const EVIDENCE_SCHEMA_VERSION: u8 = 1;
 pub const PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION: u8 = 2;
-pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 1;
+pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 2;
 pub const CUTOVER_DECISION_SCHEMA_VERSION: u8 = 1;
 const MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
@@ -135,11 +135,27 @@ pub struct WindowsPackageEvidence {
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MigrationCoverageMinimums {
+    pub config_files: u32,
+    pub plugin_directories: u32,
+    pub services: u32,
+    pub key_bindings: u32,
+    pub browser_asset_roots: u32,
+    pub browser_asset_files_scanned: u32,
+    pub browser_har_files: u32,
+    pub browser_har_requests_scanned: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProductionCutoverPolicy {
     pub schema_version: u8,
     pub target_source_revision: String,
     pub expected_app_version: String,
     pub maximum_evidence_age_seconds: u64,
+    pub expected_plugin_release_set_spec_sha256: String,
+    pub expected_plugin_package_set_sha256: String,
+    pub migration_coverage_minimums: MigrationCoverageMinimums,
     pub plugin_matrix_signer_key_id: String,
     pub migration_audit_signer_key_id: String,
     pub windows_package_signer_key_id: String,
@@ -160,6 +176,13 @@ impl ProductionCutoverPolicy {
         if !(60..=31 * 24 * 60 * 60).contains(&self.maximum_evidence_age_seconds) {
             return Err(EvidenceError::Invalid(
                 "maximumEvidenceAgeSeconds must be between 60 seconds and 31 days".into(),
+            ));
+        }
+        if !is_sha256(&self.expected_plugin_release_set_spec_sha256)
+            || !is_sha256(&self.expected_plugin_package_set_sha256)
+        {
+            return Err(EvidenceError::Invalid(
+                "expected plugin release-set hashes must be lowercase SHA-256 digests".into(),
             ));
         }
         for key_id in [
@@ -700,6 +723,59 @@ pub fn evaluate_production_cutover(
             blockers.insert(format!("{name}-stale"));
         }
     }
+    if plugin.release_set_spec_sha256 != policy.expected_plugin_release_set_spec_sha256 {
+        blockers.insert("plugin-release-set-spec-mismatch".into());
+    }
+    if plugin.package_set_sha256 != policy.expected_plugin_package_set_sha256 {
+        blockers.insert("plugin-package-set-mismatch".into());
+    }
+    let minimums = &policy.migration_coverage_minimums;
+    for (actual, minimum, blocker) in [
+        (
+            migration.config_files,
+            minimums.config_files,
+            "migration-config-files-below-policy",
+        ),
+        (
+            migration.plugin_directories,
+            minimums.plugin_directories,
+            "migration-plugin-directories-below-policy",
+        ),
+        (
+            migration.service_count,
+            minimums.services,
+            "migration-services-below-policy",
+        ),
+        (
+            migration.key_binding_count,
+            minimums.key_bindings,
+            "migration-key-bindings-below-policy",
+        ),
+        (
+            migration.browser_asset_roots,
+            minimums.browser_asset_roots,
+            "migration-browser-asset-roots-below-policy",
+        ),
+        (
+            migration.browser_asset_files_scanned,
+            minimums.browser_asset_files_scanned,
+            "migration-browser-asset-files-below-policy",
+        ),
+        (
+            migration.browser_har_files,
+            minimums.browser_har_files,
+            "migration-browser-har-files-below-policy",
+        ),
+        (
+            migration.browser_har_requests_scanned,
+            minimums.browser_har_requests_scanned,
+            "migration-browser-har-requests-below-policy",
+        ),
+    ] {
+        if actual < minimum {
+            blockers.insert(blocker.into());
+        }
+    }
     if migration.browser_asset_roots == 0 || migration.browser_asset_files_scanned == 0 {
         blockers.insert("browser-assets-not-covered".into());
     }
@@ -1060,6 +1136,31 @@ mod tests {
         }
     }
 
+    fn valid_policy(revision: String) -> ProductionCutoverPolicy {
+        ProductionCutoverPolicy {
+            schema_version: CUTOVER_POLICY_SCHEMA_VERSION,
+            target_source_revision: revision,
+            expected_app_version: "1.2.3".into(),
+            maximum_evidence_age_seconds: 3600,
+            expected_plugin_release_set_spec_sha256: "0".repeat(64),
+            expected_plugin_package_set_sha256: "9".repeat(64),
+            migration_coverage_minimums: MigrationCoverageMinimums {
+                config_files: 1,
+                plugin_directories: 2,
+                services: 3,
+                key_bindings: 4,
+                browser_asset_roots: 1,
+                browser_asset_files_scanned: 50,
+                browser_har_files: 1,
+                browser_har_requests_scanned: 100,
+            },
+            plugin_matrix_signer_key_id: "plugin-matrix-qa".into(),
+            migration_audit_signer_key_id: "migration-audit-qa".into(),
+            windows_package_signer_key_id: "windows-package-qa".into(),
+            cutover_decision_signer_key_id: "cutover-approval".into(),
+        }
+    }
+
     fn test_dir() -> PathBuf {
         tempfile::Builder::new()
             .prefix("ssdev-cutover-evidence-")
@@ -1112,16 +1213,7 @@ mod tests {
     #[test]
     fn production_gate_requires_the_same_clean_complete_evidence_set() {
         let revision = "d".repeat(40);
-        let policy = ProductionCutoverPolicy {
-            schema_version: CUTOVER_POLICY_SCHEMA_VERSION,
-            target_source_revision: revision.clone(),
-            expected_app_version: "1.2.3".into(),
-            maximum_evidence_age_seconds: 3600,
-            plugin_matrix_signer_key_id: "plugin-matrix-qa".into(),
-            migration_audit_signer_key_id: "migration-audit-qa".into(),
-            windows_package_signer_key_id: "windows-package-qa".into(),
-            cutover_decision_signer_key_id: "cutover-approval".into(),
-        };
+        let policy = valid_policy(revision.clone());
         let mut plugin = valid();
         plugin.source_revision = revision.clone();
         plugin.executed_at_unix_seconds = 1000;
@@ -1191,6 +1283,70 @@ mod tests {
     }
 
     #[test]
+    fn production_gate_binds_the_approved_plugin_set_and_migration_inventory() {
+        let revision = "d".repeat(40);
+        let mut policy = valid_policy(revision.clone());
+        policy.migration_coverage_minimums.browser_asset_roots = 2;
+        policy.migration_coverage_minimums.browser_har_files = 2;
+        let mut plugin = valid();
+        plugin.source_revision = revision.clone();
+        plugin.executed_at_unix_seconds = 1000;
+        plugin.release_set_spec_sha256 = "a".repeat(64);
+        plugin.package_set_sha256 = "b".repeat(64);
+        let mut migration = valid_migration();
+        migration.source_revision = revision.clone();
+        migration.executed_at_unix_seconds = 1000;
+        migration.config_files = 0;
+        migration.plugin_directories = 1;
+        migration.service_count = 2;
+        migration.key_binding_count = 3;
+        migration.browser_asset_roots = 1;
+        migration.browser_asset_files_scanned = 49;
+        migration.browser_har_files = 1;
+        migration.browser_har_requests_scanned = 99;
+        migration.desktop_callback_http_evidence = HttpEvidenceLevel::NotObserved;
+        migration.warning_findings = 0;
+        migration.finding_code_counts = BTreeMap::from([("inventory-summary".into(), 1)]);
+        let mut windows = valid_windows_package();
+        windows.source_revision = revision;
+        windows.executed_at_unix_seconds = 1000;
+
+        let decision = evaluate_production_cutover(
+            ProductionCutoverInputs {
+                policy: &policy,
+                policy_sha256: "1".repeat(64),
+                evidence_trust_store_sha256: "8".repeat(64),
+                plugin: &plugin,
+                plugin_sha256: "2".repeat(64),
+                plugin_attestation_sha256: "5".repeat(64),
+                migration: &migration,
+                migration_sha256: "3".repeat(64),
+                migration_attestation_sha256: "6".repeat(64),
+                windows: &windows,
+                windows_sha256: "4".repeat(64),
+                windows_attestation_sha256: "7".repeat(64),
+            },
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            decision.blocker_codes,
+            [
+                "migration-browser-asset-files-below-policy",
+                "migration-browser-asset-roots-below-policy",
+                "migration-browser-har-files-below-policy",
+                "migration-browser-har-requests-below-policy",
+                "migration-config-files-below-policy",
+                "migration-key-bindings-below-policy",
+                "migration-plugin-directories-below-policy",
+                "migration-services-below-policy",
+                "plugin-package-set-mismatch",
+                "plugin-release-set-spec-mismatch",
+            ]
+        );
+    }
+
+    #[test]
     fn canonical_named_digest_is_ordered_and_mutation_sensitive() {
         let first = BTreeMap::from([("b".into(), b"two".to_vec()), ("a".into(), b"one".to_vec())]);
         let second = BTreeMap::from([("a".into(), b"one".to_vec()), ("b".into(), b"two".to_vec())]);
@@ -1216,6 +1372,14 @@ mod tests {
         policy.validate().unwrap();
         policy.cutover_decision_signer_key_id = policy.windows_package_signer_key_id.clone();
         assert!(policy.validate().is_err());
+
+        let mut legacy = valid_policy("d".repeat(40));
+        legacy.schema_version = 1;
+        assert!(legacy.validate().is_err());
+
+        let mut malformed = valid_policy("d".repeat(40));
+        malformed.expected_plugin_package_set_sha256 = "not-a-digest".into();
+        assert!(malformed.validate().is_err());
     }
 
     #[test]
