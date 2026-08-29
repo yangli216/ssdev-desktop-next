@@ -5743,6 +5743,7 @@ pub fn run() {
             desktop::show_floating_window,
             desktop::close_floating_window,
             desktop::resolve_floating_window,
+            desktop::inspect_business_data_clear,
             desktop::clear_business_data,
             desktop::reload_business_windows,
             desktop::retry_timed_out_business_windows,

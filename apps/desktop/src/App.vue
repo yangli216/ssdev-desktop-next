@@ -371,6 +371,18 @@ type BusinessFrontendRetryResult = {
   unavailableWindows: number
 }
 
+type BusinessDataClearPreview = {
+  planId: string
+  configuredBusinessOrigins: number
+  businessWindows: number
+  floatingWindows: number
+}
+
+type BusinessDataClearResult = {
+  closeRequestedWindows: number
+  failedWindowClosures: number
+}
+
 type ControlRefreshField = 'status' | 'config' | 'inventory' | 'deployment'
 type PrimaryActionOutcome = {
   succeeded: boolean
@@ -393,6 +405,7 @@ const selectedPluginPackage = ref('')
 const catalogPluginId = ref('')
 const pluginUpdates = ref<PluginUpdateCheck | null>(null)
 const appUpdate = ref<AppUpdateCheck | null>(null)
+const businessDataClearPreview = ref<BusinessDataClearPreview | null>(null)
 const updateProgress = ref('')
 const error = ref('')
 const ssoActive = ref(false)
@@ -1096,8 +1109,39 @@ function changeEnvironmentUrl(environment: EnvironmentConfig, value: string) {
   }
 }
 
-async function clearBusinessData() {
-  await run(() => invoke('clear_business_data'), '业务窗口缓存与站点数据已清理。')
+async function inspectBusinessDataClear() {
+  let preview: BusinessDataClearPreview | undefined
+  const succeeded = await run(async () => {
+    preview = await invoke<BusinessDataClearPreview>('inspect_business_data_clear')
+  }, '已读取当前站点数据清理影响；确认前不会修改任何数据。')
+  if (succeeded && preview) businessDataClearPreview.value = preview
+}
+
+function cancelBusinessDataClear() {
+  businessDataClearPreview.value = null
+}
+
+async function confirmBusinessDataClear() {
+  const preview = businessDataClearPreview.value
+  if (!preview) return
+  let result: BusinessDataClearResult | undefined
+  const outcome = await runPrimaryThenRefresh(async () => {
+    result = await invoke<BusinessDataClearResult>('clear_business_data', {
+      expectedPlanId: preview.planId,
+    })
+    businessDataClearPreview.value = null
+  }, ['status'])
+  if (!outcome.succeeded || !result) {
+    businessDataClearPreview.value = null
+    return
+  }
+  const closeSummary = result.failedWindowClosures > 0
+    ? `${result.failedWindowClosures} 个页面未能自动关闭，请手动关闭后再重新进入。`
+    : `${result.closeRequestedWindows} 个受影响页面已请求关闭。`
+  showPrimaryActionSuccess(
+    `站点数据清理已提交，Cookie、登录状态、缓存和本地存储不可恢复；${closeSummary}`,
+    outcome.refreshed,
+  )
 }
 
 async function reloadBusiness() {
@@ -1626,7 +1670,12 @@ async function exportDeploymentCheck() {
             <small class="config-path">配置位置：{{ snapshot.path }}</small>
           </form>
         </section>
-        <section class="compact-panel"><div><h2>业务窗口维护</h2><p>仅在页面显示异常或需要清除登录状态时使用。</p></div><div class="actions"><button type="button" :disabled="busy" @click="reloadBusiness">刷新业务窗口</button><button type="button" :disabled="busy" @click="clearBusinessData">清理站点数据</button></div></section>
+        <section class="compact-panel"><div><h2>业务窗口维护</h2><p>刷新不会清除登录状态；站点数据清理必须先检查影响并单独确认。</p></div><div class="actions"><button type="button" :disabled="busy" @click="reloadBusiness">刷新业务窗口</button><button type="button" :disabled="busy" @click="inspectBusinessDataClear">检查清理影响</button></div></section>
+        <section v-if="businessDataClearPreview" class="business-data-clear-preview" aria-label="站点数据清理影响">
+          <header><div><p class="eyebrow">DESTRUCTIVE MAINTENANCE</p><h2>确认清理全部 WebView 站点数据</h2><p>确认时会重新核对项目来源和窗口集合；发生变化则停止操作并要求重新检查。</p></div><div class="business-data-clear-actions"><button type="button" :disabled="busy" @click="cancelBusinessDataClear">取消</button><button class="danger-link" type="button" :disabled="busy" @click="confirmBusinessDataClear">确认清理且不可恢复</button></div></header>
+          <div class="business-data-clear-impact"><span><small>当前配置来源</small><strong>{{ businessDataClearPreview.configuredBusinessOrigins }}</strong></span><span><small>业务窗口</small><strong>{{ businessDataClearPreview.businessWindows }}</strong></span><span><small>悬浮页面</small><strong>{{ businessDataClearPreview.floatingWindows }}</strong></span></div>
+          <p>该操作清除应用 WebView 配置文件中的 Cookie、登录状态、缓存和本地存储，并关闭所有业务窗口与悬浮页面；设备操作和业务系统中的服务端数据不会回退。</p>
+        </section>
       </section>
 
       <section v-show="activeSection === 'native'" class="page page-native" aria-labelledby="native-title">

@@ -45,6 +45,7 @@
     "allow-import-desktop-config",
     "allow-export-desktop-config",
     "allow-open-business-window",
+    "allow-inspect-business-data-clear",
     "allow-clear-business-data",
     "allow-reload-business-windows",
     "allow-retry-timed-out-business-windows",

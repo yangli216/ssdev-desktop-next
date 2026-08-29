@@ -65,6 +65,22 @@ pub(crate) struct BusinessFrontendRetryResult {
     unavailable_windows: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BusinessDataClearPreview {
+    plan_id: String,
+    configured_business_origins: usize,
+    business_windows: usize,
+    floating_windows: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BusinessDataClearResult {
+    close_requested_windows: usize,
+    failed_window_closures: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BusinessReadyTransition {
     recovered_after_timeout: bool,
@@ -1135,9 +1151,59 @@ pub(crate) fn resolve_floating_window(
 }
 
 #[tauri::command]
-pub(crate) fn clear_business_data(caller: WebviewWindow, app: AppHandle) -> Result<(), String> {
+pub(crate) fn inspect_business_data_clear(
+    caller: WebviewWindow,
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+) -> Result<BusinessDataClearPreview, String> {
     require_control(&caller)?;
-    clear_business_data_internal(&app)
+    build_business_data_clear_preview(&app, &state)
+}
+
+#[tauri::command]
+pub(crate) fn clear_business_data(
+    caller: WebviewWindow,
+    app: AppHandle,
+    state: State<'_, DesktopState>,
+    expected_plan_id: String,
+) -> Result<BusinessDataClearResult, String> {
+    require_control(&caller)?;
+    if !crate::is_lowercase_sha256(&expected_plan_id) {
+        return Err("站点数据清理计划标识无效，请重新检查影响".into());
+    }
+    let preview = build_business_data_clear_preview(&app, &state)?;
+    if preview.plan_id != expected_plan_id {
+        return Err("业务窗口或项目来源在确认后发生变化，请重新检查清理影响".into());
+    }
+
+    caller.clear_all_browsing_data().map_err(|_| {
+        tracing::warn!(
+            event_code = "business-data-clear-failed",
+            error_code = "webview-data-clear",
+            "business browsing data clear request failed"
+        );
+        "无法提交站点数据清理请求，请关闭业务窗口后重试；错误码：webview-data-clear".to_owned()
+    })?;
+
+    let mut result = BusinessDataClearResult::default();
+    for (label, window) in app.webview_windows() {
+        if label.starts_with(BUSINESS_LABEL_PREFIX) || label.starts_with(FLOATING_LABEL_PREFIX) {
+            result.close_requested_windows += 1;
+            if window.close().is_err() {
+                result.failed_window_closures += 1;
+            }
+        }
+    }
+    tracing::info!(
+        event_code = "business-data-clear-requested",
+        configured_business_origins = preview.configured_business_origins,
+        business_windows = preview.business_windows,
+        floating_windows = preview.floating_windows,
+        close_requested_windows = result.close_requested_windows,
+        failed_window_closures = result.failed_window_closures,
+        "business browsing data clear request accepted"
+    );
+    Ok(result)
 }
 
 #[tauri::command]
@@ -1181,14 +1247,6 @@ pub(crate) fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                         tracing::warn!(
                             event_code = "tray-reload-business-failed",
                             "tray reload action failed"
-                        );
-                    }
-                }
-                "clear-business-data" => {
-                    if clear_business_data_internal(app).is_err() {
-                        tracing::warn!(
-                            event_code = "tray-clear-business-data-failed",
-                            "tray clear business data action failed"
                         );
                     }
                 }
@@ -1241,7 +1299,6 @@ fn build_tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     builder
         .separator()
         .text("reload-business", "刷新业务窗口")
-        .text("clear-business-data", "清理站点数据")
         .separator()
         .text("quit", "退出程序")
         .build()
@@ -1869,15 +1926,58 @@ pub(crate) fn close_business_windows(app: &AppHandle) {
     }
 }
 
-fn clear_business_data_internal(app: &AppHandle) -> Result<(), String> {
-    for (label, window) in app.webview_windows() {
+fn build_business_data_clear_preview(
+    app: &AppHandle,
+    state: &DesktopState,
+) -> Result<BusinessDataClearPreview, String> {
+    let business_origins = state
+        .config
+        .snapshot()
+        .business_origins()
+        .map_err(|error| error.to_string())?;
+    let mut business_window_labels = Vec::new();
+    let mut floating_window_labels = Vec::new();
+    for label in app.webview_windows().into_keys() {
         if label.starts_with(BUSINESS_LABEL_PREFIX) {
-            window
-                .clear_all_browsing_data()
-                .map_err(|error| error.to_string())?;
+            business_window_labels.push(label);
+        } else if label.starts_with(FLOATING_LABEL_PREFIX) {
+            floating_window_labels.push(label);
         }
     }
-    Ok(())
+    business_window_labels.sort();
+    floating_window_labels.sort();
+    Ok(BusinessDataClearPreview {
+        plan_id: business_data_clear_plan_id(
+            &business_origins,
+            &business_window_labels,
+            &floating_window_labels,
+        ),
+        configured_business_origins: business_origins.len(),
+        business_windows: business_window_labels.len(),
+        floating_windows: floating_window_labels.len(),
+    })
+}
+
+fn business_data_clear_plan_id(
+    business_origins: &BTreeSet<String>,
+    business_window_labels: &[String],
+    floating_window_labels: &[String],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-BUSINESS-DATA-CLEAR-PLAN\0");
+    crate::hash_plan_field(&mut hasher, env!("CARGO_PKG_VERSION").as_bytes());
+    for origin in business_origins {
+        crate::hash_plan_field(&mut hasher, origin.as_bytes());
+    }
+    crate::hash_plan_field(&mut hasher, b"business-windows");
+    for label in business_window_labels {
+        crate::hash_plan_field(&mut hasher, label.as_bytes());
+    }
+    crate::hash_plan_field(&mut hasher, b"floating-windows");
+    for label in floating_window_labels {
+        crate::hash_plan_field(&mut hasher, label.as_bytes());
+    }
+    crate::lowercase_hex(&hasher.finalize())
 }
 
 fn reload_business_windows_internal(app: &AppHandle) -> Result<(), String> {
@@ -1946,6 +2046,58 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn business_data_clear_plan_binds_origins_and_open_window_set() {
+        let origins = BTreeSet::from([
+            "http://project-a.example.test".to_owned(),
+            "https://project-b.example.test".to_owned(),
+        ]);
+        let business = vec!["business-1".to_owned(), "business-2".to_owned()];
+        let floating = vec!["floating-3".to_owned()];
+        let plan = business_data_clear_plan_id(&origins, &business, &floating);
+
+        assert!(crate::is_lowercase_sha256(&plan));
+        assert_eq!(
+            plan,
+            business_data_clear_plan_id(&origins, &business, &floating)
+        );
+        assert_ne!(
+            plan,
+            business_data_clear_plan_id(
+                &BTreeSet::from(["https://changed.example.test".to_owned()]),
+                &business,
+                &floating,
+            )
+        );
+        assert_ne!(
+            plan,
+            business_data_clear_plan_id(&origins, &["business-1".to_owned()], &floating)
+        );
+        assert_ne!(plan, business_data_clear_plan_id(&origins, &business, &[]));
+    }
+
+    #[test]
+    fn business_data_clear_preview_exposes_only_aggregate_impact() {
+        let value = serde_json::to_value(BusinessDataClearPreview {
+            plan_id: "ab".repeat(32),
+            configured_business_origins: 3,
+            business_windows: 2,
+            floating_windows: 1,
+        })
+        .unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "planId": "ab".repeat(32),
+                "configuredBusinessOrigins": 3,
+                "businessWindows": 2,
+                "floatingWindows": 1,
+            })
+        );
+        assert!(!value.to_string().contains("example.test"));
+    }
 
     #[test]
     fn config_import_plan_binds_candidate_and_current_configuration() {
