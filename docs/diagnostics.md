@@ -15,6 +15,8 @@ SSDEV Desktop 的诊断目标是定位客户端边界故障，而不是复刻业
 
 应用更新签名包已经通过验证、但解包或系统安装程序启动失败时记录稳定事件 `app-update-install-handoff-failed` 和错误码 `updater-install`；不记录更新 URL、文件路径或安装器原始错误。此时 controller 与持久协调器已经恢复准入，原业务窗口继续可用。
 
+下一次更新尝试清理下载中崩溃遗留的固定前缀普通文件时记录 `app-update-stale-downloads-cleaned` 和清理数量，不记录临时目录、文件名或更新时间。
+
 ## 有界存储
 
 - 每个 JSON 事件最多 64 KiB；超过上限时用固定的 `diagnostic-event-oversized` 事件替代。

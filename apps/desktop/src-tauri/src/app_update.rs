@@ -21,6 +21,7 @@ const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
 const HARD_MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ENDPOINTS: usize = 4;
 const MAX_NOTES_CHARS: usize = 4096;
+const UPDATE_TEMP_PREFIX: &str = ".app-update-";
 
 pub(crate) struct AppUpdateState {
     policy: Option<AppUpdatePolicy>,
@@ -478,10 +479,16 @@ async fn download_and_verify(
     on_event: &Channel<AppUpdateEvent>,
 ) -> Result<NamedTempFile, String> {
     require_https_url(&update.download_url, "应用更新包地址")?;
-    fs::create_dir_all(temporary_directory)
-        .map_err(|error| format!("无法创建应用更新临时目录: {error}"))?;
+    let stale_files = prepare_update_temporary_directory(temporary_directory)?;
+    if stale_files > 0 {
+        tracing::info!(
+            event_code = "app-update-stale-downloads-cleaned",
+            stale_files,
+            "stale application update downloads cleaned"
+        );
+    }
     let file = TempBuilder::new()
-        .prefix(".app-update-")
+        .prefix(UPDATE_TEMP_PREFIX)
         .tempfile_in(temporary_directory)
         .map_err(|error| format!("无法创建应用更新临时文件: {error}"))?;
     let write_handle = file
@@ -548,6 +555,38 @@ async fn download_and_verify(
         .finalize()
         .map_err(|error| format!("应用更新包签名验证失败: {error}"))?;
     Ok(file)
+}
+
+fn prepare_update_temporary_directory(directory: &Path) -> Result<usize, String> {
+    fs::create_dir_all(directory).map_err(|error| format!("无法创建应用更新临时目录: {error}"))?;
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|error| format!("无法检查应用更新临时目录: {error}"))?;
+    if !metadata.file_type().is_dir() {
+        return Err("应用更新临时目录必须是非符号链接目录".to_owned());
+    }
+
+    let mut removed = 0_usize;
+    for entry in
+        fs::read_dir(directory).map_err(|error| format!("无法扫描应用更新临时目录: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("无法读取应用更新临时目录项: {error}"))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(UPDATE_TEMP_PREFIX) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("无法检查应用更新临时文件: {error}"))?;
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        fs::remove_file(entry.path())
+            .map_err(|error| format!("无法清理崩溃残留的应用更新临时文件: {error}"))?;
+        removed = removed.saturating_add(1);
+    }
+    Ok(removed)
 }
 
 fn decode_public_key(encoded: &str) -> Result<PublicKey, String> {
@@ -770,6 +809,45 @@ mod tests {
         let bounded = truncate_notes(&notes);
         assert_eq!(bounded.chars().count(), MAX_NOTES_CHARS + 1);
         assert!(bounded.ends_with('…'));
+    }
+
+    #[test]
+    fn update_temporary_directory_cleans_only_stale_regular_downloads() {
+        let directory = tempdir().unwrap();
+        let stale_a = directory.path().join(format!("{UPDATE_TEMP_PREFIX}first"));
+        let stale_b = directory.path().join(format!("{UPDATE_TEMP_PREFIX}second"));
+        let unrelated = directory.path().join("operator-note.txt");
+        let matching_directory = directory
+            .path()
+            .join(format!("{UPDATE_TEMP_PREFIX}directory"));
+        fs::write(&stale_a, b"partial download").unwrap();
+        fs::write(&stale_b, b"partial download").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+        fs::create_dir(&matching_directory).unwrap();
+
+        assert_eq!(
+            prepare_update_temporary_directory(directory.path()).unwrap(),
+            2
+        );
+        assert!(!stale_a.exists());
+        assert!(!stale_b.exists());
+        assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+        assert!(matching_directory.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_temporary_directory_rejects_a_symbolic_link_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("updates");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(prepare_update_temporary_directory(&link).is_err());
+        assert!(fs::read_dir(target).unwrap().next().is_none());
     }
 
     #[test]
