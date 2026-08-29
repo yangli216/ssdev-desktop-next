@@ -42,6 +42,7 @@ cargo run --locked -p ssdev-plugin-tool -- prepare `
 - 非 SemVer 版本、无效或超过 128 字符的 Desktop SemVer requirement、无调用方法的服务、缺失入口或显式依赖；
 - DLL/EXE 的 PE 位数与 `architecture` 不一致；
 - 超过 12 个机器字参数、浮点参数/返回、不受支持的输出缓冲区或调用约定等通用 DLL 适配器无法表达的静态 ABI；
+- 通用 COM Automation 适配器无法表达的参数或 BYREF 输出类型，以及非 COM 服务误声明的返回属性；
 - 仍声明非空 `installRun` 的旧插件。
 
 COM/OCX 的 ProgID 和真实注册状态无法在离线准备阶段验证，必须进入 Windows 候选宿主预检和真实黄金矩阵。

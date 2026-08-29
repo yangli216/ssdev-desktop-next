@@ -1,5 +1,5 @@
 use serde_json::{Map, Value};
-use webplus_plugin_config::{MethodDefinition, ServiceDefinition};
+use webplus_plugin_config::{validate_com_automation, MethodDefinition, ServiceDefinition};
 use webplus_protocol::InvokeResponse;
 #[cfg(windows)]
 use webplus_protocol::NATIVE_RETURN_VALUE_FIELD;
@@ -27,6 +27,7 @@ impl ComAdapter {
         method: &MethodDefinition,
         parameters: &Map<String, Value>,
     ) -> Result<InvokeResponse, NativeError> {
+        validate_com_declaration(service)?;
         #[cfg(windows)]
         {
             self.platform.invoke(service, method, parameters)
@@ -41,6 +42,7 @@ impl ComAdapter {
     }
 
     pub(crate) fn preflight(&mut self, service: &ServiceDefinition) -> Result<(), NativeError> {
+        validate_com_declaration(service)?;
         #[cfg(windows)]
         {
             self.platform.preflight(service)
@@ -58,6 +60,10 @@ impl ComAdapter {
         #[cfg(windows)]
         self.platform.pump_messages();
     }
+}
+
+fn validate_com_declaration(service: &ServiceDefinition) -> Result<(), NativeError> {
+    validate_com_automation(service).map_err(NativeError::Com)
 }
 
 #[cfg(windows)]
@@ -263,6 +269,7 @@ mod platform {
 
     enum OutputStorage {
         I32(Box<i32>),
+        U32(Box<u32>),
         F64(Box<f64>),
         Bool(Box<VARIANT_BOOL>),
         String(Box<BSTR>),
@@ -277,6 +284,7 @@ mod platform {
         fn new(name: &str, parameter_type: &str) -> Result<Self, NativeError> {
             let storage = match parameter_type.trim().to_ascii_lowercase().as_str() {
                 "int" | "int32" | "long" => OutputStorage::I32(Box::new(0)),
+                "uint" | "uint32" | "dword" => OutputStorage::U32(Box::new(0)),
                 "float" | "double" => OutputStorage::F64(Box::new(0.0)),
                 "bool" | "boolean" => OutputStorage::Bool(Box::new(VARIANT_BOOL(0))),
                 "" | "inferred" | "string" | "buffer" => {
@@ -298,6 +306,7 @@ mod platform {
         fn byref_variant(&mut self) -> VARIANT {
             match &mut self.storage {
                 OutputStorage::I32(value) => byref_variant(VT_I4, value.as_mut() as *mut i32),
+                OutputStorage::U32(value) => byref_variant(VT_UI4, value.as_mut() as *mut u32),
                 OutputStorage::F64(value) => byref_variant(VT_R8, value.as_mut() as *mut f64),
                 OutputStorage::Bool(value) => {
                     byref_variant(VT_BOOL, value.as_mut() as *mut VARIANT_BOOL)
@@ -309,6 +318,7 @@ mod platform {
         fn value(&self) -> Result<Value, NativeError> {
             match &self.storage {
                 OutputStorage::I32(value) => Ok(json!(**value)),
+                OutputStorage::U32(value) => Ok(json!(**value)),
                 OutputStorage::F64(value) => Number::from_f64(**value)
                     .map(Value::Number)
                     .ok_or_else(|| NativeError::Com("COM output was NaN or infinite".into())),
@@ -356,6 +366,11 @@ mod platform {
                 .and_then(|value| i32::try_from(value).ok())
                 .map(VARIANT::from)
                 .ok_or_else(|| invalid_value(name, "expected a 32-bit integer")),
+            ("uint" | "uint32" | "dword", Value::Number(value)) => value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .map(VARIANT::from)
+                .ok_or_else(|| invalid_value(name, "expected a 32-bit unsigned integer")),
             ("float" | "double", Value::Number(value)) => value
                 .as_f64()
                 .map(VARIANT::from)
@@ -497,6 +512,16 @@ mod platform {
                 resolved,
                 GUID::from_u128(0x00000000_0000_0000_c000_000000000046)
             );
+        }
+
+        #[test]
+        fn prepares_unsigned_input_and_byref_output_variants() {
+            let input = json_to_variant("value", "uint32", &json!(42)).unwrap();
+            assert_eq!(input.vt(), VT_UI4);
+
+            let mut output = OutputBinding::new("value", "dword").unwrap();
+            assert_eq!(output.byref_variant().vt(), VT_UI4 | VT_BYREF);
+            assert_eq!(output.value().unwrap(), json!(0));
         }
     }
 }

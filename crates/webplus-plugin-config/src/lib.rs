@@ -726,6 +726,42 @@ pub fn validate_dll_abi(service: &ServiceDefinition) -> Result<(), String> {
     Ok(())
 }
 
+/// Validates the scalar/BSTR `IDispatch` parameter model implemented by the
+/// COM adapter without instantiating or invoking the declared component.
+pub fn validate_com_automation(service: &ServiceDefinition) -> Result<(), String> {
+    for method in &service.methods {
+        for parameter in &method.parameters {
+            let ParameterDefinition::Detailed(detail) = parameter else {
+                continue;
+            };
+            let kind = detail.parameter_type.trim().to_ascii_lowercase();
+            let supported = matches!(
+                kind.as_str(),
+                "" | "inferred"
+                    | "string"
+                    | "buffer"
+                    | "bool"
+                    | "boolean"
+                    | "int"
+                    | "int32"
+                    | "long"
+                    | "uint"
+                    | "uint32"
+                    | "dword"
+                    | "float"
+                    | "double"
+            );
+            if !supported {
+                return Err(format!(
+                    "COM method [{}] parameter [{}] has an unsupported automation type [{}]",
+                    method.name, detail.name, kind
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_manifest(plugin_id: &str, services: &[ServiceDefinition]) -> Result<(), ConfigError> {
     validate_plugin_id(plugin_id)?;
     if services.is_empty() {
@@ -910,9 +946,17 @@ fn validate_service<'a>(
                 )));
             }
         }
+        if !method.props.is_empty() && !matches!(main_type.as_str(), "dll" | "com" | "ocx") {
+            return Err(ConfigError::Validation(format!(
+                "method [{}] cannot declare COM properties for main type [{}]",
+                method.name, main_type
+            )));
+        }
     }
-    if main_type == "dll" {
-        validate_dll_abi(service).map_err(ConfigError::Validation)?;
+    match main_type.as_str() {
+        "dll" => validate_dll_abi(service).map_err(ConfigError::Validation)?,
+        "com" | "ocx" => validate_com_automation(service).map_err(ConfigError::Validation)?,
+        _ => {}
     }
     Ok(())
 }
@@ -1223,6 +1267,33 @@ mod tests {
 
         let manifest = PluginManifest::load("reader", root.path()).unwrap();
         validate_dll_abi(&manifest.services[0]).unwrap();
+    }
+
+    #[test]
+    fn com_automation_rejects_unsupported_parameter_types_cross_platform() {
+        for api in [
+            r#"{"serviceId":"reader","mainClass":"Vendor.Reader","mainType":"com","methods":[{"name":"read","parameters":[{"name":"input","type":"pointer"}]}]}"#,
+            r#"{"serviceId":"reader","mainClass":"Vendor.Reader","mainType":"ocx","methods":[{"name":"read","parameters":[{"name":"$output","type":"struct"}]}]}"#,
+        ] {
+            let root = tempdir().unwrap();
+            fs::write(root.path().join(API_FILENAME), api).unwrap();
+
+            let error = PluginManifest::load("reader", root.path()).unwrap_err();
+            assert!(error.to_string().contains("unsupported automation type"));
+        }
+    }
+
+    #[test]
+    fn com_automation_accepts_the_complete_scalar_and_bstr_contract() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join(API_FILENAME),
+            r#"{"serviceId":"reader","mainClass":"Vendor.Reader","mainType":"com","methods":[{"name":"read","parameters":[{"name":"text","type":" STRING "},{"name":"flag","type":"boolean"},{"name":"signed","type":"int32"},{"name":"unsigned","type":"uint32"},{"name":"ratio","type":"double"},{"name":"$buffer","type":"buffer"},{"name":"$status","type":"dword"}],"props":["Count"]}]}"#,
+        )
+        .unwrap();
+
+        let manifest = PluginManifest::load("reader", root.path()).unwrap();
+        validate_com_automation(&manifest.services[0]).unwrap();
     }
 
     #[test]

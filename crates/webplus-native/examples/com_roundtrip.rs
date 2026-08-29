@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "name": "Add",
                     "parameters": [
                         { "name": "key", "type": "string" },
-                        "item"
+                        { "name": "item", "type": "uint32" }
                     ],
                     "props": ["Count"]
                 },

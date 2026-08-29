@@ -20,7 +20,7 @@ type MethodDefinition = {
   timeout: number
   returnType: string
   parameters: Array<ParameterDefinition | string>
-  props: unknown[]
+  props: string[]
 }
 
 type ServiceDefinition = {
@@ -148,6 +148,7 @@ const notice = ref('')
 
 const service = computed(() => draft.value.services[serviceIndex.value])
 const method = computed(() => service.value?.methods[methodIndex.value])
+const isComService = computed(() => service.value?.mainType === 'com' || service.value?.mainType === 'ocx')
 const callableParameters = computed(() => (method.value?.parameters ?? []).filter((item): item is ParameterDefinition => typeof item !== 'string' && !item.name.startsWith('$')))
 const returnTypeOptions = computed(() => service.value?.mainType === 'dll'
   ? ['void', 'string', 'bool', 'int', 'uint', 'pointer']
@@ -198,6 +199,7 @@ function normalizeMapping(mapping: LocalMappingDefinition): LocalMappingDefiniti
     item.charset ||= 'utf8'
     item.callingConvention ||= 'system'
     for (const mappedMethod of item.methods) {
+      mappedMethod.props ??= []
       mappedMethod.parameters = mappedMethod.parameters.map((parameter) =>
         typeof parameter === 'string'
           ? { name: parameter, type: 'string', len: 1024 }
@@ -370,6 +372,14 @@ function parameterTypeOptions(parameter: ParameterDefinition): string[] {
 
 function removeParameter(index: number) {
   method.value?.parameters.splice(index, 1)
+}
+
+function addComProperty() {
+  method.value?.props.push('')
+}
+
+function removeComProperty(index: number) {
+  method.value?.props.splice(index, 1)
 }
 
 function parameterAt(index: number): ParameterDefinition {
@@ -852,6 +862,13 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
                 </div>
                 <button type="button" @click="addParameter">＋ 添加参数</button>
               </div>
+              <div v-if="isComService || method.props.length" class="com-property-list">
+                <strong>调用后读取属性</strong>
+                <p v-if="isComService">方法执行成功后以 <code>PROPERTYGET</code> 读取，结果与 <code>ReturnValue</code>、输出参数一起进入 <code>ResData</code>；属性类型在生成客户端中保持为 <code>JsonValue</code>。</p>
+                <p v-else class="mapping-import-warning">当前组件不是 COM/OCX，请移除已有属性后再保存。</p>
+                <div v-for="(_property, index) in method.props" :key="index"><input v-model.trim="method.props[index]" required maxlength="256" placeholder="例如 Count" /><button type="button" @click="removeComProperty(index)">移除</button></div>
+                <button v-if="isComService" type="button" @click="addComProperty">＋ 添加返回属性</button>
+              </div>
               <p v-if="service.mainType === 'dll'" class="field-hint">DLL 使用最多 12 个机器字参数的受限 ABI：输入支持字符串、布尔和整数，输出支持字符串缓冲区和 32 位整数；浮点、结构体与回调需要专用 Rust 适配器。</p>
               <button class="danger-link" type="button" @click="removeMethod(methodIndex)">删除当前方法</button>
             </div>
@@ -981,6 +998,11 @@ legend { padding: 0 7px; color: #355746; font-size: 13px; font-weight: 800; }
 .parameter-head, .parameter-row { display: grid; grid-template-columns: 1.1fr .75fr .55fr .7fr auto; gap: 6px; align-items: center; }
 .parameter-head { color: #718078; font-size: 11px; }
 .parameter-table > button { justify-self: start; }
+.com-property-list { display: grid; gap: 7px; margin: 14px 0; padding: 12px; border: 1px solid #d1d9d2; border-radius: 9px; background: #f6f8f5; color: #4c5d53; font-size: 12px; }
+.com-property-list > p { margin: 0; color: #718078; line-height: 1.5; }
+.com-property-list > div { display: grid; grid-template-columns: 1fr auto; gap: 7px; }
+.com-property-list > button { justify-self: start; }
+.com-property-list .mapping-import-warning { color: #8b5b22; }
 .debug-panel > p { margin-top: 0; color: #66736b; font-size: 12px; }
 .debug-inputs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 12px 0; }
 .debug-inputs label span small { color: #89958d; font-weight: 500; }
