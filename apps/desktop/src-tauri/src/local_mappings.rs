@@ -148,6 +148,10 @@ struct MappingActivationJournal {
 }
 
 impl ActivatedLocalMapping {
+    pub(crate) fn transaction_root(&self) -> &Path {
+        &self.transaction
+    }
+
     pub(crate) fn commit(mut self) -> Result<PluginManifest, String> {
         commit_mapping_transaction(&self.root, &self.transaction)?;
         self.finalized = true;
@@ -654,6 +658,34 @@ pub(crate) fn export_bundle(
         .persist(destination)
         .map_err(|error| format!("无法保存映射包: {}", error.error))?;
     Ok(())
+}
+
+pub(crate) fn load_exported_bundle_definition(
+    source: &Path,
+) -> Result<LocalMappingDefinition, String> {
+    let metadata =
+        fs::symlink_metadata(source).map_err(|error| format!("无法读取映射状态快照: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > MAX_BUNDLE_BYTES
+    {
+        return Err("映射状态快照不是受支持的普通文件".into());
+    }
+    let file = File::open(source).map_err(|error| format!("无法打开映射状态快照: {error}"))?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|error| format!("映射状态快照无效: {error}"))?;
+    let mut entry = archive
+        .by_name(LOCAL_MAPPING_FILENAME)
+        .map_err(|_| "映射状态快照缺少映射定义".to_owned())?;
+    if entry.is_dir() || entry.size() > 4 * 1024 * 1024 {
+        return Err("映射状态快照中的定义不是受支持的普通文件".into());
+    }
+    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    entry
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("无法读取映射状态快照定义: {error}"))?;
+    let definition: LocalMappingDefinition =
+        serde_json::from_slice(&bytes).map_err(|error| format!("映射状态快照定义无效: {error}"))?;
+    validate_definition_header(&definition)?;
+    Ok(definition)
 }
 
 pub(crate) fn prepare_import(root: &Path, source: &Path) -> Result<PreparedLocalMapping, String> {

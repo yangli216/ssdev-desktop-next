@@ -23,7 +23,7 @@ test('native mapping operations cannot silently use an older activated mapping',
   assert.match(source, /async function invokeDebug[\s\S]+requireActiveMappingSnapshot\('运行现场测试'\)[\s\S]+debug_plugin_invoke/)
   assert.match(source, /async function saveDebugCase[\s\S]+requireActiveMappingSnapshot\('保存调试用例'\)[\s\S]+save_local_mapping_debug_case/)
   assert.match(source, /async function runDebugCases[\s\S]+requireActiveMappingSnapshot\('运行回归用例'\)[\s\S]+run_local_mapping_debug_cases/)
-  assert.match(source, /deletionDiscardsCurrentDraft\(pluginId\)[\s\S]+本地映射「\$\{pluginId\}」有未保存更改。删除成功后这些草稿也会丢失/)
+  assert.match(source, /const draftWarning = deletionDiscardsCurrentDraft\(pluginId\) \? ' 当前未保存草稿也会丢失。'/)
   assert.match(source, /当前草稿有未保存更改；当前映射的调试、回归和导出已暂停/)
   assert.match(source, /function discardDraftChanges\(\)[\s\S]+replaceDraft\(savedDraft\.value, '已放弃未保存更改，恢复到最近保存状态。'\)/)
   assert.match(source, /v-if="draftDirty" type="button" :disabled="busy \|\| disabled" @click="discardDraftChanges">放弃更改/)

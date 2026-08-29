@@ -76,6 +76,15 @@ type LocalMappingImportPreview = {
   }>
 }
 
+type LocalMappingRemovalPreview = {
+  planId: string
+  pluginId: string
+  displayName: string
+  serviceCount: number
+  methodCount: number
+  debugCaseCount: number
+}
+
 type NativeInspection = {
   fileName: string
   fileBytes: number
@@ -656,14 +665,26 @@ async function saveMapping() {
 }
 
 async function deleteMapping(pluginId: string) {
-  if (deletionDiscardsCurrentDraft(pluginId) && !window.confirm(`本地映射「${pluginId}」有未保存更改。删除成功后这些草稿也会丢失，确定继续吗？`)) return
-  if (!window.confirm(`确定删除本地映射「${pluginId}」吗？签名插件不会受影响。`)) return
+  busy.value = true
+  error.value = ''
+  notice.value = ''
+  let preview: LocalMappingRemovalPreview
+  try {
+    preview = await invoke<LocalMappingRemovalPreview>('inspect_local_mapping_removal', { pluginId })
+  } catch (reason) {
+    error.value = reasonText(reason)
+    busy.value = false
+    return
+  }
+  busy.value = false
+  const draftWarning = deletionDiscardsCurrentDraft(pluginId) ? ' 当前未保存草稿也会丢失。' : ''
+  if (!window.confirm(`确定删除本地映射「${preview.displayName || preview.pluginId}」吗？将卸载 ${preview.serviceCount} 个服务、${preview.methodCount} 个方法，并删除 ${preview.debugCaseCount} 个回归用例。${draftWarning} 签名插件不会受影响。`)) return
   await runCommittedMappingAction(
-    () => invoke('delete_local_mapping', { pluginId }),
+    () => invoke('delete_local_mapping', { pluginId: preview.pluginId, expectedPlanId: preview.planId }),
     () => ({
       action: 'delete',
-      pluginId,
-      successMessage: `本地映射 ${pluginId} 已删除并从路由卸载。`,
+      pluginId: preview.pluginId,
+      successMessage: `本地映射 ${preview.pluginId} 已删除并从路由卸载。`,
     }),
   )
 }

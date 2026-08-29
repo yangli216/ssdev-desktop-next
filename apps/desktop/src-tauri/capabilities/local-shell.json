@@ -31,6 +31,7 @@
     "allow-export-local-mapping-release-source",
     "allow-inspect-local-mapping-import",
     "allow-import-local-mapping",
+    "allow-inspect-local-mapping-removal",
     "allow-delete-local-mapping",
     "allow-debug-plugin-invoke",
     "allow-save-local-mapping-debug-case",
