@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "targetSourceRevision": "0123456789abcdef0123456789abcdef01234567",
   "expectedAppVersion": "1.0.0",
   "maximumEvidenceAgeSeconds": 604800,
@@ -8,6 +8,7 @@
   "expectedPluginPackageSetSha256": "9999999999999999999999999999999999999999999999999999999999999999",
   "expectedPluginTrustStoreSha256": "2222222222222222222222222222222222222222222222222222222222222222",
   "expectedPluginMatrixSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+  "expectedPilotMaterialSetSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "expectedOriginPolicySha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "migrationCoverageMinimums": {
     "configFiles": 1,

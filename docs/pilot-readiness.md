@@ -8,6 +8,8 @@
 
 复制 [试点材料清单示例](pilot-materials.example.json)，并把所有 `inputs` 写成材料根目录下的正斜杠相对路径。禁止绝对路径、`..`、反斜杠、符号链接和特殊文件。工具递归散列声明目录，但报告不会保存文件名、目录、项目标签或审批引用原文。
 
+schema 2 manifest 还必须填写 `migrationAuditBindings`，明确正式迁移审计使用哪些配置、插件根目录、快捷键、业务前端、HAR，以及签名来源策略三件套。五类列表必须分别与 `legacy-config`、`production-native-assets`、`legacy-keymap`、`business-assets` 和 `business-hars` 的 `inputs` 精确相等；策略三件套必须与 `signed-origin-policy` 的三个输入精确相等。不能只交付一个更大的材料目录，再在正式审计时人工挑选较小或不同的样本。
+
 十个类别必须提供真实输入，不能标记为不适用：
 
 - `legacy-config`：当前使用的旧桌面配置样本；
@@ -34,7 +36,7 @@ cargo run --locked -p ssdev-pilot-readiness -- `
   D:\ssdev-pilot\reports\pilot-readiness.json
 ```
 
-退出码 `0` 表示材料清单完整；`3` 表示报告已写出但仍有稳定阻断码；`1` 表示 manifest、路径或 I/O 本身无效。材料变化会改变每类 `contentSha256` 和总 `materialSetSha256`，后续移交应记录这个总摘要。
+退出码 `0` 表示材料清单完整；`3` 表示报告已写出但仍有稳定阻断码；`1` 表示 manifest、路径或 I/O 本身无效。schema 2 报告会同时记录 `migrationAuditBindingsSha256`；材料内容、类别身份或审计角色变化都会改变总 `materialSetSha256`，后续移交应记录这个总摘要。
 
 接收方不能只查看对方提供的摘要，应对收到的同一 manifest 和材料目录独立复验：
 
@@ -50,7 +52,7 @@ cargo run --locked -p ssdev-pilot-readiness -- `
 
 预检通过后按顺序执行：
 
-1. 用同一签名来源策略运行正式迁移审计，确认旧本机 HTTP 和资产覆盖结论；
+1. 把材料根目录、同一 manifest 和已复验报告三件套交给正式迁移审计；工具只从 `migrationAuditBindings` 派生输入和签名来源策略，并在审计完成后再次复验全部材料；
 2. 对批准发布集合运行真实 x86/x64 插件黄金矩阵；
 3. 使用上一正式版本和候选 NSIS 运行 Windows 升级、启动、回退与卸载验收；
 4. 对三份独立证据签名并运行生产 Go/No-Go。

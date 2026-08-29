@@ -12,9 +12,12 @@ use ssdev_cutover_evidence::{
 };
 use ssdev_migration_audit::{
     audit, audit_with_verified_origin_policy, AuditInputs, AuditReport,
-    EvidenceLevel as AuditEvidenceLevel, Severity,
+    EvidenceLevel as AuditEvidenceLevel, PilotMaterialAudit, Severity,
 };
 use ssdev_origin_policy::OriginPolicy;
+use ssdev_pilot_readiness::{
+    load_manifest, load_report, resolve_migration_audit_inputs, verify_materials,
+};
 use ssdev_release_manifest::capture_source_identity;
 use ssdev_release_signing::{verify, ArtifactKind};
 use webplus_plugin_trust::TrustStore;
@@ -24,6 +27,24 @@ struct CliOptions {
     inputs: AuditInputs,
     formal: Option<FormalOutputs>,
     origin_policy: Option<OriginPolicyInputs>,
+    pilot: Option<PilotInputPaths>,
+}
+
+#[derive(Debug)]
+struct PilotInputPaths {
+    materials_root: PathBuf,
+    manifest: PathBuf,
+    report: PathBuf,
+}
+
+struct VerifiedPilotInputs {
+    paths: PilotInputPaths,
+    manifest_bytes: Vec<u8>,
+    report_bytes: Vec<u8>,
+    audit_inputs: AuditInputs,
+    origin_policy: OriginPolicyInputs,
+    material_set_sha256: String,
+    migration_audit_bindings_sha256: String,
 }
 
 #[derive(Debug)]
@@ -53,22 +74,37 @@ fn main() {
     match run() {
         Ok(()) => {}
         Err(error) => {
-            eprintln!("{error}\n\n用法: ssdev-migration-audit [--config FILE]... [--plugins DIR]... [--keymap FILE]... [--browser-assets FILE_OR_DIR]... [--browser-har FILE]... [--origin-policy FILE --origin-policy-envelope FILE --release-trust-store FILE] [--workspace DIR --report-output FILE --evidence-output FILE --evidence-environment LABEL]");
+            eprintln!("{error}\n\n用法: ssdev-migration-audit [--config FILE]... [--plugins DIR]... [--keymap FILE]... [--browser-assets FILE_OR_DIR]... [--browser-har FILE]... [--origin-policy FILE --origin-policy-envelope FILE --release-trust-store FILE] [--pilot-materials-root DIR --pilot-manifest FILE --pilot-report FILE] [--workspace DIR --report-output FILE --evidence-output FILE --evidence-environment LABEL]");
             std::process::exit(2);
         }
     }
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let options = parse_args(env::args().skip(1))
+    let mut options = parse_args(env::args().skip(1))
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let verified_policy = options
-        .origin_policy
-        .map(load_verified_origin_policy)
-        .transpose()?;
+    let verified_pilot = options.pilot.map(load_verified_pilot_inputs).transpose()?;
+    if let Some(pilot) = &verified_pilot {
+        options.inputs = AuditInputs {
+            configs: pilot.audit_inputs.configs.clone(),
+            plugin_roots: pilot.audit_inputs.plugin_roots.clone(),
+            keymaps: pilot.audit_inputs.keymaps.clone(),
+            browser_asset_roots: pilot.audit_inputs.browser_asset_roots.clone(),
+            browser_hars: pilot.audit_inputs.browser_hars.clone(),
+        };
+    }
+    let policy_inputs = verified_pilot
+        .as_ref()
+        .map(|pilot| OriginPolicyInputs {
+            document: pilot.origin_policy.document.clone(),
+            envelope: pilot.origin_policy.envelope.clone(),
+            trust_store: pilot.origin_policy.trust_store.clone(),
+        })
+        .or(options.origin_policy);
+    let verified_policy = policy_inputs.map(load_verified_origin_policy).transpose()?;
     match options.formal {
         None => {
-            let report = match verified_policy.as_ref() {
+            let mut report = match verified_policy.as_ref() {
                 Some(verified) => audit_with_verified_origin_policy(
                     &options.inputs,
                     &verified.policy,
@@ -76,6 +112,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                 ),
                 None => audit(&options.inputs),
             };
+            bind_pilot_materials(&mut report, verified_pilot.as_ref());
+            if let Some(pilot) = &verified_pilot {
+                pilot.verify_unchanged()?;
+            }
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
@@ -85,7 +125,78 @@ fn run() -> Result<(), Box<dyn Error>> {
             verified_policy.ok_or_else(|| {
                 invalid_input("formal migration evidence requires a verified signed origin policy")
             })?,
+            verified_pilot.ok_or_else(|| {
+                invalid_input("formal migration evidence requires verified pilot materials")
+            })?,
         ),
+    }
+}
+
+fn load_verified_pilot_inputs(
+    paths: PilotInputPaths,
+) -> Result<VerifiedPilotInputs, Box<dyn Error>> {
+    let canonical_root = fs::canonicalize(&paths.materials_root)?;
+    let canonical_report = fs::canonicalize(&paths.report)?;
+    if canonical_report.starts_with(&canonical_root) {
+        return Err(invalid_input(
+            "pilot readiness report must stay outside the materials root",
+        ));
+    }
+    let (manifest, manifest_bytes) = load_manifest(&paths.manifest)?;
+    let (report, report_bytes) = load_report(&paths.report)?;
+    verify_materials(&paths.materials_root, &manifest, &manifest_bytes, &report)?;
+    if !report.intake_complete {
+        return Err(invalid_input(
+            "pilot material report is verified but still incomplete",
+        ));
+    }
+    let resolved = resolve_migration_audit_inputs(&paths.materials_root, &manifest)?;
+    Ok(VerifiedPilotInputs {
+        paths,
+        manifest_bytes,
+        report_bytes,
+        audit_inputs: AuditInputs {
+            configs: resolved.configs,
+            plugin_roots: resolved.plugin_roots,
+            keymaps: resolved.keymaps,
+            browser_asset_roots: resolved.browser_asset_roots,
+            browser_hars: resolved.browser_hars,
+        },
+        origin_policy: OriginPolicyInputs {
+            document: resolved.origin_policy,
+            envelope: resolved.origin_policy_envelope,
+            trust_store: resolved.release_trust_store,
+        },
+        material_set_sha256: report.material_set_sha256,
+        migration_audit_bindings_sha256: report.migration_audit_bindings_sha256,
+    })
+}
+
+impl VerifiedPilotInputs {
+    fn verify_unchanged(&self) -> Result<(), Box<dyn Error>> {
+        let (manifest, manifest_bytes) = load_manifest(&self.paths.manifest)?;
+        let (report, report_bytes) = load_report(&self.paths.report)?;
+        if manifest_bytes != self.manifest_bytes || report_bytes != self.report_bytes {
+            return Err(invalid_input(
+                "pilot manifest or readiness report changed during migration audit",
+            ));
+        }
+        verify_materials(
+            &self.paths.materials_root,
+            &manifest,
+            &manifest_bytes,
+            &report,
+        )?;
+        Ok(())
+    }
+}
+
+fn bind_pilot_materials(report: &mut AuditReport, pilot: Option<&VerifiedPilotInputs>) {
+    if let Some(pilot) = pilot {
+        report.pilot_materials = Some(PilotMaterialAudit {
+            material_set_sha256: pilot.material_set_sha256.clone(),
+            migration_audit_bindings_sha256: pilot.migration_audit_bindings_sha256.clone(),
+        });
     }
 }
 
@@ -130,6 +241,7 @@ fn run_formal(
     inputs: &AuditInputs,
     formal: FormalOutputs,
     verified_policy: VerifiedOriginPolicy,
+    verified_pilot: VerifiedPilotInputs,
 ) -> Result<(), Box<dyn Error>> {
     let workspace = fs::canonicalize(&formal.workspace)?;
     if !workspace.is_dir() {
@@ -142,18 +254,21 @@ fn run_formal(
             "report and evidence outputs must be different files",
         ));
     }
-    if report_output.starts_with(&workspace) || evidence_output.starts_with(&workspace) {
-        return Err(invalid_input(
-            "formal outputs must stay outside the source workspace",
-        ));
-    }
+    let pilot_materials_root = fs::canonicalize(&verified_pilot.paths.materials_root)?;
+    validate_formal_output_locations(
+        &report_output,
+        &evidence_output,
+        &workspace,
+        &pilot_materials_root,
+    )?;
 
     let source_before = capture_source_identity(&workspace)?;
-    let report = audit_with_verified_origin_policy(
+    let mut report = audit_with_verified_origin_policy(
         inputs,
         &verified_policy.policy,
         verified_policy.document_sha256.clone(),
     );
+    bind_pilot_materials(&mut report, Some(&verified_pilot));
     let mut report_bytes = serde_json::to_vec_pretty(&report)?;
     report_bytes.push(b'\n');
     let report_sha256 = sha256_bytes(&report_bytes);
@@ -167,6 +282,7 @@ fn run_formal(
             "source identity or signed origin policy inputs changed during migration audit",
         ));
     }
+    verified_pilot.verify_unchanged()?;
 
     let evidence = build_evidence(
         &report,
@@ -183,6 +299,27 @@ fn run_formal(
         report.browser_compatibility.asset_files_scanned,
         report.browser_compatibility.har_requests_scanned
     );
+    Ok(())
+}
+
+fn validate_formal_output_locations(
+    report_output: &std::path::Path,
+    evidence_output: &std::path::Path,
+    workspace: &std::path::Path,
+    pilot_materials_root: &std::path::Path,
+) -> Result<(), Box<dyn Error>> {
+    if report_output.starts_with(workspace) || evidence_output.starts_with(workspace) {
+        return Err(invalid_input(
+            "formal outputs must stay outside the source workspace",
+        ));
+    }
+    if report_output.starts_with(pilot_materials_root)
+        || evidence_output.starts_with(pilot_materials_root)
+    {
+        return Err(invalid_input(
+            "formal outputs must stay outside the pilot materials root",
+        ));
+    }
     Ok(())
 }
 
@@ -226,6 +363,12 @@ fn build_evidence(
         runner_os: env::consts::OS.into(),
         runner_architecture: env::consts::ARCH.into(),
         report_sha256,
+        pilot_material_set_sha256: report
+            .pilot_materials
+            .as_ref()
+            .ok_or_else(|| invalid_input("formal audit report is missing pilot material binding"))?
+            .material_set_sha256
+            .clone(),
         origin_policy_sha256: report
             .origin_policy
             .as_ref()
@@ -304,6 +447,9 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<CliOptions,
     let mut origin_policy = None;
     let mut origin_policy_envelope = None;
     let mut release_trust_store = None;
+    let mut pilot_materials_root = None;
+    let mut pilot_manifest = None;
+    let mut pilot_report = None;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         let value = arguments
@@ -326,16 +472,44 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<CliOptions,
             "--release-trust-store" => {
                 set_once(&mut release_trust_store, PathBuf::from(value), &argument)?
             }
+            "--pilot-materials-root" => {
+                set_once(&mut pilot_materials_root, PathBuf::from(value), &argument)?
+            }
+            "--pilot-manifest" => set_once(&mut pilot_manifest, PathBuf::from(value), &argument)?,
+            "--pilot-report" => set_once(&mut pilot_report, PathBuf::from(value), &argument)?,
             _ => return Err(format!("未知参数 [{argument}]")),
         }
     }
-    if inputs.configs.is_empty()
-        && inputs.plugin_roots.is_empty()
-        && inputs.keymaps.is_empty()
-        && inputs.browser_asset_roots.is_empty()
-        && inputs.browser_hars.is_empty()
-    {
-        return Err("至少需要一个审计输入".into());
+    let manual_inputs_present = !inputs.configs.is_empty()
+        || !inputs.plugin_roots.is_empty()
+        || !inputs.keymaps.is_empty()
+        || !inputs.browser_asset_roots.is_empty()
+        || !inputs.browser_hars.is_empty();
+    let pilot_count = [
+        pilot_materials_root.is_some(),
+        pilot_manifest.is_some(),
+        pilot_report.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    let pilot = match pilot_count {
+        0 => None,
+        3 => Some(PilotInputPaths {
+            materials_root: pilot_materials_root.unwrap(),
+            manifest: pilot_manifest.unwrap(),
+            report: pilot_report.unwrap(),
+        }),
+        _ => return Err(
+            "试点材料模式必须同时提供 --pilot-materials-root、--pilot-manifest 和 --pilot-report"
+                .into(),
+        ),
+    };
+    if !manual_inputs_present && pilot.is_none() {
+        return Err("至少需要一个审计输入或一套已复验试点材料".into());
+    }
+    if pilot.is_some() && manual_inputs_present {
+        return Err("试点材料模式不能同时提供手工 --config/--plugins/--keymap/--browser-assets/--browser-har 输入".into());
     }
     let formal_count = [
         report_output.is_some(),
@@ -358,6 +532,9 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<CliOptions,
             return Err("正式模式必须同时提供 --workspace、--report-output、--evidence-output 和 --evidence-environment".into())
         }
     };
+    if formal.is_some() && pilot.is_none() {
+        return Err("正式迁移审计必须从 --pilot-materials-root、--pilot-manifest 和 --pilot-report 派生输入".into());
+    }
     let policy_count = [
         origin_policy.is_some(),
         origin_policy_envelope.is_some(),
@@ -366,8 +543,11 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<CliOptions,
     .into_iter()
     .filter(|present| *present)
     .count();
+    if pilot.is_some() && policy_count != 0 {
+        return Err("试点材料模式从 manifest 派生签名来源策略，不能同时提供手工策略参数".into());
+    }
     let origin_policy = match policy_count {
-        0 if formal.is_none() => None,
+        0 if formal.is_none() || pilot.is_some() => None,
         3 => Some(OriginPolicyInputs {
             document: origin_policy.unwrap(),
             envelope: origin_policy_envelope.unwrap(),
@@ -384,6 +564,7 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<CliOptions,
         inputs,
         formal,
         origin_policy,
+        pilot,
     })
 }
 
@@ -400,6 +581,7 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine as _;
     use ed25519_dalek::{Signer, SigningKey};
+    use ssdev_pilot_readiness::{inspect_materials, write_report, PilotMaterialManifest};
     use tempfile::tempdir;
 
     #[test]
@@ -513,8 +695,12 @@ mod tests {
         ])
         .is_err());
         let parsed = parse_args([
-            "--config".into(),
-            "a.json".into(),
+            "--pilot-materials-root".into(),
+            "materials".into(),
+            "--pilot-manifest".into(),
+            "pilot-materials.json".into(),
+            "--pilot-report".into(),
+            "pilot-readiness.json".into(),
             "--workspace".into(),
             ".".into(),
             "--report-output".into(),
@@ -523,15 +709,182 @@ mod tests {
             "evidence.json".into(),
             "--evidence-environment".into(),
             "production".into(),
-            "--origin-policy".into(),
-            "origin-policy.json".into(),
-            "--origin-policy-envelope".into(),
-            "origin-policy.sig.json".into(),
-            "--release-trust-store".into(),
-            "plugin-trust.json".into(),
         ])
         .unwrap();
         assert!(parsed.formal.is_some());
-        assert!(parsed.origin_policy.is_some());
+        assert!(parsed.pilot.is_some());
+        assert!(parsed.origin_policy.is_none());
+        assert!(parse_args([
+            "--config".into(),
+            "a.json".into(),
+            "--pilot-materials-root".into(),
+            "materials".into(),
+            "--pilot-manifest".into(),
+            "pilot-materials.json".into(),
+            "--pilot-report".into(),
+            "pilot-readiness.json".into(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn formal_outputs_cannot_modify_source_or_pilot_materials() {
+        let root = tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let materials = root.path().join("materials");
+        let outputs = root.path().join("outputs");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&materials).unwrap();
+        fs::create_dir_all(&outputs).unwrap();
+
+        assert!(validate_formal_output_locations(
+            &workspace.join("migration-report.json"),
+            &outputs.join("migration-evidence.json"),
+            &workspace,
+            &materials,
+        )
+        .is_err());
+        assert!(validate_formal_output_locations(
+            &outputs.join("migration-report.json"),
+            &materials.join("migration-evidence.json"),
+            &workspace,
+            &materials,
+        )
+        .is_err());
+        validate_formal_output_locations(
+            &outputs.join("migration-report.json"),
+            &outputs.join("migration-evidence.json"),
+            &workspace,
+            &materials,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pilot_handoff_derives_the_exact_audit_and_policy_inputs() {
+        let root = tempdir().unwrap();
+        let materials = root.path().join("materials");
+        fs::create_dir(&materials).unwrap();
+        let manifest_bytes = include_bytes!("../../../docs/pilot-materials.example.json");
+        let manifest: PilotMaterialManifest = serde_json::from_slice(manifest_bytes).unwrap();
+        for input in manifest
+            .categories
+            .iter()
+            .flat_map(|category| &category.inputs)
+        {
+            let path = materials.join(input);
+            if input == "native/components" {
+                fs::create_dir_all(path.join("reader")).unwrap();
+                fs::write(
+                    path.join("reader/api.json"),
+                    r#"{"serviceId":"reader","mainClass":"reader.dll","mainType":"dll","methods":[{"name":"read"}]}"#,
+                )
+                .unwrap();
+            } else {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, b"{}\n").unwrap();
+            }
+        }
+        fs::write(
+            materials.join("legacy/config"),
+            r#"{"website":"http://10.17.5.57/project"}"#,
+        )
+        .unwrap();
+        fs::write(
+            materials.join("business/representative.har"),
+            r#"{"log":{"entries":[{"request":{"url":"https://example.test/flow"}}]}}"#,
+        )
+        .unwrap();
+
+        let policy_path = materials.join("policy/origin-policy.json");
+        let envelope_path = materials.join("policy/origin-policy.sig.json");
+        let trust_path = materials.join("policy/release-trust.json");
+        let policy_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schemaVersion": 2,
+            "businessGrants": [{
+                "origin": "http://10.17.5.57",
+                "services": [{"serviceId": "reader", "methods": ["read"]}]
+            }],
+            "allowInsecureHttp": true
+        }))
+        .unwrap();
+        fs::write(&policy_path, &policy_bytes).unwrap();
+        let signing_key = SigningKey::from_bytes(&[23; 32]);
+        let signature = signing_key.sign(&ssdev_origin_policy::signing_payload(&policy_bytes));
+        fs::write(
+            &envelope_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 1,
+                "keyId": "pilot-origin-policy-test",
+                "algorithm": "ed25519",
+                "signature": STANDARD.encode(signature.to_bytes())
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &trust_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 2,
+                "keys": [{
+                    "keyId": "pilot-origin-policy-test",
+                    "algorithm": "ed25519",
+                    "publicKey": STANDARD.encode(signing_key.verifying_key().to_bytes()),
+                    "purposes": ["origin-policy"]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let manifest_path = root.path().join("pilot-materials.json");
+        let report_path = root.path().join("pilot-readiness.json");
+        fs::write(&manifest_path, manifest_bytes).unwrap();
+        let report = inspect_materials(&materials, &manifest, manifest_bytes).unwrap();
+        assert!(report.intake_complete);
+        write_report(&report_path, &report).unwrap();
+
+        let verified = load_verified_pilot_inputs(PilotInputPaths {
+            materials_root: materials.clone(),
+            manifest: manifest_path,
+            report: report_path,
+        })
+        .unwrap();
+        let canonical_materials = fs::canonicalize(&materials).unwrap();
+        assert_eq!(
+            verified.audit_inputs.configs,
+            vec![canonical_materials.join("legacy/config")]
+        );
+        assert_eq!(
+            verified.audit_inputs.browser_hars,
+            vec![canonical_materials.join("business/representative.har")]
+        );
+        let verified_policy = load_verified_origin_policy(OriginPolicyInputs {
+            document: verified.origin_policy.document.clone(),
+            envelope: verified.origin_policy.envelope.clone(),
+            trust_store: verified.origin_policy.trust_store.clone(),
+        })
+        .unwrap();
+        let mut audit_report = audit_with_verified_origin_policy(
+            &verified.audit_inputs,
+            &verified_policy.policy,
+            verified_policy.document_sha256,
+        );
+        bind_pilot_materials(&mut audit_report, Some(&verified));
+        assert_eq!(
+            audit_report
+                .pilot_materials
+                .as_ref()
+                .unwrap()
+                .material_set_sha256,
+            report.material_set_sha256
+        );
+
+        fs::write(
+            materials.join("business/representative.har"),
+            r#"{"log":{"entries":[]}}"#,
+        )
+        .unwrap();
+        assert!(verified.verify_unchanged().is_err());
     }
 }

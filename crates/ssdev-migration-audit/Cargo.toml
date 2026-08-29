@@ -11,6 +11,7 @@ serde_json.workspace = true
 ssdev-config.workspace = true
 ssdev-cutover-evidence.workspace = true
 ssdev-origin-policy.workspace = true
+ssdev-pilot-readiness.workspace = true
 ssdev-release-manifest.workspace = true
 ssdev-release-signing.workspace = true
 url.workspace = true

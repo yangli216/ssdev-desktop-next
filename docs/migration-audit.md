@@ -2,9 +2,28 @@
 
 `ssdev-migration-audit` 用于在正式迁移前建立旧 Electron/WebPlus 资产清单。它不会自动“修复”或激活任何旧资产，因为任意进程路径、`installRun` 和 `eval(snippet)` 都必须经过人工归类和组织签名。
 
-## 输入与输出
+## 正式输入与输出
 
-命令可以重复指定五类输入：
+正式迁移评审不能重新手工挑选输入。它必须使用已经由接收方复验通过的试点材料三件套：
+
+```powershell
+cargo run --locked -p ssdev-migration-audit -- `
+  --pilot-materials-root D:/ssdev-pilot/materials `
+  --pilot-manifest D:/ssdev-pilot/pilot-materials.json `
+  --pilot-report D:/ssdev-pilot/reports/pilot-readiness.json `
+  --workspace C:/src/ssdev-desktop/next `
+  --report-output D:/cutover-evidence/migration-report.json `
+  --evidence-output D:/cutover-evidence/migration-evidence.json `
+  --evidence-environment hospital-a-production-workflows
+```
+
+工具先严格复验 schema 2 试点报告、manifest 与全部材料，要求 `intakeComplete: true`，再从 manifest 的 `migrationAuditBindings` 精确派生五类审计输入和签名来源策略三件套。正式模式禁止同时提供任何手工 `--config`、`--plugins`、`--keymap`、`--browser-assets`、`--browser-har` 或策略参数；审计完成后还会再次复验材料、报告、源码和策略输入，期间发生变化即失败。正式报告与证据必须同时位于源码工作区和试点材料根目录之外，且只创建、不覆盖。
+
+schema 4 完整报告绑定 `materialSetSha256` 和 `migrationAuditBindingsSha256`。schema 3 迁移证据继续绑定完整报告和来源策略 SHA-256，并新增同一个试点材料集合摘要。后续 schema 5 Go/No-Go 策略必须精确指定该材料集合，Windows 包 schema 3 继续绑定同一来源策略，因此不能用一套材料完成移交、再用另一套较小样本通过审计。
+
+## 探索性盘点
+
+尚未建立正式试点移交时，可以重复指定五类手工输入，并把完整 schema 4 JSON 报告写到标准输出：
 
 ```bash
 cargo run --locked -p ssdev-migration-audit -- \
@@ -15,11 +34,7 @@ cargo run --locked -p ssdev-migration-audit -- \
   --browser-har D:/HIS/evidence/critical-workflows.har \
   --origin-policy D:/release-inputs/origin-policy.json \
   --origin-policy-envelope D:/release-inputs/origin-policy.sig.json \
-  --release-trust-store D:/release-inputs/plugin-trust.json \
-  --workspace C:/src/ssdev-desktop/next \
-  --report-output D:/cutover-evidence/migration-report.json \
-  --evidence-output D:/cutover-evidence/migration-evidence.json \
-  --evidence-environment hospital-a-production-workflows
+  --release-trust-store D:/release-inputs/plugin-trust.json
 ```
 
 - `--config`：旧 Electron 配置，盘点业务地址、环境数、旧进程条目数和 HTTP 来源数量；报告不复制具体业务地址。
@@ -27,11 +42,9 @@ cargo run --locked -p ssdev-migration-audit -- \
 - `--keymap`：旧 `keymap.json`，盘点启用状态和是否包含脚本。
 - `--browser-assets`：业务前端源码、构建目录或单个文本资源，检查是否静态引用 WebPlus `7711`、旧桌面 `45121` 及其已知端点。
 - `--browser-har`：Chrome/Edge 在真实业务流程中导出的 HAR。只读取请求 URL 做本地端点分类，不读取请求体、响应体、Cookie 或 Header。
-- 来源策略三项：用 active 发布密钥验证候选安装包将携带的精确策略，并以运行时相同规则核对配置来源；三项必须同时提供。
+- 来源策略三项：探索时可省略，或全部提供以提前验证候选策略覆盖；正式模式只能从已复验 manifest 派生。
 
-不提供最后四个正式输出参数时，`schemaVersion: 3` 的完整 JSON 报告仍写到标准输出，适合探索性盘点；此时签名来源策略三项可以全部省略，也可以全部提供以提前验证覆盖。正式迁移评审必须提供候选签名策略三项以及源码工作区、报告输出、证据输出和环境标签。只有当前签名策略完整覆盖的 HTTP 业务来源才记录为信息项；缺少、错签、换策略或覆盖不完整仍是阻塞项。两份输出必须位于源码工作区之外、父目录必须已存在，并且只创建、不覆盖。
-
-正式 schema 2 迁移证据绑定完整报告和来源策略 SHA-256，同时记录发现与获准的 HTTP 来源计数。审计期间源码、策略、旁签或信任库变化都会失败。后续 schema 4 Go/No-Go 策略和 schema 3 Windows 包证据必须指向同一来源策略摘要，因此不能用一份策略通过审计、再把另一份策略装入候选包。报告可作为迁移评审输入，但它不是可直接安装的插件包、进程策略或新配置。
+探索报告可用于收集和修复问题，但因为没有正式输出、clean source 身份和已复验材料绑定，不能进入生产 Go/No-Go。只有当前签名策略完整覆盖的 HTTP 业务来源才记录为信息项；缺少、错签或覆盖不完整仍是阻塞项。报告不是可直接安装的插件包、进程策略或新配置。
 
 ## 安全边界
 

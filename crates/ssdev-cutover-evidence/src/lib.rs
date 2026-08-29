@@ -12,10 +12,10 @@ use webplus_plugin_trust::{
     validate_signing_key_id, DetachedSignatureDocument, TrustPurpose, TrustStore,
 };
 
-pub const EVIDENCE_SCHEMA_VERSION: u8 = 2;
+pub const EVIDENCE_SCHEMA_VERSION: u8 = 3;
 pub const PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION: u8 = 2;
 pub const WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION: u8 = 3;
-pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 4;
+pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 5;
 pub const CUTOVER_DECISION_SCHEMA_VERSION: u8 = 1;
 const MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
@@ -93,6 +93,7 @@ pub struct MigrationAuditEvidence {
     pub runner_os: String,
     pub runner_architecture: String,
     pub report_sha256: String,
+    pub pilot_material_set_sha256: String,
     pub origin_policy_sha256: String,
     pub config_files: u32,
     pub plugin_directories: u32,
@@ -166,6 +167,7 @@ pub struct ProductionCutoverPolicy {
     pub expected_plugin_package_set_sha256: String,
     pub expected_plugin_trust_store_sha256: String,
     pub expected_plugin_matrix_sha256: String,
+    pub expected_pilot_material_set_sha256: String,
     pub expected_origin_policy_sha256: String,
     pub migration_coverage_minimums: MigrationCoverageMinimums,
     pub plugin_matrix_signer_key_id: String,
@@ -196,6 +198,7 @@ impl ProductionCutoverPolicy {
             &self.expected_plugin_package_set_sha256,
             &self.expected_plugin_trust_store_sha256,
             &self.expected_plugin_matrix_sha256,
+            &self.expected_pilot_material_set_sha256,
             &self.expected_origin_policy_sha256,
         ]
         .into_iter()
@@ -410,10 +413,12 @@ impl MigrationAuditEvidence {
             &self.runner_os,
             &self.runner_architecture,
         )?;
-        if !is_sha256(&self.report_sha256) || !is_sha256(&self.origin_policy_sha256) {
+        if !is_sha256(&self.report_sha256)
+            || !is_sha256(&self.pilot_material_set_sha256)
+            || !is_sha256(&self.origin_policy_sha256)
+        {
             return Err(EvidenceError::Invalid(
-                "migration report and origin policy hashes must be lowercase SHA-256 digests"
-                    .into(),
+                "migration report, pilot material set, and origin policy hashes must be lowercase SHA-256 digests".into(),
             ));
         }
         if self.authorized_insecure_http_origin_count > self.insecure_http_origin_count {
@@ -772,6 +777,9 @@ pub fn evaluate_production_cutover(
     }
     if migration.origin_policy_sha256 != policy.expected_origin_policy_sha256 {
         blockers.insert("migration-origin-policy-mismatch".into());
+    }
+    if migration.pilot_material_set_sha256 != policy.expected_pilot_material_set_sha256 {
+        blockers.insert("migration-pilot-material-set-mismatch".into());
     }
     if windows.origin_policy_sha256 != policy.expected_origin_policy_sha256 {
         blockers.insert("windows-origin-policy-mismatch".into());
@@ -1153,6 +1161,7 @@ mod tests {
             runner_os: "windows".into(),
             runner_architecture: "x86_64".into(),
             report_sha256: "6".repeat(64),
+            pilot_material_set_sha256: "b".repeat(64),
             origin_policy_sha256: "a".repeat(64),
             config_files: 1,
             plugin_directories: 2,
@@ -1216,6 +1225,7 @@ mod tests {
             expected_plugin_package_set_sha256: "9".repeat(64),
             expected_plugin_trust_store_sha256: "2".repeat(64),
             expected_plugin_matrix_sha256: "3".repeat(64),
+            expected_pilot_material_set_sha256: "b".repeat(64),
             expected_origin_policy_sha256: "a".repeat(64),
             migration_coverage_minimums: MigrationCoverageMinimums {
                 config_files: 1,
@@ -1283,7 +1293,7 @@ mod tests {
         evidence.validate().unwrap();
 
         let mut legacy = valid_windows_package();
-        legacy.schema_version = EVIDENCE_SCHEMA_VERSION;
+        legacy.schema_version = 2;
         assert!(legacy.validate().is_err());
 
         let mut unbound = valid_windows_package();
@@ -1331,6 +1341,7 @@ mod tests {
 
         let mut policy_drift_migration = migration.clone();
         policy_drift_migration.origin_policy_sha256 = "b".repeat(64);
+        policy_drift_migration.pilot_material_set_sha256 = "c".repeat(64);
         policy_drift_migration.authorized_insecure_http_origin_count = 1;
         let mut policy_drift_windows = windows.clone();
         policy_drift_windows.origin_policy_sha256 = "c".repeat(64);
@@ -1357,6 +1368,7 @@ mod tests {
             [
                 "migration-http-origin-authorization-incomplete",
                 "migration-origin-policy-mismatch",
+                "migration-pilot-material-set-mismatch",
                 "windows-origin-policy-mismatch",
             ]
         );
@@ -1522,6 +1534,9 @@ mod tests {
         let mut inconsistent = valid_migration();
         inconsistent.warning_findings = 2;
         assert!(inconsistent.validate().is_err());
+        let mut legacy = valid_migration();
+        legacy.schema_version = 2;
+        assert!(legacy.validate().is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -35,7 +35,16 @@ pub struct AuditReport {
     pub browser_compatibility: BrowserCompatibilityAudit,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_policy: Option<OriginPolicyAudit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pilot_materials: Option<PilotMaterialAudit>,
     pub findings: Vec<Finding>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PilotMaterialAudit {
+    pub material_set_sha256: String,
+    pub migration_audit_bindings_sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,13 +180,14 @@ fn audit_inner(
     verified_origin_policy: Option<(&OriginPolicy, String)>,
 ) -> AuditReport {
     let mut report = AuditReport {
-        schema_version: 3,
+        schema_version: 4,
         summary: AuditSummary::default(),
         configs: Vec::new(),
         plugins: Vec::new(),
         key_bindings: Vec::new(),
         browser_compatibility: BrowserCompatibilityAudit::default(),
         origin_policy: None,
+        pilot_materials: None,
         findings: Vec::new(),
     };
     for path in &inputs.configs {
@@ -1059,7 +1069,7 @@ mod tests {
             &http_policy("http://10.17.5.57"),
             "a".repeat(64),
         );
-        assert_eq!(authorized.schema_version, 3);
+        assert_eq!(authorized.schema_version, 4);
         assert_eq!(
             authorized.configs[0].authorized_insecure_http_origin_count,
             1

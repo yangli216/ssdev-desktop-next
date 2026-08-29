@@ -6,8 +6,8 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
-pub const MANIFEST_SCHEMA_VERSION: u8 = 1;
-pub const REPORT_SCHEMA_VERSION: u8 = 1;
+pub const MANIFEST_SCHEMA_VERSION: u8 = 2;
+pub const REPORT_SCHEMA_VERSION: u8 = 2;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_REPORT_BYTES: u64 = 1024 * 1024;
 const MAX_INPUTS_PER_CATEGORY: usize = 256;
@@ -109,6 +109,20 @@ pub struct PilotMaterialManifest {
     pub schema_version: u8,
     pub project_label: String,
     pub categories: Vec<MaterialCategory>,
+    pub migration_audit_bindings: MigrationAuditBindings,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MigrationAuditBindings {
+    pub configs: Vec<String>,
+    pub plugin_roots: Vec<String>,
+    pub keymaps: Vec<String>,
+    pub browser_asset_roots: Vec<String>,
+    pub browser_hars: Vec<String>,
+    pub origin_policy: String,
+    pub origin_policy_envelope: String,
+    pub release_trust_store: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -141,11 +155,37 @@ pub struct PilotReadinessReport {
     pub report_type: String,
     pub manifest_sha256: String,
     pub project_label_sha256: String,
+    pub migration_audit_bindings_sha256: String,
     pub material_set_sha256: String,
     pub intake_complete: bool,
     pub downstream_validation_required: bool,
     pub categories: Vec<MaterialCategoryReport>,
     pub blocker_codes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedMigrationAuditInputs {
+    pub configs: Vec<PathBuf>,
+    pub plugin_roots: Vec<PathBuf>,
+    pub keymaps: Vec<PathBuf>,
+    pub browser_asset_roots: Vec<PathBuf>,
+    pub browser_hars: Vec<PathBuf>,
+    pub origin_policy: PathBuf,
+    pub origin_policy_envelope: PathBuf,
+    pub release_trust_store: PathBuf,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NormalizedMigrationAuditBindings {
+    configs: Vec<String>,
+    plugin_roots: Vec<String>,
+    keymaps: Vec<String>,
+    browser_asset_roots: Vec<String>,
+    browser_hars: Vec<String>,
+    origin_policy: String,
+    origin_policy_envelope: String,
+    release_trust_store: String,
 }
 
 #[derive(Debug, Error)]
@@ -250,6 +290,30 @@ pub fn inspect_materials(
         }
     }
 
+    let (migration_audit_bindings_sha256, bindings_valid) =
+        match normalize_migration_audit_bindings(&manifest.migration_audit_bindings) {
+            Ok(bindings) => {
+                let valid = migration_audit_bindings_match_categories(&bindings, &supplied);
+                (
+                    sha256_bytes(
+                        &serde_json::to_vec(&bindings)
+                            .expect("normalized migration audit bindings are serializable"),
+                    ),
+                    valid,
+                )
+            }
+            Err(_) => (
+                sha256_bytes(
+                    &serde_json::to_vec(&manifest.migration_audit_bindings)
+                        .expect("migration audit bindings are serializable"),
+                ),
+                false,
+            ),
+        };
+    if !bindings_valid {
+        global_blockers.insert("migration-audit-binding-mismatch".into());
+    }
+
     let mut reports = Vec::with_capacity(CATEGORY_RULES.len());
     let mut material_payloads = BTreeMap::new();
     for rule in CATEGORY_RULES {
@@ -261,6 +325,10 @@ pub fn inspect_materials(
         material_payloads.insert(rule.id.to_string(), category_identity_payload(&report));
         reports.push(report);
     }
+    material_payloads.insert(
+        "migration-audit-bindings".into(),
+        migration_audit_bindings_sha256.as_bytes().to_vec(),
+    );
     let material_set_sha256 = digest_named_payloads("pilot-material-set", &material_payloads)?;
     let blocker_codes = global_blockers.into_iter().collect::<Vec<_>>();
     Ok(PilotReadinessReport {
@@ -268,6 +336,7 @@ pub fn inspect_materials(
         report_type: "pilot-material-readiness".into(),
         manifest_sha256: sha256_bytes(manifest_bytes),
         project_label_sha256: sha256_bytes(manifest.project_label.as_bytes()),
+        migration_audit_bindings_sha256,
         material_set_sha256,
         intake_complete: blocker_codes.is_empty(),
         downstream_validation_required: true,
@@ -288,6 +357,49 @@ pub fn verify_materials(
         return Err(PilotReadinessError::VerificationFailed);
     }
     Ok(())
+}
+
+pub fn resolve_migration_audit_inputs(
+    materials_root: &Path,
+    manifest: &PilotMaterialManifest,
+) -> Result<ResolvedMigrationAuditInputs, PilotReadinessError> {
+    if manifest.schema_version != MANIFEST_SCHEMA_VERSION {
+        return Err(PilotReadinessError::Invalid(
+            "unsupported pilot material manifest schema".into(),
+        ));
+    }
+    let root_metadata = fs::symlink_metadata(materials_root)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(PilotReadinessError::Invalid(
+            "materials root must be a real directory".into(),
+        ));
+    }
+    let root = fs::canonicalize(materials_root)?;
+    let normalized = normalize_migration_audit_bindings(&manifest.migration_audit_bindings)
+        .map_err(|_| PilotReadinessError::Invalid("migration audit bindings are invalid".into()))?;
+    let mut supplied = BTreeMap::new();
+    for category in &manifest.categories {
+        if supplied.insert(category.id.as_str(), category).is_some() {
+            return Err(PilotReadinessError::Invalid(
+                "migration audit bindings contain duplicate material categories".into(),
+            ));
+        }
+    }
+    if !migration_audit_bindings_match_categories(&normalized, &supplied) {
+        return Err(PilotReadinessError::Invalid(
+            "migration audit bindings do not exactly match their material categories".into(),
+        ));
+    }
+    Ok(ResolvedMigrationAuditInputs {
+        configs: resolve_binding_paths(&root, &normalized.configs)?,
+        plugin_roots: resolve_binding_paths(&root, &normalized.plugin_roots)?,
+        keymaps: resolve_binding_paths(&root, &normalized.keymaps)?,
+        browser_asset_roots: resolve_binding_paths(&root, &normalized.browser_asset_roots)?,
+        browser_hars: resolve_binding_paths(&root, &normalized.browser_hars)?,
+        origin_policy: resolve_binding_path(&root, &normalized.origin_policy)?,
+        origin_policy_envelope: resolve_binding_path(&root, &normalized.origin_policy_envelope)?,
+        release_trust_store: resolve_binding_path(&root, &normalized.release_trust_store)?,
+    })
 }
 
 pub fn prepare_new_output(path: &Path) -> Result<PathBuf, PilotReadinessError> {
@@ -328,6 +440,7 @@ fn validate_report(report: &PilotReadinessReport) -> Result<(), PilotReadinessEr
         || !report.downstream_validation_required
         || !is_sha256(&report.manifest_sha256)
         || !is_sha256(&report.project_label_sha256)
+        || !is_sha256(&report.migration_audit_bindings_sha256)
         || !is_sha256(&report.material_set_sha256)
         || report.intake_complete != report.blocker_codes.is_empty()
         || !is_sorted_unique_codes(&report.blocker_codes)
@@ -435,7 +548,9 @@ fn validate_report(report: &PilotReadinessReport) -> Result<(), PilotReadinessEr
         || report_blockers.difference(&category_blockers).any(|code| {
             !matches!(
                 code.as_str(),
-                "unknown-material-category" | "duplicate-material-category"
+                "unknown-material-category"
+                    | "duplicate-material-category"
+                    | "migration-audit-binding-mismatch"
             )
         })
     {
@@ -443,6 +558,10 @@ fn validate_report(report: &PilotReadinessReport) -> Result<(), PilotReadinessEr
             "pilot readiness report blocker summary is inconsistent".into(),
         ));
     }
+    payloads.insert(
+        "migration-audit-bindings".into(),
+        report.migration_audit_bindings_sha256.as_bytes().to_vec(),
+    );
     if digest_named_payloads("pilot-material-set", &payloads)? != report.material_set_sha256 {
         return Err(PilotReadinessError::Invalid(
             "pilot readiness material set digest is inconsistent".into(),
@@ -583,6 +702,89 @@ fn inspect_provided(
         approval_reference_sha256: None,
         blocker_codes: blockers.into_iter().collect(),
     }
+}
+
+fn normalize_migration_audit_bindings(
+    bindings: &MigrationAuditBindings,
+) -> Result<NormalizedMigrationAuditBindings, ScanFailure> {
+    let normalized = NormalizedMigrationAuditBindings {
+        configs: normalize_binding_paths(&bindings.configs)?,
+        plugin_roots: normalize_binding_paths(&bindings.plugin_roots)?,
+        keymaps: normalize_binding_paths(&bindings.keymaps)?,
+        browser_asset_roots: normalize_binding_paths(&bindings.browser_asset_roots)?,
+        browser_hars: normalize_binding_paths(&bindings.browser_hars)?,
+        origin_policy: normalize_relative_path(&bindings.origin_policy)?,
+        origin_policy_envelope: normalize_relative_path(&bindings.origin_policy_envelope)?,
+        release_trust_store: normalize_relative_path(&bindings.release_trust_store)?,
+    };
+    if normalized.configs.is_empty()
+        || normalized.plugin_roots.is_empty()
+        || normalized.browser_asset_roots.is_empty()
+        || normalized.browser_hars.is_empty()
+    {
+        return Err(ScanFailure::InvalidPath);
+    }
+    Ok(normalized)
+}
+
+fn normalize_binding_paths(paths: &[String]) -> Result<Vec<String>, ScanFailure> {
+    if paths.len() > MAX_INPUTS_PER_CATEGORY {
+        return Err(ScanFailure::LimitExceeded);
+    }
+    let normalized = paths
+        .iter()
+        .map(|path| normalize_relative_path(path))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if normalized.len() != paths.len() {
+        return Err(ScanFailure::InvalidPath);
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+fn migration_audit_bindings_match_categories(
+    bindings: &NormalizedMigrationAuditBindings,
+    supplied: &BTreeMap<&str, &MaterialCategory>,
+) -> bool {
+    category_inputs("legacy-config", supplied).as_ref() == Some(&bindings.configs)
+        && category_inputs("production-native-assets", supplied).as_ref()
+            == Some(&bindings.plugin_roots)
+        && category_inputs("legacy-keymap", supplied).as_ref() == Some(&bindings.keymaps)
+        && category_inputs("business-assets", supplied).as_ref()
+            == Some(&bindings.browser_asset_roots)
+        && category_inputs("business-hars", supplied).as_ref() == Some(&bindings.browser_hars)
+        && category_inputs("signed-origin-policy", supplied).is_some_and(|inputs| {
+            inputs
+                == [
+                    bindings.origin_policy.clone(),
+                    bindings.origin_policy_envelope.clone(),
+                    bindings.release_trust_store.clone(),
+                ]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        })
+}
+
+fn category_inputs(id: &str, supplied: &BTreeMap<&str, &MaterialCategory>) -> Option<Vec<String>> {
+    let category = supplied.get(id)?;
+    normalize_binding_paths(&category.inputs).ok()
+}
+
+fn resolve_binding_paths(
+    root: &Path,
+    bindings: &[String],
+) -> Result<Vec<PathBuf>, PilotReadinessError> {
+    bindings
+        .iter()
+        .map(|binding| resolve_binding_path(root, binding))
+        .collect()
+}
+
+fn resolve_binding_path(root: &Path, binding: &str) -> Result<PathBuf, PilotReadinessError> {
+    resolve_without_symlink(root, binding).map_err(|_| {
+        PilotReadinessError::Invalid("a migration audit binding is unavailable or unsafe".into())
+    })
 }
 
 fn normalize_relative_path(raw: &str) -> Result<String, ScanFailure> {
@@ -965,11 +1167,31 @@ mod tests {
                     }
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let category_inputs = |id: &str| {
+            categories
+                .iter()
+                .find(|category| category.id == id)
+                .unwrap()
+                .inputs
+                .clone()
+        };
+        let signed_policy = category_inputs("signed-origin-policy");
+        let migration_audit_bindings = MigrationAuditBindings {
+            configs: category_inputs("legacy-config"),
+            plugin_roots: category_inputs("production-native-assets"),
+            keymaps: category_inputs("legacy-keymap"),
+            browser_asset_roots: category_inputs("business-assets"),
+            browser_hars: category_inputs("business-hars"),
+            origin_policy: signed_policy[0].clone(),
+            origin_policy_envelope: signed_policy[1].clone(),
+            release_trust_store: signed_policy[2].clone(),
+        };
         PilotMaterialManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
             project_label: "hospital-a-pilot".into(),
             categories,
+            migration_audit_bindings,
         }
     }
 
@@ -1000,6 +1222,43 @@ mod tests {
         fs::write(temp.path().join("material-0-0.bin"), "changed").unwrap();
         let changed = inspect_materials(temp.path(), &manifest, &bytes).unwrap();
         assert_ne!(first.material_set_sha256, changed.material_set_sha256);
+    }
+
+    #[test]
+    fn migration_audit_roles_are_exact_and_part_of_the_material_identity() {
+        let temp = tempdir().unwrap();
+        let manifest = complete_manifest(temp.path());
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let first = inspect_materials(temp.path(), &manifest, &bytes).unwrap();
+        let resolved = resolve_migration_audit_inputs(temp.path(), &manifest).unwrap();
+        assert_eq!(resolved.configs.len(), 1);
+        assert_eq!(resolved.plugin_roots.len(), 1);
+        assert_eq!(resolved.browser_asset_roots.len(), 1);
+        assert_eq!(resolved.browser_hars.len(), 1);
+
+        let mut role_changed = manifest.clone();
+        std::mem::swap(
+            &mut role_changed.migration_audit_bindings.origin_policy,
+            &mut role_changed.migration_audit_bindings.origin_policy_envelope,
+        );
+        let changed_bytes = serde_json::to_vec(&role_changed).unwrap();
+        let changed = inspect_materials(temp.path(), &role_changed, &changed_bytes).unwrap();
+        assert!(changed.intake_complete);
+        assert_ne!(
+            first.migration_audit_bindings_sha256,
+            changed.migration_audit_bindings_sha256
+        );
+        assert_ne!(first.material_set_sha256, changed.material_set_sha256);
+
+        let mut incomplete = manifest;
+        incomplete.migration_audit_bindings.browser_hars.clear();
+        let incomplete_bytes = serde_json::to_vec(&incomplete).unwrap();
+        let incomplete_report =
+            inspect_materials(temp.path(), &incomplete, &incomplete_bytes).unwrap();
+        assert!(!incomplete_report.intake_complete);
+        assert!(incomplete_report
+            .blocker_codes
+            .contains(&"migration-audit-binding-mismatch".into()));
     }
 
     #[test]

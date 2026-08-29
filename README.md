@@ -27,7 +27,7 @@ business webview -> narrow Tauri command -> Rust controller
 
 产品定位、迭代优先级和明确不投入的方向见 [docs/product-direction.md](docs/product-direction.md)。新能力进入核心运行时前应先符合其中的工作选择规则。
 
-真实项目开始前可使用 [试点材料预检](docs/pilot-readiness.md) 收齐生产组件、黄金用例、业务 HAR、签名公钥材料、上一 Windows 安装包和实机计划。预检报告只输出摘要与稳定缺项，不复制路径或材料内容，也不替代后续迁移审计、硬件矩阵和 Go/No-Go。
+真实项目开始前可使用 [试点材料预检](docs/pilot-readiness.md) 收齐生产组件、黄金用例、业务 HAR、签名公钥材料、上一 Windows 安装包和实机计划。schema 2 manifest 还会把正式迁移审计的配置、插件、HAR 和签名策略角色精确绑定到这些材料；预检报告只输出摘要与稳定缺项，不复制路径或材料内容，也不替代后续迁移审计、硬件矩阵和 Go/No-Go。
 
 业务页面从 localhost HTTP 切换到窄桥接接口的方式见 [docs/web-bridge-migration.md](docs/web-bridge-migration.md)。
 业务前端应通过 [packages/web-bridge](packages/web-bridge/README.md) 的类型化协议适配层接入，不直接依赖 Tauri 内部 API。SDK 会运行时校验系统声明并提供稳定错误分类；当前能力 schema 严格验证，未来未知 schema 保留但不会被误判为已经支持。主分支 CI 还会生成并自检固定 `.tgz + 摘要清单` 的平台无关 SDK 制品，并在离线临时消费者中验证安装、ESM 运行和 TypeScript 类型，业务项目不再需要从源码目录人工打包。
@@ -111,22 +111,20 @@ powershell -ExecutionPolicy Bypass -File scripts/test-windows.ps1
 
 ## 旧资产只读审计
 
-迁移前可以同时传入多个旧配置、插件目录、快捷键文件、业务前端资源和浏览器 HAR：
+正式迁移审计只接受已由接收方复验的试点材料三件套，并从 manifest 精确派生旧配置、插件目录、快捷键、业务前端、浏览器 HAR 和签名来源策略：
 
 ```bash
 cargo run --locked -p ssdev-migration-audit -- \
-  --config /path/to/config.json \
-  --plugins /path/to/web-plus/plugins \
-  --keymap /path/to/keymap.json \
-  --browser-assets /path/to/business-web/dist \
-  --browser-har /path/to/critical-workflows.har \
+  --pilot-materials-root /secure/pilot/materials \
+  --pilot-manifest /secure/pilot/pilot-materials.json \
+  --pilot-report /secure/pilot/reports/pilot-readiness.json \
   --workspace /path/to/ssdev-desktop/next \
   --report-output /secure/cutover/migration-report.json \
   --evidence-output /secure/cutover/migration-evidence.json \
   --evidence-environment hospital-a-production-workflows
 ```
 
-工具只读取审计输入；不会加载原生组件、执行 `installRun` 或旧快捷键脚本。正式模式以不覆盖方式写出完整报告和绑定源码提交、报告 SHA-256、覆盖计数及 HTTP 证据级别的精简证据；输出必须在源码工作区之外。省略最后四个正式参数时，报告写到标准输出用于探索。报告不复制源码、请求 URL、查询参数或 HAR 内容。HAR 覆盖只计入带可解析绝对 `request.url` 的条目，缺失、相对或损坏 URL 会单独计为跳过并产生阻断生产判定的 warning。
+工具只读取审计输入；不会加载原生组件、执行 `installRun` 或旧快捷键脚本。正式模式禁止混入手工路径，以不覆盖方式写出 schema 4 完整报告和 schema 3 精简证据，后者绑定源码提交、报告、试点材料集合、来源策略、覆盖计数及 HTTP 证据级别；输出必须在源码工作区之外。手工 `--config` 等参数只用于把报告写到标准输出的探索性盘点，不能生成正式证据。报告不复制源码、请求 URL、查询参数或 HAR 内容。HAR 覆盖只计入带可解析绝对 `request.url` 的条目，缺失、相对或损坏 URL 会单独计为跳过并产生阻断生产判定的 warning。
 
 新插件可用 `ssdev-plugin-tool init` 生成固定 x86/x64 的最小 Rust DLL、清单、矩阵种子和 Web 客户端；DLL 构建或旧插件清理后先用 `source-check` 在不接触密钥的情况下检查文件边界、PE 位数、命名导出和 ABI。已有插件升级再用 `api-check` 对照上一份已验签包，阻止删除路由、增加必填输入或改变输入/响应类型，并把原生绑定变化列为黄金矩阵复核项；随后用 `client` 从同一份已校验 `api.json` 生成类型化 Web Bridge 客户端。SDK 的严格 fixture invoker 可把生成客户端直接用于无桌面、无硬件的业务前端单元测试；已脱敏并完成精确复核的正式矩阵还可用 `web-fixtures` 生成同路由测试数组，避免再次手抄。单插件正式交接推荐使用 `web-kit`，把同版本客户端、fixture 及 API/矩阵摘要清单原子写入一个新目录，业务 CI 再用 `web-kit-check` 拒绝文件集或摘要漂移，并用 `web-integration-consumer.mjs` 把精确 kit 与 SDK `.tgz` 放入离线临时项目完成严格编译和全路由运行冒烟，避免两份制品分别正确、组合后不可用；多插件项目通过重复 `--kit` 联合检查身份、公开路由、编译与共享 invoker，不创建额外集合格式。这些前端工具都不模拟持久调用或原生副作用。`prepare` 生成隔离暂存目录、外部 Ed25519 待签材料和不会误触硬件的草稿黄金矩阵；组织签名系统返回签名后，用 `finalize` 验签并制作可复现的 `.ssdev-plugin`。工作台和命令行共用客户端生成器，正式插件与现场映射不会出现两套方法命名。完整命令和信任边界见 [docs/plugin-release.md](docs/plugin-release.md)。
 

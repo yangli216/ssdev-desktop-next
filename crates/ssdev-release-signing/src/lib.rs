@@ -100,6 +100,7 @@ pub enum ArtifactSummary {
     },
     MigrationAuditEvidence {
         source_revision: String,
+        pilot_material_set_sha256: String,
         origin_policy_sha256: String,
         browser_asset_files: u32,
         browser_har_requests: u32,
@@ -386,6 +387,7 @@ fn prepare_material(
                 )?,
                 ArtifactSummary::MigrationAuditEvidence {
                     source_revision: evidence.source_revision,
+                    pilot_material_set_sha256: evidence.pilot_material_set_sha256,
                     origin_policy_sha256: evidence.origin_policy_sha256,
                     browser_asset_files: evidence.browser_asset_files_scanned,
                     browser_har_requests: evidence.browser_har_requests_scanned,
@@ -756,6 +758,7 @@ mod tests {
                     "runnerOs": "windows",
                     "runnerArchitecture": "x86_64",
                     "reportSha256": "66".repeat(32),
+                    "pilotMaterialSetSha256": "bb".repeat(32),
                     "originPolicySha256": "aa".repeat(32),
                     "configFiles": 1,
                     "pluginDirectories": 1,

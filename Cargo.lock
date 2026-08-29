@@ -4493,6 +4493,7 @@ dependencies = [
  "ssdev-config",
  "ssdev-cutover-evidence",
  "ssdev-origin-policy",
+ "ssdev-pilot-readiness",
  "ssdev-release-manifest",
  "ssdev-release-signing",
  "tempfile",

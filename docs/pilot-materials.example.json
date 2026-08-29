@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "projectLabel": "hospital-a-pilot",
   "categories": [
     {
@@ -71,5 +71,15 @@
       "status": "notApplicable",
       "approvalReference": "PILOT-HTTP-001"
     }
-  ]
+  ],
+  "migrationAuditBindings": {
+    "configs": ["legacy/config"],
+    "pluginRoots": ["native/components"],
+    "keymaps": [],
+    "browserAssetRoots": ["business/dist"],
+    "browserHars": ["business/representative.har"],
+    "originPolicy": "policy/origin-policy.json",
+    "originPolicyEnvelope": "policy/origin-policy.sig.json",
+    "releaseTrustStore": "policy/release-trust.json"
+  }
 }
