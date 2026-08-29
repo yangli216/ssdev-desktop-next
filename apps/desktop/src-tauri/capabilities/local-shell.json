@@ -18,6 +18,7 @@
     "allow-inspect-plugin-package",
     "allow-install-plugin-package",
     "allow-install-plugin-from-catalog",
+    "allow-inspect-signed-plugin-uninstall",
     "allow-uninstall-signed-plugin",
     "allow-check-plugin-updates",
     "allow-reload-plugins",

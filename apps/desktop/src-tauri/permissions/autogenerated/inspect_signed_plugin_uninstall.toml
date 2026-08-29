@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-inspect-signed-plugin-uninstall"
+description = "Enables the inspect_signed_plugin_uninstall command without any pre-configured scope."
+commands.allow = ["inspect_signed_plugin_uninstall"]
+
+[[permission]]
+identifier = "deny-inspect-signed-plugin-uninstall"
+description = "Denies the inspect_signed_plugin_uninstall command without any pre-configured scope."
+commands.deny = ["inspect_signed_plugin_uninstall"]

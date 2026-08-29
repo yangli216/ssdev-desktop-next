@@ -485,6 +485,10 @@ pub struct PluginActivation {
 }
 
 impl PluginActivation {
+    pub fn transaction_root(&self) -> &Path {
+        &self.transaction
+    }
+
     pub fn commit(mut self) -> Result<(), PackageError> {
         commit_transaction(&self.plugin_root, &self.transaction)?;
         self.finalized = true;

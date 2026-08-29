@@ -257,6 +257,15 @@ type PluginPackagePreview = {
   preflightedHosts: number
 }
 
+type SignedPluginUninstallPreview = {
+  planId: string
+  pluginId: string
+  displayName: string
+  pluginVersion: string
+  serviceCount: number
+  methodCount: number
+}
+
 type PluginInventory = {
   plugins: Array<{
     pluginId: string
@@ -1153,16 +1162,32 @@ function cancelPluginPackageInstall() {
   notice.value = '已取消签名插件安装。'
 }
 
-async function uninstallSignedPlugin(pluginId: string, displayName: string) {
+async function uninstallSignedPlugin(pluginId: string) {
   if (!requireCleanProjectDrafts('卸载签名插件')) return
-  if (!window.confirm(`确定卸载签名插件「${displayName}」(${pluginId}) 吗？对应原生服务将立即停止。`)) return
+  let preview: SignedPluginUninstallPreview | undefined
+  const inspected = await run(async () => {
+    preview = await invoke<SignedPluginUninstallPreview>('inspect_signed_plugin_uninstall', { pluginId })
+  }, '')
+  if (!inspected || !preview) return
+  const confirmed = preview
+  if (!window.confirm(
+    `确定卸载签名插件「${confirmed.displayName}」(${confirmed.pluginId} ${confirmed.pluginVersion}) 吗？` +
+    `将停止 ${confirmed.serviceCount} 个服务、${confirmed.methodCount} 个方法。` +
+    '插件程序会被删除，但不会恢复已经发生的设备操作或业务数据。',
+  )) return
   const outcome = await runPrimaryThenRefresh(async () => {
-    await invoke('uninstall_signed_plugin', { pluginId })
+    await invoke('uninstall_signed_plugin', {
+      pluginId: confirmed.pluginId,
+      expectedPlanId: confirmed.planId,
+    })
     pluginUpdates.value = null
     appUpdate.value = null
   }, ['status', 'inventory', 'deployment'])
   if (outcome.succeeded) {
-    showPrimaryActionSuccess(`签名插件 ${pluginId} 已卸载并从路由移除。`, outcome.refreshed)
+    showPrimaryActionSuccess(
+      `签名插件 ${confirmed.pluginId} ${confirmed.pluginVersion} 已卸载并从路由移除。`,
+      outcome.refreshed,
+    )
   }
 }
 
@@ -1598,7 +1623,7 @@ async function exportDeploymentCheck() {
               <div v-for="update in pluginUpdates.updates" :key="update.pluginId"><span><strong>{{ update.pluginId }}<b v-if="!update.installedVersion && update.catalogAvailable" class="catalog-new">新插件</b></strong><small>已安装 {{ update.installedVersion ?? '无' }} · 当前客户端可用 {{ update.availableVersion ?? '无' }}<template v-if="update.installedVersionWithdrawn"> · 当前版本已撤回（{{ update.withdrawalReason ? withdrawalReasonLabels[update.withdrawalReason] : '原因未分类' }}）</template><template v-if="update.compatibilityLimited"> · 仓库最新 {{ update.latestCatalogVersion }} 需要其他 Desktop 版本</template></small></span><button v-if="update.updateAvailable && update.availableVersion && update.installPlanId" type="button" :disabled="busy" @click="installFromCatalog(update.pluginId, update.availableVersion, update.installPlanId, update.installedVersion ? 'upgrade' : 'install')">{{ update.installedVersion ? `安装更新 ${update.availableVersion}` : `安装 ${update.availableVersion}` }}</button><em v-else>{{ update.installBlocker === 'local-mapping-conflict' ? '同名本地映射占用，请先调整' : update.installBlocker === 'invalid-target-state' ? '本机同名插件目录异常，请先处理隔离项' : update.installedVersionWithdrawn ? '当前版本已撤回，请升级、受控回退或卸载' : update.catalogAvailable ? (update.compatibilityLimited ? '新版本与当前客户端不兼容' : '已是最新版本') : '仓库未收录' }}</em><details v-if="update.rollbackVersions.length" class="plugin-rollback-options"><summary>受控回退版本（{{ update.rollbackVersionCount }}）</summary><p>仅列出当前 Desktop 兼容且仍可安装的签名版本；回退前仍会重新验签、预检宿主并核对本机状态。</p><ul><li v-for="rollback in update.rollbackVersions" :key="rollback.version"><span><strong>{{ rollback.version }}</strong><small>Desktop {{ rollback.desktopVersionRequirement }}</small></span><button class="danger-link" type="button" :disabled="busy" @click="installFromCatalog(update.pluginId, rollback.version, rollback.installPlanId, 'rollback')">回退到此版本</button></li></ul><small v-if="update.rollbackVersionCount > update.rollbackVersions.length">仅显示最近 {{ update.rollbackVersions.length }} 个版本。</small></details></div>
             </div>
             <article v-for="plugin in inventory?.plugins ?? []" :key="plugin.pluginId">
-              <header><span><strong>{{ plugin.displayName }}</strong><small>{{ plugin.pluginId }} · {{ plugin.source === 'local-mapping' ? '本机动态映射' : `${plugin.version ?? '未知版本'} · Desktop ${plugin.desktopVersionRequirement ?? '未声明'}` }}</small></span><div v-if="plugin.source === 'signed-package'" class="plugin-actions"><button type="button" :disabled="busy" @click="checkPluginUpdates(plugin.pluginId)">检查更新</button><button class="danger-link" type="button" :disabled="busy" @click="uninstallSignedPlugin(plugin.pluginId, plugin.displayName)">卸载</button></div></header>
+              <header><span><strong>{{ plugin.displayName }}</strong><small>{{ plugin.pluginId }} · {{ plugin.source === 'local-mapping' ? '本机动态映射' : `${plugin.version ?? '未知版本'} · Desktop ${plugin.desktopVersionRequirement ?? '未声明'}` }}</small></span><div v-if="plugin.source === 'signed-package'" class="plugin-actions"><button type="button" :disabled="busy" @click="checkPluginUpdates(plugin.pluginId)">检查更新</button><button class="danger-link" type="button" :disabled="busy" @click="uninstallSignedPlugin(plugin.pluginId)">卸载</button></div></header>
               <details v-for="service in plugin.services" :key="service.serviceId" class="service-mapping"><summary><code>{{ service.serviceId }}</code><span>{{ service.architecture }} / {{ service.mainType }} / {{ service.methodCount }} 个方法</span></summary><dl><div><dt>原生目标</dt><dd><code>{{ service.mainClass }}</code></dd></div><div><dt>调用约定</dt><dd>{{ service.callingConvention || '默认' }} · {{ service.charset || '默认字符集' }}</dd></div><div><dt>服务策略</dt><dd>{{ service.timeoutMs || '默认' }} ms · {{ service.cacheable ? '缓存实例' : '按需实例' }} · {{ service.dependencyCount }} 个依赖</dd></div></dl><div v-for="method in service.methods" :key="`${service.serviceId}:${method.requestName}`" class="method-mapping"><code>{{ method.requestName }}</code><span aria-hidden="true">→</span><code>{{ method.nativeName }}</code><small>{{ method.returnType || '默认返回类型' }} · {{ method.parameterCount }} 参数 · {{ method.timeoutMs || '默认' }} ms</small></div></details>
             </article>
             <p v-if="inventory && inventory.plugins.length === 0" class="empty">尚未安装通过验签的插件。</p>

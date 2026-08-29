@@ -2388,6 +2388,17 @@ struct PluginPackageServicePreview {
     method_count: usize,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SignedPluginUninstallPreview {
+    plan_id: String,
+    plugin_id: String,
+    display_name: String,
+    plugin_version: String,
+    service_count: usize,
+    method_count: usize,
+}
+
 struct LocalPluginInstallContext {
     current_state_sha256: String,
     current_version: Option<semver::Version>,
@@ -3072,27 +3083,17 @@ fn plugin_update_installed_state_digest(
     plugin_id: &str,
     installed: Option<&PluginManifest>,
 ) -> Result<String, String> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"SSDEV-PLUGIN-UPDATE-STATE\0");
-    hash_plan_field(&mut hasher, plugin_id.as_bytes());
     match installed {
         Some(manifest) => {
             if manifest.plugin_id != plugin_id || !manifest.plugin_dir.starts_with(plugin_root) {
                 return Err("插件更新基线不属于目标签名插件目录".to_owned());
             }
-            let identity =
-                read_identity(&manifest.plugin_dir).map_err(|error| error.to_string())?;
-            if identity.plugin_id != plugin_id {
-                return Err("插件更新基线签名身份与目标插件不一致".to_owned());
-            }
-            let material =
-                prepare_signing_material(&manifest.plugin_dir, plugin_id, &identity.key_id)
-                    .map_err(|error| error.to_string())?;
-            hash_plan_field(&mut hasher, b"installed");
-            hash_plan_field(&mut hasher, identity.key_id.as_bytes());
-            hash_plan_field(&mut hasher, &material.payload);
+            signed_plugin_directory_state_digest(plugin_root, plugin_id, plugin_id)
         }
         None => {
+            let mut hasher = Sha256::new();
+            hasher.update(b"SSDEV-PLUGIN-UPDATE-STATE\0");
+            hash_plan_field(&mut hasher, plugin_id.as_bytes());
             let target = plugin_root.join(plugin_id);
             match fs::symlink_metadata(&target) {
                 Ok(_) => {
@@ -3107,9 +3108,55 @@ fn plugin_update_installed_state_digest(
                     return Err(format!("无法读取插件 [{plugin_id}] 的更新基线: {error}"));
                 }
             }
+            Ok(lowercase_hex(&hasher.finalize()))
         }
     }
+}
+
+fn signed_plugin_directory_state_digest(
+    root: &std::path::Path,
+    directory_name: &str,
+    plugin_id: &str,
+) -> Result<String, String> {
+    let plugin_dir = root.join(directory_name);
+    let metadata = fs::symlink_metadata(&plugin_dir)
+        .map_err(|error| format!("无法读取签名插件状态: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("签名插件状态不是安全的真实目录".to_owned());
+    }
+    let identity = read_identity(&plugin_dir).map_err(|error| error.to_string())?;
+    if identity.plugin_id != plugin_id {
+        return Err("签名插件状态身份与目标插件不一致".to_owned());
+    }
+    let material = prepare_signing_material(&plugin_dir, plugin_id, &identity.key_id)
+        .map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-PLUGIN-UPDATE-STATE\0");
+    hash_plan_field(&mut hasher, plugin_id.as_bytes());
+    hash_plan_field(&mut hasher, b"installed");
+    hash_plan_field(&mut hasher, identity.key_id.as_bytes());
+    hash_plan_field(&mut hasher, &material.payload);
     Ok(lowercase_hex(&hasher.finalize()))
+}
+
+fn signed_plugin_uninstall_plan_id(
+    plugin_id: &str,
+    current_state_sha256: &str,
+    desktop_version: &semver::Version,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-SIGNED-PLUGIN-UNINSTALL-PLAN\0");
+    hash_plan_field(&mut hasher, plugin_id.as_bytes());
+    hash_plan_field(&mut hasher, current_state_sha256.as_bytes());
+    hash_plan_field(&mut hasher, desktop_version.to_string().as_bytes());
+    lowercase_hex(&hasher.finalize())
+}
+
+fn ensure_signed_plugin_uninstall_plan_matches(expected: &str, actual: &str) -> Result<(), String> {
+    if expected != actual {
+        return Err("签名插件状态在卸载确认后发生变化，请重新检查卸载影响".to_owned());
+    }
+    Ok(())
 }
 
 fn plugin_update_plan_id(
@@ -3606,38 +3653,131 @@ async fn activate_prepared_plugin(
     })
 }
 
-#[tauri::command]
-async fn uninstall_signed_plugin(
-    caller: WebviewWindow,
-    state: State<'_, BridgeState>,
-    plugin_id: String,
-) -> Result<(), String> {
-    desktop::require_control(&caller)?;
-    let _install = state.install_lock.lock().await;
-    recover_plugin_store(&state)?;
-    let before = inspect_all_plugins(
+struct SignedPluginUninstallContext {
+    manifest: PluginManifest,
+    current_state_sha256: String,
+    failures: Vec<String>,
+}
+
+async fn signed_plugin_uninstall_context(
+    state: &BridgeState,
+    plugin_id: &str,
+) -> Result<SignedPluginUninstallContext, String> {
+    let inspected = inspect_all_plugins(
         &state.plugin_root,
         &state.local_mapping_root,
         state.trust_store.as_deref(),
         &state.desktop_version,
     )?;
-    let baseline_failures = before.failures.clone();
-    before
+    let active_matches = state
+        .controller
+        .manifests_match_active_routes(&inspected.manifests)
+        .await
+        .map_err(|error| format!("无法核对当前插件运行状态 ({})", error.diagnostic_code()))?;
+    if !active_matches {
+        return Err(
+            "插件目录与当前运行路由不一致，请先重新扫描并处理隔离项后再卸载插件".to_owned(),
+        );
+    }
+    let manifest = inspected
         .manifests
         .iter()
-        .any(|manifest| {
-            manifest.plugin_id == plugin_id
-                && !is_local_manifest(manifest, &state.local_mapping_root)
+        .find(|manifest| {
+            !is_local_manifest(manifest, &state.local_mapping_root)
+                && normalized_plugin_id(&manifest.plugin_id) == normalized_plugin_id(plugin_id)
         })
-        .then_some(())
-        .ok_or_else(|| format!("签名插件 [{plugin_id}] 不存在"))?;
-    let previous_active_manifest = state
-        .controller
-        .active_manifests()
-        .await
-        .map_err(|error| format!("无法读取当前插件运行状态 ({})", error.diagnostic_code()))?
-        .into_iter()
-        .find(|manifest| manifest.plugin_id == plugin_id);
+        .cloned();
+    if contains_plugin_id(&inspected.discovered_plugin_ids, plugin_id) && manifest.is_none() {
+        return Err(format!(
+            "签名插件 [{plugin_id}] 的本机目录存在但未通过校验；请先处理隔离项再卸载"
+        ));
+    }
+    let manifest = manifest.ok_or_else(|| format!("签名插件 [{plugin_id}] 不存在"))?;
+    if manifest.plugin_id != plugin_id {
+        return Err(format!(
+            "插件 ID [{plugin_id}] 与现有签名插件 [{}] 仅大小写不同，请重新读取插件清单",
+            manifest.plugin_id
+        ));
+    }
+    let digest_root = state.plugin_root.clone();
+    let digest_plugin_id = plugin_id.to_owned();
+    let digest_manifest = manifest.clone();
+    let current_state_sha256 = tokio::task::spawn_blocking(move || {
+        plugin_update_installed_state_digest(
+            &digest_root,
+            &digest_plugin_id,
+            Some(&digest_manifest),
+        )
+    })
+    .await
+    .map_err(|_| "签名插件卸载状态复核任务异常终止".to_owned())??;
+    Ok(SignedPluginUninstallContext {
+        manifest,
+        current_state_sha256,
+        failures: inspected.failures,
+    })
+}
+
+#[tauri::command]
+async fn inspect_signed_plugin_uninstall(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    plugin_id: String,
+) -> Result<SignedPluginUninstallPreview, String> {
+    desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
+    recover_plugin_store(&state)?;
+    let context = signed_plugin_uninstall_context(&state, &plugin_id).await?;
+    let metadata = context
+        .manifest
+        .metadata
+        .as_ref()
+        .ok_or_else(|| "签名插件缺少版本元数据，无法生成卸载预检".to_owned())?;
+    let method_count = context
+        .manifest
+        .services
+        .iter()
+        .map(|service| service.methods.len())
+        .sum();
+    let plan_id = signed_plugin_uninstall_plan_id(
+        &plugin_id,
+        &context.current_state_sha256,
+        &state.desktop_version,
+    );
+    Ok(SignedPluginUninstallPreview {
+        plan_id,
+        plugin_id,
+        display_name: if metadata.display_name.trim().is_empty() {
+            context.manifest.plugin_id.clone()
+        } else {
+            metadata.display_name.clone()
+        },
+        plugin_version: metadata.version.to_string(),
+        service_count: context.manifest.services.len(),
+        method_count,
+    })
+}
+
+#[tauri::command]
+async fn uninstall_signed_plugin(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    plugin_id: String,
+    expected_plan_id: String,
+) -> Result<(), String> {
+    desktop::require_control(&caller)?;
+    if !is_lowercase_sha256(&expected_plan_id) {
+        return Err("签名插件卸载确认标识无效，请重新检查卸载影响".to_owned());
+    }
+    let _install = state.install_lock.lock().await;
+    recover_plugin_store(&state)?;
+    let inspected = signed_plugin_uninstall_context(&state, &plugin_id).await?;
+    let actual_plan_id = signed_plugin_uninstall_plan_id(
+        &plugin_id,
+        &inspected.current_state_sha256,
+        &state.desktop_version,
+    );
+    ensure_signed_plugin_uninstall_plan_matches(&expected_plan_id, &actual_plan_id)?;
     let maintenance = state
         .controller
         .begin_plugin_maintenance(&plugin_id)
@@ -3648,6 +3788,15 @@ async fn uninstall_signed_plugin(
                 error.diagnostic_code()
             )
         })?;
+    let verified = signed_plugin_uninstall_context(&state, &plugin_id).await?;
+    let verified_plan_id = signed_plugin_uninstall_plan_id(
+        &plugin_id,
+        &verified.current_state_sha256,
+        &state.desktop_version,
+    );
+    ensure_signed_plugin_uninstall_plan_matches(&expected_plan_id, &verified_plan_id)?;
+    let baseline_failures = verified.failures;
+    let previous_active_manifest = verified.manifest;
     let root = state.plugin_root.clone();
     let removal = tokio::task::spawn_blocking({
         let plugin_id = plugin_id.clone();
@@ -3656,6 +3805,33 @@ async fn uninstall_signed_plugin(
     .await
     .map_err(|_| "插件卸载任务异常终止".to_owned())?
     .map_err(|error| error.to_string())?;
+    let removed_root = removal.transaction_root().to_path_buf();
+    let removed_plugin_id = plugin_id.clone();
+    let removed_state = tokio::task::spawn_blocking(move || {
+        signed_plugin_directory_state_digest(&removed_root, "previous", &removed_plugin_id)
+    })
+    .await
+    .map_err(|_| "签名插件卸载最终复核任务异常终止".to_owned())
+    .and_then(|result| result);
+    let removed_state_sha256 = match removed_state {
+        Ok(digest) => digest,
+        Err(error) => {
+            removal
+                .rollback()
+                .map_err(|rollback| format!("{error}; 恢复原插件同时失败: {rollback}"))?;
+            return Err(format!("无法复核待卸载插件，已恢复原插件: {error}"));
+        }
+    };
+    let removed_plan_id =
+        signed_plugin_uninstall_plan_id(&plugin_id, &removed_state_sha256, &state.desktop_version);
+    if let Err(error) =
+        ensure_signed_plugin_uninstall_plan_matches(&expected_plan_id, &removed_plan_id)
+    {
+        removal
+            .rollback()
+            .map_err(|rollback| format!("{error}; 恢复原插件同时失败: {rollback}"))?;
+        return Err(format!("{error}；已恢复原插件"));
+    }
     let installed = match inspect_all_plugins(
         &state.plugin_root,
         &state.local_mapping_root,
@@ -3700,14 +3876,14 @@ async fn uninstall_signed_plugin(
             .rollback()
             .map_err(|rollback| format!("卸载路由失败: {error}; 恢复原插件同时失败: {rollback}"))?;
         maintenance
-            .replace_manifest(previous_active_manifest.as_ref())
+            .replace_manifest(Some(&previous_active_manifest))
             .await
             .map_err(|restore| format!("卸载路由失败: {error}; 恢复原路由失败: {restore}"))?;
         return Err(format!("卸载路由失败，已恢复原插件: {error}"));
     }
     if let Err(error) = removal.commit() {
         maintenance
-            .replace_manifest(previous_active_manifest.as_ref())
+            .replace_manifest(Some(&previous_active_manifest))
             .await
             .map_err(|restore| format!("卸载事务提交失败: {error}; 恢复原路由失败: {restore}"))?;
         return Err(format!("卸载事务提交失败，已恢复原插件: {error}"));
@@ -5201,6 +5377,7 @@ pub fn run() {
             inspect_plugin_package,
             install_plugin_package,
             install_plugin_from_catalog,
+            inspect_signed_plugin_uninstall,
             uninstall_signed_plugin,
             check_plugin_updates,
             reload_plugins,
@@ -5914,22 +6091,24 @@ mod tests {
         ensure_local_plugin_install_plan_matches, ensure_plugin_update_plan_matches,
         ensure_plugin_version_change_allowed, ensure_project_export_active_manifests_match,
         ensure_project_export_runtime_matches, ensure_signed_plugin_compatible,
-        ensure_signed_plugin_route_coverage, ensure_upgrade_allowed, inspect_all_plugins,
-        is_lowercase_sha256, is_plugin_update_available, legacy_config_candidates,
-        local_mapping_directory_state_digest, local_mapping_import_plan_id,
-        local_mapping_import_state_digest, local_mapping_removal_plan_id, local_mappings,
-        local_plugin_install_plan_id, open_project_bundle_for_mode,
-        persist_startup_failure_document, plugin_update_installed_state_digest,
-        plugin_update_plan_id, preflight_failure_message, project_bundle, project_import_plan_id,
+        ensure_signed_plugin_route_coverage, ensure_signed_plugin_uninstall_plan_matches,
+        ensure_upgrade_allowed, inspect_all_plugins, is_lowercase_sha256,
+        is_plugin_update_available, legacy_config_candidates, local_mapping_directory_state_digest,
+        local_mapping_import_plan_id, local_mapping_import_state_digest,
+        local_mapping_removal_plan_id, local_mappings, local_plugin_install_plan_id,
+        open_project_bundle_for_mode, persist_startup_failure_document,
+        plugin_update_installed_state_digest, plugin_update_plan_id, preflight_failure_message,
+        prepare_plugin_removal, project_bundle, project_import_plan_id,
         project_import_state_digest, resolve_startup_failure_document, same_manifest_contracts,
         select_runtime_path, service_inventory_item, signed_plugin_api_change_summary,
-        signed_plugin_route_policy_coverage, startup_failure_message,
+        signed_plugin_directory_state_digest, signed_plugin_route_policy_coverage,
+        signed_plugin_uninstall_plan_id, startup_failure_message,
         validate_signed_plugin_activation_routes, validate_signed_plugin_api_changes,
         BridgePluginHostHealth, CatalogWithdrawalReason, FrontendRuntime, InspectedPlugins,
         LocalMappingImportPreview, LocalMappingImportServicePreview, LocalMappingRemovalPreview,
         PluginInstallBlocker, PluginInstallSource, PluginPackagePreview,
-        PluginPackageServicePreview, ProjectBundlePreview, StartupFailureDocument, StartupStage,
-        FRONTEND_READY_TIMEOUT,
+        PluginPackageServicePreview, ProjectBundlePreview, SignedPluginUninstallPreview,
+        StartupFailureDocument, StartupStage, FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -7273,6 +7452,86 @@ mod tests {
         assert_ne!(absent, before);
         assert_ne!(before, after);
         assert!(plugin_update_installed_state_digest(root.path(), "reader", None).is_err());
+    }
+
+    #[test]
+    fn signed_plugin_uninstall_plan_binds_identity_state_and_desktop_version() {
+        let desktop = Version::new(0, 1, 5);
+        let state = "22".repeat(32);
+        let base = signed_plugin_uninstall_plan_id("reader", &state, &desktop);
+        assert!(is_lowercase_sha256(&base));
+        assert_ne!(
+            base,
+            signed_plugin_uninstall_plan_id("writer", &state, &desktop)
+        );
+        assert_ne!(
+            base,
+            signed_plugin_uninstall_plan_id("reader", &"33".repeat(32), &desktop)
+        );
+        assert_ne!(
+            base,
+            signed_plugin_uninstall_plan_id("reader", &state, &Version::new(0, 2, 0))
+        );
+        assert!(ensure_signed_plugin_uninstall_plan_matches(&base, &base).is_ok());
+        assert!(ensure_signed_plugin_uninstall_plan_matches(&base, &"44".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn moved_signed_plugin_bytes_retain_confirmed_state_before_uninstall() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin = root.path().join("reader");
+        fs::create_dir(&plugin).unwrap();
+        fs::write(
+            plugin.join(API_FILENAME),
+            r#"{"serviceId":"reader","mainClass":"reader.dll","methods":[{"name":"read"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin.join("plugin.json"),
+            r#"{"schemaVersion":1,"pluginId":"reader","version":"1.0.0","desktopVersionRequirement":">=0.1.0, <0.2.0","displayName":"Reader"}"#,
+        )
+        .unwrap();
+        fs::write(plugin.join("reader.dll"), b"signed plugin bytes").unwrap();
+        let signing_key = SigningKey::from_bytes(&[93_u8; 32]);
+        let material = prepare_signing_material(&plugin, "reader", "test-key").unwrap();
+        let signature = BASE64.encode(signing_key.sign(&material.payload).to_bytes());
+        fs::write(
+            plugin.join(SIGNATURE_FILENAME),
+            encode_signature_document(&material, &signature).unwrap(),
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("reader", &plugin).unwrap();
+        let confirmed =
+            plugin_update_installed_state_digest(root.path(), "reader", Some(&manifest)).unwrap();
+
+        let removal = prepare_plugin_removal(root.path(), "reader").unwrap();
+        let moved =
+            signed_plugin_directory_state_digest(removal.transaction_root(), "previous", "reader")
+                .unwrap();
+        assert_eq!(moved, confirmed);
+        removal.rollback().unwrap();
+        assert!(root.path().join("reader").is_dir());
+    }
+
+    #[test]
+    fn signed_plugin_uninstall_preview_exposes_only_bounded_impact() {
+        let preview = SignedPluginUninstallPreview {
+            plan_id: "11".repeat(32),
+            plugin_id: "reader".to_owned(),
+            display_name: "Reader".to_owned(),
+            plugin_version: "1.0.0".to_owned(),
+            service_count: 1,
+            method_count: 2,
+        };
+        let value = serde_json::to_value(preview).unwrap();
+        assert_eq!(value["pluginId"], "reader");
+        assert_eq!(value["pluginVersion"], "1.0.0");
+        assert_eq!(value["serviceCount"], 1);
+        assert_eq!(value["methodCount"], 2);
+        let text = value.to_string().to_ascii_lowercase();
+        assert!(!text.contains("path"));
+        assert!(!text.contains("keyid"));
+        assert!(!text.contains("component"));
     }
 
     #[test]
