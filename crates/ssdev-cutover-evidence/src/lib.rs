@@ -16,7 +16,7 @@ pub const EVIDENCE_SCHEMA_VERSION: u8 = 3;
 pub const PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION: u8 = 2;
 pub const WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION: u8 = 4;
 pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 7;
-pub const CUTOVER_DECISION_SCHEMA_VERSION: u8 = 2;
+pub const CUTOVER_DECISION_SCHEMA_VERSION: u8 = 3;
 const MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_HASHED_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -248,6 +248,17 @@ impl ProductionCutoverPolicy {
         }
         Ok(())
     }
+
+    pub fn from_bytes_for_signing(bytes: &[u8]) -> Result<Self, EvidenceError> {
+        if bytes.len() as u64 > MAX_EVIDENCE_BYTES {
+            return Err(EvidenceError::Invalid(
+                "production cutover policy exceeds the safety limit".into(),
+            ));
+        }
+        let policy: Self = serde_json::from_slice(bytes)?;
+        policy.validate()?;
+        Ok(policy)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -259,6 +270,7 @@ pub struct CutoverDecision {
     pub approval_signer_key_id: String,
     pub evaluated_at_unix_seconds: u64,
     pub policy_sha256: String,
+    pub policy_attestation_sha256: String,
     pub evidence_trust_store_sha256: String,
     pub approval_trust_store_sha256: String,
     pub plugin_matrix_evidence_sha256: String,
@@ -290,6 +302,7 @@ impl CutoverDecision {
         }
         for digest in [
             &self.policy_sha256,
+            &self.policy_attestation_sha256,
             &self.evidence_trust_store_sha256,
             &self.approval_trust_store_sha256,
             &self.plugin_matrix_evidence_sha256,
@@ -684,6 +697,36 @@ pub fn verify_evidence_attestation(
     Ok(())
 }
 
+pub fn verify_production_cutover_policy_attestation(
+    policy_path: &Path,
+    envelope_path: &Path,
+    trust_store_path: &Path,
+) -> Result<ProductionCutoverPolicy, EvidenceError> {
+    let document = read_bounded_bytes(policy_path, MAX_EVIDENCE_BYTES)?;
+    let policy = ProductionCutoverPolicy::from_bytes_for_signing(&document)?;
+    let envelope: DetachedSignatureDocument =
+        serde_json::from_slice(&read_bounded_bytes(envelope_path, MAX_EVIDENCE_BYTES)?)?;
+    envelope.validate()?;
+    if envelope.key_id != policy.cutover_decision_signer_key_id {
+        return Err(EvidenceError::Invalid(
+            "cutover policy signer does not match the approved release duty".into(),
+        ));
+    }
+    if sha256_file(trust_store_path)? != policy.expected_plugin_trust_store_sha256 {
+        return Err(EvidenceError::Invalid(
+            "cutover policy approval trust store does not match the approved release trust root"
+                .into(),
+        ));
+    }
+    TrustStore::load(trust_store_path)?.verify_detached_for_issuance(
+        TrustPurpose::CutoverDecision,
+        &envelope.key_id,
+        &cutover_policy_signing_payload(&document)?,
+        &envelope.signature,
+    )?;
+    Ok(policy)
+}
+
 pub fn load_production_cutover_policy(
     path: &Path,
 ) -> Result<ProductionCutoverPolicy, EvidenceError> {
@@ -704,7 +747,9 @@ pub fn write_production_cutover_policy(
 pub struct ProductionCutoverInputs<'a> {
     pub policy: &'a ProductionCutoverPolicy,
     pub policy_sha256: String,
+    pub policy_attestation_sha256: String,
     pub evidence_trust_store_sha256: String,
+    pub approval_trust_store_sha256: String,
     pub plugin: &'a PluginMatrixEvidence,
     pub plugin_sha256: String,
     pub plugin_attestation_sha256: String,
@@ -723,7 +768,9 @@ pub fn evaluate_production_cutover(
     let ProductionCutoverInputs {
         policy,
         policy_sha256,
+        policy_attestation_sha256,
         evidence_trust_store_sha256,
+        approval_trust_store_sha256,
         plugin,
         plugin_sha256,
         plugin_attestation_sha256,
@@ -740,7 +787,9 @@ pub fn evaluate_production_cutover(
     windows.validate()?;
     for digest in [
         &policy_sha256,
+        &policy_attestation_sha256,
         &evidence_trust_store_sha256,
+        &approval_trust_store_sha256,
         &plugin_sha256,
         &migration_sha256,
         &windows_sha256,
@@ -763,6 +812,9 @@ pub fn evaluate_production_cutover(
     let mut blockers = std::collections::BTreeSet::new();
     if evidence_trust_store_sha256 != policy.expected_evidence_trust_store_sha256 {
         blockers.insert("evidence-trust-store-mismatch".into());
+    }
+    if approval_trust_store_sha256 != policy.expected_plugin_trust_store_sha256 {
+        blockers.insert("approval-trust-store-mismatch".into());
     }
     for (name, revision, dirty, executed_at) in [
         (
@@ -940,8 +992,9 @@ pub fn evaluate_production_cutover(
         approval_signer_key_id: policy.cutover_decision_signer_key_id.clone(),
         evaluated_at_unix_seconds,
         policy_sha256,
+        policy_attestation_sha256,
         evidence_trust_store_sha256,
-        approval_trust_store_sha256: policy.expected_plugin_trust_store_sha256.clone(),
+        approval_trust_store_sha256,
         plugin_matrix_evidence_sha256: plugin_sha256,
         migration_audit_evidence_sha256: migration_sha256,
         windows_package_evidence_sha256: windows_sha256,
@@ -1067,6 +1120,14 @@ pub fn cutover_decision_signing_payload(document: &[u8]) -> Vec<u8> {
     let mut payload = b"SSDEV-CUTOVER-DECISION\0".to_vec();
     payload.extend_from_slice(&digest);
     payload
+}
+
+pub fn cutover_policy_signing_payload(document: &[u8]) -> Result<Vec<u8>, EvidenceError> {
+    ProductionCutoverPolicy::from_bytes_for_signing(document)?;
+    let digest = Sha256::digest(document);
+    let mut payload = b"SSDEV-CUTOVER-POLICY\0".to_vec();
+    payload.extend_from_slice(&digest);
+    Ok(payload)
 }
 
 pub fn digest_named_payloads(
@@ -1383,7 +1444,9 @@ mod tests {
             ProductionCutoverInputs {
                 policy: &policy,
                 policy_sha256: "1".repeat(64),
+                policy_attestation_sha256: "0".repeat(64),
                 evidence_trust_store_sha256: "8".repeat(64),
+                approval_trust_store_sha256: "2".repeat(64),
                 plugin: &plugin,
                 plugin_sha256: "2".repeat(64),
                 plugin_attestation_sha256: "5".repeat(64),
@@ -1399,16 +1462,19 @@ mod tests {
         .unwrap();
         assert!(decision.eligible);
         assert!(decision.blocker_codes.is_empty());
+        assert_eq!(decision.policy_attestation_sha256, "0".repeat(64));
         assert_eq!(decision.approval_trust_store_sha256, "2".repeat(64));
         let mut legacy_decision = decision.clone();
-        legacy_decision.schema_version = 1;
+        legacy_decision.schema_version = 2;
         assert!(legacy_decision.validate().is_err());
 
         let substituted_trust = evaluate_production_cutover(
             ProductionCutoverInputs {
                 policy: &policy,
                 policy_sha256: "1".repeat(64),
+                policy_attestation_sha256: "0".repeat(64),
                 evidence_trust_store_sha256: "f".repeat(64),
+                approval_trust_store_sha256: "2".repeat(64),
                 plugin: &plugin,
                 plugin_sha256: "2".repeat(64),
                 plugin_attestation_sha256: "5".repeat(64),
@@ -1427,6 +1493,31 @@ mod tests {
             ["evidence-trust-store-mismatch"]
         );
 
+        let substituted_approval_trust = evaluate_production_cutover(
+            ProductionCutoverInputs {
+                policy: &policy,
+                policy_sha256: "1".repeat(64),
+                policy_attestation_sha256: "0".repeat(64),
+                evidence_trust_store_sha256: "8".repeat(64),
+                approval_trust_store_sha256: "f".repeat(64),
+                plugin: &plugin,
+                plugin_sha256: "2".repeat(64),
+                plugin_attestation_sha256: "5".repeat(64),
+                migration: &migration,
+                migration_sha256: "3".repeat(64),
+                migration_attestation_sha256: "6".repeat(64),
+                windows: &windows,
+                windows_sha256: "4".repeat(64),
+                windows_attestation_sha256: "7".repeat(64),
+            },
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            substituted_approval_trust.blocker_codes,
+            ["approval-trust-store-mismatch"]
+        );
+
         let mut policy_drift_migration = migration.clone();
         policy_drift_migration.origin_policy_sha256 = "b".repeat(64);
         policy_drift_migration.pilot_material_set_sha256 = "c".repeat(64);
@@ -1437,7 +1528,9 @@ mod tests {
             ProductionCutoverInputs {
                 policy: &policy,
                 policy_sha256: "1".repeat(64),
+                policy_attestation_sha256: "0".repeat(64),
                 evidence_trust_store_sha256: "8".repeat(64),
+                approval_trust_store_sha256: "2".repeat(64),
                 plugin: &plugin,
                 plugin_sha256: "2".repeat(64),
                 plugin_attestation_sha256: "5".repeat(64),
@@ -1469,7 +1562,9 @@ mod tests {
             ProductionCutoverInputs {
                 policy: &policy,
                 policy_sha256: "1".repeat(64),
+                policy_attestation_sha256: "0".repeat(64),
                 evidence_trust_store_sha256: "8".repeat(64),
+                approval_trust_store_sha256: "2".repeat(64),
                 plugin: &plugin,
                 plugin_sha256: "2".repeat(64),
                 plugin_attestation_sha256: "5".repeat(64),
@@ -1498,7 +1593,9 @@ mod tests {
             ProductionCutoverInputs {
                 policy: &policy,
                 policy_sha256: "1".repeat(64),
+                policy_attestation_sha256: "0".repeat(64),
                 evidence_trust_store_sha256: "8".repeat(64),
+                approval_trust_store_sha256: "2".repeat(64),
                 plugin: &plugin,
                 plugin_sha256: "2".repeat(64),
                 plugin_attestation_sha256: "5".repeat(64),
@@ -1565,7 +1662,9 @@ mod tests {
             ProductionCutoverInputs {
                 policy: &policy,
                 policy_sha256: "1".repeat(64),
+                policy_attestation_sha256: "0".repeat(64),
                 evidence_trust_store_sha256: "8".repeat(64),
+                approval_trust_store_sha256: "2".repeat(64),
                 plugin: &plugin,
                 plugin_sha256: "2".repeat(64),
                 plugin_attestation_sha256: "5".repeat(64),
@@ -1641,6 +1740,16 @@ mod tests {
         invalid_upgrade.expected_previous_app_version =
             invalid_upgrade.expected_app_version.clone();
         assert!(invalid_upgrade.validate().is_err());
+
+        let bytes = serde_json::to_vec(&valid_policy("d".repeat(40))).unwrap();
+        ProductionCutoverPolicy::from_bytes_for_signing(&bytes).unwrap();
+        assert!(cutover_policy_signing_payload(&bytes)
+            .unwrap()
+            .starts_with(b"SSDEV-CUTOVER-POLICY\0"));
+        assert_ne!(
+            cutover_policy_signing_payload(&bytes).unwrap(),
+            cutover_decision_signing_payload(&bytes)
+        );
     }
 
     #[test]

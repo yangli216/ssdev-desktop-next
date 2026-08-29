@@ -169,7 +169,7 @@ fn required_purposes(options: &HashMap<String, String>) -> Result<Vec<TrustPurpo
 }
 
 fn usage() -> &'static str {
-    "用法:\n  ssdev-release-signing prepare --kind <cutover-decision|plugin-matrix-evidence|migration-audit-evidence|windows-package-evidence|origin-policy|process-policy|plugin-catalog|project-bundle> --document FILE --key-id ID --trust-store FILE --request FILE\n  ssdev-release-signing finalize --kind KIND --document FILE --request FILE --signature FILE --trust-store FILE --envelope FILE\n  ssdev-release-signing verify --kind KIND --document FILE --envelope FILE --trust-store FILE\n  ssdev-release-signing verify-trust-store --trust-store FILE --required-purposes plugin,origin-policy,project-bundle"
+    "用法:\n  ssdev-release-signing prepare --kind <cutover-policy|cutover-decision|plugin-matrix-evidence|migration-audit-evidence|windows-package-evidence|origin-policy|process-policy|plugin-catalog|project-bundle> --document FILE --key-id ID --trust-store FILE --request FILE\n  ssdev-release-signing finalize --kind KIND --document FILE --request FILE --signature FILE --trust-store FILE --envelope FILE\n  ssdev-release-signing verify --kind KIND --document FILE --envelope FILE --trust-store FILE\n  ssdev-release-signing verify-trust-store --trust-store FILE --required-purposes plugin,origin-policy,project-bundle"
 }
 
 #[cfg(test)]

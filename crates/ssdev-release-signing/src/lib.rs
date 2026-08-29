@@ -8,8 +8,9 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ssdev_cutover_evidence::{
-    cutover_decision_signing_payload, evidence_attestation_signing_payload, CutoverDecision,
-    EvidenceAttestationKind, MigrationAuditEvidence, PluginMatrixEvidence, WindowsPackageEvidence,
+    cutover_decision_signing_payload, cutover_policy_signing_payload,
+    evidence_attestation_signing_payload, CutoverDecision, EvidenceAttestationKind,
+    MigrationAuditEvidence, PluginMatrixEvidence, ProductionCutoverPolicy, WindowsPackageEvidence,
 };
 use ssdev_origin_policy::{signing_payload as origin_payload, OriginPolicy};
 use ssdev_process_policy::{signing_payload as process_payload, ProcessPolicy};
@@ -28,6 +29,7 @@ const MAX_SIGNATURE_BYTES: u64 = 1024;
 #[serde(rename_all = "kebab-case")]
 pub enum ArtifactKind {
     CutoverDecision,
+    CutoverPolicy,
     MigrationAuditEvidence,
     OriginPolicy,
     PluginMatrixEvidence,
@@ -40,7 +42,7 @@ pub enum ArtifactKind {
 impl ArtifactKind {
     pub const fn trust_purpose(self) -> TrustPurpose {
         match self {
-            Self::CutoverDecision => TrustPurpose::CutoverDecision,
+            Self::CutoverDecision | Self::CutoverPolicy => TrustPurpose::CutoverDecision,
             Self::MigrationAuditEvidence
             | Self::PluginMatrixEvidence
             | Self::WindowsPackageEvidence => TrustPurpose::CutoverEvidence,
@@ -54,6 +56,7 @@ impl ArtifactKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CutoverDecision => "cutover-decision",
+            Self::CutoverPolicy => "cutover-policy",
             Self::MigrationAuditEvidence => "migration-audit-evidence",
             Self::OriginPolicy => "origin-policy",
             Self::PluginMatrixEvidence => "plugin-matrix-evidence",
@@ -71,6 +74,7 @@ impl std::str::FromStr for ArtifactKind {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "cutover-decision" => Ok(Self::CutoverDecision),
+            "cutover-policy" => Ok(Self::CutoverPolicy),
             "migration-audit-evidence" => Ok(Self::MigrationAuditEvidence),
             "origin-policy" => Ok(Self::OriginPolicy),
             "plugin-matrix-evidence" => Ok(Self::PluginMatrixEvidence),
@@ -96,6 +100,16 @@ pub enum ArtifactSummary {
         source_revision: String,
         app_version: String,
         evaluated_at_unix_seconds: u64,
+        approval_signer_key_id: String,
+        policy_attestation_sha256: String,
+        evidence_trust_store_sha256: String,
+        approval_trust_store_sha256: String,
+    },
+    CutoverPolicy {
+        source_revision: String,
+        app_version: String,
+        previous_app_version: String,
+        maximum_evidence_age_seconds: u64,
         approval_signer_key_id: String,
         evidence_trust_store_sha256: String,
         approval_trust_store_sha256: String,
@@ -385,8 +399,24 @@ fn prepare_material(
                     app_version: decision.app_version,
                     evaluated_at_unix_seconds: decision.evaluated_at_unix_seconds,
                     approval_signer_key_id: decision.approval_signer_key_id,
+                    policy_attestation_sha256: decision.policy_attestation_sha256,
                     evidence_trust_store_sha256: decision.evidence_trust_store_sha256,
                     approval_trust_store_sha256: decision.approval_trust_store_sha256,
+                },
+            )
+        }
+        ArtifactKind::CutoverPolicy => {
+            let policy = ProductionCutoverPolicy::from_bytes_for_signing(document)?;
+            (
+                cutover_policy_signing_payload(document)?,
+                ArtifactSummary::CutoverPolicy {
+                    source_revision: policy.target_source_revision,
+                    app_version: policy.expected_app_version,
+                    previous_app_version: policy.expected_previous_app_version,
+                    maximum_evidence_age_seconds: policy.maximum_evidence_age_seconds,
+                    approval_signer_key_id: policy.cutover_decision_signer_key_id,
+                    evidence_trust_store_sha256: policy.expected_evidence_trust_store_sha256,
+                    approval_trust_store_sha256: policy.expected_plugin_trust_store_sha256,
                 },
             )
         }
@@ -510,14 +540,21 @@ fn prepare_material(
 }
 
 fn ensure_expected_signer(summary: &ArtifactSummary, key_id: &str) -> Result<(), SigningError> {
-    if let ArtifactSummary::CutoverDecision {
-        approval_signer_key_id,
-        ..
-    } = summary
-    {
+    let expected = match summary {
+        ArtifactSummary::CutoverDecision {
+            approval_signer_key_id,
+            ..
+        }
+        | ArtifactSummary::CutoverPolicy {
+            approval_signer_key_id,
+            ..
+        } => Some(approval_signer_key_id),
+        _ => None,
+    };
+    if let Some(approval_signer_key_id) = expected {
         if approval_signer_key_id != key_id {
             return Err(SigningError::Invalid(
-                "cutover approval signer does not match the production policy".into(),
+                "cutover signer does not match the production policy approval duty".into(),
             ));
         }
     }
@@ -528,15 +565,23 @@ fn ensure_expected_trust_store(
     summary: &ArtifactSummary,
     trust_store_path: &Path,
 ) -> Result<(), SigningError> {
-    if let ArtifactSummary::CutoverDecision {
-        approval_trust_store_sha256,
-        ..
-    } = summary
-    {
+    let expected = match summary {
+        ArtifactSummary::CutoverDecision {
+            approval_trust_store_sha256,
+            ..
+        }
+        | ArtifactSummary::CutoverPolicy {
+            approval_trust_store_sha256,
+            ..
+        } => Some(approval_trust_store_sha256),
+        _ => None,
+    };
+    if let Some(approval_trust_store_sha256) = expected {
         let actual = sha256_hex(&read_bounded(trust_store_path, MAX_DOCUMENT_BYTES)?);
-        if &actual != approval_trust_store_sha256 {
+        if actual != *approval_trust_store_sha256 {
             return Err(SigningError::Invalid(
-                "cutover approval trust store does not match the production policy".into(),
+                "cutover approval trust store does not match the production policy trust root"
+                    .into(),
             ));
         }
     }
@@ -706,7 +751,9 @@ pub enum SigningError {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use ssdev_cutover_evidence::verify_evidence_attestation;
+    use ssdev_cutover_evidence::{
+        verify_evidence_attestation, verify_production_cutover_policy_attestation,
+    };
 
     const NOW: u64 = 1_700_000_000;
 
@@ -853,6 +900,40 @@ mod tests {
                 }),
             ),
             (
+                ArtifactKind::CutoverPolicy,
+                serde_json::json!({
+                    "schemaVersion": ssdev_cutover_evidence::CUTOVER_POLICY_SCHEMA_VERSION,
+                    "targetSourceRevision": "aa".repeat(20),
+                    "expectedAppVersion": "1.2.3",
+                    "expectedPreviousAppVersion": "1.2.2",
+                    "maximumEvidenceAgeSeconds": 3600,
+                    "expectedWindowsArtifactManifestSha256": "88".repeat(32),
+                    "expectedPreviousWindowsArtifactManifestSha256": "dd".repeat(32),
+                    "expectedPreviousReleaseMetadataSha256": "99".repeat(32),
+                    "expectedPluginReleaseSetSpecSha256": "00".repeat(32),
+                    "expectedPluginPackageSetSha256": "99".repeat(32),
+                    "expectedPluginTrustStoreSha256": sha256_hex(&fs::read(root.join("trust.json")).unwrap()),
+                    "expectedEvidenceTrustStoreSha256": "88".repeat(32),
+                    "expectedPluginMatrixSha256": "33".repeat(32),
+                    "expectedPilotMaterialSetSha256": "bb".repeat(32),
+                    "expectedOriginPolicySha256": "aa".repeat(32),
+                    "migrationCoverageMinimums": {
+                        "configFiles": 1,
+                        "pluginDirectories": 1,
+                        "services": 1,
+                        "keyBindings": 0,
+                        "browserAssetRoots": 1,
+                        "browserAssetFilesScanned": 10,
+                        "browserHarFiles": 1,
+                        "browserHarRequestsScanned": 20
+                    },
+                    "pluginMatrixSignerKeyId": "plugin-matrix-qa",
+                    "migrationAuditSignerKeyId": "migration-audit-qa",
+                    "windowsPackageSignerKeyId": "windows-package-qa",
+                    "cutoverDecisionSignerKeyId": "release-key"
+                }),
+            ),
+            (
                 ArtifactKind::CutoverDecision,
                 serde_json::json!({
                     "schemaVersion": ssdev_cutover_evidence::CUTOVER_DECISION_SCHEMA_VERSION,
@@ -861,6 +942,7 @@ mod tests {
                     "approvalSignerKeyId": "release-key",
                     "evaluatedAtUnixSeconds": NOW,
                     "policySha256": "11".repeat(32),
+                    "policyAttestationSha256": "00".repeat(32),
                     "evidenceTrustStoreSha256": "88".repeat(32),
                     "approvalTrustStoreSha256": sha256_hex(&fs::read(root.join("trust.json")).unwrap()),
                     "pluginMatrixEvidenceSha256": "22".repeat(32),
@@ -1012,6 +1094,12 @@ mod tests {
                     "different-qa-key",
                 )
                 .is_err());
+            }
+            if kind == ArtifactKind::CutoverPolicy {
+                let policy =
+                    verify_production_cutover_policy_attestation(&document, &envelope, &trust)
+                        .unwrap();
+                assert_eq!(policy.cutover_decision_signer_key_id, "release-key");
             }
         }
     }
@@ -1174,6 +1262,82 @@ mod tests {
             &envelope,
             &substitute_trust,
             now,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cutover_policy_rejects_substituted_trust_and_document_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let approved_key = SigningKey::from_bytes(&[64_u8; 32]);
+        let approved_trust = trust_store(root.path(), &approved_key);
+        let (_, document) = documents(root.path())
+            .into_iter()
+            .find(|(kind, _)| *kind == ArtifactKind::CutoverPolicy)
+            .unwrap();
+        let substitute_root = root.path().join("policy-substitute");
+        fs::create_dir(&substitute_root).unwrap();
+        let substitute_key = SigningKey::from_bytes(&[65_u8; 32]);
+        let substitute_trust = trust_store(&substitute_root, &substitute_key);
+        let now = unix_time(NOW).unwrap();
+
+        let rejected_request = root.path().join("policy-substitute.request.json");
+        assert!(prepare(&PrepareOptions {
+            kind: ArtifactKind::CutoverPolicy,
+            document: &document,
+            key_id: "release-key",
+            trust_store: &substitute_trust,
+            request: &rejected_request,
+            now,
+        })
+        .is_err());
+        assert!(!rejected_request.exists());
+
+        let request = root.path().join("policy.request.json");
+        let signature = root.path().join("policy.signature");
+        let envelope = root.path().join("policy.sig.json");
+        prepare(&PrepareOptions {
+            kind: ArtifactKind::CutoverPolicy,
+            document: &document,
+            key_id: "release-key",
+            trust_store: &approved_trust,
+            request: &request,
+            now,
+        })
+        .unwrap();
+        let request_document: SigningRequest =
+            serde_json::from_slice(&fs::read(&request).unwrap()).unwrap();
+        let payload = BASE64.decode(request_document.payload_base64).unwrap();
+        fs::write(
+            &signature,
+            BASE64.encode(approved_key.sign(&payload).to_bytes()),
+        )
+        .unwrap();
+        finalize(&FinalizeOptions {
+            kind: ArtifactKind::CutoverPolicy,
+            document: &document,
+            request: &request,
+            signature: &signature,
+            trust_store: &approved_trust,
+            envelope: &envelope,
+            now,
+        })
+        .unwrap();
+        assert!(verify_production_cutover_policy_attestation(
+            &document,
+            &envelope,
+            &substitute_trust,
+        )
+        .is_err());
+
+        let mut changed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&document).unwrap()).unwrap();
+        changed["expectedAppVersion"] = serde_json::json!("1.2.4");
+        fs::write(&document, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+        assert!(verify_production_cutover_policy_attestation(
+            &document,
+            &envelope,
+            &approved_trust,
         )
         .is_err());
     }

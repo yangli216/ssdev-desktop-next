@@ -1,6 +1,6 @@
 # 统一发布文档签名
 
-`ssdev-release-signing` 为八类 detached Ed25519 发布制品提供同一条受控流水线：
+`ssdev-release-signing` 为九类 detached Ed25519 发布制品提供同一条受控流水线：
 
 | `--kind` | 信任用途 | 文档 |
 | --- | --- | --- |
@@ -8,6 +8,7 @@
 | `process-policy` | `process-policy` | `process-policy.json` |
 | `plugin-catalog` | `plugin-catalog` | 插件仓库 `catalog.json` |
 | `project-bundle` | `project-bundle` | 项目交付 `.ssdev-project` |
+| `cutover-policy` | `cutover-decision` | 生产切换 `production-policy.json` |
 | `cutover-decision` | `cutover-decision` | 生产切换 `cutover-decision.json` |
 | `plugin-matrix-evidence` | `cutover-evidence` | 真实插件黄金矩阵证据 |
 | `migration-audit-evidence` | `cutover-evidence` | 生产流程迁移审计证据 |
@@ -44,10 +45,11 @@ cargo run --locked -p ssdev-release-signing -- prepare `
 - 进程策略检查固定绝对路径、参数上限、SHA-256 格式、重复 ID 和条目上限；
 - 插件目录检查 schema、SemVer、HTTPS URL、包大小/摘要、重复版本、结构化精确版本撤回，以及当前签发/过期时间和最长 31 天有效期。可安装条目不得与撤回身份重叠；目录本身应先由 `ssdev-plugin-tool catalog` 从已验签包和已审批撤回清单生成，避免人工录入包字段。
 - 项目包先通过与客户端相同的受限 ZIP、配置、组件清单、大小和摘要校验，再对整个原始 `.ssdev-project` 文件建立独立域签名；审核摘要只公开创建版本、组件分类计数、包大小和 SHA-256。
-- 切换决策检查严格 schema、源码提交、应用版本、策略/信任库/三份证据/三个封套摘要和阻塞码一致性；只有 `eligible: true` 的 `GO` 决策可以进入签名请求，且请求、封套和独立验证的 keyId 都必须等于策略选定的 `approvalSignerKeyId`。`NO-GO` 决策只能归档，不能获准发布。
+- 生产策略检查严格 schema、目标提交、候选/上一版本、证据时效、全部项目输入摘要和四个互异职责 keyId；签名请求必须使用策略选定的最终审批 keyId 和策略已绑定的发布信任库。它与最终决策共享 `cutover-decision` 信任用途和审批职责，但使用独立 `SSDEV-CUTOVER-POLICY\0` 签名域。
+- 切换决策检查严格 schema、源码提交、应用版本、策略/策略封套/两份信任库/三份证据/三个证据封套摘要和阻塞码一致性；只有 `eligible: true` 的 `GO` 决策可以进入签名请求，且请求、封套和独立验证的 keyId 都必须等于策略选定的 `approvalSignerKeyId`。`NO-GO` 决策只能归档，不能获准发布。
 - 三类执行证据分别检查自身严格 schema、来源提交、执行环境、输入摘要、覆盖与结果一致性，并使用不同域分隔 payload；插件矩阵 schema 2 的审核摘要额外公开 `packageSetSha256`，把硬件结论绑定到批准的确定性包集合；迁移证据 schema 3 公开已复验试点材料集合、签名来源策略摘要以及发现/获准的 HTTP 来源计数；Windows 包 schema 4 公开最终产物清单、实际安装插件信任库、来源策略及 x86/x64 宿主 SHA-256，升级验收还公开上一版本号、发布元数据和产物清单摘要，使审批者能确认测试的是指定上一生产版本。它们共享 `cutover-evidence` 用途，但生产策略可为每类证据指定不同 `keyId` 以隔离 QA 职责。
 
-请求文件明确记录 `artifactKind`、对应 `trustPurpose`、`keyId`、文档摘要、待签字节及其摘要，并给出不含敏感内容的审核摘要。来源策略摘要包含授权来源/服务/方法数量和 HTTP 例外状态；进程策略包含条目数；插件目录包含签发时间、过期时间和条目数；项目包包含创建版本、组件分类计数、包大小和摘要；执行证据包含源码提交与关键覆盖/结果计数；切换决策包含源码提交、应用版本和判定时间。
+请求文件明确记录 `artifactKind`、对应 `trustPurpose`、`keyId`、文档摘要、待签字节及其摘要，并给出不含敏感内容的审核摘要。来源策略摘要包含授权来源/服务/方法数量和 HTTP 例外状态；进程策略包含条目数；插件目录包含签发时间、过期时间和条目数；项目包包含创建版本、组件分类计数、包大小和摘要；执行证据包含源码提交与关键覆盖/结果计数；生产策略包含目标提交、候选/上一版本、证据时效和两份信任库摘要；切换决策包含源码提交、应用版本、判定时间和策略封套摘要。
 
 项目包的发布审批必须把桌面端导出成功时显示的 SHA-256 与请求中的 `documentSha256` 逐字节核对。二者不同表示选错草稿或导出后文件发生变化，应废弃请求并从稳定项目包重新执行 `prepare`，不能只依据相同文件名继续签发。
 
@@ -97,4 +99,5 @@ cargo run --locked -p ssdev-release-signing -- verify `
 - 插件目录签名只证明索引本身。客户端仍会校验 HTTPS、下载字节数/摘要、插件内部签名、候选宿主预检和真实硬件黄金矩阵。
 - 项目包签名绑定整个交付容器和发布者身份，但不会把本地映射提升为通用组织插件。客户端仍会验证每个签名插件、当前来源授权、联合路由、目标架构宿主，并在确认前保持目标机器不变。
 - 应用更新与 bundle 产物使用 Tauri Minisign/Authenticode，不复用本工具的 Ed25519 封套或密钥。
-- `cutover-decision` 签名证明具备独立用途的审批密钥批准了某一精确 `GO` 文档；`prepare`、`finalize` 和 `verify` 都要求实际发布信任库摘要等于 schema 2 决策中的 `approvalTrustStoreSha256`，同名 keyId 的替代库无效。验证方仍应保留并按文档中的 SHA-256 复核原始策略与三份证据。
+- `cutover-policy` 签名证明最终审批职责授权了某一精确生产策略；`prepare`、`finalize`、`verify` 和后续 `decide` 都要求实际发布信任库摘要等于策略绑定值，同名 keyId 的替代库无效。策略签名不代表三类 QA 执行已经通过。
+- `cutover-decision` 签名证明同一独立用途的审批密钥批准了某一精确 `GO` 文档；`prepare`、`finalize` 和 `verify` 都要求实际发布信任库摘要等于 schema 3 决策中的 `approvalTrustStoreSha256`，同名 keyId 的替代库无效。验证方仍应保留并按文档中的 SHA-256 复核原始策略、策略封套与三份证据。

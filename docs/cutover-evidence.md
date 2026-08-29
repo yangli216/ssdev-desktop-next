@@ -6,7 +6,7 @@
 - 迁移审计证据：schema 3 必须从已复验的 schema 2 试点材料 manifest 精确派生全部输入，同时扫描业务前端静态资源和代表性真实 HAR，并绑定试点 `materialSetSha256` 以及通过 active 签名验证、实际授权全部迁移配置的来源策略 SHA-256；旧 WebPlus `7711` 与桌面回调 `45121` 均不得有静态或运行时证据，HTTP 业务来源必须全部获得该策略批准，且不能留有 critical 或 warning finding。配置文件、插件目录、服务、快捷键、前端资源和 HAR 的八类计数还必须达到项目策略批准的最低覆盖，避免用另一组较小或不同输入替代已移交材料。
 - Windows 包证据：schema 4 必须验证 Authenticode、NSIS、实际启动事件，以及从指定上一生产版本升级并保留配置；证据绑定上一版本号、`release.json` 与已验签 `artifacts.json` 的 SHA-256，不能用任意更低版本或 CI 合成版本替代。它同时从实际安装目录记录插件信任库、来源策略和 x86/x64 插件宿主 SHA-256，最终判定要求来源策略与迁移审计及生产策略一致，信任库和宿主与真实硬件矩阵使用的输入逐字节一致。历史 MSI 字段仅为格式兼容保留，不参与新发布判定；旧 schema 包证据缺少这些身份，不能用于新决策。
 
-三份证据必须指向策略指定的同一 Git 提交、全部为 clean source，并且不超过策略允许的年龄。schema 7 策略还绑定批准的试点材料集合、候选与上一生产版本、两者的 Windows 产物清单、上一版本发布元数据、来源策略、QA 证据信任库，以及发布集合规范、确定性插件包集合、插件发布/审批信任库和定稿黄金矩阵 SHA-256，并设置项目级迁移覆盖下限；它可以为项目确实不存在的旧资产类别显式填 `0`，但不能省略字段或用旧 schema 绕过确认。策略只能指定这些项目事实、目标提交、预期 SemVer、60 秒至 31 天的证据有效期，以及三类证据和最终审批各自预期的签名 `keyId`，不能关闭其他固化门禁。四个职责的 `keyId` 必须互不相同。
+三份证据必须指向策略指定的同一 Git 提交、全部为 clean source，并且不超过策略允许的年龄。schema 7 策略还绑定批准的试点材料集合、候选与上一生产版本、两者的 Windows 产物清单、上一版本发布元数据、来源策略、QA 证据信任库，以及发布集合规范、确定性插件包集合、插件发布/审批信任库和定稿黄金矩阵 SHA-256，并设置项目级迁移覆盖下限；它可以为项目确实不存在的旧资产类别显式填 `0`，但不能省略字段或用旧 schema 绕过确认。策略只能指定这些项目事实、目标提交、预期 SemVer、60 秒至 31 天的证据有效期，以及三类证据和最终审批各自预期的签名 `keyId`，不能关闭其他固化门禁。四个职责的 `keyId` 必须互不相同。生成后的策略还必须由最终审批职责签名；未签名策略不能进入判定。
 
 ## 1. 准备策略
 
@@ -28,9 +28,36 @@ cargo run --locked -p ssdev-cutover-evidence -- prepare-policy `
 
 工具会重新验证完整试点材料集合，从固定类别中确定发布集合规范、唯一插件包目录、唯一黄金矩阵和上一生产 bundle；QA 证据信任库必须来自 `organization-public-trust` 类别。候选与上一 bundle 的 `artifacts.json` 必须逐文件匹配，候选 `release.json` 必须匹配当前 clean 源码，上一版本必须低于候选版本。来源策略必须使用试点发布信任库中的 active `origin-policy` 密钥有效签名，插件发布集合则必须在批准包目录边界内通过同一信任库和黄金矩阵检查；三个 QA keyId 必须在证据信任库中是 active `cutover-evidence` 密钥，最终审批 keyId 必须在发布信任库中是 active `cutover-decision` 密钥。目标提交、候选/上一版本、两份产物清单、上一版发布元数据、来源策略、试点材料、发布集合、包集合、两份信任库和矩阵摘要都由这些已验证输入自动写入，人工批准文件不能覆盖它们。
 
-写入前工具会再次检查源码、manifest、报告、材料、两个 bundle 和批准文件没有漂移；输出不得位于源码、材料或任一 bundle 内，且不能覆盖现有文件。[完整策略示例](cutover-policy.example.json) 只用于说明最终 schema 和测试，不应在生产中手工填写摘要。策略原始字节的 SHA-256 会进入最终决策。
+写入前工具会再次检查源码、manifest、报告、材料、两个 bundle 和批准文件没有漂移；输出不得位于源码、材料或任一 bundle 内，且不能覆盖现有文件。[完整策略示例](cutover-policy.example.json) 只用于说明最终 schema 和测试，不应在生产中手工填写摘要。
 
-## 2. 签署执行证据
+## 2. 签署生产策略
+
+策略生成后，使用策略中已批准的最终审批 `keyId` 和同一发布信任库创建签名请求：
+
+```powershell
+cargo run --locked -p ssdev-release-signing -- prepare `
+  --kind cutover-policy `
+  --document D:\cutover-inputs\production-policy.json `
+  --key-id central-release-approval-2026 `
+  --trust-store D:\cutover-inputs\release-trust.json `
+  --request D:\cutover-output\production-policy.request.json
+```
+
+KMS/HSM 返回签名后生成策略封套：
+
+```powershell
+cargo run --locked -p ssdev-release-signing -- finalize `
+  --kind cutover-policy `
+  --document D:\cutover-inputs\production-policy.json `
+  --request D:\cutover-output\production-policy.request.json `
+  --signature D:\secure-signing-output\production-policy.sig.base64 `
+  --trust-store D:\cutover-inputs\release-trust.json `
+  --envelope D:\cutover-output\production-policy.sig.json
+```
+
+工具要求签名 keyId 等于策略中的 `cutoverDecisionSignerKeyId`，并要求传入信任库原始字节 SHA-256 等于策略已绑定的插件/发布信任库；同名 keyId 的替代公钥库不能签发。签名域是 `SSDEV-CUTOVER-POLICY\0` 加策略原始字节 SHA-256，与最终 GO 的签名域不同，因此两个封套不能互换。该步骤复用现有最终审批职责，不新增第五个签名职责。
+
+## 3. 签署执行证据
 
 每份证据生成后，由对应受控 QA 环境使用统一外部签名流程处理，三个 artifact kind 分别为 `plugin-matrix-evidence`、`migration-audit-evidence` 和 `windows-package-evidence`。例如：
 
@@ -45,11 +72,13 @@ cargo run --locked -p ssdev-release-signing -- prepare `
 
 签名密钥必须为 `active` 并显式具备 `cutover-evidence` 用途。KMS/HSM 返回签名后用 `finalize` 生成封套；三种证据使用不同域分隔 payload，不能相互替换。生产策略中的三个预期 `keyId` 应分别指向实际负责插件硬件、业务流程审计和 Windows 安装升级验收的环境密钥，且 `decide` 使用的证据信任库原始字节 SHA-256 必须与 schema 7 策略一致。同名 keyId 的替代公钥库只能产生 `evidence-trust-store-mismatch`，不能生成 `GO`。
 
-## 3. 汇总判定
+## 4. 汇总判定
 
 ```powershell
 cargo run --locked -p ssdev-cutover-evidence -- decide `
   D:\cutover-inputs\production-policy.json `
+  D:\cutover-output\production-policy.sig.json `
+  D:\cutover-inputs\release-trust.json `
   D:\cutover-inputs\evidence-trust.json `
   D:\cutover-inputs\plugin-matrix-evidence.json `
   D:\cutover-inputs\plugin-matrix-evidence.sig.json `
@@ -60,11 +89,11 @@ cargo run --locked -p ssdev-cutover-evidence -- decide `
   D:\cutover-output\cutover-decision.json
 ```
 
-输入必须是有大小上限的普通文件，决策输出的父目录必须预先存在且目标不能已存在。工具先按策略指定 `keyId` 和 `cutover-evidence` 用途验证三个 active-key 封套，再在读取前后重新计算全部摘要，拒绝执行中变化。插件矩阵只接受 schema 2，迁移审计只接受 schema 3，Windows 包只接受 schema 4；对应旧证据必须用已复验试点输入、指定上一生产 bundle 和实际候选包重新执行。schema 2 决策同时记录实际 QA 证据信任库和策略指定的最终审批信任库摘要。`GO` 返回 0；`NO-GO` 仍以不覆盖方式写出排序后的稳定阻塞码，随后返回 3，便于 CI 阻断发布；输入损坏、签名/用途/keyId 不匹配、schema 不匹配或 I/O 失败返回 1。
+输入必须是有大小上限的普通文件，决策输出的父目录必须预先存在且目标不能已存在。工具先使用获准发布信任库验证策略的 `cutover-policy` 封套、keyId、用途和独立签名域，再按策略指定 `keyId` 和 `cutover-evidence` 用途验证三个 active-key 证据封套；所有策略、封套、信任库和证据都在读取前后重新计算摘要，执行中变化直接拒绝。插件矩阵只接受 schema 2，迁移审计只接受 schema 3，Windows 包只接受 schema 4；对应旧证据必须用已复验试点输入、指定上一生产 bundle 和实际候选包重新执行。schema 3 决策记录策略、策略封套、实际 QA 证据信任库和实际最终审批信任库摘要；旧 schema 2 GO 缺少策略授权身份，不能继续签发。`GO` 返回 0；`NO-GO` 仍以不覆盖方式写出排序后的稳定阻塞码，随后返回 3，便于 CI 阻断发布；输入损坏、签名/用途/keyId 不匹配、schema 不匹配或 I/O 失败返回 1。
 
 常见阻塞码包括 dirty/source mismatch、证据过期或未来时间、试点材料集合不匹配、候选或上一生产 Windows 版本/产物清单/发布元数据不匹配、插件发布集合/信任库/矩阵不匹配、实机矩阵与安装包信任库或宿主不一致、迁移/安装/策略三方来源策略摘要不一致、HTTP 来源授权不完整、迁移资产计数低于策略、静态资源/HAR 未覆盖、旧本机 HTTP 仍被观察到、迁移 warning/critical 未清零，以及 Windows 签名、NSIS 安装、启动或升级未验证。
 
-## 4. 独立审批签名
+## 5. 独立审批签名
 
 原始证据是测试执行器生成的事实记录，不等于审批。只有 `eligible: true` 的决策才能进入统一外部 Ed25519 签名流程：
 
@@ -77,6 +106,6 @@ cargo run --locked -p ssdev-release-signing -- prepare `
   --request D:\cutover-output\cutover-decision.request.json
 ```
 
-审批密钥必须为 `active`，显式声明独立的 `cutover-decision` 用途，并精确匹配策略写入决策的 `approvalSignerKeyId`；`prepare`、`finalize` 和 `verify` 还会把传入发布信任库的原始字节 SHA-256 与决策中的 `approvalTrustStoreSha256` 比较。即使替代库包含同名 active keyId，也不能签发或复验这份 GO。插件、目录、来源策略、进程策略或 QA 证据密钥不能越权签发。KMS/HSM 返回签名后，使用 [统一发布文档签名](release-signing.md) 的 `finalize` 生成 detached 封套，再用 `verify --kind cutover-decision` 独立复验。签名域为 `SSDEV-CUTOVER-DECISION\0` 加决策原始字节 SHA-256，任何空白或字段变化都会使签名失效。
+审批密钥必须为 `active`，显式声明独立的 `cutover-decision` 用途，并精确匹配策略写入决策的 `approvalSignerKeyId`；`prepare`、`finalize` 和 `verify` 还会把传入发布信任库的原始字节 SHA-256 与 schema 3 决策中的 `approvalTrustStoreSha256` 比较。即使替代库包含同名 active keyId，也不能签发或复验这份 GO。插件、目录、来源策略、进程策略或 QA 证据密钥不能越权签发。KMS/HSM 返回签名后，使用 [统一发布文档签名](release-signing.md) 的 `finalize` 生成 detached 封套，再用 `verify --kind cutover-decision` 独立复验。签名域为 `SSDEV-CUTOVER-DECISION\0` 加决策原始字节 SHA-256，任何空白或字段变化都会使签名失效。
 
-归档时必须一起保存策略、证据信任库、三份证据及其封套、迁移完整报告、决策、签名请求、审批系统审计 ID 和最终签名封套。验证方应按决策中的策略、信任库、三份证据和三个证据封套 SHA-256 找回全部原始输入，不能只保留签名后的摘要页。
+归档时必须一起保存策略及其签名封套、发布和证据信任库、三份证据及其封套、迁移完整报告、决策、签名请求、审批系统审计 ID 和最终签名封套。验证方应按决策中的策略、策略封套、两份信任库、三份证据和三个证据封套 SHA-256 找回全部原始输入，不能只保留签名后的摘要页。

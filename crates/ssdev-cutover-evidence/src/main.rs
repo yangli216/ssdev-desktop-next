@@ -10,10 +10,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use ssdev_cutover_evidence::{
     evaluate_production_cutover, load_migration_audit_evidence, load_plugin_matrix_evidence,
-    load_production_cutover_policy, load_windows_package_evidence, prepare_new_output, sha256_file,
-    verify_evidence_attestation, write_cutover_decision, write_production_cutover_policy,
-    write_windows_package_evidence, EvidenceAttestationKind, EvidenceType,
-    MigrationCoverageMinimums, ProductionCutoverInputs, ProductionCutoverPolicy,
+    load_windows_package_evidence, prepare_new_output, sha256_file, verify_evidence_attestation,
+    verify_production_cutover_policy_attestation, write_cutover_decision,
+    write_production_cutover_policy, write_windows_package_evidence, EvidenceAttestationKind,
+    EvidenceType, MigrationCoverageMinimums, ProductionCutoverInputs, ProductionCutoverPolicy,
     WindowsPackageEvidence, CUTOVER_POLICY_SCHEMA_VERSION, WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION,
 };
 use ssdev_origin_policy::{signing_payload as origin_policy_signing_payload, OriginPolicy};
@@ -398,21 +398,26 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_decision(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> {
-    if arguments.len() != 10 {
+    if arguments.len() != 12 {
         return Err(usage().into());
     }
     let policy_path = path_argument(arguments.get(1), "production cutover policy")?;
-    let trust_store_path = path_argument(arguments.get(2), "evidence trust store")?;
-    let plugin_path = path_argument(arguments.get(3), "plugin matrix evidence")?;
-    let plugin_attestation_path = path_argument(arguments.get(4), "plugin matrix attestation")?;
-    let migration_path = path_argument(arguments.get(5), "migration audit evidence")?;
+    let policy_attestation_path =
+        path_argument(arguments.get(2), "production cutover policy attestation")?;
+    let approval_trust_store_path = path_argument(arguments.get(3), "approval trust store")?;
+    let trust_store_path = path_argument(arguments.get(4), "evidence trust store")?;
+    let plugin_path = path_argument(arguments.get(5), "plugin matrix evidence")?;
+    let plugin_attestation_path = path_argument(arguments.get(6), "plugin matrix attestation")?;
+    let migration_path = path_argument(arguments.get(7), "migration audit evidence")?;
     let migration_attestation_path =
-        path_argument(arguments.get(6), "migration audit attestation")?;
-    let windows_path = path_argument(arguments.get(7), "Windows package evidence")?;
-    let windows_attestation_path = path_argument(arguments.get(8), "Windows package attestation")?;
-    let output = prepare_new_output(&path_argument(arguments.get(9), "decision output")?)?;
+        path_argument(arguments.get(8), "migration audit attestation")?;
+    let windows_path = path_argument(arguments.get(9), "Windows package evidence")?;
+    let windows_attestation_path = path_argument(arguments.get(10), "Windows package attestation")?;
+    let output = prepare_new_output(&path_argument(arguments.get(11), "decision output")?)?;
 
     let policy_hash_before = sha256_file(&policy_path)?;
+    let policy_attestation_hash_before = sha256_file(&policy_attestation_path)?;
+    let approval_trust_store_hash_before = sha256_file(&approval_trust_store_path)?;
     let trust_store_hash_before = sha256_file(&trust_store_path)?;
     let plugin_hash_before = sha256_file(&plugin_path)?;
     let plugin_attestation_hash_before = sha256_file(&plugin_attestation_path)?;
@@ -420,7 +425,11 @@ fn run_decision(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> {
     let migration_attestation_hash_before = sha256_file(&migration_attestation_path)?;
     let windows_hash_before = sha256_file(&windows_path)?;
     let windows_attestation_hash_before = sha256_file(&windows_attestation_path)?;
-    let policy = load_production_cutover_policy(&policy_path)?;
+    let policy = verify_production_cutover_policy_attestation(
+        &policy_path,
+        &policy_attestation_path,
+        &approval_trust_store_path,
+    )?;
     verify_evidence_attestation(
         EvidenceAttestationKind::PluginMatrix,
         &plugin_path,
@@ -450,6 +459,8 @@ fn run_decision(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> {
         .map_err(|_| invalid_input("system clock is before the Unix epoch"))?
         .as_secs();
     let policy_hash_after = sha256_file(&policy_path)?;
+    let policy_attestation_hash_after = sha256_file(&policy_attestation_path)?;
+    let approval_trust_store_hash_after = sha256_file(&approval_trust_store_path)?;
     let trust_store_hash_after = sha256_file(&trust_store_path)?;
     let plugin_hash_after = sha256_file(&plugin_path)?;
     let plugin_attestation_hash_after = sha256_file(&plugin_attestation_path)?;
@@ -458,6 +469,8 @@ fn run_decision(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> {
     let windows_hash_after = sha256_file(&windows_path)?;
     let windows_attestation_hash_after = sha256_file(&windows_attestation_path)?;
     if policy_hash_before != policy_hash_after
+        || policy_attestation_hash_before != policy_attestation_hash_after
+        || approval_trust_store_hash_before != approval_trust_store_hash_after
         || trust_store_hash_before != trust_store_hash_after
         || plugin_hash_before != plugin_hash_after
         || plugin_attestation_hash_before != plugin_attestation_hash_after
@@ -467,14 +480,16 @@ fn run_decision(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> {
         || windows_attestation_hash_before != windows_attestation_hash_after
     {
         return Err(invalid_input(
-            "cutover policy or evidence changed during evaluation",
+            "cutover policy, trust store, or evidence changed during evaluation",
         ));
     }
     let decision = evaluate_production_cutover(
         ProductionCutoverInputs {
             policy: &policy,
             policy_sha256: policy_hash_after,
+            policy_attestation_sha256: policy_attestation_hash_after,
             evidence_trust_store_sha256: trust_store_hash_after,
+            approval_trust_store_sha256: approval_trust_store_hash_after,
             plugin: &plugin,
             plugin_sha256: plugin_hash_after,
             plugin_attestation_sha256: plugin_attestation_hash_after,
@@ -761,7 +776,7 @@ fn invalid_input(message: &str) -> Box<dyn Error> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ssdev-cutover-evidence prepare-policy <workspace> <pilot-materials-root> <pilot-manifest.json> <pilot-report.json> <candidate-bundle-root> <evidence-trust.json> <policy-approval-inputs.json> <policy-output.json>\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
+    "usage:\n  ssdev-cutover-evidence prepare-policy <workspace> <pilot-materials-root> <pilot-manifest.json> <pilot-report.json> <candidate-bundle-root> <evidence-trust.json> <policy-approval-inputs.json> <policy-output.json>\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
 }
 
 #[cfg(test)]
