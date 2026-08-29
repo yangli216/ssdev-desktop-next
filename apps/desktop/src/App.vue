@@ -61,6 +61,13 @@ type BridgeStatus = {
   autoStartError?: string
   appUpdateConfigured: boolean
   appUpdateError?: string
+  businessWindowCount: number
+  businessLoadingWindows: number
+  businessNavigatingWindows: number
+  businessReadyWindows: number
+  businessTimedOutWindows: number
+  businessFrontendTimeouts: number
+  businessFrontendRecoveries: number
   ssoActive: boolean
   ssoError?: string
   originPolicy: {
@@ -378,6 +385,23 @@ const needsDeepDeploymentCheck = computed(() => (
   && deploymentCheck.value.deepAvailable
   && !deploymentCheck.value.deliveryReady
 ))
+const businessFrontendReadiness = computed(() => {
+  const current = status.value
+  if (!current) return { label: '检查中', detail: '正在读取业务窗口状态' }
+  if (current.businessTimedOutWindows > 0) {
+    return { label: '加载失败', detail: `${current.businessTimedOutWindows} 个窗口未到达原生 IPC` }
+  }
+  if (current.businessReadyWindows > 0) {
+    return { label: '已连接', detail: `${current.businessReadyWindows} / ${current.businessWindowCount} 个窗口就绪` }
+  }
+  if (current.businessNavigatingWindows > 0) {
+    return { label: '登录跳转中', detail: `${current.businessNavigatingWindows} 个窗口等待返回业务页面` }
+  }
+  if (current.businessLoadingWindows > 0) {
+    return { label: '正在加载', detail: '页面加载完成后将自动验证原生 IPC' }
+  }
+  return { label: '未启动', detail: '启动业务环境后自动校验' }
+})
 const sections: Array<{ id: ConsoleSection; label: string; description: string }> = [
   { id: 'overview', label: '运行概览', description: '状态与常用操作' },
   { id: 'configuration', label: '项目配置', description: '环境、来源与启动项' },
@@ -652,7 +676,7 @@ async function importSelectedProjectBundle() {
 }
 
 async function openBusiness() {
-  await run(() => invoke('open_business_window'), '业务窗口已启动。')
+  await run(() => invoke('open_business_window'), '业务窗口已创建；页面完成加载后首页将显示“已连接”。')
 }
 
 async function openEnvironment(environment: EnvironmentConfig) {
@@ -662,7 +686,7 @@ async function openEnvironment(environment: EnvironmentConfig) {
     selectedConfigImport.value = ''
     configImportPreview.value = null
     await invoke('open_business_window', { environment: environment.name })
-  }, `已保存配置并打开环境「${environment.name}」。`)
+  }, `已保存配置并创建环境「${environment.name}」窗口；页面完成加载后首页将显示“已连接”。`)
 }
 
 function addEnvironment() {
@@ -995,7 +1019,7 @@ async function exportDeploymentCheck() {
         <section class="summary-grid" aria-label="关键运行状态">
           <article><span>桌面通信</span><strong>{{ status?.transport ?? '连接中' }}</strong><small>不开放 localhost 端口</small></article>
           <article><span>原生服务</span><strong>{{ status?.serviceCount ?? '—' }}</strong><small>{{ status?.pluginCount ?? '—' }} 个插件 · x86 / x64 隔离</small></article>
-          <article><span>当前调用</span><strong>{{ status ? `${status.inFlightInvocations} / ${status.maxInFlightInvocations}` : '—' }}</strong><small>{{ status?.acceptingPluginInvocations ? '正在接受新调用' : '暂不接受新调用' }}</small></article>
+          <article><span>业务页面</span><strong>{{ businessFrontendReadiness.label }}</strong><small>{{ businessFrontendReadiness.detail }}</small></article>
           <article><span>部署状态</span><strong>{{ deploymentReadiness.label }}</strong><small>{{ deploymentReadiness.detail }}</small></article>
         </section>
 
@@ -1029,11 +1053,12 @@ async function exportDeploymentCheck() {
           </section>
         </div>
 
-        <section v-if="needsDeepDeploymentCheck || deploymentCheck?.failures || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
+        <section v-if="needsDeepDeploymentCheck || deploymentCheck?.failures || status?.businessTimedOutWindows || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
           <div><p class="eyebrow">ATTENTION</p><h2>待处理事项</h2></div>
           <ul>
             <li v-if="needsDeepDeploymentCheck"><strong>快速检查已通过，正式交付前还需验证当前 x86/x64 插件宿主</strong><button type="button" :disabled="busy" @click="runDeploymentCheck">立即深度自检</button></li>
             <li v-if="deploymentCheck?.failures"><strong>部署自检存在 {{ deploymentCheck.failures }} 项阻塞问题</strong><button type="button" @click="activeSection = 'security'">查看自检</button></li>
+            <li v-if="status?.businessTimedOutWindows"><strong>{{ status.businessTimedOutWindows }} 个业务页面加载失败或未到达原生 IPC</strong><button type="button" @click="activeSection = 'security'">查看诊断</button></li>
             <li v-if="inventory?.quarantined.length"><strong>{{ inventory.quarantined.length }} 个插件已隔离</strong><button type="button" @click="activeSection = 'plugins'">查看插件</button></li>
             <li v-if="status?.pluginPreflightFailures"><strong>{{ status.pluginPreflightFailures }} 次宿主预检失败</strong><button type="button" @click="activeSection = 'security'">查看诊断</button></li>
             <li v-if="status?.pluginApiBaselineFailures"><strong>签名插件契约基线有 {{ status.pluginApiBaselineFailures }} 次持久化失败</strong><button type="button" @click="activeSection = 'security'">查看诊断</button></li>

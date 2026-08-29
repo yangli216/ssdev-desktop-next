@@ -14,6 +14,7 @@ business webview -> narrow Tauri command -> Rust controller
 - Tauri 主进程永不加载第三方 DLL 或 OCX。
 - 32 位和 64 位插件分别运行在对应架构的插件宿主中。
 - 远程业务页面只能获得业务级命令，不能获得 Shell 或文件系统通用权限。
+- 业务窗口创建后会自动验证真实页面已到达 Rust IPC；30 秒超时提供原生提示、部署门禁和脱敏诊断，SSO 跳转不会被误判。
 - 新实现保持 `serviceId`、`method`、`parameters`、`ResCode`、`ResData` 语义兼容。
 - 所有跨进程请求必须具有长度上限、超时、请求 ID 和确定的失败响应。
 - 业务 Web Bridge 与 controller/plugin-host 私有 IPC 使用独立版本域，任一侧演进都不强迫另一侧同步升级。

@@ -389,6 +389,13 @@ struct BridgeStatus {
     auto_start_error: Option<String>,
     app_update_configured: bool,
     app_update_error: Option<String>,
+    business_window_count: usize,
+    business_loading_windows: usize,
+    business_navigating_windows: usize,
+    business_ready_windows: usize,
+    business_timed_out_windows: usize,
+    business_frontend_timeouts: u64,
+    business_frontend_recoveries: u64,
     sso_active: bool,
     sso_error: Option<&'static str>,
     origin_policy: OriginPolicySummary,
@@ -443,6 +450,7 @@ async fn bridge_status(
     desktop::require_control(&caller)?;
     let (auto_start_enabled, auto_start_error) = desktop::autostart_status(&app);
     let app_update = update_state.status();
+    let business_frontend = desktop_state.business_frontend_health();
     let (sso_active, sso_error) = sso_state.status();
     let admission = state.controller.invocation_admission_stats();
     let hosts = state.controller.plugin_host_stats();
@@ -516,6 +524,13 @@ async fn bridge_status(
         auto_start_error,
         app_update_configured: app_update.configured,
         app_update_error: app_update.error,
+        business_window_count: business_frontend.active_windows,
+        business_loading_windows: business_frontend.loading_windows,
+        business_navigating_windows: business_frontend.navigating_windows,
+        business_ready_windows: business_frontend.ready_windows,
+        business_timed_out_windows: business_frontend.timed_out_windows,
+        business_frontend_timeouts: business_frontend.total_timeouts,
+        business_frontend_recoveries: business_frontend.recovered_after_timeout,
         sso_active,
         sso_error,
         origin_policy: desktop_state.origin_policy_summary(),
@@ -680,6 +695,7 @@ async fn run_deployment_check(
         Some(coordinator) => Some(coordinator.stats().await),
         None => None,
     };
+    let business_frontend = desktop_state.business_frontend_health();
     let report = deployment_check::evaluate(&deployment_check::DeploymentCheckFacts {
         is_windows: cfg!(windows),
         deep_preflight: deep,
@@ -687,6 +703,11 @@ async fn run_deployment_check(
         deep_preflight_failure,
         config_error,
         business_origin_count,
+        business_window_count: business_frontend.active_windows,
+        business_loading_windows: business_frontend.loading_windows,
+        business_navigating_windows: business_frontend.navigating_windows,
+        business_ready_windows: business_frontend.ready_windows,
+        business_timed_out_windows: business_frontend.timed_out_windows,
         origin_policy_error,
         allow_insecure_http: origin.allow_insecure_http,
         plugin_trust_mode: state.plugin_trust_mode,
@@ -968,6 +989,7 @@ async fn export_diagnostics(
         None => None,
     };
     let (auto_start_enabled, _) = desktop::autostart_status(&app);
+    let business_frontend = desktop_state.business_frontend_health();
     let context = DiagnosticContext {
         app_version: app.package_info().version.to_string(),
         os: std::env::consts::OS.into(),
@@ -994,6 +1016,13 @@ async fn export_diagnostics(
         managed_process_failures: bridge_state.managed_process_failures,
         origin_policy_enforced: origin.enforced,
         business_origin_count: origin.business_origins,
+        business_window_count: business_frontend.active_windows,
+        business_loading_window_count: business_frontend.loading_windows,
+        business_navigating_window_count: business_frontend.navigating_windows,
+        business_ready_window_count: business_frontend.ready_windows,
+        business_timed_out_window_count: business_frontend.timed_out_windows,
+        business_frontend_timeout_count: business_frontend.total_timeouts,
+        business_frontend_recovery_count: business_frontend.recovered_after_timeout,
         origin_service_grant_count: origin.service_grants,
         origin_method_grant_count: origin.method_grants,
         max_in_flight_invocations: admission.max_in_flight,
@@ -4972,6 +5001,7 @@ pub fn run() {
             inspect_project_bundle,
             import_project_bundle,
             frontend_ready,
+            desktop::business_frontend_ready,
             open_diagnostics_directory,
             inspect_plugin_package,
             install_plugin_package,

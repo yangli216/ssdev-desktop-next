@@ -7,6 +7,7 @@ pub const APP_COMMANDS: &[&str] = &[
     "inspect_project_bundle",
     "import_project_bundle",
     "frontend_ready",
+    "business_frontend_ready",
     "inspect_plugin_package",
     "install_plugin_package",
     "install_plugin_from_catalog",
@@ -100,6 +101,7 @@ pub const CONTROL_PERMISSIONS: &[&str] = &[
 ];
 
 pub const BUSINESS_PERMISSIONS: &[&str] = &[
+    "allow-business-frontend-ready",
     "allow-plugin-invoke",
     "allow-plugin-invoke-tracked",
     "allow-plugin-invocation-status",

@@ -12,7 +12,7 @@ use ssdev_origin_policy::{InvocationPolicyCoverage, OriginPolicy, OriginPolicySu
 use tauri::ipc::CapabilityBuilder;
 use tauri::menu::{Menu, MenuBuilder, SubmenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::webview::NewWindowResponse;
+use tauri::webview::{NewWindowResponse, PageLoadEvent};
 use tauri::{
     AppHandle, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
@@ -27,7 +27,39 @@ const FLOATING_LABEL_PREFIX: &str = "floating-";
 const FLOATING_ACTION_EVENT: &str = "ssdev-floating-action";
 const CONTROL_PAGE: &str = "/index.html";
 const APP_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const BUSINESS_FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BUSINESS_WINDOWS: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusinessFrontendState {
+    Loading,
+    Navigating,
+    Ready,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BusinessWindowRuntime {
+    state: BusinessFrontendState,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BusinessFrontendHealth {
+    pub(crate) active_windows: usize,
+    pub(crate) loading_windows: usize,
+    pub(crate) navigating_windows: usize,
+    pub(crate) ready_windows: usize,
+    pub(crate) timed_out_windows: usize,
+    pub(crate) total_timeouts: u64,
+    pub(crate) recovered_after_timeout: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BusinessReadyTransition {
+    recovered_after_timeout: bool,
+    duplicate_signal: bool,
+}
 
 pub(crate) struct DesktopState {
     pub(crate) config: Arc<ConfigStore>,
@@ -37,7 +69,9 @@ pub(crate) struct DesktopState {
     next_tray_action_id: AtomicU64,
     exit_lifecycle: ExitLifecycle,
     ipc_business_origins: Mutex<BTreeSet<String>>,
-    business_windows: Mutex<BTreeSet<String>>,
+    business_windows: Mutex<HashMap<String, BusinessWindowRuntime>>,
+    business_frontend_timeouts: AtomicU64,
+    business_frontend_recoveries: AtomicU64,
     tray_environment_actions: Mutex<HashMap<String, String>>,
     floating_windows: Mutex<HashMap<String, FloatingEntry>>,
 }
@@ -52,7 +86,9 @@ impl DesktopState {
             next_tray_action_id: AtomicU64::new(1),
             exit_lifecycle: ExitLifecycle::new(),
             ipc_business_origins: Mutex::new(BTreeSet::new()),
-            business_windows: Mutex::new(BTreeSet::new()),
+            business_windows: Mutex::new(HashMap::new()),
+            business_frontend_timeouts: AtomicU64::new(0),
+            business_frontend_recoveries: AtomicU64::new(0),
             tray_environment_actions: Mutex::new(HashMap::new()),
             floating_windows: Mutex::new(HashMap::new()),
         }
@@ -111,7 +147,11 @@ impl DesktopState {
         loop {
             let id = self.next_window_id.fetch_add(1, Ordering::Relaxed);
             let label = format!("{BUSINESS_LABEL_PREFIX}{id}");
-            if windows.insert(label.clone()) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = windows.entry(label.clone()) {
+                entry.insert(BusinessWindowRuntime {
+                    state: BusinessFrontendState::Loading,
+                    generation: 0,
+                });
                 return Ok(label);
             }
         }
@@ -122,6 +162,81 @@ impl DesktopState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(label);
+    }
+
+    fn mark_business_navigation(&self, label: &str, business_origin: bool) -> Option<u64> {
+        let mut windows = self
+            .business_windows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let runtime = windows.get_mut(label)?;
+        runtime.generation = runtime.generation.wrapping_add(1).max(1);
+        runtime.state = if business_origin {
+            BusinessFrontendState::Loading
+        } else {
+            BusinessFrontendState::Navigating
+        };
+        business_origin.then_some(runtime.generation)
+    }
+
+    fn mark_business_frontend_ready(&self, label: &str) -> Result<BusinessReadyTransition, String> {
+        let mut windows = self
+            .business_windows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let runtime = windows
+            .get_mut(label)
+            .ok_or_else(|| "业务窗口就绪状态已失效".to_owned())?;
+        let recovered_after_timeout = runtime.state == BusinessFrontendState::TimedOut;
+        let duplicate_signal = runtime.state == BusinessFrontendState::Ready;
+        runtime.state = BusinessFrontendState::Ready;
+        if recovered_after_timeout {
+            self.business_frontend_recoveries
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(BusinessReadyTransition {
+            recovered_after_timeout,
+            duplicate_signal,
+        })
+    }
+
+    fn report_business_frontend_timeout(&self, label: &str, generation: u64) -> bool {
+        let mut windows = self
+            .business_windows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(runtime) = windows.get_mut(label) else {
+            return false;
+        };
+        if runtime.generation != generation || runtime.state != BusinessFrontendState::Loading {
+            return false;
+        }
+        runtime.state = BusinessFrontendState::TimedOut;
+        self.business_frontend_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    pub(crate) fn business_frontend_health(&self) -> BusinessFrontendHealth {
+        let windows = self
+            .business_windows
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut health = BusinessFrontendHealth {
+            active_windows: windows.len(),
+            total_timeouts: self.business_frontend_timeouts.load(Ordering::Relaxed),
+            recovered_after_timeout: self.business_frontend_recoveries.load(Ordering::Relaxed),
+            ..BusinessFrontendHealth::default()
+        };
+        for runtime in windows.values() {
+            match runtime.state {
+                BusinessFrontendState::Loading => health.loading_windows += 1,
+                BusinessFrontendState::Navigating => health.navigating_windows += 1,
+                BusinessFrontendState::Ready => health.ready_windows += 1,
+                BusinessFrontendState::TimedOut => health.timed_out_windows += 1,
+            }
+        }
+        health
     }
 
     fn take_floating_label(&self) -> String {
@@ -1186,6 +1301,27 @@ pub(crate) fn require_business<R: tauri::Runtime>(
     }
 }
 
+#[tauri::command]
+pub(crate) fn business_frontend_ready(
+    caller: WebviewWindow,
+    state: State<'_, DesktopState>,
+) -> Result<(), String> {
+    require_business(&caller, &state)?;
+    let transition = state.mark_business_frontend_ready(caller.label())?;
+    if transition.recovered_after_timeout {
+        tracing::info!(
+            event_code = "business-frontend-recovered",
+            "business frontend reached native IPC after a readiness timeout"
+        );
+    } else if !transition.duplicate_signal {
+        tracing::info!(
+            event_code = "business-frontend-ready",
+            "business frontend reached native IPC"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn require_plugin_invocation<R: tauri::Runtime>(
     caller: &WebviewWindow<R>,
     state: &DesktopState,
@@ -1237,6 +1373,7 @@ fn build_business_window(
     options: BusinessWindowOptions,
 ) -> Result<WebviewWindow, String> {
     let script = bridge_initialization_script(&business_origins, options.context.as_ref())?;
+    let readiness_origins = business_origins;
     let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::External(url))
         .title(options.title)
         .inner_size(1280.0, 800.0)
@@ -1246,6 +1383,23 @@ fn build_business_window(
                 && navigation_origins.contains(&url.origin().ascii_serialization())
         })
         .on_new_window(|_, _| NewWindowResponse::Deny)
+        .on_page_load(move |window, payload| {
+            if payload.event() != PageLoadEvent::Started {
+                return;
+            }
+            let is_business_origin =
+                readiness_origins.contains(&payload.url().origin().ascii_serialization());
+            let generation = window
+                .state::<DesktopState>()
+                .mark_business_navigation(window.label(), is_business_origin);
+            if let Some(generation) = generation {
+                start_business_frontend_watchdog(
+                    window.app_handle().clone(),
+                    window.label().to_owned(),
+                    generation,
+                );
+            }
+        })
         .on_document_title_changed(|window, title| {
             let _ = window.set_title(&title);
         });
@@ -1261,6 +1415,35 @@ fn build_business_window(
     install_close_confirmation(app, &window);
     install_business_cleanup(app, &window, label.to_owned());
     Ok(window)
+}
+
+fn start_business_frontend_watchdog(app: AppHandle, label: String, generation: u64) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(BUSINESS_FRONTEND_READY_TIMEOUT).await;
+        if !app
+            .state::<DesktopState>()
+            .report_business_frontend_timeout(&label, generation)
+        {
+            return;
+        }
+        tracing::error!(
+            event_code = "business-frontend-timeout",
+            error_code = "business-frontend-not-ready",
+            timeout_seconds = BUSINESS_FRONTEND_READY_TIMEOUT.as_secs(),
+            "business frontend did not reach native IPC before the readiness deadline"
+        );
+        if let Some(window) = app.get_webview_window(&label) {
+            app.dialog()
+                .message(
+                    "业务页面未在 30 秒内完成加载。请检查业务地址、网络和证书后重试；如仍失败，请导出诊断包。错误码：business-frontend-not-ready",
+                )
+                .title("SSDEV Desktop")
+                .kind(MessageDialogKind::Error)
+                .buttons(MessageDialogButtons::Ok)
+                .parent(&window)
+                .show(|_| {});
+        }
+    });
 }
 
 struct BusinessWindowOptions {
@@ -1565,6 +1748,12 @@ fn bridge_initialization_script(
   Object.defineProperty(window, 'ssdevDesktop', {{ value: api, configurable: false }});
   Object.defineProperty(window, 'webPlusInvoke', {{ value: invokePlugin, configurable: false }});
   Object.defineProperty(window, 'ssdevDesktopContext', {{ value: deepFreeze({context}), configurable: false }});
+  const signalReady = () => invoke('business_frontend_ready').catch(() => {{}});
+  if (document.readyState === 'loading') {{
+    document.addEventListener('DOMContentLoaded', signalReady, {{ once: true }});
+  }} else {{
+    queueMicrotask(signalReady);
+  }}
 }})();"#
     ))
 }
@@ -1734,6 +1923,33 @@ mod tests {
     }
 
     #[test]
+    fn business_frontend_health_tracks_navigation_timeout_and_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            ConfigStore::open(directory.path().join("config.json"), Vec::<PathBuf>::new()).unwrap();
+        let state = DesktopState::new(store, OriginPolicy::development_unrestricted());
+        let label = state.reserve_business_window_label().unwrap();
+
+        let generation = state.mark_business_navigation(&label, true).unwrap();
+        assert_eq!(state.business_frontend_health().loading_windows, 1);
+        assert!(!state.report_business_frontend_timeout(&label, generation + 1));
+        assert!(state.report_business_frontend_timeout(&label, generation));
+        assert_eq!(state.business_frontend_health().timed_out_windows, 1);
+
+        let transition = state.mark_business_frontend_ready(&label).unwrap();
+        assert!(transition.recovered_after_timeout);
+        let health = state.business_frontend_health();
+        assert_eq!(health.ready_windows, 1);
+        assert_eq!(health.total_timeouts, 1);
+        assert_eq!(health.recovered_after_timeout, 1);
+
+        assert!(state.mark_business_navigation(&label, false).is_none());
+        assert_eq!(state.business_frontend_health().navigating_windows, 1);
+        state.release_business_window_label(&label);
+        assert_eq!(state.business_frontend_health().active_windows, 0);
+    }
+
+    #[test]
     fn bridge_script_contains_only_the_narrow_plugin_api() {
         let origins = BTreeSet::from(["https://example.test".into()]);
         let script = bridge_initialization_script(&origins, None).unwrap();
@@ -1744,6 +1960,8 @@ mod tests {
         assert!(script.contains("webPlusInvoke"));
         assert!(script.contains("open_secondary_window"));
         assert!(script.contains("deepFreeze"));
+        assert!(script.contains("business_frontend_ready"));
+        assert!(script.contains("DOMContentLoaded"));
         assert!(!script.contains("shell"));
         assert!(!script.contains("filesystem"));
     }

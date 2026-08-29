@@ -15,6 +15,11 @@ pub(crate) struct DeploymentCheckFacts {
     pub(crate) deep_preflight_failure: Option<DeploymentPreflightFailure>,
     pub(crate) config_error: Option<String>,
     pub(crate) business_origin_count: usize,
+    pub(crate) business_window_count: usize,
+    pub(crate) business_loading_windows: usize,
+    pub(crate) business_navigating_windows: usize,
+    pub(crate) business_ready_windows: usize,
+    pub(crate) business_timed_out_windows: usize,
     pub(crate) origin_policy_error: Option<String>,
     pub(crate) allow_insecure_http: bool,
     pub(crate) plugin_trust_mode: &'static str,
@@ -153,7 +158,7 @@ pub(crate) fn persist_export_document(destination: &Path, bytes: &[u8]) -> Resul
 }
 
 pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
-    let mut items = Vec::with_capacity(12);
+    let mut items = Vec::with_capacity(13);
 
     items.push(item(
         "webview-runtime",
@@ -162,6 +167,64 @@ pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
         "控制台已通过 WebView 到达 Rust 原生 IPC，运行环境可用。",
         None,
     ));
+
+    if facts.business_timed_out_windows > 0 {
+        items.push(item(
+            "business-frontend",
+            "业务页面就绪",
+            DeploymentCheckStatus::Fail,
+            format!(
+                "有 {} 个业务窗口未在 30 秒内到达原生 IPC。",
+                facts.business_timed_out_windows
+            ),
+            Some("检查业务地址、网络、代理和证书；修复后重新加载窗口，必要时导出诊断包。"),
+        ));
+    } else if facts.business_ready_windows > 0 {
+        items.push(item(
+            "business-frontend",
+            "业务页面就绪",
+            DeploymentCheckStatus::Pass,
+            format!(
+                "{} 个活动业务窗口中有 {} 个页面已到达原生 IPC。",
+                facts.business_window_count, facts.business_ready_windows
+            ),
+            None,
+        ));
+    } else if facts.deep_preflight {
+        items.push(item(
+            "business-frontend",
+            "业务页面就绪",
+            DeploymentCheckStatus::Fail,
+            if facts.business_window_count == 0 {
+                "深度交付检查要求至少启动一个真实业务页面并完成原生 IPC 握手。".into()
+            } else {
+                format!(
+                    "业务页面尚未就绪（加载中 {} 个，登录跳转中 {} 个）。",
+                    facts.business_loading_windows, facts.business_navigating_windows
+                )
+            },
+            Some("启动目标业务环境，等待首页显示“已连接”后重新执行深度检查。"),
+        ));
+    } else if facts.business_window_count > 0 {
+        items.push(item(
+            "business-frontend",
+            "业务页面就绪",
+            DeploymentCheckStatus::Warning,
+            format!(
+                "业务页面尚未就绪（加载中 {} 个，登录跳转中 {} 个）。",
+                facts.business_loading_windows, facts.business_navigating_windows
+            ),
+            Some("等待页面完成加载；超过 30 秒时按客户端提示检查网络和证书。"),
+        ));
+    } else {
+        items.push(item(
+            "business-frontend",
+            "业务页面就绪",
+            DeploymentCheckStatus::Info,
+            "尚未启动业务窗口；日常检查不阻断，正式交付前应执行深度检查。",
+            None,
+        ));
+    }
 
     match (&facts.config_error, facts.business_origin_count) {
         (Some(_), _) => items.push(item(
@@ -592,6 +655,11 @@ mod tests {
             deep_preflight_failure: None,
             config_error: None,
             business_origin_count: 2,
+            business_window_count: 1,
+            business_loading_windows: 0,
+            business_navigating_windows: 0,
+            business_ready_windows: 1,
+            business_timed_out_windows: 0,
             origin_policy_error: None,
             allow_insecure_http: true,
             plugin_trust_mode: "ed25519-strict",
@@ -701,6 +769,54 @@ mod tests {
             item.id == "plugin-preflight"
                 && item.status == DeploymentCheckStatus::Info
                 && item.summary.contains("快速检查")
+        }));
+    }
+
+    #[test]
+    fn deep_check_requires_a_real_business_page_handshake() {
+        let mut facts = healthy_facts();
+        facts.business_window_count = 0;
+        facts.business_ready_windows = 0;
+
+        let report = evaluate(&facts);
+
+        assert!(!report.ready);
+        assert!(!report.delivery_ready);
+        assert!(report.items.iter().any(|item| {
+            item.id == "business-frontend" && item.status == DeploymentCheckStatus::Fail
+        }));
+    }
+
+    #[test]
+    fn quick_check_without_a_business_window_remains_a_daily_readiness_check() {
+        let mut facts = healthy_facts();
+        facts.deep_preflight = false;
+        facts.deep_preflighted_hosts = 0;
+        facts.business_window_count = 0;
+        facts.business_ready_windows = 0;
+
+        let report = evaluate(&facts);
+
+        assert!(report.ready);
+        assert!(!report.delivery_ready);
+        assert!(report.items.iter().any(|item| {
+            item.id == "business-frontend" && item.status == DeploymentCheckStatus::Info
+        }));
+    }
+
+    #[test]
+    fn an_active_business_page_timeout_blocks_readiness() {
+        let mut facts = healthy_facts();
+        facts.business_ready_windows = 0;
+        facts.business_timed_out_windows = 1;
+
+        let report = evaluate(&facts);
+
+        assert!(!report.ready);
+        assert!(report.items.iter().any(|item| {
+            item.id == "business-frontend"
+                && item.status == DeploymentCheckStatus::Fail
+                && item.summary.contains("30 秒")
         }));
     }
 

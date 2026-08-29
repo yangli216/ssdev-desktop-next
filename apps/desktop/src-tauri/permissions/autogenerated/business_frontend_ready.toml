@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-business-frontend-ready"
+description = "Enables the business_frontend_ready command without any pre-configured scope."
+commands.allow = ["business_frontend_ready"]
+
+[[permission]]
+identifier = "deny-business-frontend-ready"
+description = "Denies the business_frontend_ready command without any pre-configured scope."
+commands.deny = ["business_frontend_ready"]
