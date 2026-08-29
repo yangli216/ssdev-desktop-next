@@ -1,0 +1,94 @@
+import assert from 'node:assert/strict'
+import { createHash, createPublicKey, verify } from 'node:crypto'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import test from 'node:test'
+
+import {
+  signCiPluginRequestDocument,
+  signCiPluginRequestFile,
+} from '../sign-ci-plugin-request.mjs'
+
+const TEST_PUBLIC_KEY = Buffer.from(
+  'd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a',
+  'hex',
+)
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex')
+
+function request(overrides = {}) {
+  const payload = Buffer.from('SSDEV CI plugin signing payload', 'utf8')
+  return {
+    schemaVersion: 1,
+    pluginId: 'ci.echo-x64',
+    version: '0.0.1',
+    desktopVersionRequirement: '>=0.1.0, <0.2.0',
+    keyId: 'ci-rfc8032-test-only',
+    algorithm: 'ed25519',
+    files: { 'api.json': 'a'.repeat(64) },
+    payloadBase64: payload.toString('base64'),
+    payloadSha256: createHash('sha256').update(payload).digest('hex'),
+    ...overrides,
+  }
+}
+
+test('signs only the constrained CI request with the public RFC 8032 fixture', () => {
+  const document = request()
+  const signature = Buffer.from(signCiPluginRequestDocument(document).trim(), 'base64')
+  const publicKey = createPublicKey({
+    key: Buffer.concat([ED25519_SPKI_PREFIX, TEST_PUBLIC_KEY]),
+    format: 'der',
+    type: 'spki',
+  })
+  assert.equal(signature.length, 64)
+  assert.equal(verify(null, Buffer.from(document.payloadBase64, 'base64'), publicKey, signature), true)
+})
+
+test('rejects non-CI identities and changed payload digests', () => {
+  assert.throws(
+    () => signCiPluginRequestDocument(request({ keyId: 'production-key' })),
+    /restricted to the test-only key/,
+  )
+  assert.throws(
+    () => signCiPluginRequestDocument(request({ pluginId: 'reader.production' })),
+    /restricted to the test-only key/,
+  )
+  assert.throws(
+    () => signCiPluginRequestDocument(request({ payloadSha256: '0'.repeat(64) })),
+    /payload digest does not match/,
+  )
+})
+
+test('writes a new signature file and refuses to overwrite it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'ssdev-ci-signing-'))
+  try {
+    const requestPath = join(root, 'request.json')
+    const signaturePath = join(root, 'signature.txt')
+    await writeFile(requestPath, JSON.stringify(request()), 'utf8')
+    await signCiPluginRequestFile(requestPath, signaturePath)
+    assert.match(await readFile(signaturePath, 'utf8'), /^[A-Za-z0-9+/]{86}==\n$/)
+    await assert.rejects(
+      signCiPluginRequestFile(requestPath, signaturePath),
+      /EEXIST/,
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('Windows native gate executes the production matrix wrapper for both hosts', async () => {
+  const [nativeGate, matrixGate] = await Promise.all([
+    readFile(new URL('../test-windows.ps1', import.meta.url), 'utf8'),
+    readFile(new URL('../test-plugin-matrix-ci.ps1', import.meta.url), 'utf8'),
+  ])
+  assert.match(nativeGate, /test-plugin-matrix-ci\.ps1/)
+  assert.match(nativeGate, /i686-pc-windows-msvc\/debug\/webplus-plugin-host\.exe/)
+  assert.match(nativeGate, /x86_64-pc-windows-msvc\/debug\/webplus-plugin-host\.exe/)
+  assert.match(matrixGate, /ci\.echo-x86/)
+  assert.match(matrixGate, /ci\.echo-x64/)
+  assert.match(matrixGate, /release-set-check/)
+  assert.match(matrixGate, /release-set-materialize/)
+  assert.match(matrixGate, /test-plugin-matrix\.ps1/)
+  assert.match(matrixGate, /x86HostSha256/)
+  assert.match(matrixGate, /x64HostSha256/)
+})
