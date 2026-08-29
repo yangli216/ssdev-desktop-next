@@ -123,8 +123,18 @@ type DebugCaseRunResult = {
   passed: boolean
 }
 
+type MappingInventoryRefreshPlan = {
+  action: 'upsert' | 'delete'
+  pluginId: string
+  successMessage: string
+}
+
 const props = defineProps<{ disabled?: boolean }>()
-const emit = defineEmits<{ changed: []; dirty: [value: boolean] }>()
+const emit = defineEmits<{
+  changed: []
+  dirty: [value: boolean]
+  stateUnverified: [value: boolean]
+}>()
 
 const inventory = ref<MappingInventory>({ mappings: [], failures: [] })
 const mappingImportPreview = ref<LocalMappingImportPreview | null>(null)
@@ -146,6 +156,10 @@ const regressionResults = ref<DebugCaseRunResult[]>([])
 const busy = ref(false)
 const error = ref('')
 const notice = ref('')
+const inventoryUnverified = ref(true)
+const pendingInventoryRefresh = ref<MappingInventoryRefreshPlan | null>(null)
+
+const MAPPING_INVENTORY_REFRESH_TIMEOUT_MS = 15_000
 
 const service = computed(() => draft.value.services[serviceIndex.value])
 const method = computed(() => service.value?.methods[methodIndex.value])
@@ -237,6 +251,7 @@ watch(draftDirty, (value) => {
   suggestedExpectedDataText.value = ''
   regressionResults.value = []
 }, { immediate: true })
+watch(inventoryUnverified, (value) => emit('stateUnverified', value), { immediate: true })
 
 function markDraftSaved() {
   savedDraft.value = clone(mappingForSave())
@@ -311,22 +326,51 @@ async function run(action: () => Promise<void>) {
   }
 }
 
+async function withMappingInventoryTimeout<T>(promise: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(
+      () => reject(new Error('mapping-inventory-refresh-timeout')),
+      MAPPING_INVENTORY_REFRESH_TIMEOUT_MS,
+    )
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer)
+        resolve(value)
+      },
+      (reason) => {
+        window.clearTimeout(timer)
+        reject(reason)
+      },
+    )
+  })
+}
+
+async function readInventory(): Promise<MappingInventory> {
+  return withMappingInventoryTimeout(invoke<MappingInventory>('local_mapping_inventory'))
+}
+
 async function loadInventory() {
-  inventory.value = await invoke<MappingInventory>('local_mapping_inventory')
+  inventory.value = await readInventory()
 }
 
 onMounted(async () => {
   window.addEventListener('beforeunload', beforeUnload)
+  busy.value = true
   try {
     await loadInventory()
-  } catch (reason) {
-    error.value = reasonText(reason)
+    inventoryUnverified.value = false
+  } catch {
+    inventoryUnverified.value = true
+    error.value = '原生映射清单未能读取。请重新读取后再编辑、调试或交付映射。'
+  } finally {
+    busy.value = false
   }
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('beforeunload', beforeUnload)
   emit('dirty', false)
+  emit('stateUnverified', false)
 })
 
 function replaceDraft(mapping: LocalMappingDefinition, editNotice = '') {
@@ -347,6 +391,80 @@ function replaceDraft(mapping: LocalMappingDefinition, editNotice = '') {
   error.value = ''
   notice.value = editNotice
   markDraftSaved()
+}
+
+function applyRefreshedInventory(next: MappingInventory, plan: MappingInventoryRefreshPlan) {
+  if (plan.action === 'upsert') {
+    const saved = next.mappings.find((item) => item.pluginId === plan.pluginId)
+    if (!saved) throw new Error('committed-mapping-missing-from-inventory')
+    replaceDraft(saved)
+  } else if (draft.value.pluginId.trim() === plan.pluginId) {
+    resetEditor(true)
+  } else if (savedMappingPluginId.value === plan.pluginId) {
+    savedDraft.value = clone(newMapping())
+  }
+  inventory.value = next
+}
+
+async function refreshCommittedMapping(plan: MappingInventoryRefreshPlan): Promise<boolean> {
+  try {
+    const next = await readInventory()
+    applyRefreshedInventory(next, plan)
+    pendingInventoryRefresh.value = null
+    inventoryUnverified.value = false
+    error.value = ''
+    notice.value = plan.successMessage
+    return true
+  } catch {
+    pendingInventoryRefresh.value = plan
+    inventoryUnverified.value = true
+    error.value = ''
+    notice.value = `${plan.successMessage} 工作台清单未重新读取；操作已经完成，请勿重复执行，重新读取后再继续。`
+    return false
+  }
+}
+
+async function runCommittedMappingAction<T>(
+  action: () => Promise<T>,
+  refreshPlan: (result: T) => MappingInventoryRefreshPlan,
+) {
+  busy.value = true
+  error.value = ''
+  notice.value = ''
+  let result: T
+  try {
+    result = await action()
+  } catch (reason) {
+    error.value = reasonText(reason)
+    busy.value = false
+    return
+  }
+  const plan = refreshPlan(result)
+  pendingInventoryRefresh.value = plan
+  emit('changed')
+  await refreshCommittedMapping(plan)
+  busy.value = false
+}
+
+async function retryMappingInventory() {
+  if (busy.value) return
+  busy.value = true
+  error.value = ''
+  notice.value = ''
+  const pending = pendingInventoryRefresh.value
+  if (pending) {
+    await refreshCommittedMapping(pending)
+  } else {
+    try {
+      inventory.value = await readInventory()
+      inventoryUnverified.value = false
+      notice.value = '原生映射清单已重新读取，可以继续操作。'
+    } catch {
+      inventoryUnverified.value = true
+      error.value = '原生映射清单仍无法读取。请检查桌面核心状态后重试。'
+    }
+  }
+  busy.value = false
 }
 
 function resetEditor(force = false) {
@@ -515,29 +633,30 @@ function useExport(name: string) {
 }
 
 async function saveMapping() {
-  await run(async () => {
-    const result = await invoke<{ pluginId: string; serviceCount: number; preflightedHosts: number }>('save_local_mapping', {
-      definition: mappingForSave(),
-    })
-    await loadInventory()
-    const saved = inventory.value.mappings.find((item) => item.pluginId === result.pluginId)
-    if (saved) replaceDraft(saved)
-    else markDraftSaved()
-    notice.value = `映射已保存并热加载：${result.serviceCount} 个服务，${result.preflightedHosts} 个宿主预检通过。`
-    emit('changed')
-  })
+  const definition = mappingForSave()
+  await runCommittedMappingAction(
+    () => invoke<{ pluginId: string; serviceCount: number; preflightedHosts: number }>('save_local_mapping', {
+      definition,
+    }),
+    (result) => ({
+      action: 'upsert',
+      pluginId: result.pluginId,
+      successMessage: `映射已保存并热加载：${result.serviceCount} 个服务，${result.preflightedHosts} 个宿主预检通过。`,
+    }),
+  )
 }
 
 async function deleteMapping(pluginId: string) {
   if (deletionDiscardsCurrentDraft(pluginId) && !window.confirm(`本地映射「${pluginId}」有未保存更改。删除成功后这些草稿也会丢失，确定继续吗？`)) return
   if (!window.confirm(`确定删除本地映射「${pluginId}」吗？签名插件不会受影响。`)) return
-  await run(async () => {
-    await invoke('delete_local_mapping', { pluginId })
-    await loadInventory()
-    if (draft.value.pluginId === pluginId) resetEditor(true)
-    notice.value = `本地映射 ${pluginId} 已删除并从路由卸载。`
-    emit('changed')
-  })
+  await runCommittedMappingAction(
+    () => invoke('delete_local_mapping', { pluginId }),
+    () => ({
+      action: 'delete',
+      pluginId,
+      successMessage: `本地映射 ${pluginId} 已删除并从路由卸载。`,
+    }),
+  )
 }
 
 async function exportMapping(pluginId: string) {
@@ -608,20 +727,21 @@ async function confirmMappingImport() {
   }
   if (!window.confirm(`映射包「${preview.displayName || preview.pluginId}」不验证发布者签名，确认信任其原生代码并${preview.action === 'replace' ? '替换现有映射' : '安装'}吗？`)) return
   if (!confirmDiscardDraft()) return
-  await run(async () => {
-    const result = await invoke<{ pluginId: string; serviceCount: number; preflightedHosts: number }>('import_local_mapping', {
+  await runCommittedMappingAction(
+    () => invoke<{ pluginId: string; serviceCount: number; preflightedHosts: number }>('import_local_mapping', {
       source,
       expectedPlanId: preview.planId,
-    })
-    await loadInventory()
-    const imported = inventory.value.mappings.find((item) => item.pluginId === result.pluginId)
-    if (imported) replaceDraft(imported)
-    else markDraftSaved()
-    mappingImportPreview.value = null
-    selectedMappingImport.value = ''
-    notice.value = `映射包已复核并热加载：${result.serviceCount} 个服务，${result.preflightedHosts} 个宿主预检通过。`
-    emit('changed')
-  })
+    }),
+    (result) => {
+      mappingImportPreview.value = null
+      selectedMappingImport.value = ''
+      return {
+        action: 'upsert',
+        pluginId: result.pluginId,
+        successMessage: `映射包已复核并热加载：${result.serviceCount} 个服务，${result.preflightedHosts} 个宿主预检通过。`,
+      }
+    },
+  )
 }
 
 function mappingImportActionLabel(action: LocalMappingImportPreview['action']): string {
@@ -791,7 +911,11 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
 
 <template>
   <section class="mapping-studio" aria-label="DLL 动态映射工作台">
-    <div class="studio-copy">
+    <div v-if="inventoryUnverified" class="mapping-state-warning" role="alert">
+      <span><strong>{{ pendingInventoryRefresh ? '映射操作已经完成，但工作台清单尚未复核' : '映射工作台清单尚未读取' }}</strong><small>{{ pendingInventoryRefresh ? '请勿重复保存、导入或删除；重新读取成功后会恢复当前编辑器和项目门禁。' : '重新读取成功前，映射编辑、调试和项目交付均保持暂停。' }}</small></span>
+      <button type="button" :disabled="busy" @click="retryMappingInventory">重新读取映射</button>
+    </div>
+    <div class="studio-copy" :inert="busy || inventoryUnverified">
       <p class="eyebrow">NATIVE MAPPING STUDIO</p>
       <h2>DLL 动态映射与调试</h2>
       <p>选择 DLL/EXE/BAT，或填写 COM/OCX 标识；配置服务和方法后即可热加载，无需重新打包客户端。</p>
@@ -825,7 +949,7 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
       </details>
     </div>
 
-    <form class="mapping-editor" @submit.prevent="saveMapping">
+    <form class="mapping-editor" :inert="busy || inventoryUnverified" @submit.prevent="saveMapping">
       <div v-if="draftDirty" class="draft-dirty" role="status">当前草稿有未保存更改；当前映射的调试、回归和导出已暂停</div>
       <div class="mapping-heading">
         <label><span>映射 ID</span><input v-model.trim="draft.pluginId" required pattern="[A-Za-z0-9._-]+" placeholder="hospital-device" /></label>
@@ -987,6 +1111,9 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
 
 <style scoped>
 .mapping-studio { display: grid; grid-template-columns: minmax(230px, .55fr) 1.45fr; gap: 42px; margin-top: 28px; padding: 42px; border: 1px solid #c9d0c9; border-radius: 18px; background: rgba(255,255,251,.9); }
+.mapping-state-warning { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: -18px; padding: 14px 16px; border: 1px solid #d5b36a; border-radius: 10px; background: #fff6dd; color: #644b18; }
+.mapping-state-warning span { display: grid; gap: 4px; }
+.mapping-state-warning small { color: #795f29; }
 .studio-copy h2 { margin: 0; font: 500 34px Georgia, "Songti SC", serif; }
 .studio-copy > p:not(.eyebrow) { color: #66736b; line-height: 1.7; }
 button { padding: 8px 11px; border: 1px solid #9eaaa2; border-radius: 8px; background: #fff; color: #274735; cursor: pointer; }

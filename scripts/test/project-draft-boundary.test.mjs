@@ -20,7 +20,7 @@ test('unsaved native mappings cannot be omitted from project-changing operations
   assert.match(source, /if \(!requireCleanProjectDrafts\('执行深度部署自检'\)\) return/)
   assert.match(source, /if \(!requireCleanProjectDrafts\('导出深度部署自检记录'\)\) return/)
   assert.match(source, /原生映射工作台有未保存更改，插件变更、应用更新和项目交付操作已暂停/)
-  assert.match(source, /:inert="controlStateUnverified \|\| projectDeliveryDraftDirty"/)
+  assert.match(source, /:inert="projectStateUnverified \|\| projectDeliveryDraftDirty"/)
   assert.match(source, /mappingDraftDirty \? '原生映射草稿尚未保存，当前结论只对应已激活映射'/)
   assert.match(source, /projectDeliveryDraftDirty \? 'DRAFT NOT CHECKED'/)
 })

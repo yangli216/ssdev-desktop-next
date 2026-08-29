@@ -51,6 +51,6 @@ test('unsaved configuration cannot silently launch, export, or enter a project p
   assert.match(source, /@click="discardConfigChanges"/)
   assert.match(source, /项目配置有未保存更改，业务启动、原生能力变更和项目交付操作已暂停/)
   assert.match(source, /:disabled="busy \|\| controlStateUnverified \|\| configDraftDirty"/)
-  assert.match(source, /:inert="controlStateUnverified \|\| projectDeliveryDraftDirty"/)
+  assert.match(source, /:inert="projectStateUnverified \|\| projectDeliveryDraftDirty"/)
   assert.match(source, /projectDeliveryDraftDirty \? 'DRAFT NOT CHECKED'/)
 })
