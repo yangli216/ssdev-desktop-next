@@ -19,7 +19,7 @@ test('committed control actions are not reported as failed by follow-up reads', 
   assert.match(source, /runPrimaryThenRefresh\([\s\S]+invoke<PluginInstallResult>\('install_plugin_package'/)
   assert.match(source, /runPrimaryThenRefresh\([\s\S]+invoke\('uninstall_signed_plugin'/)
   assert.match(source, /runPrimaryThenRefresh\([\s\S]+invoke<DeploymentCheckReport>\('run_deployment_check', \{ deep: true \}\)/)
-  assert.match(source, /配置已经保存，但业务窗口未能创建/)
+  assert.match(source, /if \(!requireSavedConfig\('启动业务系统'\)\) return/)
 })
 
 test('post-action refresh is bounded, field-isolated, and does not expose read errors', async () => {
@@ -32,7 +32,7 @@ test('post-action refresh is bounded, field-isolated, and does not expose read e
   assert.doesNotMatch(source, /页面状态未完全刷新[^\n]+\$\{reason/)
   assert.match(source, /controlRefreshIncomplete \|\| runtimeStatusStale \? 'STATUS UNKNOWN'/)
   assert.match(source, /const controlStateUnverified = computed/)
-  assert.match(source, /type="submit" :disabled="busy \|\| controlStateUnverified">保存配置/)
+  assert.match(source, /type="submit" :disabled="busy \|\| controlStateUnverified \|\| !configDraftDirty">保存配置/)
   assert.match(source, /:disabled="busy \|\| controlStateUnverified" @click="confirmPluginPackageInstall"/)
   assert.match(source, /:disabled="busy \|\| controlStateUnverified \|\| !appUpdate\?\.available/)
   assert.match(source, /pluginUpdates\.value = null\s+appUpdate\.value = null/)

@@ -3,6 +3,7 @@ import { Channel, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { cloneConfig, configFingerprint } from './config-draft.js'
 import LocalMappingStudio from './LocalMappingStudio.vue'
 import {
   initialRuntimeStatusHealth,
@@ -356,6 +357,7 @@ const selectedProjectBundle = ref('')
 const configImportPreview = ref<ConfigImportPreview | null>(null)
 const selectedConfigImport = ref('')
 const snapshot = ref<ConfigSnapshot | null>(null)
+const savedConfigFingerprint = ref('')
 const inventory = ref<PluginInventory | null>(null)
 const pluginPackagePreview = ref<PluginPackagePreview | null>(null)
 const selectedPluginPackage = ref('')
@@ -381,6 +383,10 @@ type ConsoleSection = 'overview' | 'configuration' | 'native' | 'plugins' | 'sec
 const activeSection = ref<ConsoleSection>('overview')
 const runtimeStatusStale = computed(() => runtimeStatusHealth.value.stale)
 const controlRefreshIncomplete = computed(() => controlRefreshMissing.value.length > 0)
+const configDraftDirty = computed(() => (
+  snapshot.value != null
+  && configFingerprint(snapshot.value.config) !== savedConfigFingerprint.value
+))
 const controlStateUnverified = computed(() => (
   controlLoadFailed.value || controlRefreshIncomplete.value || runtimeStatusStale.value
 ))
@@ -395,6 +401,12 @@ const deploymentReadiness = computed(() => {
     return {
       label: '状态待刷新',
       detail: '操作已完成，但部分页面状态尚未重新读取',
+    }
+  }
+  if (configDraftDirty.value) {
+    return {
+      label: '配置未保存',
+      detail: '当前自检结论仅对应磁盘中的有效配置',
     }
   }
   if (runtimeStatusStale.value) {
@@ -597,6 +609,25 @@ function applySsoStatus(code?: string, active = false) {
   }
 }
 
+function applyConfigSnapshot(next: ConfigSnapshot) {
+  snapshot.value = next
+  savedConfigFingerprint.value = configFingerprint(next.config)
+}
+
+function requireSavedConfig(action: string): boolean {
+  if (!configDraftDirty.value) return true
+  notice.value = ''
+  error.value = `项目配置有未保存更改。请先保存或放弃更改，再${action}。`
+  activeSection.value = 'configuration'
+  return false
+}
+
+function preventConfigDraftUnload(event: BeforeUnloadEvent) {
+  if (!configDraftDirty.value) return
+  event.preventDefault()
+  event.returnValue = ''
+}
+
 async function ensureSsoStatusListener() {
   if (unlistenSsoStatus) return
   if (ssoStatusListenerPromise) return ssoStatusListenerPromise
@@ -643,7 +674,7 @@ async function loadControlConsole() {
     )
     if (!controlConsoleMounted) return
     status.value = bridge
-    snapshot.value = config
+    applyConfigSnapshot(config)
     inventory.value = plugins
     deploymentCheck.value = deployment
     if (deployment) deploymentCheckUnavailable.value = false
@@ -667,11 +698,13 @@ function retryControlLoad() {
 
 onMounted(() => {
   controlConsoleMounted = true
+  window.addEventListener('beforeunload', preventConfigDraftUnload)
   void loadControlConsole()
 })
 
 onUnmounted(() => {
   controlConsoleMounted = false
+  window.removeEventListener('beforeunload', preventConfigDraftUnload)
   unlistenSsoStatus?.()
   if (statusRefreshTimer != null) window.clearInterval(statusRefreshTimer)
   if (runtimeStatusRecoveryTimer != null) window.clearTimeout(runtimeStatusRecoveryTimer)
@@ -714,10 +747,11 @@ async function refreshControlState(fields: ControlRefreshField[]): Promise<boole
             if (!ssoStatusEventSeen) applySsoStatus(next.ssoError, next.ssoActive)
             recordRuntimeStatusEvent('success')
           } else if (field === 'config') {
-            snapshot.value = await withBoundedTimeout(
+            const next = await withBoundedTimeout(
               invoke<ConfigSnapshot>('desktop_config'),
               CONTROL_POST_ACTION_REFRESH_TIMEOUT_MS,
             )
+            applyConfigSnapshot(next)
           } else if (field === 'inventory') {
             inventory.value = await withBoundedTimeout(
               invoke<PluginInventory>('plugin_inventory'),
@@ -797,11 +831,32 @@ async function retryControlStateRefresh() {
   }
 }
 
+async function discardConfigChanges() {
+  if (!configDraftDirty.value || busy.value || controlStateUnverified.value) return
+  busy.value = true
+  error.value = ''
+  notice.value = ''
+  try {
+    const next = await withBoundedTimeout(
+      invoke<ConfigSnapshot>('desktop_config'),
+      CONTROL_POST_ACTION_REFRESH_TIMEOUT_MS,
+    )
+    applyConfigSnapshot(next)
+    notice.value = '未保存的项目配置更改已放弃，页面已恢复为当前有效配置。'
+  } catch {
+    error.value = '未能重新读取当前有效配置。请刷新状态；仍失败时重启客户端并查看日志。'
+  } finally {
+    busy.value = false
+  }
+}
+
 async function saveConfig() {
   if (!snapshot.value) return
+  const candidate = cloneConfig(snapshot.value.config)
   const outcome = await runPrimaryThenRefresh(
     async () => {
-      await invoke('save_desktop_config', { config: snapshot.value?.config })
+      await invoke('save_desktop_config', { config: candidate })
+      savedConfigFingerprint.value = configFingerprint(candidate)
       configImportPreview.value = null
       selectedConfigImport.value = ''
     },
@@ -819,6 +874,7 @@ async function importConfig() {
     filters: [{ name: 'SSDEV 桌面配置', extensions: ['json'] }],
   })
   if (typeof source !== 'string') return
+  if (configDraftDirty.value && !window.confirm('当前项目配置有未保存更改。继续预检不会立即丢弃草稿，但确认导入后将以文件内容替换草稿和当前有效配置。确定继续吗？')) return
   await run(async () => {
     configImportPreview.value = null
     selectedConfigImport.value = ''
@@ -836,10 +892,11 @@ async function confirmConfigImport() {
   const expectedPlanId = configImportPreview.value.planId
   const changed = configImportPreview.value.configChanged
   const outcome = await runPrimaryThenRefresh(async () => {
-    await invoke<ConfigSnapshot>('import_desktop_config', {
+    const imported = await invoke<ConfigSnapshot>('import_desktop_config', {
       source,
       expectedPlanId,
     })
+    applyConfigSnapshot(imported)
     configImportPreview.value = null
     selectedConfigImport.value = ''
   }, ['status', 'config', 'deployment'])
@@ -858,6 +915,7 @@ function cancelConfigImport() {
 }
 
 async function exportConfig() {
+  if (!requireSavedConfig('导出当前有效配置')) return
   const destination = await save({
     defaultPath: 'ssdev-desktop-config.json',
     filters: [{ name: 'SSDEV 桌面配置', extensions: ['json'] }],
@@ -870,6 +928,7 @@ async function exportConfig() {
 }
 
 async function exportProjectBundle() {
+  if (!requireSavedConfig('导出项目部署包')) return
   const destination = await save({
     defaultPath: 'ssdev-project.ssdev-project',
     filters: [{ name: 'SSDEV 项目部署包', extensions: ['ssdev-project'] }],
@@ -885,6 +944,7 @@ async function exportProjectBundle() {
 }
 
 async function inspectProjectBundle() {
+  if (!requireSavedConfig('预检项目部署包')) return
   const source = await open({
     multiple: false,
     directory: false,
@@ -904,6 +964,7 @@ async function importSelectedProjectBundle() {
     error.value = '请先选择并预检项目部署包。'
     return
   }
+  if (configDraftDirty.value && !window.confirm('当前项目配置有未保存更改。导入项目会以项目包中的配置替换这些草稿，确定继续吗？')) return
   if (mappingDraftDirty.value && !window.confirm('当前原生映射工作台有未保存更改。导入项目会刷新工作台并丢弃这些更改，确定继续吗？')) return
   const source = selectedProjectBundle.value
   const expectedPlanId = projectBundlePreview.value.planId
@@ -931,28 +992,16 @@ async function importSelectedProjectBundle() {
 }
 
 async function openBusiness() {
+  if (!requireSavedConfig('启动业务系统')) return
   await run(() => invoke('open_business_window'), '业务窗口已创建；页面完成加载后首页将显示“已连接”。')
 }
 
 async function openEnvironment(environment: EnvironmentConfig) {
-  if (!snapshot.value) return
-  const saved = await runPrimaryThenRefresh(async () => {
-    await invoke('save_desktop_config', { config: snapshot.value?.config })
-    selectedConfigImport.value = ''
-    configImportPreview.value = null
-  }, ['status', 'config', 'deployment'])
-  if (!saved.succeeded) return
-  if (!saved.refreshed) {
-    showPrimaryActionSuccess(`环境「${environment.name}」配置已保存。`, false)
-    return
-  }
-  const opened = await run(
+  if (!requireSavedConfig(`打开环境「${environment.name}」`)) return
+  await run(
     () => invoke('open_business_window', { environment: environment.name }),
-    `已保存配置并创建环境「${environment.name}」窗口；页面完成加载后首页将显示“已连接”。`,
+    `环境「${environment.name}」窗口已创建；页面完成加载后首页将显示“已连接”。`,
   )
-  if (!opened) {
-    notice.value = `环境「${environment.name}」配置已经保存，但业务窗口未能创建；请根据错误提示处理后重新进入，无需再次保存。`
-  }
 }
 
 function addEnvironment() {
@@ -1330,13 +1379,13 @@ async function exportDeploymentCheck() {
               <h2>进入业务系统</h2>
               <p>{{ snapshot?.config.website || '尚未配置默认业务地址' }}</p>
             </div>
-            <button class="primary large" type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || !snapshot?.config.website" @click="openBusiness">启动默认环境</button>
+            <button class="primary large" type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || configDraftDirty || !snapshot?.config.website" @click="openBusiness">启动默认环境</button>
             <div v-if="snapshot?.config.allowSwitch && snapshot.config.environments.length" class="environment-shortcuts">
               <button
                 v-for="environment in snapshot.config.environments"
                 :key="`${environment.name}:${environment.url}`"
                 type="button"
-                :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || !environment.name || !environment.url"
+                :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || configDraftDirty || !environment.name || !environment.url"
                 @click="openEnvironment(environment)"
               >{{ environment.name || '未命名环境' }}</button>
             </div>
@@ -1353,13 +1402,14 @@ async function exportDeploymentCheck() {
           </section>
         </div>
 
-        <section v-if="controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || needsDeepDeploymentCheck || deploymentCheck?.failures || status?.businessTimedOutWindows || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
+        <section v-if="controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || configDraftDirty || needsDeepDeploymentCheck || deploymentCheck?.failures || status?.businessTimedOutWindows || status?.pluginPreflightFailures || status?.pluginApiBaselineFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
           <div><p class="eyebrow">ATTENTION</p><h2>待处理事项</h2></div>
           <ul>
             <li v-if="controlLoadFailed"><strong>控制台初始化未完成，不能确认当前项目和原生能力状态</strong><button type="button" :disabled="controlLoadActive" @click="retryControlLoad">重新加载</button></li>
             <li v-if="controlRefreshIncomplete"><strong>已完成的操作仍有 {{ controlRefreshMissing.length }} 类页面状态待刷新，请勿重复执行</strong><button type="button" :disabled="busy || controlRefreshActive" @click="retryControlStateRefresh">刷新状态</button></li>
             <li v-if="runtimeStatusStale"><strong>桌面核心通信中断，所有运行状态和部署结论均已标记为未知</strong><button type="button" :disabled="busy || statusRefreshActive" @click="retryRuntimeStatus">重新连接</button></li>
-            <li v-if="needsDeepDeploymentCheck"><strong>快速检查已通过，正式交付前还需验证当前 x86/x64 插件宿主</strong><button type="button" :disabled="busy || controlStateUnverified" @click="runDeploymentCheck">立即深度自检</button></li>
+            <li v-if="configDraftDirty"><strong>项目配置有未保存更改，业务启动、原生能力变更和项目交付操作已暂停</strong><button type="button" @click="activeSection = 'configuration'">处理配置</button></li>
+            <li v-if="needsDeepDeploymentCheck"><strong>快速检查已通过，正式交付前还需验证当前 x86/x64 插件宿主</strong><button type="button" :disabled="busy || controlStateUnverified || configDraftDirty" @click="runDeploymentCheck">立即深度自检</button></li>
             <li v-if="deploymentCheck?.failures"><strong>部署自检存在 {{ deploymentCheck.failures }} 项阻塞问题</strong><button type="button" @click="activeSection = 'security'">查看自检</button></li>
             <li v-if="status?.businessTimedOutWindows"><strong>{{ status.businessTimedOutWindows }} 个业务页面加载失败或未到达原生 IPC</strong><button type="button" :disabled="busy || controlStateUnverified" @click="retryTimedOutBusinessWindows">仅重试失败窗口</button></li>
             <li v-if="inventory?.quarantined.length"><strong>{{ inventory.quarantined.length }} 个插件已隔离</strong><button type="button" @click="activeSection = 'plugins'">查看插件</button></li>
@@ -1372,7 +1422,7 @@ async function exportDeploymentCheck() {
       </section>
 
       <section v-show="activeSection === 'configuration'" class="page" aria-labelledby="configuration-title">
-        <header class="section-header"><div><p class="eyebrow">PROJECT CONFIGURATION</p><h1 id="configuration-title">项目配置</h1><p>管理业务环境、来源边界和桌面启动行为。</p></div><div class="header-actions"><button type="button" :disabled="busy" @click="importConfig">导入配置</button><button type="button" :disabled="busy" @click="exportConfig">导出配置</button></div></header>
+        <header class="section-header"><div><p class="eyebrow">PROJECT CONFIGURATION</p><h1 id="configuration-title">项目配置</h1><p>管理业务环境、来源边界和桌面启动行为。</p></div><div class="header-actions"><span v-if="configDraftDirty" class="section-chip">配置未保存</span><button type="button" :disabled="busy" @click="importConfig">导入配置</button><button type="button" :disabled="busy || controlStateUnverified || configDraftDirty" @click="exportConfig">导出配置</button></div></header>
         <section v-if="configImportPreview" class="config-import-preview" aria-label="配置导入变更预览">
           <header>
             <div><p class="eyebrow">CONFIG IMPORT PLAN</p><h2>{{ configImportPreview.configChanged ? '核对配置变更' : '配置内容没有变化' }}</h2><p>确认时会重新读取文件并核对当前已保存配置；任一变化都会要求重新预检。</p></div>
@@ -1399,7 +1449,7 @@ async function exportDeploymentCheck() {
         </section>
         <section class="project-bundle-panel">
           <div class="project-bundle-copy"><p class="eyebrow">PROJECT DELIVERY</p><h2>项目部署包</h2><p>将当前配置、签名插件和本地映射作为一个交付单元迁移到目标 Windows 机器；正式导入要求同目录组织签名旁签。</p></div>
-          <div class="project-bundle-actions"><button type="button" :disabled="busy" @click="exportProjectBundle">导出当前项目</button><button class="primary" type="button" :disabled="busy" @click="inspectProjectBundle">选择项目包并预检</button></div>
+          <div class="project-bundle-actions"><button type="button" :disabled="busy || controlStateUnverified || configDraftDirty" @click="exportProjectBundle">导出当前项目</button><button class="primary" type="button" :disabled="busy || controlStateUnverified || configDraftDirty" @click="inspectProjectBundle">选择项目包并预检</button></div>
           <div v-if="projectBundlePreview" class="project-bundle-preview">
             <header><div><strong>变更计划已验证，可以导入</strong><small>由客户端 {{ projectBundlePreview.createdByVersion }} 创建 · schema {{ projectBundlePreview.schemaVersion }} · {{ projectBundlePreview.signatureVerified ? `组织签名 ${projectBundlePreview.signatureKeyId}` : '调试态未签名' }}</small></div><button class="primary" type="button" :disabled="busy || controlStateUnverified" @click="importSelectedProjectBundle">确认计划并切换项目</button></header>
             <div class="bundle-summary"><span><strong>{{ projectBundlePreview.businessOrigins }}</strong>业务来源</span><span><strong>{{ projectBundlePreview.signedPlugins }}</strong>签名插件</span><span><strong>{{ projectBundlePreview.localMappings }}</strong>本地映射</span><span><strong>{{ projectBundlePreview.serviceCount }}</strong>原生服务</span><span><strong>{{ projectBundlePreview.preflightedHosts }}</strong>宿主预检</span></div>
@@ -1435,7 +1485,7 @@ async function exportDeploymentCheck() {
             <p v-if="snapshot?.migratedFrom" class="migration">已合并 {{ snapshot.migrationSources.length }} 个旧配置来源；首选来源：{{ snapshot.migratedFrom }}</p>
             <p v-if="snapshot?.migrationWarnings.length" class="migration warning">有 {{ snapshot.migrationWarnings.length }} 项旧配置未能自动读取，请查看运行日志并人工核对。</p>
           </div>
-          <form v-if="snapshot" @submit.prevent="saveConfig">
+          <form v-if="snapshot" :inert="busy || controlStateUnverified || Boolean(configImportPreview)" @submit.prevent="saveConfig">
             <label><span>业务系统地址</span><input v-model.trim="snapshot.config.website" type="url" maxlength="4096" placeholder="http://project.internal" /></label>
             <label><span>默认租户</span><input v-model.trim="snapshot.config.tenantId" type="text" placeholder="可选" /></label>
             <fieldset class="environments">
@@ -1444,7 +1494,7 @@ async function exportDeploymentCheck() {
                 <label class="environment-default" title="设为默认环境"><input v-model="snapshot.config.website" type="radio" :value="environment.url" /><span>默认</span></label>
                 <input v-model.trim="environment.name" type="text" maxlength="128" placeholder="环境名称" />
                 <input :value="environment.url" type="url" maxlength="4096" placeholder="http://project.internal" @input="changeEnvironmentUrl(environment, ($event.target as HTMLInputElement).value)" />
-                <button type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || !snapshot.config.allowSwitch || !environment.name || !environment.url" @click="openEnvironment(environment)">打开</button>
+                <button type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || configDraftDirty || !snapshot.config.allowSwitch || !environment.name || !environment.url" @click="openEnvironment(environment)">打开</button>
                 <button type="button" :disabled="busy" aria-label="删除环境" @click="removeEnvironment(index)">删除</button>
               </div>
               <button class="environment-add" type="button" :disabled="busy || snapshot.config.environments.length >= 32" @click="addEnvironment">新增环境</button>
@@ -1459,7 +1509,7 @@ async function exportDeploymentCheck() {
               <label><span>仓库索引签名</span><input v-model.trim="snapshot.config.pluginCatalogSignatureUrl" type="url" placeholder="https://plugins.example/catalog.sig.json" /></label>
             </details>
             <div class="toggles"><label><input v-model="snapshot.config.allowSwitch" type="checkbox" />允许环境切换</label><label><input v-model="snapshot.config.autoClose" type="checkbox" />关闭前确认</label><label><input v-model="snapshot.config.autoStart" type="checkbox" />开机自动启动</label></div>
-            <div class="actions"><button class="primary" type="submit" :disabled="busy || controlStateUnverified">保存配置</button><button type="button" :disabled="busy || controlStateUnverified" @click="openBusiness">进入业务系统</button></div>
+            <div class="actions"><button class="primary" type="submit" :disabled="busy || controlStateUnverified || !configDraftDirty">保存配置</button><button v-if="configDraftDirty" type="button" :disabled="busy || controlStateUnverified" @click="discardConfigChanges">放弃更改</button><button type="button" :disabled="busy || controlStateUnverified || configDraftDirty" @click="openBusiness">进入业务系统</button></div>
             <small class="config-path">配置位置：{{ snapshot.path }}</small>
           </form>
         </section>
@@ -1470,13 +1520,13 @@ async function exportDeploymentCheck() {
         <header class="section-header"><div><p class="eyebrow">NATIVE MAPPING STUDIO</p><h1 id="native-title">原生映射</h1><p>发现本机组件、配置调用映射，并在发布前完成受控调试。</p></div><span class="section-chip">本机管理员能力</span></header>
         <LocalMappingStudio
           :key="mappingWorkspaceRevision"
-          :disabled="busy || controlStateUnverified"
+          :disabled="busy || controlStateUnverified || configDraftDirty"
           @changed="refreshPluginsAfterMapping"
           @dirty="mappingDraftDirty = $event"
         />
       </section>
 
-      <section v-show="activeSection === 'plugins'" class="page" aria-labelledby="plugins-title" :inert="controlStateUnverified">
+      <section v-show="activeSection === 'plugins'" class="page" aria-labelledby="plugins-title" :inert="controlStateUnverified || configDraftDirty">
         <header class="section-header"><div><p class="eyebrow">PLUGIN MANAGEMENT</p><h1 id="plugins-title">插件管理</h1><p>管理签名插件包、本机动态映射和仓库更新。</p></div><div class="header-actions"><button type="button" :disabled="busy" @click="selectPluginPackage">选择签名插件</button><button type="button" :disabled="busy || controlStateUnverified" @click="reloadPlugins">重新扫描</button></div></header>
         <section v-if="pluginPackagePreview" class="plugin-package-preview" aria-label="签名插件安装预览">
           <header>
@@ -1506,11 +1556,11 @@ async function exportDeploymentCheck() {
       </section>
 
       <section v-show="activeSection === 'security'" class="page" aria-labelledby="security-title">
-        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>快速检查用于日常状态刷新；正式交付前执行深度自检，实际启动当前插件宿主完成 Health 验证。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale" @click="runDeploymentCheck">深度自检</button><button type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale" @click="exportDeploymentCheck">导出深度自检记录</button><button type="button" :disabled="busy" @click="openDiagnosticsDirectory">打开日志目录</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
-        <section v-if="deploymentCheck" :class="['deployment-check', { ready: deploymentCheck.ready && !controlLoadFailed && !controlRefreshIncomplete && !runtimeStatusStale }]" aria-label="部署自检结果">
+        <header class="section-header"><div><p class="eyebrow">SECURITY & DIAGNOSTICS</p><h1 id="security-title">安全与诊断</h1><p>快速检查用于日常状态刷新；正式交付前执行深度自检，实际启动当前插件宿主完成 Health 验证。</p></div><div class="header-actions"><button class="primary" type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || configDraftDirty" @click="runDeploymentCheck">深度自检</button><button type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || configDraftDirty" @click="exportDeploymentCheck">导出深度自检记录</button><button type="button" :disabled="busy" @click="openDiagnosticsDirectory">打开日志目录</button><button type="button" :disabled="busy || !status?.diagnosticsAvailable" @click="exportDiagnostics">导出脱敏诊断包</button></div></header>
+        <section v-if="deploymentCheck" :class="['deployment-check', { ready: deploymentCheck.ready && !controlLoadFailed && !controlRefreshIncomplete && !runtimeStatusStale && !configDraftDirty }]" aria-label="部署自检结果">
           <header>
-            <div><p class="eyebrow">{{ deploymentCheck.deep ? 'DEEP DEPLOYMENT CHECK' : 'QUICK DEPLOYMENT CHECK' }}</p><h2>{{ controlRefreshIncomplete ? '操作后的项目状态尚未完整刷新' : runtimeStatusStale ? '桌面核心通信中断，当前自检结论已过期' : deploymentCheck.ready ? (deploymentCheck.deep ? '当前机器通过深度交付检查' : '快速检查未发现阻塞') : '部署条件尚未满足' }}</h2><p>{{ deploymentCheck.passed }} 项正常 · {{ deploymentCheck.warnings }} 项提醒 · {{ deploymentCheck.failures }} 项阻塞</p></div>
-            <span>{{ controlRefreshIncomplete || runtimeStatusStale ? 'STATUS UNKNOWN' : deploymentCheck.ready ? (deploymentCheck.deep ? 'READY' : 'QUICK PASS') : 'ACTION REQUIRED' }}</span>
+            <div><p class="eyebrow">{{ deploymentCheck.deep ? 'DEEP DEPLOYMENT CHECK' : 'QUICK DEPLOYMENT CHECK' }}</p><h2>{{ controlRefreshIncomplete ? '操作后的项目状态尚未完整刷新' : runtimeStatusStale ? '桌面核心通信中断，当前自检结论已过期' : configDraftDirty ? '项目配置草稿尚未保存，当前结论只对应有效配置' : deploymentCheck.ready ? (deploymentCheck.deep ? '当前机器通过深度交付检查' : '快速检查未发现阻塞') : '部署条件尚未满足' }}</h2><p>{{ deploymentCheck.passed }} 项正常 · {{ deploymentCheck.warnings }} 项提醒 · {{ deploymentCheck.failures }} 项阻塞</p></div>
+            <span>{{ controlRefreshIncomplete || runtimeStatusStale ? 'STATUS UNKNOWN' : configDraftDirty ? 'DRAFT NOT CHECKED' : deploymentCheck.ready ? (deploymentCheck.deep ? 'READY' : 'QUICK PASS') : 'ACTION REQUIRED' }}</span>
           </header>
           <div class="check-list">
             <article v-for="item in deploymentCheck.items" :key="item.id" :class="`check-${item.status}`">
