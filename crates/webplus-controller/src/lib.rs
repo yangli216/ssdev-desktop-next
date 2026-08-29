@@ -347,6 +347,56 @@ impl PluginController {
         self.supervisor.health(descriptors).await
     }
 
+    /// Starts or reuses one active plugin host and completes its Health
+    /// handshake without invoking a DLL export, COM member, EXE, or BAT.
+    ///
+    /// This operator recovery path may bypass the short automatic restart
+    /// backoff, but it remains inside the global and per-plugin lifecycle
+    /// boundaries used by normal invocations.
+    pub async fn retry_plugin_host(
+        &self,
+        plugin_id: &str,
+        architecture: PluginArchitecture,
+    ) -> Result<(), ControllerError> {
+        if plugin_id.trim().is_empty() {
+            return Err(ControllerError::EmptyPluginId);
+        }
+        let plugin_lifecycle = self.plugin_lifecycle(plugin_id).await;
+        let lifecycle_epoch = self.lifecycle_epoch.load(Ordering::Acquire);
+        let plugin_epoch = plugin_lifecycle.epoch.load(Ordering::Acquire);
+        if !self.accepting_invocations.load(Ordering::Acquire)
+            || self.global_maintenance_active.load(Ordering::Acquire)
+            || plugin_lifecycle.maintenance_active.load(Ordering::Acquire)
+        {
+            return Err(ControllerError::HostRetryUnavailable);
+        }
+        let _lifecycle = self.lifecycle.read().await;
+        let _plugin_lifecycle = plugin_lifecycle.lifecycle.read().await;
+        if !self.accepting_invocations.load(Ordering::Acquire)
+            || self.global_maintenance_active.load(Ordering::Acquire)
+            || plugin_lifecycle.maintenance_active.load(Ordering::Acquire)
+            || self.lifecycle_epoch.load(Ordering::Acquire) != lifecycle_epoch
+            || plugin_lifecycle.epoch.load(Ordering::Acquire) != plugin_epoch
+        {
+            return Err(ControllerError::HostRetryUnavailable);
+        }
+        let descriptor = {
+            let routes = self.routes.read().await;
+            routes
+                .values()
+                .find(|route| {
+                    route.descriptor.plugin_id == plugin_id
+                        && route.descriptor.architecture == architecture
+                })
+                .map(|route| route.descriptor.clone())
+                .ok_or_else(|| ControllerError::HostRouteNotFound {
+                    plugin_id: plugin_id.to_owned(),
+                    architecture,
+                })?
+        };
+        self.supervisor.retry(&descriptor).await
+    }
+
     pub fn validate_manifests(manifests: &[PluginManifest]) -> Result<(), ControllerError> {
         routes_from_manifests(manifests).map(|_| ())
     }
@@ -1062,9 +1112,21 @@ impl PluginSupervisor {
         Ok(())
     }
 
+    async fn retry(&self, descriptor: &PluginDescriptor) -> Result<(), ControllerError> {
+        self.worker_for_mode(descriptor, true).await.map(|_| ())
+    }
+
     async fn worker_for(
         &self,
         descriptor: &PluginDescriptor,
+    ) -> Result<Arc<Mutex<PluginWorker>>, ControllerError> {
+        self.worker_for_mode(descriptor, false).await
+    }
+
+    async fn worker_for_mode(
+        &self,
+        descriptor: &PluginDescriptor,
+        force_retry: bool,
     ) -> Result<Arc<Mutex<PluginWorker>>, ControllerError> {
         let key = WorkerKey::from(descriptor);
         let slot = {
@@ -1079,7 +1141,9 @@ impl PluginSupervisor {
         loop {
             match &*state {
                 WorkerSlotState::Ready(worker) => return Ok(Arc::clone(worker)),
-                WorkerSlotState::Failed { retry_after } if Instant::now() < *retry_after => {
+                WorkerSlotState::Failed { retry_after }
+                    if !force_retry && Instant::now() < *retry_after =>
+                {
                     return Err(ControllerError::HostInitializationFailed(
                         descriptor.plugin_id.clone(),
                     ));
@@ -1527,6 +1591,13 @@ pub enum ControllerError {
     PreflightRouteMismatch(String),
     #[error("plugin host candidate preflight is unavailable during reload or shutdown")]
     PreflightUnavailable,
+    #[error("plugin host recovery is unavailable during reload, plugin maintenance, or shutdown")]
+    HostRetryUnavailable,
+    #[error("plugin host route for [{plugin_id}] and {architecture:?} is not active")]
+    HostRouteNotFound {
+        plugin_id: String,
+        architecture: PluginArchitecture,
+    },
     #[error("plugin maintenance is unavailable during global reload or shutdown")]
     MaintenanceUnavailable,
     #[error("plugin maintenance for [{expected}] cannot install manifest [{actual}]")]
@@ -1586,6 +1657,8 @@ impl ControllerError {
             Self::MissingActiveManifest(_) => "active-manifest-missing",
             Self::PreflightRouteMismatch(_) => "preflight-route-mismatch",
             Self::PreflightUnavailable => "preflight-unavailable",
+            Self::HostRetryUnavailable => "host-retry-unavailable",
+            Self::HostRouteNotFound { .. } => "host-route-not-found",
             Self::MaintenanceUnavailable => "maintenance-unavailable",
             Self::MaintenancePluginMismatch { .. } => "maintenance-plugin-mismatch",
             Self::HostInitializationFailed(_) => "host-initialization-failed",
@@ -2726,6 +2799,102 @@ mod tests {
         assert_eq!(health[0].state, PluginHostRuntimeState::RestartBackoff);
         assert_eq!(health[0].failure_count, 2);
         assert_eq!(health[0].last_failure_code, Some("host-spawn-failed"));
+    }
+
+    #[tokio::test]
+    async fn operator_retry_bypasses_backoff_without_entering_business_admission() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("api.json"),
+            r#"{"serviceId":"unavailable","mainClass":"reader.dll","architecture":"x86","methods":[{"name":"probe"}]}"#,
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("unavailable-plugin", root.path()).unwrap();
+        let controller = Arc::new(PluginController::new(config()).unwrap());
+        controller.replace_manifests(&[manifest]).await.unwrap();
+
+        let initial = controller
+            .invoke(InvokeRequest {
+                service_id: "unavailable".into(),
+                method: "probe".into(),
+                parameters: Map::new(),
+            })
+            .await;
+        assert_eq!(initial.res_code, HOST_FAILURE);
+        assert_eq!(controller.plugin_host_stats().failed_starts, 1);
+        assert_eq!(
+            controller.plugin_host_health().await[0].state,
+            PluginHostRuntimeState::RestartBackoff
+        );
+
+        let failure = controller
+            .retry_plugin_host("unavailable-plugin", PluginArchitecture::X86)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(failure, ControllerError::Spawn { .. }));
+        assert_eq!(controller.plugin_host_stats().failed_starts, 2);
+        assert_eq!(controller.invocation_admission_stats().in_flight, 0);
+        assert_eq!(controller.invocation_admission_stats().rejected, 0);
+        let health = controller.plugin_host_health().await;
+        assert_eq!(health[0].state, PluginHostRuntimeState::RestartBackoff);
+        assert_eq!(health[0].failure_count, 2);
+        assert_eq!(health[0].last_failure_code, Some("host-spawn-failed"));
+    }
+
+    #[tokio::test]
+    async fn operator_retry_requires_an_exact_active_plugin_architecture_route() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("api.json"),
+            r#"{"serviceId":"x86-only","mainClass":"reader.dll","architecture":"x86"}"#,
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("reader-plugin", root.path()).unwrap();
+        let controller = PluginController::new(config()).unwrap();
+        controller.replace_manifests(&[manifest]).await.unwrap();
+
+        let failure = controller
+            .retry_plugin_host("reader-plugin", PluginArchitecture::X64)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            failure,
+            ControllerError::HostRouteNotFound {
+                ref plugin_id,
+                architecture: PluginArchitecture::X64,
+            } if plugin_id == "reader-plugin"
+        ));
+        assert_eq!(failure.diagnostic_code(), "host-route-not-found");
+        assert_eq!(controller.plugin_host_stats().failed_starts, 0);
+    }
+
+    #[tokio::test]
+    async fn operator_retry_cannot_cross_plugin_maintenance() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("api.json"),
+            r#"{"serviceId":"reader","mainClass":"reader.dll","architecture":"x64"}"#,
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("reader-plugin", root.path()).unwrap();
+        let controller = PluginController::new(config()).unwrap();
+        controller.replace_manifests(&[manifest]).await.unwrap();
+        let maintenance = controller
+            .begin_plugin_maintenance("reader-plugin")
+            .await
+            .unwrap();
+
+        let failure = controller
+            .retry_plugin_host("reader-plugin", PluginArchitecture::X64)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(failure, ControllerError::HostRetryUnavailable));
+        assert_eq!(failure.diagnostic_code(), "host-retry-unavailable");
+        assert_eq!(controller.plugin_host_stats().failed_starts, 0);
+        drop(maintenance);
     }
 
     #[test]

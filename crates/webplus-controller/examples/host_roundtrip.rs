@@ -5,7 +5,7 @@ use std::time::Duration;
 use serde_json::{json, Map};
 use webplus_controller::{PluginController, PluginTrust, SupervisorConfig};
 use webplus_plugin_config::PluginManifest;
-use webplus_protocol::InvokeRequest;
+use webplus_protocol::{InvokeRequest, PluginArchitecture};
 
 #[tokio::main]
 async fn main() {
@@ -73,6 +73,18 @@ async fn main() {
     drop(maintenance);
     assert_eq!(controller.plugin_host_stats().active_hosts, 0);
     assert_eq!(controller.plugin_host_stats().successful_starts, 1);
+
+    let architecture = if cfg!(target_arch = "x86") {
+        PluginArchitecture::X86
+    } else {
+        PluginArchitecture::X64
+    };
+    controller
+        .retry_plugin_host("smoke-plugin", architecture)
+        .await
+        .expect("operator host recovery failed");
+    assert_eq!(controller.plugin_host_stats().active_hosts, 1);
+    assert_eq!(controller.plugin_host_stats().successful_starts, 2);
 
     let mut calls = tokio::task::JoinSet::new();
     for _ in 0..webplus_controller::DEFAULT_MAX_IN_FLIGHT_INVOCATIONS {

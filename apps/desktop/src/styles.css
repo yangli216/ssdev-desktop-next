@@ -267,7 +267,8 @@ button:disabled { cursor: wait !important; opacity: .5; }
 .host-health-list { border-top: 1px solid #e0e6e1; }
 .host-health-list article { display: flex; justify-content: space-between; gap: 24px; align-items: center; padding: 13px 22px; border-top: 1px solid #edf0ed; }
 .host-health-list article:first-child { border-top: 0; }
-.host-health-list article > span:last-child { text-align: right; }
+.host-health-runtime { display: flex; align-items: center; justify-content: flex-end; gap: 14px; text-align: right; }
+.host-health-runtime button { flex: 0 0 auto; padding: 7px 11px; }
 .host-health-list strong, .host-health-list small { display: block; }
 .host-health-list strong { color: #294738; font-size: 12px; }
 .host-health-list b { color: #496457; font-size: 11px; }
@@ -332,6 +333,8 @@ button:disabled { cursor: wait !important; opacity: .5; }
   .environment-row input[type="url"] { grid-column: 2 / -1; }
   .maintenance-panel { grid-template-columns: 1fr; }
   .host-health-panel > summary { align-items: flex-start; flex-direction: column; }
+  .host-health-list article { align-items: flex-start; flex-direction: column; }
+  .host-health-runtime { width: 100%; justify-content: space-between; text-align: left; }
   .check-list { grid-template-columns: 1fr; }
   .check-list article { border-right: 0; }
   .maintenance-panel .update-details { grid-column: 1; }

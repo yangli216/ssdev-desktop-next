@@ -8,6 +8,7 @@
     "dialog:allow-open",
     "dialog:allow-save",
     "allow-bridge-status",
+    "allow-retry-plugin-host",
     "allow-run-deployment-check",
     "allow-export-deployment-check",
     "allow-export-project-bundle",

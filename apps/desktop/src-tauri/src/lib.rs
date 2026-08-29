@@ -512,6 +512,39 @@ async fn bridge_status(
 }
 
 #[tauri::command]
+async fn retry_plugin_host(
+    caller: WebviewWindow,
+    state: State<'_, BridgeState>,
+    plugin_id: String,
+    architecture: PluginArchitecture,
+) -> Result<(), String> {
+    desktop::require_control(&caller)?;
+    match state
+        .controller
+        .retry_plugin_host(&plugin_id, architecture)
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(
+                event_code = "plugin-host-operator-retry-succeeded",
+                architecture = plugin_architecture_name(architecture),
+                "plugin host operator recovery succeeded"
+            );
+            Ok(())
+        }
+        Err(failure) => {
+            tracing::warn!(
+                event_code = "plugin-host-operator-retry-failed",
+                architecture = plugin_architecture_name(architecture),
+                error_code = failure.diagnostic_code(),
+                "plugin host operator recovery failed"
+            );
+            Err(format!("插件宿主恢复失败 ({})", failure.diagnostic_code()))
+        }
+    }
+}
+
+#[tauri::command]
 async fn run_deployment_check(
     caller: WebviewWindow,
     deep: bool,
@@ -4476,6 +4509,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             bridge_status,
+            retry_plugin_host,
             run_deployment_check,
             export_deployment_check,
             export_project_bundle,

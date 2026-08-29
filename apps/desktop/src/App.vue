@@ -83,6 +83,8 @@ type BridgeStatus = {
   }
 }
 
+type PluginHostStatus = BridgeStatus['pluginHosts'][number]
+
 type DeploymentCheckReport = {
   deep: boolean
   ready: boolean
@@ -354,8 +356,21 @@ let ssoStatusEventSeen = false
 let statusRefreshTimer: number | undefined
 let statusRefreshActive = false
 
-function pluginHostNeedsAttention(host: BridgeStatus['pluginHosts'][number]) {
+function pluginHostNeedsAttention(host: PluginHostStatus) {
   return host.state === 'restart-backoff' || host.state === 'retry-ready'
+}
+
+async function retryPluginHost(host: PluginHostStatus) {
+  await run(async () => {
+    try {
+      await invoke('retry_plugin_host', {
+        pluginId: host.pluginId,
+        architecture: host.architecture,
+      })
+    } finally {
+      status.value = await invoke<BridgeStatus>('bridge_status')
+    }
+  }, `${host.pluginId} ${host.architecture.toUpperCase()} 宿主 Health 已恢复；未调用业务方法。`)
 }
 
 async function refreshRuntimeStatus() {
@@ -1115,7 +1130,7 @@ async function exportDeploymentCheck() {
           <div class="host-health-list">
             <article v-for="host in status.pluginHosts" :key="`${host.pluginId}:${host.architecture}`" :class="`host-${host.state}`">
               <span><strong>{{ host.pluginId }}</strong><small>{{ host.architecture.toUpperCase() }} · {{ host.serviceCount }} 个服务</small></span>
-              <span><b>{{ host.state === 'ready' ? '运行中' : host.state === 'restart-backoff' ? '启动退避' : host.state === 'retry-ready' ? '等待重试' : '按需待机' }}</b><small>累计失败 {{ host.failureCount }}<template v-if="host.lastFailureCode"> · {{ host.lastFailureCode }}</template></small></span>
+              <div class="host-health-runtime"><span><b>{{ host.state === 'ready' ? '运行中' : host.state === 'restart-backoff' ? '启动退避' : host.state === 'retry-ready' ? '等待重试' : '按需待机' }}</b><small>累计失败 {{ host.failureCount }}<template v-if="host.lastFailureCode"> · {{ host.lastFailureCode }}</template></small></span><button v-if="pluginHostNeedsAttention(host)" type="button" :disabled="busy" title="只重新启动隔离宿主并完成 Health，不调用 DLL、COM 或进程业务方法" @click="retryPluginHost(host)">恢复宿主</button></div>
             </article>
           </div>
         </details>
