@@ -51,7 +51,7 @@ const status = await bridge.getPluginInvocation(
 
 ## 崩溃一致性边界
 
-协调器在进入 Rust controller 前同步写入并 `fsync` “已接纳”记录，然后由独立监督任务执行插件调用；页面导航、Promise 丢弃或 WebView 销毁不会取消这条链。响应产生后先写入完成标记，再通知等待者。进程可能在原生组件产生副作用与完成标记之间崩溃，因此系统不会虚假承诺物理设备的 exactly-once；它会恢复为 `indeterminate`，并阻止同 ID 自动重放。
+协调器在进入 Rust controller 前同步写入并 `fsync` “已接纳”记录，然后由独立监督任务执行插件调用；页面导航、Promise 丢弃或 WebView 销毁不会取消这条链。响应产生后先写入完成标记，再通知等待者。监督层还会观察工作流任务本身：任务在持久接纳前异常终止时释放全部等待者并返回稳定失败，允许业务仍用同一操作 ID 重试；接纳后异常终止则根据账本发布 `indeterminate` 或 `completedWithoutResult`，不会永久停留在 `pending`，正常退出也不会被遗留计数拖住。若账本复核本身失败，结果保守收敛为 `indeterminate`。进程可能在原生组件产生副作用与完成标记之间崩溃，因此系统不会虚假承诺物理设备的 exactly-once；它会恢复为 `indeterminate`，并阻止同 ID 自动重放。
 
 正常退出和应用更新会先关闭持久调用准入，再排空 controller 中的原生调用，最后等待完成标记落盘后才退出或安装更新。更新安装失败时，controller 与持久协调器会一起恢复准入，安装器接管前保留的原业务窗口可以继续工作，无需重新打开。若整个进程异常终止，或正常排空超过全局退出上限，已经接纳但来不及可靠落盘的操作仍按上述规则恢复为 `indeterminate`，不会自动重放。
 

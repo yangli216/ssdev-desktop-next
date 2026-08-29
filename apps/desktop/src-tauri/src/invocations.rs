@@ -169,12 +169,15 @@ impl InvocationCoordinator {
             receiver
         };
 
+        let workflow_runtime_key = runtime_key.clone();
+        let workflow_identity = identity.clone();
         let coordinator = Arc::clone(self);
-        tokio::spawn(async move {
+        let workflow = tokio::spawn(async move {
             coordinator
-                .run_workflow(runtime_key, identity, request, controller)
+                .run_workflow(workflow_runtime_key, workflow_identity, request, controller)
                 .await;
         });
+        self.supervise_workflow(runtime_key, identity, workflow);
         await_result(receiver).await
     }
 
@@ -395,9 +398,6 @@ impl InvocationCoordinator {
         request: InvokeRequest,
         controller: Arc<PluginController>,
     ) {
-        let _active = ActiveWorkflowGuard {
-            coordinator: Arc::clone(&self),
-        };
         match begin_durable(Arc::clone(&self.ledger), identity.clone()).await {
             Ok(BeginDecision::Started) => {
                 let response = Arc::new(controller.invoke(request).await);
@@ -413,6 +413,62 @@ impl InvocationCoordinator {
             }
             Err(error) => {
                 self.publish_failure(runtime_key, error.diagnostic_code())
+                    .await;
+            }
+        }
+    }
+
+    fn supervise_workflow(
+        self: &Arc<Self>,
+        runtime_key: String,
+        identity: OperationIdentity,
+        workflow: tokio::task::JoinHandle<()>,
+    ) {
+        let coordinator = Arc::clone(self);
+        let active = ActiveWorkflowGuard {
+            coordinator: Arc::clone(&coordinator),
+        };
+        tokio::spawn(async move {
+            let _active = active;
+            if workflow.await.is_err() {
+                coordinator
+                    .reconcile_terminated_workflow(runtime_key, identity)
+                    .await;
+            }
+        });
+    }
+
+    async fn reconcile_terminated_workflow(
+        &self,
+        runtime_key: String,
+        identity: OperationIdentity,
+    ) {
+        warn!(
+            event_code = "tracked-invocation-workflow-terminated",
+            error_code = "tracked-invocation-task-failed",
+            "tracked invocation workflow terminated before publishing a result"
+        );
+        match status_durable(Arc::clone(&self.ledger), identity.lookup()).await {
+            Ok(DurableStatus::Unknown) => {
+                self.publish_retryable_failure(runtime_key, "tracked-invocation-task-failed")
+                    .await;
+            }
+            Ok(DurableStatus::Indeterminate) => {
+                self.publish_terminal(runtime_key, TrackedInvocationStatus::Indeterminate)
+                    .await;
+            }
+            Ok(DurableStatus::CompletedWithoutResult) => {
+                self.publish_terminal(runtime_key, TrackedInvocationStatus::CompletedWithoutResult)
+                    .await;
+            }
+            Err(error) => {
+                self.persistence_failures.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    event_code = "tracked-invocation-workflow-reconcile-failed",
+                    error_code = error.diagnostic_code(),
+                    "tracked invocation workflow state could not be reconciled"
+                );
+                self.publish_terminal(runtime_key, TrackedInvocationStatus::Indeterminate)
                     .await;
             }
         }
@@ -455,6 +511,30 @@ impl InvocationCoordinator {
             };
             waiters
         };
+        for waiter in waiters {
+            let _ = waiter.send(Err(error_code));
+        }
+    }
+
+    async fn publish_retryable_failure(&self, runtime_key: String, error_code: &'static str) {
+        let mut runtime = self.runtime.lock().await;
+        let Some(operation) = runtime.get(&runtime_key).cloned() else {
+            return;
+        };
+        let waiters = {
+            let mut state = operation.state.lock().await;
+            let RuntimeState::Pending { waiters } = &mut *state else {
+                return;
+            };
+            let waiters = std::mem::take(waiters);
+            *state = RuntimeState::Failed {
+                error_code,
+                completed_at: Instant::now(),
+            };
+            waiters
+        };
+        runtime.remove(&runtime_key);
+        drop(runtime);
         for waiter in waiters {
             let _ = waiter.send(Err(error_code));
         }
@@ -611,6 +691,32 @@ mod tests {
         );
         controller.replace_manifests(&[manifest]).await.unwrap();
         controller
+    }
+
+    async fn pending_operation(
+        coordinator: &Arc<InvocationCoordinator>,
+        operation_id: &str,
+    ) -> (
+        String,
+        OperationIdentity,
+        oneshot::Receiver<Result<TrackedInvocationStatus, &'static str>>,
+    ) {
+        let identity =
+            OperationIdentity::for_request(operation_id, "https://business.example", &request(1))
+                .unwrap();
+        let runtime_key = identity.runtime_key();
+        let (sender, receiver) = oneshot::channel();
+        coordinator.runtime.lock().await.insert(
+            runtime_key.clone(),
+            Arc::new(RuntimeOperation {
+                identity: identity.clone(),
+                state: Mutex::new(RuntimeState::Pending {
+                    waiters: vec![sender],
+                }),
+            }),
+        );
+        coordinator.active_workflows.fetch_add(1, Ordering::AcqRel);
+        (runtime_key, identity, receiver)
     }
 
     #[tokio::test]
@@ -842,5 +948,77 @@ mod tests {
             .await
             .expect("drain should be notified")
             .expect("drain task should succeed");
+    }
+
+    #[tokio::test]
+    async fn terminated_workflow_without_durable_acceptance_fails_waiters_and_drains() {
+        let root = tempdir().unwrap();
+        let controller = controller(root.path()).await;
+        let coordinator =
+            Arc::new(InvocationCoordinator::open(root.path().join("ledger")).unwrap());
+        let (runtime_key, identity, receiver) = pending_operation(&coordinator, OPERATION_ID).await;
+        let workflow = tokio::spawn(async move {
+            panic!("synthetic workflow failure before durable acceptance");
+        });
+        coordinator.supervise_workflow(runtime_key, identity, workflow);
+
+        let error = tokio::time::timeout(Duration::from_secs(1), await_result(receiver))
+            .await
+            .expect("workflow waiter should be released")
+            .unwrap_err();
+        assert_eq!(error.diagnostic_code(), "tracked-invocation-task-failed");
+        tokio::time::timeout(Duration::from_secs(1), coordinator.drain())
+            .await
+            .expect("terminated workflow should not block drain");
+        assert_eq!(coordinator.stats().await.pending_operations, 0);
+        assert!(matches!(
+            coordinator
+                .invoke(
+                    "https://business.example",
+                    OPERATION_ID,
+                    request(1),
+                    controller,
+                )
+                .await
+                .unwrap(),
+            TrackedInvocationStatus::Completed { durable: true, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminated_workflow_after_durable_acceptance_becomes_indeterminate() {
+        let root = tempdir().unwrap();
+        let coordinator =
+            Arc::new(InvocationCoordinator::open(root.path().join("ledger")).unwrap());
+        let (runtime_key, identity, receiver) = pending_operation(&coordinator, OPERATION_ID).await;
+        assert_eq!(
+            begin_durable(Arc::clone(&coordinator.ledger), identity.clone())
+                .await
+                .unwrap(),
+            BeginDecision::Started
+        );
+        let workflow = tokio::spawn(async move {
+            panic!("synthetic workflow failure after durable acceptance");
+        });
+        coordinator.supervise_workflow(runtime_key, identity, workflow);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), await_result(receiver))
+                .await
+                .expect("workflow waiter should be released")
+                .unwrap(),
+            TrackedInvocationStatus::Indeterminate
+        );
+        tokio::time::timeout(Duration::from_secs(1), coordinator.drain())
+            .await
+            .expect("terminated workflow should not block drain");
+        assert_eq!(coordinator.stats().await.pending_operations, 0);
+        assert_eq!(
+            coordinator
+                .status("https://business.example", OPERATION_ID, "printer", "print",)
+                .await
+                .unwrap(),
+            TrackedInvocationStatus::Indeterminate
+        );
     }
 }
