@@ -82,8 +82,10 @@ test('Windows native gate executes the production matrix wrapper for both hosts'
     readFile(new URL('../test-plugin-matrix-ci.ps1', import.meta.url), 'utf8'),
   ])
   assert.match(nativeGate, /test-plugin-matrix-ci\.ps1/)
-  assert.match(nativeGate, /i686-pc-windows-msvc\/debug\/webplus-plugin-host\.exe/)
-  assert.match(nativeGate, /x86_64-pc-windows-msvc\/debug\/webplus-plugin-host\.exe/)
+  assert.match(nativeGate, /cargo build --locked --release -p webplus-plugin-host --target \$target/)
+  assert.match(nativeGate, /i686-pc-windows-msvc\/release\/webplus-plugin-host\.exe/)
+  assert.match(nativeGate, /x86_64-pc-windows-msvc\/release\/webplus-plugin-host\.exe/)
+  assert.doesNotMatch(nativeGate, /debug\/webplus-plugin-host\.exe/)
   assert.match(matrixGate, /ci\.echo-x86/)
   assert.match(matrixGate, /ci\.echo-x64/)
   assert.match(matrixGate, /release-set-check/)

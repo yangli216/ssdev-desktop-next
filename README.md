@@ -21,7 +21,7 @@ business webview -> narrow Tauri command -> Rust controller
 - controller 最多接受 8 个在途插件调用；容量饱和时在进入原生宿主前快速拒绝，不建立无界等待队列。
 - localhost HTTP 仅作为可关闭的旧浏览器兼容网关，不是新架构内部依赖。
 
-每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归；Windows 门禁还会实际生成并构建两种架构的最小 DLL 插件脚手架，用公开 RFC 8032 测试向量制作两个仅供 CI 的签名包，经过正式发布集合检查和物化后，由生产黄金矩阵包装器分别拉起已经构建的 x86/x64 宿主完成调用并核对 schema 2 证据。随后分别为 x64 与 x86 桌面构建 `0.0.1` 合成旧版本和当前候选版本，对离线 NSIS 执行原位升级、配置保留、布局/架构检查、真实启动和卸载；再额外构建在线轻量 NSIS 并执行安装、启动和卸载冒烟。Linux DEB/AppImage 和 macOS DMG 仅在手动选择 `all` 平台时构建。CI 测试签名密钥、临时更新密钥均非生产信任材料，平台代码签名也被明确跳过，产物不能分发。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
+每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归；Windows 门禁还会实际生成并构建两种架构的最小 DLL 插件脚手架，用公开 RFC 8032 测试向量制作两个仅供 CI 的签名包，经过正式发布集合检查和物化后，由生产黄金矩阵包装器分别拉起已经构建的 Release x86/x64 宿主完成调用并核对 schema 2 证据。随后分别为 x64 与 x86 桌面构建 `0.0.1` 合成旧版本和当前候选版本，对离线 NSIS 执行原位升级、配置保留、布局/架构检查、真实启动和卸载；再额外构建在线轻量 NSIS 并执行安装、启动和卸载冒烟。Linux DEB/AppImage 和 macOS DMG 仅在手动选择 `all` 平台时构建。CI 测试签名密钥、临时更新密钥均非生产信任材料，平台代码签名也被明确跳过，产物不能分发；生产硬件矩阵仍必须输入候选安装包构建留下的已签名宿主原文件，CI Release 宿主不能替代该身份门禁。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
 
 架构决策和迁移门槛见 [docs/adr/0001-target-architecture.md](docs/adr/0001-target-architecture.md)。
 业务页面从 localhost HTTP 切换到窄桥接接口的方式见 [docs/web-bridge-migration.md](docs/web-bridge-migration.md)。
