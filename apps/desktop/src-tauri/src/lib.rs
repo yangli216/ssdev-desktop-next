@@ -1280,6 +1280,17 @@ async fn import_project_bundle(
             });
         }
     };
+    let baseline_transition =
+        match SignedPluginApiBaselineTransition::prepare(&state, &installed.manifests) {
+            Ok(transition) => transition,
+            Err(error) => {
+                let rollback = rollback_project_components(transaction, activated);
+                return Err(match rollback {
+                    Ok(()) => format!("{error}，已恢复导入前状态"),
+                    Err(rollback) => format!("{error}; {rollback}"),
+                });
+            }
+        };
     if let Err(error) = maintenance.replace_manifests(&installed.manifests).await {
         let rollback = rollback_project_components(transaction, activated);
         return Err(match rollback {
@@ -1326,6 +1337,7 @@ async fn import_project_bundle(
                 .map_or_else(|| "成功".to_owned(), |failure| failure)
         ));
     }
+    baseline_transition.commit();
 
     let mut deferred_cleanup = 0_usize;
     for component in activated {
@@ -1340,7 +1352,6 @@ async fn import_project_bundle(
     } else {
         drop(transaction);
     }
-    record_signed_plugin_api_baseline(&state, &installed.manifests);
     let service_count = state.controller.service_count().await;
     state
         .plugin_load_failures
@@ -1857,21 +1868,94 @@ fn validate_signed_plugin_api_baseline(
     ))
 }
 
-fn record_signed_plugin_api_baseline(state: &BridgeState, manifests: &[PluginManifest]) {
-    let result = match state.plugin_api_baseline.lock() {
-        Ok(mut baseline) => baseline.replace_with_manifests(manifests, &state.local_mapping_root),
-        Err(_) => Err("签名插件契约基线锁已损坏".to_owned()),
-    };
-    if result.is_err() {
-        state
-            .plugin_api_baseline_failures
-            .fetch_add(1, Ordering::AcqRel);
-        tracing::error!(
-            event_code = "plugin-api-baseline-persist-failed",
-            error_code = "plugin-api-baseline-io",
-            "accepted signed plugin API baseline could not be persisted"
-        );
+struct SignedPluginApiBaselineTransition<'a> {
+    state: &'a BridgeState,
+    finalized: bool,
+}
+
+impl<'a> SignedPluginApiBaselineTransition<'a> {
+    fn prepare(state: &'a BridgeState, manifests: &[PluginManifest]) -> Result<Self, String> {
+        Self::prepare_retiring(state, manifests, &[])
     }
+
+    fn prepare_retiring(
+        state: &'a BridgeState,
+        manifests: &[PluginManifest],
+        retired_plugin_ids: &[&str],
+    ) -> Result<Self, String> {
+        let prepared = state
+            .plugin_api_baseline
+            .lock()
+            .map_err(|_| "签名插件契约基线锁已损坏".to_owned())
+            .and_then(|mut baseline| {
+                if retired_plugin_ids.is_empty() {
+                    baseline.prepare_transition(manifests, &state.local_mapping_root)
+                } else {
+                    baseline.prepare_transition_retiring(
+                        manifests,
+                        &state.local_mapping_root,
+                        retired_plugin_ids,
+                    )
+                }
+            });
+        if prepared.is_err() {
+            record_plugin_api_baseline_failure(state, "plugin-api-baseline-prepare-failed");
+            return Err("无法写入签名插件契约切换准备记录；未提交插件变更".into());
+        }
+        Ok(Self {
+            state,
+            finalized: false,
+        })
+    }
+
+    /// Called only after the enclosing plugin/project transaction has reached
+    /// its durable commit point. A persistence failure intentionally leaves the
+    /// pending record for deterministic startup recovery and must not trigger a
+    /// rollback claim for an already committed plugin transaction.
+    fn commit(mut self) {
+        let result = self
+            .state
+            .plugin_api_baseline
+            .lock()
+            .map_err(|_| "签名插件契约基线锁已损坏".to_owned())
+            .and_then(|mut baseline| baseline.commit_transition());
+        self.finalized = true;
+        if result.is_err() {
+            record_plugin_api_baseline_failure(self.state, "plugin-api-baseline-commit-deferred");
+        }
+    }
+
+    fn abort(&mut self) {
+        let result = self
+            .state
+            .plugin_api_baseline
+            .lock()
+            .map_err(|_| "签名插件契约基线锁已损坏".to_owned())
+            .and_then(|mut baseline| baseline.abort_transition());
+        self.finalized = true;
+        if result.is_err() {
+            record_plugin_api_baseline_failure(self.state, "plugin-api-baseline-abort-deferred");
+        }
+    }
+}
+
+impl Drop for SignedPluginApiBaselineTransition<'_> {
+    fn drop(&mut self) {
+        if !self.finalized {
+            self.abort();
+        }
+    }
+}
+
+fn record_plugin_api_baseline_failure(state: &BridgeState, event_code: &'static str) {
+    state
+        .plugin_api_baseline_failures
+        .fetch_add(1, Ordering::AcqRel);
+    tracing::error!(
+        event_code,
+        error_code = "plugin-api-baseline-io",
+        "signed plugin API baseline transition could not be persisted"
+    );
 }
 
 fn signed_plugin_baseline_version(
@@ -3333,6 +3417,7 @@ async fn activate_prepared_plugin(
             ));
         }
     };
+    let baseline_transition = SignedPluginApiBaselineTransition::prepare(state, &candidates)?;
 
     let maintenance = state
         .controller
@@ -3401,7 +3486,7 @@ async fn activate_prepared_plugin(
             .map_err(|reload| format!("插件事务提交失败: {error}; 恢复旧路由失败: {reload}"))?;
         return Err(format!("插件事务提交失败，已恢复旧插件: {error}"));
     }
-    record_signed_plugin_api_baseline(state, &installed.manifests);
+    baseline_transition.commit();
     state
         .plugin_load_failures
         .store(installed.failures.len(), Ordering::Release);
@@ -3509,6 +3594,19 @@ async fn uninstall_signed_plugin(
             .map_err(|rollback| format!("{error}; 恢复原插件同时失败: {rollback}"))?;
         return Err(format!("{error}；已恢复原插件"));
     }
+    let baseline_transition = match SignedPluginApiBaselineTransition::prepare_retiring(
+        &state,
+        &installed.manifests,
+        &[plugin_id.as_str()],
+    ) {
+        Ok(transition) => transition,
+        Err(error) => {
+            removal
+                .rollback()
+                .map_err(|rollback| format!("{error}; 恢复原插件同时失败: {rollback}"))?;
+            return Err(format!("{error}，已恢复原插件"));
+        }
+    };
     if let Err(error) = maintenance.replace_manifest(None).await {
         removal
             .rollback()
@@ -3526,7 +3624,7 @@ async fn uninstall_signed_plugin(
             .map_err(|restore| format!("卸载事务提交失败: {error}; 恢复原路由失败: {restore}"))?;
         return Err(format!("卸载事务提交失败，已恢复原插件: {error}"));
     }
-    record_signed_plugin_api_baseline(&state, &installed.manifests);
+    baseline_transition.commit();
     state
         .plugin_load_failures
         .store(installed.failures.len(), Ordering::Release);
@@ -3570,12 +3668,14 @@ async fn reload_plugins(
     )?;
     let preflighted_hosts =
         preflight_manifests(&state, &plugins.manifests, "待重载插件或映射").await?;
+    let baseline_transition =
+        SignedPluginApiBaselineTransition::prepare(&state, &plugins.manifests)?;
     state
         .controller
         .replace_manifests(&plugins.manifests)
         .await
         .map_err(|error| error.to_string())?;
-    record_signed_plugin_api_baseline(&state, &plugins.manifests);
+    baseline_transition.commit();
     state
         .plugin_load_failures
         .store(plugins.failures.len(), Ordering::Release);
@@ -4709,13 +4809,23 @@ pub fn run() {
                 &desktop_version,
             )
                 .map_err(std::io::Error::other)?;
-            let (plugin_api_baseline, offline_breaking_plugins) =
+            let (
+                plugin_api_baseline,
+                offline_breaking_plugins,
+                recovered_api_baseline_transition,
+            ) =
                 PluginApiBaselineStore::open(
                     local_data_dir.join("plugin-api-baseline.json"),
                     &plugins.manifests,
                     &local_mapping_root,
                 )
                 .map_err(std::io::Error::other)?;
+            if recovered_api_baseline_transition {
+                tracing::info!(
+                    event_code = "plugin-api-baseline-transition-recovered",
+                    "signed plugin API baseline transition recovered after plugin transactions"
+                );
+            }
             if !offline_breaking_plugins.is_empty() {
                 plugins.manifests.retain(|manifest| {
                     !offline_breaking_plugins
@@ -4777,7 +4887,11 @@ pub fn run() {
                 invocation_coordinator_error,
                 plugin_load_failures: AtomicUsize::new(plugins.failures.len()),
                 plugin_count: AtomicUsize::new(plugins.manifests.len()),
-                recovered_plugin_transactions: AtomicUsize::new(recovery.total()),
+                recovered_plugin_transactions: AtomicUsize::new(
+                    recovery
+                        .total()
+                        .saturating_add(usize::from(recovered_api_baseline_transition)),
+                ),
                 preflighted_plugin_hosts: AtomicUsize::new(0),
                 plugin_preflight_failures: AtomicUsize::new(0),
                 plugin_api_baseline_failures: AtomicUsize::new(0),
