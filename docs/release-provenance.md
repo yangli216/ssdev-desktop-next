@@ -41,7 +41,7 @@ cargo run --locked -p ssdev-release-manifest -- metadata-verify `
   C:\src\ssdev-desktop\next
 ```
 
-Windows 安装包验收对候选包执行第二种验证；真实上一生产版本通常来自不同提交，因此不要求匹配当前源码，但必须验证其结构、签名清单和独立更新公钥锚定。schema 4 Windows 证据记录上一版本号、`release.json` 与 `artifacts.json` 摘要，schema 7 生产策略逐项锁定这些值，避免用另一个更低版本替代真实升级演练。
+Windows 安装包验收对候选包执行第二种验证；真实上一生产版本通常来自不同提交，因此不要求匹配当前源码，但必须验证其结构、签名清单和独立更新公钥锚定。schema 5 Windows 证据记录上一版本号、`release.json`、`artifacts.json` 及近期深度部署记录摘要，schema 7 生产策略逐项锁定发布身份，最终判定另要求部署记录存在，避免用另一个更低版本或只启动控制台替代真实升级与业务页面演练。
 
 ## 边界
 

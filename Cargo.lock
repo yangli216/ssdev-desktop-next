@@ -4428,6 +4428,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "ssdev-config",
+ "ssdev-cutover-evidence",
  "ssdev-diagnostics",
  "ssdev-invocation-ledger",
  "ssdev-origin-policy",

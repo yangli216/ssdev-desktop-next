@@ -14,10 +14,12 @@ use webplus_plugin_trust::{
 
 pub const EVIDENCE_SCHEMA_VERSION: u8 = 3;
 pub const PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION: u8 = 2;
-pub const WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION: u8 = 4;
+pub const WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION: u8 = 5;
 pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 7;
 pub const CUTOVER_DECISION_SCHEMA_VERSION: u8 = 3;
 const MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
+const MAX_DEPLOYMENT_CHECK_BYTES: u64 = 128 * 1024;
+const MAX_DEPLOYMENT_CHECK_AGE_SECONDS: u64 = 60 * 60;
 const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_HASHED_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_NAMED_PAYLOADS: usize = 4096;
@@ -130,6 +132,8 @@ pub struct WindowsPackageEvidence {
     pub origin_policy_sha256: String,
     pub x86_host_sha256: String,
     pub x64_host_sha256: String,
+    pub deployment_check_sha256: Option<String>,
+    pub deployment_check_generated_at_unix_ms: Option<u64>,
     pub app_version: String,
     pub authenticode_required: bool,
     pub authenticode_verified: bool,
@@ -141,6 +145,50 @@ pub struct WindowsPackageEvidence {
     pub previous_release_metadata_sha256: Option<String>,
     pub previous_artifact_manifest_sha256: Option<String>,
     pub passed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeploymentCheckRecord {
+    pub schema_version: u16,
+    pub generated_at_unix_ms: u64,
+    pub desktop_version: String,
+    pub os: String,
+    pub architecture: String,
+    pub evidence_level: String,
+    pub report: DeploymentCheckRecordReport,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeploymentCheckRecordReport {
+    pub deep: bool,
+    pub deep_available: bool,
+    pub ready: bool,
+    pub delivery_ready: bool,
+    pub passed: usize,
+    pub warnings: usize,
+    pub failures: usize,
+    pub items: Vec<DeploymentCheckRecordItem>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeploymentCheckRecordItem {
+    pub id: String,
+    pub label: String,
+    pub status: DeploymentCheckRecordStatus,
+    pub summary: String,
+    pub action: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeploymentCheckRecordStatus {
+    Pass,
+    Warning,
+    Fail,
+    Info,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -384,6 +432,35 @@ impl WindowsPackageEvidence {
                 "Windows package input hashes must be lowercase SHA-256 digests".into(),
             ));
         }
+        match (
+            self.deployment_check_sha256.as_deref(),
+            self.deployment_check_generated_at_unix_ms,
+        ) {
+            (None, None) => {}
+            (Some(digest), Some(generated_at_unix_ms)) => {
+                if !is_sha256(digest) || generated_at_unix_ms == 0 {
+                    return Err(EvidenceError::Invalid(
+                        "deployment check binding must use a lowercase SHA-256 digest and non-zero timestamp".into(),
+                    ));
+                }
+                let generated_at_unix_seconds = generated_at_unix_ms / 1_000;
+                if generated_at_unix_seconds > self.executed_at_unix_seconds.saturating_add(300)
+                    || self
+                        .executed_at_unix_seconds
+                        .saturating_sub(generated_at_unix_seconds)
+                        > MAX_DEPLOYMENT_CHECK_AGE_SECONDS
+                {
+                    return Err(EvidenceError::Invalid(
+                        "deployment check record must be generated within one hour of package evidence".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(EvidenceError::Invalid(
+                    "deployment check digest and timestamp must be present together".into(),
+                ));
+            }
+        }
         let app_version = Version::parse(&self.app_version).map_err(|_| {
             EvidenceError::Invalid("appVersion must be a valid semantic version".into())
         })?;
@@ -432,6 +509,108 @@ impl WindowsPackageEvidence {
         }
         Ok(())
     }
+}
+
+impl DeploymentCheckRecord {
+    pub fn validate_for_delivery(&self, expected_version: &str) -> Result<(), EvidenceError> {
+        if self.schema_version != 1
+            || self.evidence_level != "unsigned-local-record"
+            || self.generated_at_unix_ms == 0
+            || self.os != "windows"
+            || !matches!(self.architecture.as_str(), "x86" | "x86_64")
+            || self.desktop_version != expected_version
+            || Version::parse(&self.desktop_version).is_err()
+        {
+            return Err(EvidenceError::Invalid(
+                "deployment check record metadata does not match the candidate Windows release"
+                    .into(),
+            ));
+        }
+        let report = &self.report;
+        if !report.deep
+            || !report.deep_available
+            || !report.ready
+            || !report.delivery_ready
+            || report.failures != 0
+            || report.items.len() != 13
+        {
+            return Err(EvidenceError::Invalid(
+                "deployment check record is not a passing Windows deep delivery check".into(),
+            ));
+        }
+        let passed = report
+            .items
+            .iter()
+            .filter(|item| item.status == DeploymentCheckRecordStatus::Pass)
+            .count();
+        let warnings = report
+            .items
+            .iter()
+            .filter(|item| item.status == DeploymentCheckRecordStatus::Warning)
+            .count();
+        let failures = report
+            .items
+            .iter()
+            .filter(|item| item.status == DeploymentCheckRecordStatus::Fail)
+            .count();
+        if (report.passed, report.warnings, report.failures) != (passed, warnings, failures) {
+            return Err(EvidenceError::Invalid(
+                "deployment check record counters do not match its items".into(),
+            ));
+        }
+        let expected_ids = BTreeSet::from([
+            "webview-runtime",
+            "business-frontend",
+            "project-config",
+            "origin-policy",
+            "plugin-trust",
+            "plugin-hosts",
+            "plugin-inventory",
+            "plugin-route-policy",
+            "tracked-invocations",
+            "plugin-preflight",
+            "diagnostics",
+            "managed-processes",
+            "app-update",
+        ]);
+        let actual_ids = report
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<BTreeSet<_>>();
+        if actual_ids != expected_ids
+            || !report.items.iter().any(|item| {
+                item.id == "business-frontend" && item.status == DeploymentCheckRecordStatus::Pass
+            })
+            || report.items.iter().any(|item| {
+                item.label.is_empty()
+                    || item.label.len() > 128
+                    || item.summary.is_empty()
+                    || item.summary.len() > 2_048
+                    || item
+                        .action
+                        .as_ref()
+                        .is_some_and(|action| action.is_empty() || action.len() > 2_048)
+            })
+        {
+            return Err(EvidenceError::Invalid(
+                "deployment check record does not contain the complete bounded delivery checklist"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn load_delivery_ready_deployment_check(
+    path: &Path,
+    expected_version: &str,
+) -> Result<(DeploymentCheckRecord, String), EvidenceError> {
+    let bytes = read_bounded_bytes(path, MAX_DEPLOYMENT_CHECK_BYTES)?;
+    let digest = sha256_bytes(&bytes);
+    let record: DeploymentCheckRecord = serde_json::from_slice(&bytes)?;
+    record.validate_for_delivery(expected_version)?;
+    Ok((record, digest))
 }
 
 impl MigrationAuditEvidence {
@@ -982,6 +1161,9 @@ pub fn evaluate_production_cutover(
     if !windows.launch_verified {
         blockers.insert("windows-launch-not-verified".into());
     }
+    if windows.deployment_check_sha256.is_none() {
+        blockers.insert("windows-business-frontend-not-verified".into());
+    }
     if !windows.upgrade_verified {
         blockers.insert("windows-upgrade-not-verified".into());
     }
@@ -1317,6 +1499,8 @@ mod tests {
             origin_policy_sha256: "a".repeat(64),
             x86_host_sha256: "4".repeat(64),
             x64_host_sha256: "5".repeat(64),
+            deployment_check_sha256: Some("6".repeat(64)),
+            deployment_check_generated_at_unix_ms: Some(1_000),
             app_version: "1.2.3".into(),
             authenticode_required: true,
             authenticode_verified: true,
@@ -1328,6 +1512,51 @@ mod tests {
             previous_release_metadata_sha256: Some("9".repeat(64)),
             previous_artifact_manifest_sha256: Some("d".repeat(64)),
             passed: true,
+        }
+    }
+
+    fn valid_deployment_check_record() -> DeploymentCheckRecord {
+        let items = [
+            "webview-runtime",
+            "business-frontend",
+            "project-config",
+            "origin-policy",
+            "plugin-trust",
+            "plugin-hosts",
+            "plugin-inventory",
+            "plugin-route-policy",
+            "tracked-invocations",
+            "plugin-preflight",
+            "diagnostics",
+            "managed-processes",
+            "app-update",
+        ]
+        .into_iter()
+        .map(|id| DeploymentCheckRecordItem {
+            id: id.into(),
+            label: id.into(),
+            status: DeploymentCheckRecordStatus::Pass,
+            summary: "verified".into(),
+            action: None,
+        })
+        .collect::<Vec<_>>();
+        DeploymentCheckRecord {
+            schema_version: 1,
+            generated_at_unix_ms: 1_000,
+            desktop_version: "1.2.3".into(),
+            os: "windows".into(),
+            architecture: "x86_64".into(),
+            evidence_level: "unsigned-local-record".into(),
+            report: DeploymentCheckRecordReport {
+                deep: true,
+                deep_available: true,
+                ready: true,
+                delivery_ready: true,
+                passed: items.len(),
+                warnings: 0,
+                failures: 0,
+                items,
+            },
         }
     }
 
@@ -1421,6 +1650,38 @@ mod tests {
         let mut unbound = valid_windows_package();
         unbound.x86_host_sha256 = "not-a-digest".into();
         assert!(unbound.validate().is_err());
+
+        let mut missing_timestamp = valid_windows_package();
+        missing_timestamp.deployment_check_generated_at_unix_ms = None;
+        assert!(missing_timestamp.validate().is_err());
+
+        let mut stale = valid_windows_package();
+        stale.executed_at_unix_seconds = MAX_DEPLOYMENT_CHECK_AGE_SECONDS + 2;
+        assert!(stale.validate().is_err());
+    }
+
+    #[test]
+    fn deployment_check_binding_requires_a_complete_real_business_handshake() {
+        let record = valid_deployment_check_record();
+        record.validate_for_delivery("1.2.3").unwrap();
+
+        let mut no_business_handshake = record.clone();
+        let business = no_business_handshake
+            .report
+            .items
+            .iter_mut()
+            .find(|item| item.id == "business-frontend")
+            .unwrap();
+        business.status = DeploymentCheckRecordStatus::Warning;
+        no_business_handshake.report.passed -= 1;
+        no_business_handshake.report.warnings = 1;
+        assert!(no_business_handshake
+            .validate_for_delivery("1.2.3")
+            .is_err());
+
+        let mut wrong_version = record.clone();
+        wrong_version.desktop_version = "1.2.4".into();
+        assert!(wrong_version.validate_for_delivery("1.2.3").is_err());
     }
 
     #[test]
@@ -1585,6 +1846,34 @@ mod tests {
                 "windows-previous-artifact-manifest-mismatch",
                 "windows-previous-release-metadata-mismatch",
             ]
+        );
+
+        let mut no_deployment_check = windows.clone();
+        no_deployment_check.deployment_check_sha256 = None;
+        no_deployment_check.deployment_check_generated_at_unix_ms = None;
+        let no_business_acceptance = evaluate_production_cutover(
+            ProductionCutoverInputs {
+                policy: &policy,
+                policy_sha256: "1".repeat(64),
+                policy_attestation_sha256: "0".repeat(64),
+                evidence_trust_store_sha256: "8".repeat(64),
+                approval_trust_store_sha256: "2".repeat(64),
+                plugin: &plugin,
+                plugin_sha256: "2".repeat(64),
+                plugin_attestation_sha256: "5".repeat(64),
+                migration: &migration,
+                migration_sha256: "3".repeat(64),
+                migration_attestation_sha256: "6".repeat(64),
+                windows: &no_deployment_check,
+                windows_sha256: "4".repeat(64),
+                windows_attestation_sha256: "7".repeat(64),
+            },
+            1000,
+        )
+        .unwrap();
+        assert_eq!(
+            no_business_acceptance.blocker_codes,
+            ["windows-business-frontend-not-verified"]
         );
 
         windows.launch_verified = false;

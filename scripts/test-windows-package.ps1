@@ -16,6 +16,7 @@ param(
   [string]$EvidenceOutput,
   [Parameter(Mandatory = $true)]
   [string]$EvidenceEnvironment,
+  [string]$DeploymentCheckRecord,
   [switch]$RequireAuthenticode,
   [switch]$SkipLaunch
 )
@@ -47,6 +48,12 @@ if (-not $evidenceParent -or -not (Test-Path -LiteralPath $evidenceParent -PathT
 $EvidenceOutput = Join-Path (Resolve-Path -LiteralPath $evidenceParent).Path (Split-Path -Leaf $EvidenceOutput)
 if (Test-Path -LiteralPath $EvidenceOutput) {
   throw "EvidenceOutput already exists; package evidence is never overwritten."
+}
+if ($DeploymentCheckRecord) {
+  if (-not (Test-Path -LiteralPath $DeploymentCheckRecord -PathType Leaf)) {
+    throw "DeploymentCheckRecord must be an existing deep deployment-check JSON file."
+  }
+  $DeploymentCheckRecord = (Resolve-Path -LiteralPath $DeploymentCheckRecord).Path
 }
 
 function Read-ExpectedUpdatePublicKey {
@@ -902,6 +909,7 @@ if (
 ) {
   throw "Candidate installed runtime identity hashes were not captured during package verification."
 }
+$deploymentCheckEvidenceArgument = if ($DeploymentCheckRecord) { $DeploymentCheckRecord } else { "none" }
 $evidenceArguments = @(
   "run", "--quiet", "--locked", "--manifest-path", (Join-Path $workspace "Cargo.toml"),
   "-p", "ssdev-cutover-evidence", "--", "windows-package",
@@ -916,7 +924,8 @@ $evidenceArguments = @(
   $script:CandidatePluginTrustStoreSha256,
   $script:CandidateOriginPolicySha256,
   $script:CandidateX86HostSha256,
-  $script:CandidateX64HostSha256
+  $script:CandidateX64HostSha256,
+  $deploymentCheckEvidenceArgument
 )
 if ($PreviousBundleRoot) {
   $evidenceArguments += (Join-Path $previousMetadataDirectory "release.json")

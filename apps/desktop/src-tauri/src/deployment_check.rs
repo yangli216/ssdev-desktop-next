@@ -912,6 +912,27 @@ mod tests {
     }
 
     #[test]
+    fn exported_deep_record_satisfies_the_production_windows_evidence_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("deployment-check.json");
+        let report = evaluate(&healthy_facts());
+        let bytes =
+            encode_export_document(&report, 1_786_000_000_000, "1.2.3", "windows", "x86_64")
+                .unwrap();
+        persist_export_document(&destination, &bytes).unwrap();
+
+        let (record, digest) =
+            ssdev_cutover_evidence::load_delivery_ready_deployment_check(&destination, "1.2.3")
+                .unwrap();
+        assert_eq!(digest, ssdev_cutover_evidence::sha256_bytes(&bytes));
+        assert!(record.report.delivery_ready);
+        assert!(record.report.items.iter().any(|item| {
+            item.id == "business-frontend"
+                && item.status == ssdev_cutover_evidence::DeploymentCheckRecordStatus::Pass
+        }));
+    }
+
+    #[test]
     fn field_record_export_never_overwrites_an_existing_file() {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("deployment-check.json");

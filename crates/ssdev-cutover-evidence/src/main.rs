@@ -9,8 +9,9 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use ssdev_cutover_evidence::{
-    evaluate_production_cutover, load_migration_audit_evidence, load_plugin_matrix_evidence,
-    load_windows_package_evidence, prepare_new_output, sha256_file, verify_evidence_attestation,
+    evaluate_production_cutover, load_delivery_ready_deployment_check,
+    load_migration_audit_evidence, load_plugin_matrix_evidence, load_windows_package_evidence,
+    prepare_new_output, sha256_file, verify_evidence_attestation,
     verify_production_cutover_policy_attestation, write_cutover_decision,
     write_production_cutover_policy, write_windows_package_evidence, EvidenceAttestationKind,
     EvidenceType, MigrationCoverageMinimums, ProductionCutoverInputs, ProductionCutoverPolicy,
@@ -242,7 +243,7 @@ fn run() -> Result<bool, Box<dyn Error>> {
 }
 
 fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
-    if !matches!(arguments.len(), 13 | 14) {
+    if !matches!(arguments.len(), 14 | 15) {
         return Err(usage().into());
     }
     if std::env::consts::OS != "windows" || std::env::consts::ARCH != "x86_64" {
@@ -290,8 +291,23 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
         string_argument(arguments.get(10), "installed origin policy SHA-256")?;
     let x86_host_sha256 = string_argument(arguments.get(11), "x86 host SHA-256")?;
     let x64_host_sha256 = string_argument(arguments.get(12), "x64 host SHA-256")?;
+    let deployment_check_argument = string_argument(arguments.get(13), "deployment check")?;
+    let deployment_check_path = if deployment_check_argument == "none" {
+        None
+    } else {
+        let path = canonical_regular_file(
+            Path::new(&deployment_check_argument),
+            "deployment check record",
+        )?;
+        if path.starts_with(&workspace) || path.starts_with(bundle_root) {
+            return Err(invalid_input(
+                "deployment check record must stay outside the source workspace and verified bundle",
+            ));
+        }
+        Some(path)
+    };
     let previous_metadata_path = arguments
-        .get(13)
+        .get(14)
         .map(|value| path_argument(Some(value), "previous release metadata"))
         .transpose()?
         .map(|path| canonical_regular_file(&path, "previous release metadata"))
@@ -319,6 +335,11 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
     let release_metadata_before = sha256_file(&release_metadata_path)?;
     let artifact_manifest_before = sha256_file(&artifact_manifest_path)?;
     let current = verify_release_metadata(&release_metadata_path, Some(&workspace))?;
+    let deployment_check = deployment_check_path
+        .as_deref()
+        .map(|path| load_delivery_ready_deployment_check(path, &current.app_version))
+        .transpose()?;
+    let deployment_check_hash_before = deployment_check.as_ref().map(|(_, digest)| digest.clone());
     let previous = previous_metadata_path
         .as_deref()
         .map(|path| verify_release_metadata(path, None))
@@ -344,11 +365,16 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
         .as_deref()
         .map(sha256_file)
         .transpose()?;
+    let deployment_check_hash_after = deployment_check_path
+        .as_deref()
+        .map(sha256_file)
+        .transpose()?;
     if source_before != source_after
         || release_metadata_before != release_metadata_after
         || artifact_manifest_before != artifact_manifest_after
         || previous_hash_before != previous_hash_after
         || previous_artifact_manifest_hash_before != previous_artifact_manifest_hash_after
+        || deployment_check_hash_before != deployment_check_hash_after
     {
         return Err(invalid_input(
             "source or release evidence inputs changed during verification",
@@ -379,6 +405,9 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
             origin_policy_sha256,
             x86_host_sha256,
             x64_host_sha256,
+            deployment_check_sha256: deployment_check_hash_after,
+            deployment_check_generated_at_unix_ms: deployment_check
+                .map(|(record, _)| record.generated_at_unix_ms),
             app_version: current.app_version,
             authenticode_required: current.authenticode_required,
             authenticode_verified,
@@ -776,7 +805,7 @@ fn invalid_input(message: &str) -> Box<dyn Error> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ssdev-cutover-evidence prepare-policy <workspace> <pilot-materials-root> <pilot-manifest.json> <pilot-report.json> <candidate-bundle-root> <evidence-trust.json> <policy-approval-inputs.json> <policy-output.json>\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
+    "usage:\n  ssdev-cutover-evidence prepare-policy <workspace> <pilot-materials-root> <pilot-manifest.json> <pilot-report.json> <candidate-bundle-root> <evidence-trust.json> <policy-approval-inputs.json> <policy-output.json>\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> <deployment-check.json|none> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
 }
 
 #[cfg(test)]

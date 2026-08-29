@@ -156,4 +156,7 @@ test("production evidence binds delivery hosts, trust store, and origin policy",
   assert.match(packageTest, /\$script:CandidateOriginPolicySha256/);
   assert.match(packageTest, /\$script:CandidateX86HostSha256/);
   assert.match(packageTest, /\$script:CandidateX64HostSha256/);
+  assert.match(packageTest, /\[string\]\$DeploymentCheckRecord/);
+  assert.match(packageTest, /DeploymentCheckRecord.*deep deployment-check JSON file/);
+  assert.match(packageTest, /else \{ "none" \}/);
 });
