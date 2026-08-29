@@ -362,6 +362,7 @@ struct BridgeStatus {
     active_plugin_hosts: usize,
     plugin_host_starts: u64,
     plugin_host_start_failures: u64,
+    plugin_hosts: Vec<BridgePluginHostHealth>,
     plugin_load_failures: usize,
     plugin_count: usize,
     recovered_plugin_transactions: usize,
@@ -389,6 +390,37 @@ struct BridgeStatus {
     diagnostics: Option<DiagnosticsStats>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgePluginHostHealth {
+    plugin_id: String,
+    architecture: &'static str,
+    service_count: usize,
+    state: &'static str,
+    failure_count: u64,
+    last_failure_code: Option<&'static str>,
+}
+
+impl From<webplus_controller::PluginHostHealth> for BridgePluginHostHealth {
+    fn from(host: webplus_controller::PluginHostHealth) -> Self {
+        Self {
+            plugin_id: host.plugin_id,
+            architecture: plugin_architecture_name(host.architecture),
+            service_count: host.service_count,
+            state: host.state.as_str(),
+            failure_count: host.failure_count,
+            last_failure_code: host.last_failure_code,
+        }
+    }
+}
+
+const fn plugin_architecture_name(architecture: PluginArchitecture) -> &'static str {
+    match architecture {
+        PluginArchitecture::X86 => "x86",
+        PluginArchitecture::X64 => "x64",
+    }
+}
+
 #[tauri::command]
 async fn bridge_status(
     caller: WebviewWindow,
@@ -405,6 +437,13 @@ async fn bridge_status(
     let (sso_active, sso_error) = sso_state.status();
     let admission = state.controller.invocation_admission_stats();
     let hosts = state.controller.plugin_host_stats();
+    let plugin_hosts = state
+        .controller
+        .plugin_host_health()
+        .await
+        .into_iter()
+        .map(BridgePluginHostHealth::from)
+        .collect();
     let trust_keys = state
         .trust_store
         .as_deref()
@@ -443,6 +482,7 @@ async fn bridge_status(
         active_plugin_hosts: hosts.active_hosts,
         plugin_host_starts: hosts.successful_starts,
         plugin_host_start_failures: hosts.failed_starts,
+        plugin_hosts,
         plugin_load_failures: state.plugin_load_failures.load(Ordering::Acquire),
         plugin_count: state.plugin_count.load(Ordering::Acquire),
         recovered_plugin_transactions: state.recovered_plugin_transactions.load(Ordering::Acquire),
@@ -5165,11 +5205,11 @@ mod tests {
         project_import_plan_id, project_import_state_digest, resolve_startup_failure_document,
         same_manifest_contracts, select_runtime_path, service_inventory_item,
         signed_plugin_route_policy_coverage, startup_failure_message,
-        validate_signed_plugin_activation_routes, CatalogWithdrawalReason, FrontendRuntime,
-        InspectedPlugins, LocalMappingImportPreview, LocalMappingImportServicePreview,
-        PluginInstallBlocker, PluginInstallSource, PluginPackagePreview,
-        PluginPackageServicePreview, ProjectBundlePreview, StartupFailureDocument, StartupStage,
-        FRONTEND_READY_TIMEOUT,
+        validate_signed_plugin_activation_routes, BridgePluginHostHealth, CatalogWithdrawalReason,
+        FrontendRuntime, InspectedPlugins, LocalMappingImportPreview,
+        LocalMappingImportServicePreview, PluginInstallBlocker, PluginInstallSource,
+        PluginPackagePreview, PluginPackageServicePreview, ProjectBundlePreview,
+        StartupFailureDocument, StartupStage, FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -6348,6 +6388,26 @@ mod tests {
         assert_eq!(item.methods[0].native_name, "ReadCardW");
         assert_eq!(item.methods[0].parameter_count, 1);
         assert!(!item.main_class.contains("plugins/reader"));
+    }
+
+    #[test]
+    fn control_host_health_exposes_only_stable_path_free_diagnostics() {
+        let health = BridgePluginHostHealth::from(webplus_controller::PluginHostHealth {
+            plugin_id: "reader-plugin".into(),
+            architecture: PluginArchitecture::X86,
+            service_count: 2,
+            state: webplus_controller::PluginHostRuntimeState::RestartBackoff,
+            failure_count: 3,
+            last_failure_code: Some("host-spawn-failed"),
+        });
+
+        let json = serde_json::to_string(&health).unwrap();
+        assert!(json.contains("reader-plugin"));
+        assert!(json.contains("host-spawn-failed"));
+        assert!(json.contains("restart-backoff"));
+        assert!(!json.contains("path"));
+        assert!(!json.contains("message"));
+        assert!(!json.contains("parameter"));
     }
 
     #[test]

@@ -259,6 +259,22 @@ button:disabled { cursor: wait !important; opacity: .5; }
 .diagnostic-grid article { min-height: 142px; padding: 20px; border: 1px solid #ced6cf; border-radius: 12px; background: rgba(255,255,252,.84); }
 .diagnostic-grid strong { display: block; margin: 20px 0 8px; color: #183d2c; font: 20px Georgia, "Songti SC", serif; }
 .diagnostic-grid small { line-height: 1.55; }
+.host-health-panel { margin-top: 18px; overflow: hidden; border: 1px solid #cbd5cd; border-radius: 14px; background: rgba(255,255,252,.84); }
+.host-health-panel > summary { display: flex; justify-content: space-between; gap: 24px; align-items: center; padding: 18px 22px; cursor: pointer; }
+.host-health-panel > summary strong, .host-health-panel > summary small { display: block; }
+.host-health-panel > summary strong { color: #294738; font-size: 13px; }
+.host-health-panel > summary small, .host-health-panel > summary em { margin-top: 4px; color: #78847c; font-size: 10px; font-style: normal; }
+.host-health-list { border-top: 1px solid #e0e6e1; }
+.host-health-list article { display: flex; justify-content: space-between; gap: 24px; align-items: center; padding: 13px 22px; border-top: 1px solid #edf0ed; }
+.host-health-list article:first-child { border-top: 0; }
+.host-health-list article > span:last-child { text-align: right; }
+.host-health-list strong, .host-health-list small { display: block; }
+.host-health-list strong { color: #294738; font-size: 12px; }
+.host-health-list b { color: #496457; font-size: 11px; }
+.host-health-list small { margin-top: 4px; color: #7b867f; font-size: 10px; overflow-wrap: anywhere; }
+.host-health-list .host-ready b { color: #2f654b; }
+.host-health-list .host-restart-backoff, .host-health-list .host-retry-ready { background: #fff7f3; }
+.host-health-list .host-restart-backoff b, .host-health-list .host-restart-backoff small, .host-health-list .host-retry-ready b, .host-health-list .host-retry-ready small { color: #8a4438; }
 .maintenance-panel { display: grid; grid-template-columns: 1fr auto; gap: 22px; align-items: center; margin-top: 18px; padding: 28px 30px; }
 .maintenance-panel h2 { font-size: 28px; }
 .maintenance-panel > div:first-child > p:last-child { margin: 8px 0 0; color: #728078; font-size: 12px; }
@@ -315,6 +331,7 @@ button:disabled { cursor: wait !important; opacity: .5; }
   .environment-row { grid-template-columns: auto 1fr auto auto; }
   .environment-row input[type="url"] { grid-column: 2 / -1; }
   .maintenance-panel { grid-template-columns: 1fr; }
+  .host-health-panel > summary { align-items: flex-start; flex-direction: column; }
   .check-list { grid-template-columns: 1fr; }
   .check-list article { border-right: 0; }
   .maintenance-panel .update-details { grid-column: 1; }

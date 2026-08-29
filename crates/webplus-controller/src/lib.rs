@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -119,6 +119,35 @@ pub struct PluginHostStats {
     pub active_hosts: usize,
     pub successful_starts: u64,
     pub failed_starts: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginHostRuntimeState {
+    Idle,
+    Ready,
+    RestartBackoff,
+    RetryReady,
+}
+
+impl PluginHostRuntimeState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Ready => "ready",
+            Self::RestartBackoff => "restart-backoff",
+            Self::RetryReady => "retry-ready",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginHostHealth {
+    pub plugin_id: String,
+    pub architecture: PluginArchitecture,
+    pub service_count: usize,
+    pub state: PluginHostRuntimeState,
+    pub failure_count: u64,
+    pub last_failure_code: Option<&'static str>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -297,6 +326,25 @@ impl PluginController {
 
     pub fn plugin_host_stats(&self) -> PluginHostStats {
         self.supervisor.stats()
+    }
+
+    /// Returns a path-free snapshot for the local operator console.
+    ///
+    /// Hosts are lazy, so `idle` is healthy until a route is invoked. Failure
+    /// details are reduced to stable controller codes and never include native
+    /// messages, invocation parameters, or plugin directory paths.
+    pub async fn plugin_host_health(&self) -> Vec<PluginHostHealth> {
+        let descriptors = {
+            let routes = self.routes.read().await;
+            let mut descriptors = HashMap::<WorkerKey, usize>::new();
+            for route in routes.values() {
+                *descriptors
+                    .entry(WorkerKey::from(&route.descriptor))
+                    .or_default() += 1;
+            }
+            descriptors.into_iter().collect::<Vec<_>>()
+        };
+        self.supervisor.health(descriptors).await
     }
 
     pub fn validate_manifests(manifests: &[PluginManifest]) -> Result<(), ControllerError> {
@@ -853,6 +901,8 @@ struct PluginSupervisor {
 
 struct WorkerSlot {
     state: Mutex<WorkerSlotState>,
+    failure_count: AtomicU64,
+    last_failure_code: StdMutex<Option<&'static str>>,
 }
 
 enum WorkerSlotState {
@@ -865,7 +915,27 @@ impl WorkerSlot {
     fn vacant() -> Self {
         Self {
             state: Mutex::new(WorkerSlotState::Vacant),
+            failure_count: AtomicU64::new(0),
+            last_failure_code: StdMutex::new(None),
         }
+    }
+
+    fn record_failure(&self, code: &'static str) {
+        self.failure_count.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut last_failure_code) = self.last_failure_code.lock() {
+            *last_failure_code = Some(code);
+        }
+    }
+
+    fn failure_snapshot(&self) -> (u64, Option<&'static str>) {
+        let last_failure_code = self
+            .last_failure_code
+            .lock()
+            .map_or(None, |last_failure_code| *last_failure_code);
+        (
+            self.failure_count.load(Ordering::Relaxed),
+            last_failure_code,
+        )
     }
 }
 
@@ -905,6 +975,51 @@ impl PluginSupervisor {
         }
     }
 
+    async fn health(&self, descriptors: Vec<(WorkerKey, usize)>) -> Vec<PluginHostHealth> {
+        let slots = {
+            let workers = self.workers.lock().await;
+            descriptors
+                .into_iter()
+                .map(|(key, service_count)| {
+                    let slot = workers.get(&key).cloned();
+                    (key, service_count, slot)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut health = Vec::with_capacity(slots.len());
+        for (key, service_count, slot) in slots {
+            let (state, failure_count, last_failure_code) = if let Some(slot) = slot {
+                let state = slot.state.lock().await;
+                let runtime_state = match &*state {
+                    WorkerSlotState::Vacant => PluginHostRuntimeState::Idle,
+                    WorkerSlotState::Ready(_) => PluginHostRuntimeState::Ready,
+                    WorkerSlotState::Failed { retry_after } if Instant::now() < *retry_after => {
+                        PluginHostRuntimeState::RestartBackoff
+                    }
+                    WorkerSlotState::Failed { .. } => PluginHostRuntimeState::RetryReady,
+                };
+                let (failure_count, last_failure_code) = slot.failure_snapshot();
+                (runtime_state, failure_count, last_failure_code)
+            } else {
+                (PluginHostRuntimeState::Idle, 0, None)
+            };
+            health.push(PluginHostHealth {
+                plugin_id: key.plugin_id,
+                architecture: key.architecture,
+                service_count,
+                state,
+                failure_count,
+                last_failure_code,
+            });
+        }
+        health.sort_by(|left, right| {
+            left.plugin_id.cmp(&right.plugin_id).then_with(|| {
+                architecture_rank(left.architecture).cmp(&architecture_rank(right.architecture))
+            })
+        });
+        health
+    }
+
     async fn invoke(
         &self,
         descriptor: &PluginDescriptor,
@@ -934,8 +1049,9 @@ impl PluginSupervisor {
             }
         };
 
-        if result.is_err() {
-            self.evict(&worker_key, &worker).await;
+        if let Err(error) = &result {
+            self.evict(&worker_key, &worker, error.diagnostic_code())
+                .await;
         }
         result
     }
@@ -979,6 +1095,7 @@ impl PluginSupervisor {
                         return Ok(worker);
                     }
                     Err(failure) => {
+                        slot.record_failure(failure.diagnostic_code());
                         *state = WorkerSlotState::Failed {
                             retry_after: Instant::now() + HOST_RESTART_BACKOFF,
                         };
@@ -1006,7 +1123,12 @@ impl PluginSupervisor {
         }
     }
 
-    async fn evict(&self, key: &WorkerKey, failed_worker: &Arc<Mutex<PluginWorker>>) {
+    async fn evict(
+        &self,
+        key: &WorkerKey,
+        failed_worker: &Arc<Mutex<PluginWorker>>,
+        diagnostic_code: &'static str,
+    ) {
         let slot = { self.workers.lock().await.get(key).cloned() };
         let Some(slot) = slot else {
             return;
@@ -1016,6 +1138,7 @@ impl PluginSupervisor {
             &*state,
             WorkerSlotState::Ready(current) if Arc::ptr_eq(current, failed_worker)
         ) {
+            slot.record_failure(diagnostic_code);
             *state = WorkerSlotState::Failed {
                 retry_after: Instant::now() + HOST_RESTART_BACKOFF,
             };
@@ -1088,6 +1211,13 @@ async fn lock_before_deadline<'a, T>(
 
 fn configured_timeout(seconds: u64) -> Option<Duration> {
     (seconds > 0).then(|| Duration::from_secs(seconds.min(300)))
+}
+
+const fn architecture_rank(architecture: PluginArchitecture) -> u8 {
+    match architecture {
+        PluginArchitecture::X86 => 0,
+        PluginArchitecture::X64 => 1,
+    }
 }
 
 fn public_host_failure(error: &ControllerError) -> String {
@@ -2146,6 +2276,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_health_groups_lazy_routes_by_plugin_architecture() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("api.json"),
+            r#"[
+              {"serviceId":"x86-a","mainClass":"a.dll","architecture":"x86"},
+              {"serviceId":"x86-b","mainClass":"b.dll","architecture":"x86"},
+              {"serviceId":"x64-a","mainClass":"c.dll","architecture":"x64"}
+            ]"#,
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("mixed-plugin", root.path()).unwrap();
+        let controller = PluginController::new(config()).unwrap();
+        controller.replace_manifests(&[manifest]).await.unwrap();
+
+        let health = controller.plugin_host_health().await;
+
+        assert_eq!(health.len(), 2);
+        assert_eq!(health[0].plugin_id, "mixed-plugin");
+        assert_eq!(health[0].architecture, PluginArchitecture::X86);
+        assert_eq!(health[0].service_count, 2);
+        assert_eq!(health[0].state, PluginHostRuntimeState::Idle);
+        assert_eq!(health[0].failure_count, 0);
+        assert_eq!(health[1].architecture, PluginArchitecture::X64);
+        assert_eq!(health[1].service_count, 1);
+    }
+
+    #[tokio::test]
     async fn preflight_rejects_a_manifest_that_is_not_the_active_route_set() {
         let root = tempdir().unwrap();
         fs::write(
@@ -2511,6 +2669,10 @@ mod tests {
             .replace_manifests(std::slice::from_ref(&manifest))
             .await
             .unwrap();
+        assert_eq!(
+            controller.plugin_host_health().await[0].state,
+            PluginHostRuntimeState::Idle
+        );
 
         let mut calls = tokio::task::JoinSet::new();
         for _ in 0..DEFAULT_MAX_IN_FLIGHT_INVOCATIONS {
@@ -2529,6 +2691,10 @@ mod tests {
             assert_eq!(response.unwrap().res_code, HOST_FAILURE);
         }
         assert_eq!(controller.plugin_host_stats().failed_starts, 1);
+        let health = controller.plugin_host_health().await;
+        assert_eq!(health[0].state, PluginHostRuntimeState::RestartBackoff);
+        assert_eq!(health[0].failure_count, 1);
+        assert_eq!(health[0].last_failure_code, Some("host-spawn-failed"));
 
         let immediate = controller
             .invoke(InvokeRequest {
@@ -2539,8 +2705,13 @@ mod tests {
             .await;
         assert_eq!(immediate.res_code, HOST_FAILURE);
         assert_eq!(controller.plugin_host_stats().failed_starts, 1);
+        assert_eq!(controller.plugin_host_health().await[0].failure_count, 1);
 
         tokio::time::sleep(HOST_RESTART_BACKOFF + Duration::from_millis(50)).await;
+        assert_eq!(
+            controller.plugin_host_health().await[0].state,
+            PluginHostRuntimeState::RetryReady
+        );
         let retried = controller
             .invoke(InvokeRequest {
                 service_id: "unavailable".into(),
@@ -2551,6 +2722,10 @@ mod tests {
         assert_eq!(retried.res_code, HOST_FAILURE);
         assert_eq!(controller.plugin_host_stats().failed_starts, 2);
         assert_eq!(controller.plugin_host_stats().active_hosts, 0);
+        let health = controller.plugin_host_health().await;
+        assert_eq!(health[0].state, PluginHostRuntimeState::RestartBackoff);
+        assert_eq!(health[0].failure_count, 2);
+        assert_eq!(health[0].last_failure_code, Some("host-spawn-failed"));
     }
 
     #[test]

@@ -34,6 +34,14 @@ type BridgeStatus = {
   activePluginHosts: number
   pluginHostStarts: number
   pluginHostStartFailures: number
+  pluginHosts: Array<{
+    pluginId: string
+    architecture: 'x86' | 'x64'
+    serviceCount: number
+    state: 'idle' | 'ready' | 'restart-backoff' | 'retry-ready'
+    failureCount: number
+    lastFailureCode?: string
+  }>
   pluginLoadFailures: number
   pluginCount: number
   recoveredPluginTransactions: number
@@ -343,6 +351,25 @@ const withdrawalReasonLabels = {
 } as const
 let unlistenSsoStatus: UnlistenFn | undefined
 let ssoStatusEventSeen = false
+let statusRefreshTimer: number | undefined
+let statusRefreshActive = false
+
+function pluginHostNeedsAttention(host: BridgeStatus['pluginHosts'][number]) {
+  return host.state === 'restart-backoff' || host.state === 'retry-ready'
+}
+
+async function refreshRuntimeStatus() {
+  if (busy.value || statusRefreshActive) return
+  statusRefreshActive = true
+  try {
+    status.value = await invoke<BridgeStatus>('bridge_status')
+  } catch {
+    // The explicit actions retain user-facing error handling. Background
+    // refresh must not replace a useful screen with a transient IPC warning.
+  } finally {
+    statusRefreshActive = false
+  }
+}
 
 function applySsoStatus(code?: string, active = false) {
   ssoActive.value = active
@@ -379,12 +406,16 @@ onMounted(async () => {
     inventory.value = plugins
     deploymentCheck.value = deployment
     if (!ssoStatusEventSeen) applySsoStatus(bridge.ssoError, bridge.ssoActive)
+    statusRefreshTimer = window.setInterval(() => void refreshRuntimeStatus(), 5_000)
   } catch (reason) {
     error.value = reason instanceof Error ? reason.message : String(reason)
   }
 })
 
-onUnmounted(() => unlistenSsoStatus?.())
+onUnmounted(() => {
+  unlistenSsoStatus?.()
+  if (statusRefreshTimer != null) window.clearInterval(statusRefreshTimer)
+})
 
 async function run(action: () => Promise<unknown>, success: string) {
   busy.value = true
@@ -905,12 +936,13 @@ async function exportDeploymentCheck() {
           </section>
         </div>
 
-        <section v-if="deploymentCheck?.failures || status?.pluginPreflightFailures || inventory?.quarantined.length || ssoError" class="attention-panel">
+        <section v-if="deploymentCheck?.failures || status?.pluginPreflightFailures || status?.pluginHosts.some(pluginHostNeedsAttention) || inventory?.quarantined.length || ssoError" class="attention-panel">
           <div><p class="eyebrow">ATTENTION</p><h2>待处理事项</h2></div>
           <ul>
             <li v-if="deploymentCheck?.failures"><strong>部署自检存在 {{ deploymentCheck.failures }} 项阻塞问题</strong><button type="button" @click="activeSection = 'security'">查看自检</button></li>
             <li v-if="inventory?.quarantined.length"><strong>{{ inventory.quarantined.length }} 个插件已隔离</strong><button type="button" @click="activeSection = 'plugins'">查看插件</button></li>
             <li v-if="status?.pluginPreflightFailures"><strong>{{ status.pluginPreflightFailures }} 次宿主预检失败</strong><button type="button" @click="activeSection = 'security'">查看诊断</button></li>
+            <li v-if="status?.pluginHosts.some(pluginHostNeedsAttention)"><strong>{{ status.pluginHosts.filter(pluginHostNeedsAttention).length }} 个插件宿主等待恢复</strong><button type="button" @click="activeSection = 'security'">定位宿主</button></li>
             <li v-if="ssoError"><strong>最近一次 SSO 登录失败</strong><button type="button" @click="activeSection = 'security'">查看详情</button></li>
           </ul>
         </section>
@@ -1078,6 +1110,15 @@ async function exportDeploymentCheck() {
           <article><span>隐私诊断日志</span><strong>{{ status?.diagnosticsAvailable ? '可用' : '不可用' }}</strong><small :title="status?.diagnosticsLogDir">{{ status?.diagnosticsError ?? `${status?.diagnostics?.logFiles ?? '—'} 个文件 · ${((status?.diagnostics?.logBytes ?? 0) / 1024).toFixed(1)} KiB` }}</small></article>
           <article><span>协议与兼容网关</span><strong>v{{ status?.protocolVersion ?? '—' }}</strong><small>宿主 v{{ status?.pluginHostProtocolVersion ?? '—' }} · HTTP 网关{{ status?.httpGatewayEnabled ? '已启用' : '关闭' }}</small></article>
         </section>
+        <details v-if="status?.pluginHosts.length" class="host-health-panel" :open="status.pluginHosts.some(pluginHostNeedsAttention)">
+          <summary><span><strong>插件宿主明细</strong><small>{{ status.pluginHosts.length }} 个插件/架构运行单元 · {{ status.pluginHosts.filter(pluginHostNeedsAttention).length }} 个等待恢复</small></span><em>仅显示稳定诊断码，不包含路径、调用参数或厂商错误</em></summary>
+          <div class="host-health-list">
+            <article v-for="host in status.pluginHosts" :key="`${host.pluginId}:${host.architecture}`" :class="`host-${host.state}`">
+              <span><strong>{{ host.pluginId }}</strong><small>{{ host.architecture.toUpperCase() }} · {{ host.serviceCount }} 个服务</small></span>
+              <span><b>{{ host.state === 'ready' ? '运行中' : host.state === 'restart-backoff' ? '启动退避' : host.state === 'retry-ready' ? '等待重试' : '按需待机' }}</b><small>累计失败 {{ host.failureCount }}<template v-if="host.lastFailureCode"> · {{ host.lastFailureCode }}</template></small></span>
+            </article>
+          </div>
+        </details>
         <section class="maintenance-panel"><div><p class="eyebrow">CLIENT MAINTENANCE</p><h2>客户端维护</h2><p>{{ status?.appUpdateError ?? (status?.appUpdateConfigured ? '应用更新包必须通过签名验证，并与当前插件及本地映射兼容。' : '当前构建未配置生产更新端点。') }}</p></div><div class="maintenance-actions"><button type="button" :disabled="busy || !status?.appUpdateConfigured" @click="checkAppUpdate">检查应用更新</button><button class="primary" type="button" :disabled="busy || !appUpdate?.available || !appUpdate.compatible || !appUpdate.installPlanId" @click="installAppUpdate">安装签名更新</button></div><details v-if="appUpdate?.available" class="update-details" open><summary>版本 {{ appUpdate.version }}{{ appUpdate.date ? ` · ${appUpdate.date}` : '' }}</summary><p v-if="!appUpdate.compatible">{{ appUpdate.capabilityBlockers }} 个插件或本地映射阻止升级；请先修复对应能力。</p><p>{{ appUpdate.notes || '此版本未提供发布说明。' }}</p><small v-if="updateProgress">{{ updateProgress }}</small></details></section>
         <section class="boundary"><div><p class="eyebrow">TRUST BOUNDARY</p><h2>第三方 DLL 永不进入主进程</h2></div><ol><li><b>业务 WebView</b><span>只调用受限的业务命令</span></li><li><b>Rust Controller</b><span>执行路由、策略、超时和监督</span></li><li><b>Plugin Host</b><span>加载 DLL、COM、OCX、EXE 或 BAT</span></li></ol></section>
       </section>
