@@ -6,6 +6,10 @@ const appUpdateUrl = new URL(
   "../../apps/desktop/src-tauri/src/app_update.rs",
   import.meta.url,
 );
+const controlFrontendUrl = new URL(
+  "../../apps/desktop/src/App.vue",
+  import.meta.url,
+);
 
 test("failed application update handoff preserves the current business workspace", async () => {
   const source = await readFile(appUpdateUrl, "utf8");
@@ -30,4 +34,22 @@ test("failed application update handoff preserves the current business workspace
   assert.match(body, /event_code = "app-update-install-handoff-failed"/);
   assert.match(body, /error_code = "updater-install"/);
   assert.match(body, /当前版本已恢复可用/);
+});
+
+test("control console clears the consumed update plan after a failed handoff", async () => {
+  const source = await readFile(controlFrontendUrl, "utf8");
+  const start = source.indexOf("async function installAppUpdate()");
+  const end = source.indexOf("\nasync function exportDiagnostics()", start);
+
+  assert.notEqual(start, -1, "installAppUpdate must remain available");
+  assert.notEqual(end, -1, "installAppUpdate boundary must remain detectable");
+
+  const body = source.slice(start, end);
+  assert.match(body, /let installHandoffStarted = false/);
+  assert.match(body, /installHandoffStarted = true/);
+  assert.match(body, /const completed = await run\(/);
+  assert.match(body, /if \(!completed\)/);
+  assert.match(body, /appUpdate\.value\.installPlanId = undefined/);
+  assert.match(body, /当前版本与业务窗口已恢复，请重新检查更新后重试/);
+  assert.match(body, /await refreshRuntimeStatus\(\)/);
 });

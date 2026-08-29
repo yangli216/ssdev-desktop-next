@@ -534,15 +534,17 @@ onUnmounted(() => {
   if (statusRefreshTimer != null) window.clearInterval(statusRefreshTimer)
 })
 
-async function run(action: () => Promise<unknown>, success: string) {
+async function run(action: () => Promise<unknown>, success: string): Promise<boolean> {
   busy.value = true
   error.value = ''
   notice.value = ''
   try {
     await action()
     notice.value = success
+    return true
   } catch (reason) {
     error.value = reason instanceof Error ? reason.message : String(reason)
+    return false
   } finally {
     busy.value = false
   }
@@ -899,6 +901,7 @@ async function installAppUpdate() {
     return
   }
   const expectedPlanId = appUpdate.value.installPlanId
+  let installHandoffStarted = false
   const onEvent = new Channel<AppUpdateEvent>()
   onEvent.onmessage = (event) => {
     if (event.event === 'started') {
@@ -909,13 +912,23 @@ async function installAppUpdate() {
     } else if (event.event === 'verified') {
       updateProgress.value = '更新包签名已验证'
     } else {
+      installHandoffStarted = true
       updateProgress.value = '正在启动系统安装程序…'
     }
   }
-  await run(
+  const completed = await run(
     () => invoke('install_app_update', { expectedPlanId, onEvent }),
     '更新已安装，客户端即将重新启动。',
   )
+  if (!completed) {
+    if (appUpdate.value?.installPlanId === expectedPlanId) {
+      appUpdate.value.installPlanId = undefined
+    }
+    updateProgress.value = installHandoffStarted
+      ? '系统安装程序未能启动；当前版本与业务窗口已恢复，请重新检查更新后重试。'
+      : '更新安装未完成；请根据错误提示重新检查更新后重试。'
+    await refreshRuntimeStatus()
+  }
 }
 
 async function exportDiagnostics() {
