@@ -50,7 +50,7 @@ target/i686-pc-windows-msvc/debug/ssdev_windows_system_example.dll
   -OutputRoot C:\secure-release\windows-system-example-x64-1.0.0
 ```
 
-`DesktopVersionRequirement` 是该插件已经验证过的 SSDEV Desktop SemVer 范围，并进入签名覆盖的 `plugin.json`。示例当前按 `0.1.x` 客户端验证，因此使用 `>=0.1.0, <0.2.0`；生产插件应根据真实兼容矩阵填写，不要为省事使用 `*`。
+脚本在接触信任库之前先运行 `source-check`，只读验证源文件、PE 位数、全部声明导出和通用 DLL ABI；随后才进入正式准备。`DesktopVersionRequirement` 是该插件已经验证过的 SSDEV Desktop SemVer 范围，并进入签名覆盖的 `plugin.json`。示例当前按 `0.1.x` 客户端验证，因此使用 `>=0.1.0, <0.2.0`；生产插件应根据真实兼容矩阵填写，不要为省事使用 `*`。
 
 输出目录中的 `plugin-signing-request.json` 包含 `payloadBase64` 和 `payloadSha256`。由组织 KMS/HSM 对 Base64 解码后的原始字节执行 Ed25519 签名，把 64 字节签名写成单行 Base64 文件。私钥不能交给示例脚本或桌面客户端。
 

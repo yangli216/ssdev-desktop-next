@@ -30,6 +30,20 @@ cargo run --locked -p ssdev-plugin-tool -- init `
 
 该命令有意不提供结构体、回调、浮点 ABI、任意 Win32 API 或自动设备操作选项。这些能力必须依据厂商文档开发专用 Rust 适配器并经过真实硬件矩阵，不能让脚手架猜测。
 
+### 签名前只读检查
+
+DLL 构建或旧插件清理完成后，先在不接触信任库和签名密钥的开发环境执行：
+
+```powershell
+cargo run --locked -p ssdev-plugin-tool -- source-check `
+  --source C:\plugin-development\card-reader\release-source `
+  --plugin-id hospital.card-reader
+```
+
+`source-check` 把来源复制到临时快照，复用 `prepare` 的文件数量、总大小、符号链接、便携路径、旧 `license.dat` 排除、清单和 ABI 规则；对 DLL/EXE 读取有界 PE 头核对 x86/x64，对 DLL 还读取有界命名导出表并要求每个声明方法精确存在。它不加载 DLL、实例化 COM、执行 EXE/BAT、注册 OCX、修改来源或生成任何发布文件。报告只给出服务、方法、架构、类型和快照文件计数。
+
+该检查证明“当前文件可以进入签名准备”，不证明厂商 ABI 参数真实正确或硬件副作用安全；后者仍必须经过 Windows 候选宿主预检和黄金矩阵。
+
 ### 生成业务 Web 客户端
 
 确定 `api.json` 后，可在不启动桌面端和原生组件的情况下生成类型化 Web Bridge 客户端：
@@ -73,7 +87,7 @@ cargo run --locked -p ssdev-plugin-tool -- prepare `
 - 符号链接、Windows 不可移植路径、忽略大小写后的重复路径；
 - 超过 4,096 个文件或 512 MiB；
 - 非 SemVer 版本、无效或超过 128 字符的 Desktop SemVer requirement、无调用方法的服务、缺失入口或显式依赖；
-- DLL/EXE 的 PE 位数与 `architecture` 不一致；
+- DLL/EXE 的 PE 位数与 `architecture` 不一致，或 DLL 清单声明的方法不在命名导出表中；
 - 超过 12 个机器字参数、浮点参数/返回、不受支持的输出缓冲区或调用约定等通用 DLL 适配器无法表达的静态 ABI；
 - 通用 COM Automation 适配器无法表达的参数或 BYREF 输出类型，以及非 COM 服务误声明的返回属性；
 - 仍声明非空 `installRun` 的旧插件。

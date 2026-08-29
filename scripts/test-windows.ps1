@@ -63,6 +63,10 @@ try {
         --architecture $scaffoldArchitecture
       if ($LASTEXITCODE -ne 0) { throw "plugin scaffold generation failed with exit code $LASTEXITCODE" }
       & (Join-Path $scaffold "build.ps1")
+      cargo run --locked -p ssdev-plugin-tool -- source-check `
+        --source (Join-Path $scaffold "release-source") `
+        --plugin-id $scaffoldPluginId
+      if ($LASTEXITCODE -ne 0) { throw "generated plugin source check failed with exit code $LASTEXITCODE" }
       cargo run --locked -p webplus-native --example scaffold_roundtrip --target $target -- `
         (Join-Path $scaffold "release-source") $scaffoldPluginId
       if ($LASTEXITCODE -ne 0) { throw "generated plugin round-trip failed with exit code $LASTEXITCODE" }

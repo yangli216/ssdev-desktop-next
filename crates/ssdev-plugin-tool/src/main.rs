@@ -5,9 +5,10 @@ use std::time::SystemTime;
 
 use ssdev_plugin_tool::{
     check_executable_matrix_plugin, check_executable_matrix_root, check_release_candidate,
-    check_release_set, create_catalog, finalize, generate_client, init_dll_plugin,
+    check_release_set, check_source, create_catalog, finalize, generate_client, init_dll_plugin,
     materialize_release_set, prepare, verify, CatalogOptions, FinalizeOptions,
     GenerateClientOptions, InitDllPluginOptions, MaterializeReleaseSetOptions, PrepareOptions,
+    SourceCheckOptions,
 };
 
 fn main() {
@@ -56,6 +57,16 @@ fn run(arguments: impl IntoIterator<Item = String>) -> Result<String, String> {
                     plugin_id: required(&options, "plugin-id")?,
                     display_name: options.get("display-name").map(String::as_str),
                     output: required_path(&options, "output")?,
+                })
+                .map_err(|error| error.to_string())?,
+            )
+        }
+        "source-check" => {
+            reject_unknown(&options, &["source", "plugin-id"])?;
+            serde_json::to_string_pretty(
+                &check_source(&SourceCheckOptions {
+                    source: required_path(&options, "source")?,
+                    plugin_id: required(&options, "plugin-id")?,
                 })
                 .map_err(|error| error.to_string())?,
             )
@@ -232,7 +243,7 @@ fn required_path<'a>(options: &'a HashMap<String, String>, name: &str) -> Result
 }
 
 fn usage() -> &'static str {
-    "用法:\n  ssdev-plugin-tool init --destination NEW_DIR --plugin-id ID --service-id ID --display-name NAME --architecture x86|x64\n  ssdev-plugin-tool client --source DIR --plugin-id ID [--display-name NAME] --output FILE.ts\n  ssdev-plugin-tool prepare --source DIR --staging DIR --request FILE --matrix-template FILE --plugin-id ID --version SEMVER --desktop-version-requirement SEMVER_REQ [--display-name NAME] --key-id ID --trust-store FILE [--matrix-seed FILE]\n  ssdev-plugin-tool finalize --staging DIR --request FILE --signature FILE --trust-store FILE --package FILE.ssdev-plugin\n  ssdev-plugin-tool verify --package FILE.ssdev-plugin --trust-store FILE\n  ssdev-plugin-tool release-check --package FILE.ssdev-plugin --trust-store FILE --matrix FILE\n  ssdev-plugin-tool release-set-check --spec FILE --trust-store FILE --matrix FILE\n  ssdev-plugin-tool release-set-materialize --spec FILE --trust-store FILE --matrix FILE --plugin-root NEW_DIR\n  ssdev-plugin-tool catalog --spec FILE --trust-store FILE --catalog FILE\n  ssdev-plugin-tool matrix-check (--plugin-root DIR | --plugin-dir DIR) --matrix FILE"
+    "用法:\n  ssdev-plugin-tool init --destination NEW_DIR --plugin-id ID --service-id ID --display-name NAME --architecture x86|x64\n  ssdev-plugin-tool source-check --source DIR --plugin-id ID\n  ssdev-plugin-tool client --source DIR --plugin-id ID [--display-name NAME] --output FILE.ts\n  ssdev-plugin-tool prepare --source DIR --staging DIR --request FILE --matrix-template FILE --plugin-id ID --version SEMVER --desktop-version-requirement SEMVER_REQ [--display-name NAME] --key-id ID --trust-store FILE [--matrix-seed FILE]\n  ssdev-plugin-tool finalize --staging DIR --request FILE --signature FILE --trust-store FILE --package FILE.ssdev-plugin\n  ssdev-plugin-tool verify --package FILE.ssdev-plugin --trust-store FILE\n  ssdev-plugin-tool release-check --package FILE.ssdev-plugin --trust-store FILE --matrix FILE\n  ssdev-plugin-tool release-set-check --spec FILE --trust-store FILE --matrix FILE\n  ssdev-plugin-tool release-set-materialize --spec FILE --trust-store FILE --matrix FILE --plugin-root NEW_DIR\n  ssdev-plugin-tool catalog --spec FILE --trust-store FILE --catalog FILE\n  ssdev-plugin-tool matrix-check (--plugin-root DIR | --plugin-dir DIR) --matrix FILE"
 }
 
 #[cfg(test)]
@@ -267,5 +278,8 @@ mod tests {
         assert!(run(["init".into()])
             .unwrap_err()
             .contains("缺少 --destination"));
+        assert!(run(["source-check".into()])
+            .unwrap_err()
+            .contains("缺少 --source"));
     }
 }

@@ -39,6 +39,10 @@ const MAX_TRUST_STORE_BYTES: u64 = 256 * 1024;
 const MAX_RELEASE_SET_SPEC_BYTES: u64 = 256 * 1024;
 const MAX_CATALOG_SPEC_BYTES: u64 = 1024 * 1024;
 const MAX_CATALOG_PACKAGES: usize = 4096;
+const MAX_PE_EXPORTS: usize = 4096;
+const MAX_PE_OPTIONAL_HEADER_BYTES: usize = 4096;
+const MAX_PE_SECTIONS: usize = 96;
+const MAX_PE_EXPORT_NAME_BYTES: usize = 1024;
 const PLUGIN_METADATA_FILENAME: &str = "plugin.json";
 const LEGACY_LICENSE_FILENAME: &str = "license.dat";
 const RELEASE_SET_MATERIALIZATION_MARKER: &str = ".release-set-materializing.json";
@@ -98,6 +102,12 @@ pub struct InitDllPluginOptions<'a> {
     pub service_id: &'a str,
     pub display_name: &'a str,
     pub architecture: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceCheckOptions<'a> {
+    pub source: &'a Path,
+    pub plugin_id: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -254,6 +264,23 @@ pub struct InitDllPluginReport {
     pub native_library: String,
     pub file_count: usize,
     pub destination: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceCheckReport {
+    pub schema_version: u8,
+    pub plugin_id: String,
+    pub service_count: usize,
+    pub method_count: usize,
+    pub x86_service_count: usize,
+    pub x64_service_count: usize,
+    pub dll_service_count: usize,
+    pub com_service_count: usize,
+    pub process_service_count: usize,
+    pub source_file_count: usize,
+    pub source_bytes: u64,
+    pub legacy_license_excluded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,7 +557,7 @@ fn scaffold_readme(
         PluginArchitecture::X64 => "x64",
     };
     format!(
-        "# {display_name}\n\nSSDEV DLL 插件脚手架。插件 ID：`{plugin_id}`；服务：`{service_id}`；架构：`{architecture}`。\n\n## 1. 构建 DLL\n\n在 Windows PowerShell 中运行：\n\n```powershell\n./build.ps1\n```\n\n脚本使用锁定依赖构建 `native` crate，并把 `{native_library}` 复制到 `release-source/bin`。修改导出函数后必须同步评审 `release-source/api.json`。\n\n## 2. 本地调试\n\n在 SSDEV Desktop 的“原生映射”工作台中选择 `release-source/bin/{native_library}`，按照 `release-source/api.json` 配置 `SsdevEcho`，然后使用输入 `SSDEV_TEST` 调用 `echo`。不要把生产账号、患者数据或不可逆设备操作放入调试用例。\n\n## 3. Web 接入\n\n`web/client.ts` 由共享清单生成器产生，依赖 `@bsoft/ssdev-web-bridge`。业务代码创建桌面连接后，把 `connection.bridge` 传给生成的客户端；`api.json` 变化后重新运行 `ssdev-plugin-tool client`，输出到一个新的临时文件，评审差异后替换业务制品。\n\n## 4. 签名发布\n\n先运行 `ssdev-plugin-tool prepare --source release-source ... --matrix-seed matrix-seed.json`。矩阵种子保持 `draft: true` 和 `reviewRequired: true`；必须在 Windows 测试环境核对完整响应后才可解除这两项门禁。随后由组织 KMS/HSM 签名，并使用 `finalize` 生成 `.ssdev-plugin`。私钥、真实硬件数据和业务 Web 源码都不能放入 `release-source`。\n\n此模板只覆盖 UTF-8 字符串输入和 1 KiB 调用方输出缓冲区。结构体、回调、浮点 ABI、厂商内存释放或线程绑定组件需要单独设计 Rust 适配器，不能通过修改 JSON 猜测。\n"
+        "# {display_name}\n\nSSDEV DLL 插件脚手架。插件 ID：`{plugin_id}`；服务：`{service_id}`；架构：`{architecture}`。\n\n## 1. 构建 DLL\n\n在 Windows PowerShell 中运行：\n\n```powershell\n./build.ps1\n```\n\n脚本使用锁定依赖构建 `native` crate，并把 `{native_library}` 复制到 `release-source/bin`。修改导出函数后必须同步评审 `release-source/api.json`。\n\n## 2. 检查和本地调试\n\n先运行 `ssdev-plugin-tool source-check --source release-source --plugin-id {plugin_id}`。该命令不加载 DLL、不执行方法，也不需要签名密钥；它会用正式准备流程的同一规则检查文件边界、PE 位数、声明导出和 ABI。随后在 SSDEV Desktop 的“原生映射”工作台中选择 `release-source/bin/{native_library}`，按照 `release-source/api.json` 配置 `SsdevEcho`，然后使用输入 `SSDEV_TEST` 调用 `echo`。不要把生产账号、患者数据或不可逆设备操作放入调试用例。\n\n## 3. Web 接入\n\n`web/client.ts` 由共享清单生成器产生，依赖 `@bsoft/ssdev-web-bridge`。业务代码创建桌面连接后，把 `connection.bridge` 传给生成的客户端；`api.json` 变化后重新运行 `ssdev-plugin-tool client`，输出到一个新的临时文件，评审差异后替换业务制品。\n\n## 4. 签名发布\n\n先运行 `ssdev-plugin-tool prepare --source release-source ... --matrix-seed matrix-seed.json`。矩阵种子保持 `draft: true` 和 `reviewRequired: true`；必须在 Windows 测试环境核对完整响应后才可解除这两项门禁。随后由组织 KMS/HSM 签名，并使用 `finalize` 生成 `.ssdev-plugin`。私钥、真实硬件数据和业务 Web 源码都不能放入 `release-source`。\n\n此模板只覆盖 UTF-8 字符串输入和 1 KiB 调用方输出缓冲区。结构体、回调、浮点 ABI、厂商内存释放或线程绑定组件需要单独设计 Rust 适配器，不能通过修改 JSON 猜测。\n"
     )
 }
 
@@ -601,6 +628,61 @@ mod tests {
     }
 }
 "#;
+
+/// Performs the structural and native-file checks used by `prepare` without
+/// requiring a trust store, signing identity, or any output path. Native code
+/// is never loaded or executed.
+pub fn check_source(options: &SourceCheckOptions<'_>) -> Result<SourceCheckReport, ToolError> {
+    let source = canonical_real_directory(options.source)?;
+    let temporary = tempfile::tempdir().map_err(|source| ToolError::Io {
+        path: std::env::temp_dir(),
+        source,
+    })?;
+    let snapshot = temporary.path().join("source-check");
+    fs::create_dir(&snapshot).map_err(|source| ToolError::Io {
+        path: snapshot.clone(),
+        source,
+    })?;
+    let copy = copy_legacy_plugin(&source, &snapshot)?;
+    let manifest = PluginManifest::load(options.plugin_id, &snapshot)?;
+    validate_release_manifest(&manifest)?;
+
+    let mut x86_service_count = 0;
+    let mut x64_service_count = 0;
+    let mut dll_service_count = 0;
+    let mut com_service_count = 0;
+    let mut process_service_count = 0;
+    for service in &manifest.services {
+        match service.architecture {
+            PluginArchitecture::X86 => x86_service_count += 1,
+            PluginArchitecture::X64 => x64_service_count += 1,
+        }
+        match service.resolved_main_type().to_ascii_lowercase().as_str() {
+            "dll" => dll_service_count += 1,
+            "com" | "ocx" => com_service_count += 1,
+            "exe" | "bat" => process_service_count += 1,
+            _ => unreachable!("manifest validation accepts only known service types"),
+        }
+    }
+    Ok(SourceCheckReport {
+        schema_version: 1,
+        plugin_id: manifest.plugin_id,
+        service_count: manifest.services.len(),
+        method_count: manifest
+            .services
+            .iter()
+            .map(|service| service.methods.len())
+            .sum(),
+        x86_service_count,
+        x64_service_count,
+        dll_service_count,
+        com_service_count,
+        process_service_count,
+        source_file_count: copy.files,
+        source_bytes: copy.bytes,
+        legacy_license_excluded: copy.legacy_license_excluded,
+    })
+}
 
 /// Generates the same typed Web Bridge client used by the desktop mapping
 /// workbench, without requiring an interactive desktop session.
@@ -1520,7 +1602,8 @@ fn validate_release_manifest(manifest: &PluginManifest) -> Result<(), ToolError>
             let component =
                 resolve_component(&manifest.plugin_dir, &service.main_class, &main_type)?;
             if matches!(main_type.as_str(), "dll" | "exe") {
-                let actual = detect_pe_architecture(&component)?.ok_or_else(|| {
+                let inspection = inspect_pe_file(&component)?;
+                let actual = inspection.architecture.ok_or_else(|| {
                     ToolError::Invalid(format!(
                         "service [{}] entry is not a supported PE file",
                         service.service_id
@@ -1531,6 +1614,20 @@ fn validate_release_manifest(manifest: &PluginManifest) -> Result<(), ToolError>
                         "service [{}] declares {:?} but its PE entry is {:?}",
                         service.service_id, service.architecture, actual
                     )));
+                }
+                if main_type == "dll" {
+                    for method in &service.methods {
+                        if inspection
+                            .exports
+                            .binary_search_by(|export| export.as_str().cmp(&method.name))
+                            .is_err()
+                        {
+                            return Err(ToolError::Invalid(format!(
+                                "DLL service [{}] does not export declared method [{}]",
+                                service.service_id, method.name
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -1578,7 +1675,12 @@ fn resolve_component(root: &Path, main_class: &str, extension: &str) -> Result<P
     Ok(component)
 }
 
-fn detect_pe_architecture(path: &Path) -> Result<Option<PluginArchitecture>, ToolError> {
+struct PeFileInspection {
+    architecture: Option<PluginArchitecture>,
+    exports: Vec<String>,
+}
+
+fn inspect_pe_file(path: &Path) -> Result<PeFileInspection, ToolError> {
     let mut file = File::open(path).map_err(|source| ToolError::Io {
         path: path.to_path_buf(),
         source,
@@ -1589,7 +1691,10 @@ fn detect_pe_architecture(path: &Path) -> Result<Option<PluginArchitecture>, Too
         source,
     })?;
     if &dos[0..2] != b"MZ" {
-        return Ok(None);
+        return Ok(PeFileInspection {
+            architecture: None,
+            exports: Vec::new(),
+        });
     }
     let offset = u32::from_le_bytes(dos[0x3c..0x40].try_into().expect("fixed slice")) as u64;
     let length = file
@@ -1599,28 +1704,228 @@ fn detect_pe_architecture(path: &Path) -> Result<Option<PluginArchitecture>, Too
             source,
         })?
         .len();
-    if offset > length.saturating_sub(6) {
-        return Ok(None);
+    if offset > length.saturating_sub(24) {
+        return Ok(PeFileInspection {
+            architecture: None,
+            exports: Vec::new(),
+        });
     }
     file.seek(SeekFrom::Start(offset))
         .map_err(|source| ToolError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-    let mut header = [0_u8; 6];
+    let mut header = [0_u8; 24];
     file.read_exact(&mut header)
         .map_err(|source| ToolError::Io {
             path: path.to_path_buf(),
             source,
         })?;
     if &header[0..4] != b"PE\0\0" {
-        return Ok(None);
+        return Ok(PeFileInspection {
+            architecture: None,
+            exports: Vec::new(),
+        });
     }
-    Ok(match u16::from_le_bytes([header[4], header[5]]) {
+    let architecture = match u16::from_le_bytes([header[4], header[5]]) {
         0x014c => Some(PluginArchitecture::X86),
         0x8664 => Some(PluginArchitecture::X64),
         _ => None,
+    };
+    let section_count = u16::from_le_bytes([header[6], header[7]]) as usize;
+    if section_count == 0 || section_count > MAX_PE_SECTIONS {
+        return Err(ToolError::Invalid(format!(
+            "PE file has an invalid section count; maximum is {MAX_PE_SECTIONS}"
+        )));
+    }
+    let optional_size = u16::from_le_bytes([header[20], header[21]]) as usize;
+    if optional_size == 0 || optional_size > MAX_PE_OPTIONAL_HEADER_BYTES {
+        return Err(ToolError::Invalid(format!(
+            "PE optional header exceeds {MAX_PE_OPTIONAL_HEADER_BYTES} bytes"
+        )));
+    }
+    let mut optional = vec![0_u8; optional_size];
+    file.read_exact(&mut optional)
+        .map_err(|source| ToolError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let magic = pe_u16(&optional, 0)?;
+    let data_directory = match magic {
+        0x10b => 96,
+        0x20b => 112,
+        _ => {
+            return Err(ToolError::Invalid(
+                "PE optional header type is unsupported".into(),
+            ))
+        }
+    };
+    let data_directory_count = pe_u32(&optional, data_directory - 4)?;
+    if data_directory_count == 0 {
+        return Ok(PeFileInspection {
+            architecture,
+            exports: Vec::new(),
+        });
+    }
+    let export_rva = pe_u32(&optional, data_directory)?;
+    let section_bytes = section_count
+        .checked_mul(40)
+        .ok_or_else(|| ToolError::Invalid("PE section table byte count overflowed".into()))?;
+    let mut raw_sections = vec![0_u8; section_bytes];
+    file.read_exact(&mut raw_sections)
+        .map_err(|source| ToolError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let sections = (0..section_count)
+        .map(|index| {
+            let base = index * 40;
+            Ok((
+                pe_u32(&raw_sections, base + 12)?,
+                pe_u32(&raw_sections, base + 8)?,
+                pe_u32(&raw_sections, base + 20)?,
+                pe_u32(&raw_sections, base + 16)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, ToolError>>()?;
+    if export_rva == 0 {
+        return Ok(PeFileInspection {
+            architecture,
+            exports: Vec::new(),
+        });
+    }
+    let export_offset = pe_rva_to_offset(export_rva, &sections, length)?;
+    let mut export_directory = [0_u8; 40];
+    read_pe_at(&mut file, path, export_offset, &mut export_directory)?;
+    let export_count = pe_u32(&export_directory, 24)? as usize;
+    if export_count > MAX_PE_EXPORTS {
+        return Err(ToolError::Invalid(format!(
+            "PE file declares more than {MAX_PE_EXPORTS} named exports"
+        )));
+    }
+    if export_count == 0 {
+        return Ok(PeFileInspection {
+            architecture,
+            exports: Vec::new(),
+        });
+    }
+    let names_rva = pe_u32(&export_directory, 32)?;
+    let names_offset = pe_rva_to_offset(names_rva, &sections, length)?;
+    let names_bytes = export_count
+        .checked_mul(4)
+        .ok_or_else(|| ToolError::Invalid("PE export name table byte count overflowed".into()))?;
+    let mut name_table = vec![0_u8; names_bytes];
+    read_pe_at(&mut file, path, names_offset, &mut name_table)?;
+    let mut exports = Vec::with_capacity(export_count);
+    for index in 0..export_count {
+        let name_rva = pe_u32(&name_table, index * 4)?;
+        let name_offset = pe_rva_to_offset(name_rva, &sections, length)?;
+        exports.push(read_pe_export_name(&mut file, path, name_offset, length)?);
+    }
+    exports.sort();
+    exports.dedup();
+    Ok(PeFileInspection {
+        architecture,
+        exports,
     })
+}
+
+fn pe_u16(bytes: &[u8], offset: usize) -> Result<u16, ToolError> {
+    let value = bytes
+        .get(offset..offset.saturating_add(2))
+        .ok_or_else(|| ToolError::Invalid("PE header is truncated".into()))?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn pe_u32(bytes: &[u8], offset: usize) -> Result<u32, ToolError> {
+    let value = bytes
+        .get(offset..offset.saturating_add(4))
+        .ok_or_else(|| ToolError::Invalid("PE header is truncated".into()))?;
+    Ok(u32::from_le_bytes(value.try_into().expect("fixed slice")))
+}
+
+fn pe_rva_to_offset(
+    rva: u32,
+    sections: &[(u32, u32, u32, u32)],
+    file_length: u64,
+) -> Result<u64, ToolError> {
+    for (virtual_address, virtual_size, raw_offset, raw_size) in sections {
+        let span = (*virtual_size).max(*raw_size);
+        if rva >= *virtual_address && rva < virtual_address.saturating_add(span) {
+            let delta = rva - virtual_address;
+            if delta >= *raw_size {
+                return Err(ToolError::Invalid(
+                    "PE data directory is not backed by file bytes".into(),
+                ));
+            }
+            let offset = raw_offset
+                .checked_add(delta)
+                .map(u64::from)
+                .ok_or_else(|| ToolError::Invalid("PE file offset overflowed".into()))?;
+            if offset < file_length {
+                return Ok(offset);
+            }
+        }
+    }
+    Err(ToolError::Invalid(
+        "PE data directory is outside the file".into(),
+    ))
+}
+
+fn read_pe_at(
+    file: &mut File,
+    path: &Path,
+    offset: u64,
+    buffer: &mut [u8],
+) -> Result<(), ToolError> {
+    file.seek(SeekFrom::Start(offset))
+        .and_then(|_| file.read_exact(buffer))
+        .map_err(|source| ToolError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn read_pe_export_name(
+    file: &mut File,
+    path: &Path,
+    offset: u64,
+    file_length: u64,
+) -> Result<String, ToolError> {
+    let available = file_length.saturating_sub(offset);
+    let read_length = available.min(MAX_PE_EXPORT_NAME_BYTES as u64) as usize;
+    if read_length == 0 {
+        return Err(ToolError::Invalid(
+            "PE export name is outside the file".into(),
+        ));
+    }
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|source| ToolError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut bytes = vec![0_u8; read_length];
+    file.read_exact(&mut bytes)
+        .map_err(|source| ToolError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if let Some(end) = bytes.iter().position(|byte| *byte == 0) {
+        if end == 0 {
+            return Err(ToolError::Invalid("PE export name is empty".into()));
+        }
+        bytes.truncate(end);
+        return String::from_utf8(bytes)
+            .map_err(|_| ToolError::Invalid("PE export name is not valid UTF-8".into()));
+    }
+    if available < MAX_PE_EXPORT_NAME_BYTES as u64 {
+        return Err(ToolError::Invalid(
+            "PE export name is not NUL-terminated".into(),
+        ));
+    }
+    Err(ToolError::Invalid(format!(
+        "PE export name exceeds {MAX_PE_EXPORT_NAME_BYTES} bytes"
+    )))
 }
 
 fn draft_matrix(manifest: &PluginManifest) -> Result<PluginMatrix, ToolError> {
@@ -2289,12 +2594,47 @@ mod tests {
     use serde_json::json;
     use std::time::{Duration, UNIX_EPOCH};
 
-    fn pe(machine: u16) -> Vec<u8> {
-        let mut bytes = vec![0_u8; 128];
+    fn pe(machine: u16, exports: &[&str]) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 1536];
         bytes[0..2].copy_from_slice(b"MZ");
-        bytes[0x3c..0x40].copy_from_slice(&64_u32.to_le_bytes());
-        bytes[64..68].copy_from_slice(b"PE\0\0");
-        bytes[68..70].copy_from_slice(&machine.to_le_bytes());
+        let pe_offset = 0x80_usize;
+        bytes[0x3c..0x40].copy_from_slice(&(pe_offset as u32).to_le_bytes());
+        bytes[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+        let coff = pe_offset + 4;
+        bytes[coff..coff + 2].copy_from_slice(&machine.to_le_bytes());
+        bytes[coff + 2..coff + 4].copy_from_slice(&1_u16.to_le_bytes());
+        let (optional_size, magic, data_directory) = if machine == 0x8664 {
+            (240_u16, 0x20b_u16, 112_usize)
+        } else {
+            (224_u16, 0x10b_u16, 96_usize)
+        };
+        bytes[coff + 16..coff + 18].copy_from_slice(&optional_size.to_le_bytes());
+        let optional = coff + 20;
+        bytes[optional..optional + 2].copy_from_slice(&magic.to_le_bytes());
+        bytes[optional + data_directory - 4..optional + data_directory]
+            .copy_from_slice(&1_u32.to_le_bytes());
+        bytes[optional + data_directory..optional + data_directory + 4]
+            .copy_from_slice(&0x1000_u32.to_le_bytes());
+        let section = optional + optional_size as usize;
+        bytes[section + 8..section + 12].copy_from_slice(&0x1000_u32.to_le_bytes());
+        bytes[section + 12..section + 16].copy_from_slice(&0x1000_u32.to_le_bytes());
+        bytes[section + 16..section + 20].copy_from_slice(&0x400_u32.to_le_bytes());
+        bytes[section + 20..section + 24].copy_from_slice(&0x200_u32.to_le_bytes());
+        let export_directory = 0x200_usize;
+        bytes[export_directory + 24..export_directory + 28]
+            .copy_from_slice(&(exports.len() as u32).to_le_bytes());
+        bytes[export_directory + 32..export_directory + 36]
+            .copy_from_slice(&0x1040_u32.to_le_bytes());
+        let names = 0x240_usize;
+        let mut string_offset = 0x280_usize;
+        for (index, export) in exports.iter().enumerate() {
+            let rva = 0x1000_u32 + (string_offset as u32 - 0x200);
+            bytes[names + index * 4..names + index * 4 + 4].copy_from_slice(&rva.to_le_bytes());
+            let end = string_offset + export.len();
+            bytes[string_offset..end].copy_from_slice(export.as_bytes());
+            bytes[end] = 0;
+            string_offset = end + 1;
+        }
         bytes
     }
 
@@ -2306,7 +2646,7 @@ mod tests {
             r#"{"serviceId":"reader","mainClass":"reader.dll","architecture":"x86","methods":[{"name":"read","parameters":["timeout"]}]}"#,
         )
         .unwrap();
-        fs::write(source.join("reader.dll"), pe(0x014c)).unwrap();
+        fs::write(source.join("reader.dll"), pe(0x014c, &["read"])).unwrap();
         fs::write(source.join("license.dat"), b"legacy private-key envelope").unwrap();
         source
     }
@@ -2535,6 +2875,75 @@ mod tests {
         })
         .is_err());
         assert!(!invalid_plugin.exists());
+    }
+
+    #[test]
+    fn source_check_is_read_only_and_reports_the_prepare_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let source = source(root.path());
+        let report = check_source(&SourceCheckOptions {
+            source: &source,
+            plugin_id: "reader-plugin",
+        })
+        .unwrap();
+        assert_eq!(report.plugin_id, "reader-plugin");
+        assert_eq!(report.service_count, 1);
+        assert_eq!(report.method_count, 1);
+        assert_eq!(report.x86_service_count, 1);
+        assert_eq!(report.x64_service_count, 0);
+        assert_eq!(report.dll_service_count, 1);
+        assert_eq!(report.com_service_count, 0);
+        assert_eq!(report.process_service_count, 0);
+        assert_eq!(report.source_file_count, 2);
+        assert!(report.source_bytes > 0);
+        assert!(report.legacy_license_excluded);
+        assert!(source.join("license.dat").is_file());
+        assert!(!source.join("plugin.json").exists());
+    }
+
+    #[test]
+    fn source_check_and_prepare_reject_missing_dll_exports_before_signing() {
+        let root = tempfile::tempdir().unwrap();
+        let source = source(root.path());
+        fs::write(
+            source.join("api.json"),
+            r#"{"serviceId":"reader","mainClass":"reader.dll","architecture":"x86","methods":[{"name":"MissingExport","parameters":["timeout"]}]}"#,
+        )
+        .unwrap();
+        let error = check_source(&SourceCheckOptions {
+            source: &source,
+            plugin_id: "reader-plugin",
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not export declared method"));
+
+        let signing_key = SigningKey::from_bytes(&[41; 32]);
+        let trust = trust_store(root.path(), &signing_key, None);
+        let staging = root.path().join("stage");
+        let request = root.path().join("request.json");
+        let matrix = root.path().join("matrix.json");
+        let error = prepare(&PrepareOptions {
+            source: &source,
+            staging: &staging,
+            request: &request,
+            matrix_template: &matrix,
+            plugin_id: "reader-plugin",
+            version: "1.0.0",
+            desktop_version_requirement: ">=0.1.0, <0.2.0",
+            display_name: "Reader",
+            key_id: "test-key",
+            trust_store: &trust,
+            matrix_seed: None,
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not export declared method"));
+        assert!(!staging.exists());
+        assert!(!request.exists());
+        assert!(!matrix.exists());
     }
 
     #[test]
@@ -3367,7 +3776,7 @@ mod tests {
             matrix_seed: None,
         })
         .unwrap();
-        fs::write(staging.join("reader.dll"), pe(0x8664)).unwrap();
+        fs::write(staging.join("reader.dll"), pe(0x8664, &["read"])).unwrap();
         let signature = root.path().join("signature.txt");
         fs::write(&signature, BASE64.encode([0_u8; 64])).unwrap();
         let error = finalize(&FinalizeOptions {

@@ -41,6 +41,11 @@ try {
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot "api.$Architecture.json") `
     -Destination (Join-Path $source "api.json")
 
+  cargo run --locked -p ssdev-plugin-tool -- source-check `
+    --source $source `
+    --plugin-id "windows-system-example-$Architecture"
+  if ($LASTEXITCODE -ne 0) { throw "plugin source check failed with exit code $LASTEXITCODE" }
+
   cargo run --locked -p ssdev-plugin-tool -- prepare `
     --source $source `
     --staging $staging `
