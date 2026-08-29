@@ -1,6 +1,6 @@
 use ssdev_pilot_readiness::{
-    inspect_materials, load_manifest, load_report, prepare_new_output, verify_materials,
-    write_report, PilotReadinessError, PilotReadinessReport,
+    blocker_remediation, inspect_materials, load_manifest, load_report, prepare_new_output,
+    verify_materials, write_report, PilotReadinessError, PilotReadinessReport,
 };
 use std::env;
 use std::ffi::OsString;
@@ -107,12 +107,12 @@ fn render_report_summary(report: &PilotReadinessReport, verified: bool) -> Strin
             "next: transfer the same materials root, manifest, and report; the receiver must run verify before migration audit".into()
         });
     } else {
-        lines.extend(
-            report
-                .blocker_codes
-                .iter()
-                .map(|code| format!("blocker: {code}")),
-        );
+        for code in &report.blocker_codes {
+            lines.push(format!("blocker: {code}"));
+            if let Some(remediation) = blocker_remediation(code) {
+                lines.push(format!("action: {remediation}"));
+            }
+        }
         lines.push(if verified {
             "next: this incomplete report is authentic; resolve its blocker codes and create a new non-overwriting report".into()
         } else {
@@ -202,7 +202,9 @@ mod tests {
         let summary = render_report_summary(&incomplete, false);
         assert!(summary.contains("pilot material intake: INCOMPLETE (2 blockers)"));
         assert!(summary.contains("blocker: business-hars-missing"));
+        assert!(summary.contains("action: add the fixed category"));
         assert!(summary.contains("blocker: migration-audit-binding-mismatch"));
+        assert!(summary.contains("action: make every migrationAuditBindings role"));
         assert!(!summary.contains(&digest));
         assert!(!summary.contains("hospital-a-pilot"));
         assert!(!summary.contains("D:\\ssdev-pilot"));

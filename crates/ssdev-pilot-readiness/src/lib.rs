@@ -17,6 +17,28 @@ const MAX_BYTES_PER_CATEGORY: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_PATH_BYTES: usize = 512;
 const MAX_LOGICAL_PATH_BYTES: usize = 4096;
 const MAX_DIRECTORY_DEPTH: usize = 64;
+#[cfg(test)]
+const CATEGORY_BLOCKER_SUFFIXES: &[&str] = &[
+    "missing",
+    "not-applicable-has-inputs",
+    "required",
+    "approval-missing",
+    "provided-has-approval",
+    "inputs-empty",
+    "input-count-below-minimum",
+    "input-limit-exceeded",
+    "input-duplicate",
+    "input-path-invalid",
+    "input-name-invalid",
+    "input-changed",
+    "input-symlink",
+    "input-unavailable",
+    "input-type-unsupported",
+    "private-material-forbidden",
+    "content-empty",
+    "identity-failed",
+    "layout-invalid",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Applicability {
@@ -478,6 +500,50 @@ pub fn write_report(path: &Path, report: &PilotReadinessReport) -> Result<(), Pi
     Ok(())
 }
 
+pub fn blocker_remediation(code: &str) -> Option<&'static str> {
+    match code {
+        "unknown-material-category" => {
+            return Some("remove unsupported categories and start from the documented fixed manifest template");
+        }
+        "duplicate-material-category" => {
+            return Some("keep exactly one manifest entry for each fixed material category");
+        }
+        "migration-audit-binding-mismatch" => {
+            return Some("make every migrationAuditBindings role exactly match the inputs of its owning category");
+        }
+        _ => {}
+    }
+    let rule = CATEGORY_RULES.iter().find(|rule| {
+        code.starts_with(rule.id) && code.as_bytes().get(rule.id.len()) == Some(&b'-')
+    })?;
+    let suffix = code.get(rule.id.len() + 1..)?;
+    if !is_allowed_category_blocker(rule.id, code) {
+        return None;
+    }
+    Some(match suffix {
+        "missing" => "add the fixed category to the manifest and declare its real project inputs",
+        "not-applicable-has-inputs" => "either mark the category provided or remove all inputs from the not-applicable entry",
+        "required" => "mark this required category provided and supply real project material",
+        "approval-missing" => "add a portable non-sensitive approval reference for the conditional not-applicable decision",
+        "provided-has-approval" => "remove the not-applicable approval reference from this provided category",
+        "inputs-empty" => "add at least one real relative material input for this provided category",
+        "input-count-below-minimum" => "provide the required complete input set: origin policy needs three files and plugin release set needs two inputs",
+        "input-limit-exceeded" => "split or reduce the declared inputs to the documented bounded category limit",
+        "input-duplicate" => "remove duplicate category inputs after portable path normalization",
+        "input-path-invalid" => "replace the input with a portable forward-slash relative path beneath the materials root",
+        "input-name-invalid" => "rename non-UTF-8 material entries to portable names before creating the report",
+        "input-changed" => "freeze material collection, stop concurrent writes, and create a new report after the inputs are stable",
+        "input-symlink" => "replace symbolic links with reviewed real files or directories inside the materials root",
+        "input-unavailable" => "restore the declared input and verify the current account can read the complete material",
+        "input-type-unsupported" => "replace special filesystem entries with reviewed regular files or directories",
+        "private-material-forbidden" => "remove private keys, tokens, and secret containers; provide only organization-approved public trust material",
+        "content-empty" => "place the actual reviewed files inside the declared material input",
+        "identity-failed" => "stabilize and make the material readable, then create a new report so its deterministic identity can be computed",
+        "layout-invalid" => "provide one complete previous Windows bundle with signed metadata, updater files, and exactly one NSIS installer",
+        _ => return None,
+    })
+}
+
 fn validate_report(report: &PilotReadinessReport) -> Result<(), PilotReadinessError> {
     if report.schema_version != REPORT_SCHEMA_VERSION
         || report.report_type != "pilot-material-readiness"
@@ -488,6 +554,10 @@ fn validate_report(report: &PilotReadinessReport) -> Result<(), PilotReadinessEr
         || !is_sha256(&report.material_set_sha256)
         || report.intake_complete != report.blocker_codes.is_empty()
         || !is_sorted_unique_codes(&report.blocker_codes)
+        || report
+            .blocker_codes
+            .iter()
+            .any(|code| blocker_remediation(code).is_none())
         || report.categories.len() != CATEGORY_RULES.len()
     {
         return Err(PilotReadinessError::Invalid(
@@ -502,10 +572,10 @@ fn validate_report(report: &PilotReadinessReport) -> Result<(), PilotReadinessEr
             || category.file_count > MAX_FILES_PER_CATEGORY
             || category.total_bytes > MAX_BYTES_PER_CATEGORY
             || !is_sorted_unique_codes(&category.blocker_codes)
-            || !category
-                .blocker_codes
-                .iter()
-                .all(|code| is_allowed_category_blocker(rule.id, code))
+            || !category.blocker_codes.iter().all(|code| {
+                is_allowed_category_blocker(rule.id, code)
+                    && is_allowed_status_blocker(&category.status, rule.id, code)
+            })
             || category
                 .content_sha256
                 .as_deref()
@@ -1153,28 +1223,68 @@ fn is_allowed_category_blocker(id: &str, code: &str) -> bool {
     else {
         return false;
     };
-    matches!(
-        suffix,
-        "missing"
-            | "not-applicable-has-inputs"
-            | "required"
-            | "approval-missing"
-            | "provided-has-approval"
-            | "inputs-empty"
-            | "input-count-below-minimum"
-            | "input-limit-exceeded"
-            | "input-duplicate"
-            | "input-path-invalid"
-            | "input-name-invalid"
-            | "input-changed"
-            | "input-symlink"
-            | "input-unavailable"
-            | "input-type-unsupported"
-            | "private-material-forbidden"
-            | "content-empty"
-            | "identity-failed"
-            | "layout-invalid"
-    )
+    match suffix {
+        "required" => CATEGORY_RULES
+            .iter()
+            .any(|rule| rule.id == id && rule.applicability == Applicability::Required),
+        "approval-missing" => CATEGORY_RULES
+            .iter()
+            .any(|rule| rule.id == id && rule.applicability == Applicability::Conditional),
+        "input-count-below-minimum" => minimum_inputs(id) > 1,
+        "private-material-forbidden" => id == "organization-public-trust",
+        "layout-invalid" => id == "previous-windows-release",
+        _ => matches!(
+            suffix,
+            "missing"
+                | "not-applicable-has-inputs"
+                | "provided-has-approval"
+                | "inputs-empty"
+                | "input-limit-exceeded"
+                | "input-duplicate"
+                | "input-path-invalid"
+                | "input-name-invalid"
+                | "input-changed"
+                | "input-symlink"
+                | "input-unavailable"
+                | "input-type-unsupported"
+                | "content-empty"
+                | "identity-failed"
+        ),
+    }
+}
+
+fn is_allowed_status_blocker(status: &ReportMaterialStatus, id: &str, code: &str) -> bool {
+    let Some(suffix) = code
+        .strip_prefix(id)
+        .and_then(|value| value.strip_prefix('-'))
+    else {
+        return false;
+    };
+    match status {
+        ReportMaterialStatus::Missing => suffix == "missing",
+        ReportMaterialStatus::NotApplicable => matches!(
+            suffix,
+            "not-applicable-has-inputs" | "required" | "approval-missing"
+        ),
+        ReportMaterialStatus::Provided => matches!(
+            suffix,
+            "provided-has-approval"
+                | "inputs-empty"
+                | "input-count-below-minimum"
+                | "input-limit-exceeded"
+                | "input-duplicate"
+                | "input-path-invalid"
+                | "input-name-invalid"
+                | "input-changed"
+                | "input-symlink"
+                | "input-unavailable"
+                | "input-type-unsupported"
+                | "private-material-forbidden"
+                | "content-empty"
+                | "identity-failed"
+                | "layout-invalid"
+        ),
+    }
 }
 
 fn validate_label(value: &str, field: &str) -> Result<(), PilotReadinessError> {
@@ -1253,6 +1363,71 @@ mod tests {
         ] {
             fs::write(bundle.join(file), file).unwrap();
         }
+    }
+
+    #[test]
+    fn every_supported_blocker_has_bounded_path_free_remediation() {
+        let mut codes = vec![
+            "unknown-material-category".to_owned(),
+            "duplicate-material-category".to_owned(),
+            "migration-audit-binding-mismatch".to_owned(),
+        ];
+        for rule in CATEGORY_RULES {
+            for suffix in CATEGORY_BLOCKER_SUFFIXES {
+                let code = format!("{}-{suffix}", rule.id);
+                if is_allowed_category_blocker(rule.id, &code) {
+                    codes.push(code);
+                } else {
+                    assert!(blocker_remediation(&code).is_none());
+                }
+            }
+        }
+
+        for code in codes {
+            let remediation = blocker_remediation(&code)
+                .unwrap_or_else(|| panic!("missing remediation for {code}"));
+            assert!(!remediation.is_empty());
+            assert!(remediation.len() <= 240);
+            assert!(remediation.is_ascii());
+            assert!(!remediation.contains("C:\\"));
+            assert!(!remediation.contains("/Users/"));
+            assert!(!remediation.contains("project_label"));
+        }
+        assert!(blocker_remediation("unknown-future-blocker").is_none());
+        assert!(blocker_remediation("business-hars-unknown-suffix").is_none());
+        assert!(blocker_remediation("business-hars-layout-invalid").is_none());
+        assert!(blocker_remediation("legacy-config-private-material-forbidden").is_none());
+
+        assert!(is_allowed_status_blocker(
+            &ReportMaterialStatus::Missing,
+            "business-hars",
+            "business-hars-missing"
+        ));
+        assert!(!is_allowed_status_blocker(
+            &ReportMaterialStatus::Provided,
+            "business-hars",
+            "business-hars-missing"
+        ));
+        assert!(is_allowed_status_blocker(
+            &ReportMaterialStatus::NotApplicable,
+            "legacy-keymap",
+            "legacy-keymap-approval-missing"
+        ));
+        assert!(!is_allowed_status_blocker(
+            &ReportMaterialStatus::NotApplicable,
+            "legacy-keymap",
+            "legacy-keymap-content-empty"
+        ));
+        assert!(is_allowed_status_blocker(
+            &ReportMaterialStatus::Provided,
+            "previous-windows-release",
+            "previous-windows-release-layout-invalid"
+        ));
+        assert!(!is_allowed_status_blocker(
+            &ReportMaterialStatus::NotApplicable,
+            "previous-windows-release",
+            "previous-windows-release-layout-invalid"
+        ));
     }
 
     fn complete_manifest(root: &Path) -> PilotMaterialManifest {
