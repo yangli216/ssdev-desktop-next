@@ -47,10 +47,13 @@ target/i686-pc-windows-msvc/debug/ssdev_windows_system_example.dll
   -DesktopVersionRequirement ">=0.1.0, <0.2.0" `
   -KeyId production-plugin-2026 `
   -TrustStore C:\secure-inputs\plugin-trust.json `
-  -OutputRoot C:\secure-release\windows-system-example-x64-1.0.0
+  -OutputRoot C:\secure-release\windows-system-example-x64-1.0.0 `
+  -BaselinePackage C:\approved-artifacts\windows-system-example-x64-0.9.0.ssdev-plugin
 ```
 
 脚本在接触信任库之前先运行 `source-check`，只读验证源文件、PE 位数、全部声明导出和通用 DLL ABI；随后才进入正式准备。`DesktopVersionRequirement` 是该插件已经验证过的 SSDEV Desktop SemVer 范围，并进入签名覆盖的 `plugin.json`。示例当前按 `0.1.x` 客户端验证，因此使用 `>=0.1.0, <0.2.0`；生产插件应根据真实兼容矩阵填写，不要为省事使用 `*`。
+
+`BaselinePackage` 可在首次发布时省略；后续版本提供上一份受信任包后，脚本会在生成签名请求前写出 `api-compatibility-report.json`。破坏 Web Bridge 调用契约的变化会失败，Win32 封装实现、超时或原生参数布局变化则进入人工复核项，并仍须执行下方真实 Windows 矩阵。
 
 输出目录中的 `plugin-signing-request.json` 包含 `payloadBase64` 和 `payloadSha256`。由组织 KMS/HSM 对 Base64 解码后的原始字节执行 Ed25519 签名，把 64 字节签名写成单行 Base64 文件。私钥不能交给示例脚本或桌面客户端。
 

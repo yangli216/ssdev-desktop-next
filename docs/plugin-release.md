@@ -44,6 +44,23 @@ cargo run --locked -p ssdev-plugin-tool -- source-check `
 
 该检查证明“当前文件可以进入签名准备”，不证明厂商 ABI 参数真实正确或硬件副作用安全；后者仍必须经过 Windows 候选宿主预检和黄金矩阵。
 
+### 与上一签名版本比较 API
+
+更新已有插件时，在生成新签名请求前把候选源与上一份受信任 `.ssdev-plugin` 比较：
+
+```powershell
+cargo run --locked -p ssdev-plugin-tool -- api-check `
+  --baseline-package C:\approved-artifacts\reader-plugin-2.3.0.ssdev-plugin `
+  --candidate-source C:\plugin-development\card-reader\release-source `
+  --plugin-id reader-plugin `
+  --trust-store C:\secure-build-inputs\plugin-trust.json `
+  --report C:\secure-release\reader-plugin-2.3.1-api-report.json
+```
+
+工具先用当前信任库完整验签旧包，再把候选源复制到临时快照并复用 `source-check`/`prepare` 的文件、PE、导出和 ABI 校验。报告绑定旧包、候选源文件集合和信任库的 SHA-256，不依赖本机绝对路径。运行时同时接受方法原名和 `alias`，因此两者都作为 Web Bridge 公开路由比较。删除服务或路由、增加必填输入、删除输入、改变输入类型、删除响应字段或改变响应类型都会以非零状态阻止发布；报告会在失败前以不覆盖方式写出，CI 和评审人员可读取稳定变化码。
+
+新增服务、路由或响应字段不会阻止发布。入口组件、架构、调用约定、超时、参数原生顺序、缓冲区等变化不等同于 Web API 破坏，但会进入 `reviewChanges`，要求重新生成类型化客户端、复核厂商 ABI 并执行完整 Windows 黄金矩阵。报告不包含 DLL 路径、签名密钥或业务数据，输出必须位于候选源目录之外。
+
 ### 生成业务 Web 客户端
 
 确定 `api.json` 后，可在不启动桌面端和原生组件的情况下生成类型化 Web Bridge 客户端：

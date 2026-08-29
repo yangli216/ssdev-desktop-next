@@ -5,7 +5,8 @@ param(
   [Parameter(Mandatory = $true)][string]$DesktopVersionRequirement,
   [Parameter(Mandatory = $true)][string]$KeyId,
   [Parameter(Mandatory = $true)][string]$TrustStore,
-  [Parameter(Mandatory = $true)][string]$OutputRoot
+  [Parameter(Mandatory = $true)][string]$OutputRoot,
+  [string]$BaselinePackage = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,11 +15,19 @@ Set-StrictMode -Version Latest
 $workspace = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $output = [System.IO.Path]::GetFullPath($OutputRoot)
 $trust = [System.IO.Path]::GetFullPath($TrustStore)
+$baseline = if ($BaselinePackage.Trim().Length -gt 0) {
+  [System.IO.Path]::GetFullPath($BaselinePackage)
+} else {
+  $null
+}
 if (Test-Path -LiteralPath $output) {
   throw "OutputRoot must not already exist: $output"
 }
 if (-not (Test-Path -LiteralPath $trust -PathType Leaf)) {
   throw "TrustStore does not exist: $trust"
+}
+if ($null -ne $baseline -and -not (Test-Path -LiteralPath $baseline -PathType Leaf)) {
+  throw "BaselinePackage does not exist: $baseline"
 }
 
 $target = if ($Architecture -eq "x86") { "i686-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
@@ -27,6 +36,7 @@ $sourceBin = Join-Path $source "bin"
 $staging = Join-Path $output "staging"
 $request = Join-Path $output "plugin-signing-request.json"
 $matrix = Join-Path $output "plugin-matrix.json"
+$apiReport = Join-Path $output "api-compatibility-report.json"
 
 New-Item -ItemType Directory -Path $sourceBin | Out-Null
 
@@ -45,6 +55,18 @@ try {
     --source $source `
     --plugin-id "windows-system-example-$Architecture"
   if ($LASTEXITCODE -ne 0) { throw "plugin source check failed with exit code $LASTEXITCODE" }
+
+  if ($null -ne $baseline) {
+    cargo run --locked -p ssdev-plugin-tool -- api-check `
+      --baseline-package $baseline `
+      --candidate-source $source `
+      --plugin-id "windows-system-example-$Architecture" `
+      --trust-store $trust `
+      --report $apiReport
+    if ($LASTEXITCODE -ne 0) {
+      throw "plugin API compatibility check failed with exit code $LASTEXITCODE; inspect $apiReport"
+    }
+  }
 
   cargo run --locked -p ssdev-plugin-tool -- prepare `
     --source $source `
