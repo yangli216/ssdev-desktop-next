@@ -28,12 +28,25 @@
 
 ```powershell
 cargo run --locked -p ssdev-pilot-readiness -- `
+  create `
   D:\ssdev-pilot\materials `
   D:\ssdev-pilot\pilot-materials.json `
   D:\ssdev-pilot\reports\pilot-readiness.json
 ```
 
 退出码 `0` 表示材料清单完整；`3` 表示报告已写出但仍有稳定阻断码；`1` 表示 manifest、路径或 I/O 本身无效。材料变化会改变每类 `contentSha256` 和总 `materialSetSha256`，后续移交应记录这个总摘要。
+
+接收方不能只查看对方提供的摘要，应对收到的同一 manifest 和材料目录独立复验：
+
+```powershell
+cargo run --locked -p ssdev-pilot-readiness -- `
+  verify `
+  D:\ssdev-pilot\materials `
+  D:\ssdev-pilot\pilot-materials.json `
+  D:\ssdev-pilot\reports\pilot-readiness.json
+```
+
+`verify` 会先严格校验报告 schema、固定类别、排序阻断码和内部集合摘要，再重新扫描全部声明输入并逐字段比较；manifest、报告或任一材料在复验期间变化都会失败。完整报告复验成功返回 `0`；内容身份正确但报告本身记录为未齐全时仍返回 `3`，便于接收方确认“这是原报告”但继续阻断试点。报告必须位于材料目录之外。
 
 预检通过后按顺序执行：
 

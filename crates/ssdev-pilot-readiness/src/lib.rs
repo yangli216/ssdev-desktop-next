@@ -9,6 +9,7 @@ use thiserror::Error;
 pub const MANIFEST_SCHEMA_VERSION: u8 = 1;
 pub const REPORT_SCHEMA_VERSION: u8 = 1;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_REPORT_BYTES: u64 = 1024 * 1024;
 const MAX_INPUTS_PER_CATEGORY: usize = 256;
 const MAX_FILES_PER_CATEGORY: u64 = 100_000;
 const MAX_ENTRIES_PER_CATEGORY: u64 = 200_000;
@@ -110,7 +111,7 @@ pub struct PilotMaterialManifest {
     pub categories: Vec<MaterialCategory>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ReportMaterialStatus {
     Provided,
@@ -118,8 +119,8 @@ pub enum ReportMaterialStatus {
     Missing,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MaterialCategoryReport {
     pub id: String,
     pub status: ReportMaterialStatus,
@@ -133,8 +134,8 @@ pub struct MaterialCategoryReport {
     pub blocker_codes: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PilotReadinessReport {
     pub schema_version: u8,
     pub report_type: String,
@@ -157,6 +158,8 @@ pub enum PilotReadinessError {
     Json(#[from] serde_json::Error),
     #[error("pilot readiness report already exists")]
     OutputExists,
+    #[error("pilot readiness report does not match the current manifest and material set")]
+    VerificationFailed,
 }
 
 #[derive(Default)]
@@ -195,33 +198,16 @@ impl ScanFailure {
 }
 
 pub fn load_manifest(path: &Path) -> Result<(PilotMaterialManifest, Vec<u8>), PilotReadinessError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > MAX_MANIFEST_BYTES
-    {
-        return Err(PilotReadinessError::Invalid(
-            "manifest must be a bounded regular file".into(),
-        ));
-    }
-    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(MAX_MANIFEST_BYTES as usize));
-    File::open(path)?
-        .take(MAX_MANIFEST_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    let after = fs::symlink_metadata(path)?;
-    if bytes.len() as u64 > MAX_MANIFEST_BYTES
-        || after.file_type().is_symlink()
-        || !after.is_file()
-        || after.len() != metadata.len()
-        || after.len() != bytes.len() as u64
-        || after.modified().ok() != metadata.modified().ok()
-    {
-        return Err(PilotReadinessError::Invalid(
-            "manifest changed or exceeded its limit while being read".into(),
-        ));
-    }
+    let bytes = read_bounded_regular_file(path, MAX_MANIFEST_BYTES, "manifest")?;
     let manifest = serde_json::from_slice(&bytes)?;
     Ok((manifest, bytes))
+}
+
+pub fn load_report(path: &Path) -> Result<(PilotReadinessReport, Vec<u8>), PilotReadinessError> {
+    let bytes = read_bounded_regular_file(path, MAX_REPORT_BYTES, "report")?;
+    let report: PilotReadinessReport = serde_json::from_slice(&bytes)?;
+    validate_report(&report)?;
+    Ok((report, bytes))
 }
 
 pub fn inspect_materials(
@@ -290,6 +276,20 @@ pub fn inspect_materials(
     })
 }
 
+pub fn verify_materials(
+    materials_root: &Path,
+    manifest: &PilotMaterialManifest,
+    manifest_bytes: &[u8],
+    expected: &PilotReadinessReport,
+) -> Result<(), PilotReadinessError> {
+    validate_report(expected)?;
+    let actual = inspect_materials(materials_root, manifest, manifest_bytes)?;
+    if &actual != expected {
+        return Err(PilotReadinessError::VerificationFailed);
+    }
+    Ok(())
+}
+
 pub fn prepare_new_output(path: &Path) -> Result<PathBuf, PilotReadinessError> {
     match fs::symlink_metadata(path) {
         Ok(_) => return Err(PilotReadinessError::OutputExists),
@@ -314,10 +314,140 @@ pub fn prepare_new_output(path: &Path) -> Result<PathBuf, PilotReadinessError> {
 }
 
 pub fn write_report(path: &Path, report: &PilotReadinessReport) -> Result<(), PilotReadinessError> {
+    validate_report(report)?;
     let mut file = File::options().write(true).create_new(true).open(path)?;
     serde_json::to_writer_pretty(&mut file, report)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
+    Ok(())
+}
+
+fn validate_report(report: &PilotReadinessReport) -> Result<(), PilotReadinessError> {
+    if report.schema_version != REPORT_SCHEMA_VERSION
+        || report.report_type != "pilot-material-readiness"
+        || !report.downstream_validation_required
+        || !is_sha256(&report.manifest_sha256)
+        || !is_sha256(&report.project_label_sha256)
+        || !is_sha256(&report.material_set_sha256)
+        || report.intake_complete != report.blocker_codes.is_empty()
+        || !is_sorted_unique_codes(&report.blocker_codes)
+        || report.categories.len() != CATEGORY_RULES.len()
+    {
+        return Err(PilotReadinessError::Invalid(
+            "pilot readiness report is malformed or unsupported".into(),
+        ));
+    }
+    let mut payloads = BTreeMap::new();
+    let mut category_blockers = BTreeSet::new();
+    for (category, rule) in report.categories.iter().zip(CATEGORY_RULES) {
+        if category.id != rule.id
+            || category.input_count as usize > MAX_INPUTS_PER_CATEGORY + 1
+            || category.file_count > MAX_FILES_PER_CATEGORY
+            || category.total_bytes > MAX_BYTES_PER_CATEGORY
+            || !is_sorted_unique_codes(&category.blocker_codes)
+            || !category
+                .blocker_codes
+                .iter()
+                .all(|code| is_allowed_category_blocker(rule.id, code))
+            || category
+                .content_sha256
+                .as_deref()
+                .is_some_and(|digest| !is_sha256(digest))
+            || category
+                .approval_reference_sha256
+                .as_deref()
+                .is_some_and(|digest| !is_sha256(digest))
+        {
+            return Err(PilotReadinessError::Invalid(
+                "pilot readiness category report is malformed".into(),
+            ));
+        }
+        category_blockers.extend(category.blocker_codes.iter().cloned());
+        match category.status {
+            ReportMaterialStatus::Missing
+                if category.blocker_codes != [format!("{}-missing", rule.id)]
+                    || category.input_count != 0
+                    || category.file_count != 0
+                    || category.total_bytes != 0
+                    || category.content_sha256.is_some()
+                    || category.approval_reference_sha256.is_some() =>
+            {
+                return Err(PilotReadinessError::Invalid(
+                    "missing material report contains impossible content".into(),
+                ));
+            }
+            ReportMaterialStatus::NotApplicable
+                if (rule.applicability == Applicability::Required
+                    && !category
+                        .blocker_codes
+                        .contains(&format!("{}-required", rule.id)))
+                    || (rule.applicability == Applicability::Conditional
+                        && category.approval_reference_sha256.is_none()
+                        && !category
+                            .blocker_codes
+                            .contains(&format!("{}-approval-missing", rule.id)))
+                    || (category.input_count > 0
+                        && !category
+                            .blocker_codes
+                            .contains(&format!("{}-not-applicable-has-inputs", rule.id)))
+                    || category.file_count != 0
+                    || category.total_bytes != 0
+                    || category.content_sha256.is_some() =>
+            {
+                return Err(PilotReadinessError::Invalid(
+                    "not-applicable material report contains content".into(),
+                ));
+            }
+            ReportMaterialStatus::Provided
+                if category.approval_reference_sha256.is_some()
+                    || (category.input_count == 0
+                        && !category
+                            .blocker_codes
+                            .contains(&format!("{}-inputs-empty", rule.id)))
+                    || (category.input_count > 0
+                        && (category.input_count as usize) < minimum_inputs(rule.id)
+                        && !category
+                            .blocker_codes
+                            .contains(&format!("{}-input-count-below-minimum", rule.id)))
+                    || (category.input_count as usize > MAX_INPUTS_PER_CATEGORY
+                        && !category
+                            .blocker_codes
+                            .contains(&format!("{}-input-limit-exceeded", rule.id)))
+                    || (!category.blocker_codes.is_empty()
+                        && category.content_sha256.is_some())
+                    || (category.blocker_codes.is_empty()
+                        && (category.content_sha256.is_none() || category.file_count == 0)) =>
+            {
+                return Err(PilotReadinessError::Invalid(
+                    "provided material report has an invalid identity".into(),
+                ));
+            }
+            _ => {}
+        }
+        payloads.insert(category.id.clone(), category_identity_payload(category));
+    }
+    let report_blockers = report
+        .blocker_codes
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if !category_blockers.is_subset(&report_blockers)
+        || report_blockers.difference(&category_blockers).any(|code| {
+            !matches!(
+                code.as_str(),
+                "unknown-material-category" | "duplicate-material-category"
+            )
+        })
+    {
+        return Err(PilotReadinessError::Invalid(
+            "pilot readiness report blocker summary is inconsistent".into(),
+        ));
+    }
+    if digest_named_payloads("pilot-material-set", &payloads)? != report.material_set_sha256 {
+        return Err(PilotReadinessError::Invalid(
+            "pilot readiness material set digest is inconsistent".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -366,7 +496,7 @@ fn inspect_not_applicable(
     MaterialCategoryReport {
         id: rule.id.into(),
         status: ReportMaterialStatus::NotApplicable,
-        input_count: u32::try_from(category.inputs.len()).unwrap_or(u32::MAX),
+        input_count: reported_input_count(category.inputs.len()),
         file_count: 0,
         total_bytes: 0,
         content_sha256: None,
@@ -446,7 +576,7 @@ fn inspect_provided(
     MaterialCategoryReport {
         id: id.into(),
         status: ReportMaterialStatus::Provided,
-        input_count: u32::try_from(category.inputs.len()).unwrap_or(u32::MAX),
+        input_count: reported_input_count(category.inputs.len()),
         file_count: state.file_count,
         total_bytes: state.total_bytes,
         content_sha256,
@@ -583,6 +713,11 @@ fn scan_file(
     if public_only && has_private_key_extension(path) {
         return Err(ScanFailure::PrivateMaterial);
     }
+    if state.file_count >= MAX_FILES_PER_CATEGORY
+        || before.len() > MAX_BYTES_PER_CATEGORY.saturating_sub(state.total_bytes)
+    {
+        return Err(ScanFailure::LimitExceeded);
+    }
     state.file_count = state
         .file_count
         .checked_add(1)
@@ -591,9 +726,6 @@ fn scan_file(
         .total_bytes
         .checked_add(before.len())
         .ok_or(ScanFailure::LimitExceeded)?;
-    if state.file_count > MAX_FILES_PER_CATEGORY || state.total_bytes > MAX_BYTES_PER_CATEGORY {
-        return Err(ScanFailure::LimitExceeded);
-    }
     let mut reader = BufReader::new(File::open(path).map_err(|_| ScanFailure::Unavailable)?);
     let mut hasher = Sha256::new();
     let mut bytes_read = 0_u64;
@@ -656,8 +788,89 @@ fn minimum_inputs(id: &str) -> usize {
     }
 }
 
+fn reported_input_count(actual: usize) -> u32 {
+    u32::try_from(actual.min(MAX_INPUTS_PER_CATEGORY + 1))
+        .expect("the bounded input count always fits u32")
+}
+
 fn category_identity_payload(report: &MaterialCategoryReport) -> Vec<u8> {
     serde_json::to_vec(report).expect("category report serialization is infallible")
+}
+
+fn read_bounded_regular_file(
+    path: &Path,
+    limit: u64,
+    kind: &str,
+) -> Result<Vec<u8>, PilotReadinessError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > limit {
+        return Err(PilotReadinessError::Invalid(format!(
+            "{kind} must be a bounded regular file"
+        )));
+    }
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(limit as usize));
+    File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
+    let after = fs::symlink_metadata(path)?;
+    if bytes.len() as u64 > limit
+        || after.file_type().is_symlink()
+        || !after.is_file()
+        || after.len() != metadata.len()
+        || after.len() != bytes.len() as u64
+        || after.modified().ok() != metadata.modified().ok()
+    {
+        return Err(PilotReadinessError::Invalid(format!(
+            "{kind} changed or exceeded its limit while being read"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn is_sorted_unique_codes(codes: &[String]) -> bool {
+    codes.windows(2).all(|pair| pair[0] < pair[1])
+        && codes.iter().all(|code| {
+            !code.is_empty()
+                && code.len() <= 160
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+}
+
+fn is_allowed_category_blocker(id: &str, code: &str) -> bool {
+    let Some(suffix) = code
+        .strip_prefix(id)
+        .and_then(|value| value.strip_prefix('-'))
+    else {
+        return false;
+    };
+    matches!(
+        suffix,
+        "missing"
+            | "not-applicable-has-inputs"
+            | "required"
+            | "approval-missing"
+            | "provided-has-approval"
+            | "inputs-empty"
+            | "input-count-below-minimum"
+            | "input-limit-exceeded"
+            | "input-duplicate"
+            | "input-path-invalid"
+            | "input-name-invalid"
+            | "input-changed"
+            | "input-symlink"
+            | "input-unavailable"
+            | "input-type-unsupported"
+            | "private-material-forbidden"
+            | "content-empty"
+            | "identity-failed"
+    )
 }
 
 fn validate_label(value: &str, field: &str) -> Result<(), PilotReadinessError> {
@@ -860,6 +1073,47 @@ mod tests {
         assert!(matches!(
             prepare_new_output(&output),
             Err(PilotReadinessError::OutputExists)
+        ));
+    }
+
+    #[test]
+    fn a_handoff_report_round_trips_and_detects_material_or_identity_drift() {
+        let temp = tempdir().unwrap();
+        let materials = temp.path().join("materials");
+        fs::create_dir(&materials).unwrap();
+        let manifest = complete_manifest(&materials);
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let report = inspect_materials(&materials, &manifest, &bytes).unwrap();
+        let report_path = temp.path().join("report.json");
+        write_report(&report_path, &report).unwrap();
+        let (loaded, _) = load_report(&report_path).unwrap();
+        verify_materials(&materials, &manifest, &bytes, &loaded).unwrap();
+
+        fs::write(materials.join("material-0-0.bin"), "changed").unwrap();
+        assert!(matches!(
+            verify_materials(&materials, &manifest, &bytes, &loaded),
+            Err(PilotReadinessError::VerificationFailed)
+        ));
+
+        fs::write(materials.join("material-0-0.bin"), "content-0-0").unwrap();
+        let mut changed_identity = loaded;
+        changed_identity.project_label_sha256 = "0".repeat(64);
+        assert!(matches!(
+            verify_materials(&materials, &manifest, &bytes, &changed_identity),
+            Err(PilotReadinessError::VerificationFailed)
+        ));
+
+        let mut internally_inconsistent = report;
+        internally_inconsistent.categories[0].file_count += 1;
+        let corrupt_path = temp.path().join("corrupt-report.json");
+        fs::write(
+            &corrupt_path,
+            serde_json::to_vec(&internally_inconsistent).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_report(&corrupt_path),
+            Err(PilotReadinessError::Invalid(_))
         ));
     }
 
