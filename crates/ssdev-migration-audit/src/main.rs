@@ -70,9 +70,26 @@ struct FormalOutputs {
     workspace: PathBuf,
 }
 
+#[derive(Debug)]
+struct FindingSummary {
+    critical_findings: u32,
+    warning_findings: u32,
+    info_findings: u32,
+    code_counts: BTreeMap<String, u32>,
+    guidance: BTreeMap<String, FindingGuidance>,
+}
+
+#[derive(Debug)]
+struct FindingGuidance {
+    severity: Severity,
+    count: u32,
+    remediation: &'static str,
+}
+
 fn main() {
     match run() {
-        Ok(()) => {}
+        Ok(true) => {}
+        Ok(false) => std::process::exit(3),
         Err(error) => {
             eprintln!("{error}\n\n用法: ssdev-migration-audit [--config FILE]... [--plugins DIR]... [--keymap FILE]... [--browser-assets FILE_OR_DIR]... [--browser-har FILE]... [--origin-policy FILE --origin-policy-envelope FILE --release-trust-store FILE] [--pilot-materials-root DIR --pilot-manifest FILE --pilot-report FILE] [--workspace DIR --report-output FILE --evidence-output FILE --evidence-environment LABEL]");
             std::process::exit(2);
@@ -80,7 +97,7 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), Box<dyn Error>> {
+fn run() -> Result<bool, Box<dyn Error>> {
     let mut options = parse_args(env::args().skip(1))
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let verified_pilot = options.pilot.map(load_verified_pilot_inputs).transpose()?;
@@ -117,7 +134,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 pilot.verify_unchanged()?;
             }
             println!("{}", serde_json::to_string_pretty(&report)?);
-            Ok(())
+            Ok(true)
         }
         Some(formal) => run_formal(
             &options.inputs,
@@ -242,7 +259,7 @@ fn run_formal(
     formal: FormalOutputs,
     verified_policy: VerifiedOriginPolicy,
     verified_pilot: VerifiedPilotInputs,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<bool, Box<dyn Error>> {
     let workspace = fs::canonicalize(&formal.workspace)?;
     if !workspace.is_dir() {
         return Err(invalid_input("workspace must be an existing directory"));
@@ -269,6 +286,8 @@ fn run_formal(
         verified_policy.document_sha256.clone(),
     );
     bind_pilot_materials(&mut report, Some(&verified_pilot));
+    let finding_summary = summarize_findings(&report)?;
+    let formal_summary = render_formal_summary(&report, &finding_summary);
     let mut report_bytes = serde_json::to_vec_pretty(&report)?;
     report_bytes.push(b'\n');
     let report_sha256 = sha256_bytes(&report_bytes);
@@ -289,17 +308,117 @@ fn run_formal(
         source_after,
         report_sha256,
         formal.evidence_environment,
+        &finding_summary,
     )?;
     evidence.validate()?;
     write_new_bytes(&report_output, &report_bytes)?;
     write_migration_audit_evidence(&evidence_output, &evidence)?;
-    println!(
-        "migration audit report and evidence written: {} findings, {} browser files, {} HAR requests",
-        report.findings.len(),
+    println!("{formal_summary}");
+    Ok(!is_formal_audit_blocked(&finding_summary))
+}
+
+fn summarize_findings(report: &AuditReport) -> Result<FindingSummary, Box<dyn Error>> {
+    let mut summary = FindingSummary {
+        critical_findings: 0,
+        warning_findings: 0,
+        info_findings: 0,
+        code_counts: BTreeMap::new(),
+        guidance: BTreeMap::new(),
+    };
+    for finding in &report.findings {
+        if finding.code.is_empty()
+            || finding.code.len() > 128
+            || !finding
+                .code
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || finding.remediation.is_empty()
+            || finding.remediation.len() > 512
+            || finding.remediation.chars().any(char::is_control)
+        {
+            return Err(invalid_input(
+                "migration finding code or remediation is not safe for the formal summary",
+            ));
+        }
+        increment_count(
+            summary.code_counts.entry(finding.code.into()).or_default(),
+            "finding count",
+        )?;
+        let severity_count = match finding.severity {
+            Severity::Critical => &mut summary.critical_findings,
+            Severity::Warning => &mut summary.warning_findings,
+            Severity::Info => &mut summary.info_findings,
+        };
+        increment_count(severity_count, "severity count")?;
+        let guidance = summary
+            .guidance
+            .entry(finding.code.into())
+            .or_insert(FindingGuidance {
+                severity: finding.severity,
+                count: 0,
+                remediation: finding.remediation,
+            });
+        if guidance.severity != finding.severity || guidance.remediation != finding.remediation {
+            return Err(invalid_input(
+                "one migration finding code has inconsistent severity or remediation",
+            ));
+        }
+        increment_count(&mut guidance.count, "blocker count")?;
+    }
+    if usize::try_from(summary.critical_findings).ok() != Some(report.summary.critical_findings)
+        || usize::try_from(summary.warning_findings).ok() != Some(report.summary.warning_findings)
+    {
+        return Err(invalid_input(
+            "migration audit finding severity summary is inconsistent",
+        ));
+    }
+    Ok(summary)
+}
+
+fn increment_count(value: &mut u32, name: &str) -> Result<(), Box<dyn Error>> {
+    *value = value
+        .checked_add(1)
+        .ok_or_else(|| invalid_input(&format!("{name} overflowed")))?;
+    Ok(())
+}
+
+fn is_formal_audit_blocked(summary: &FindingSummary) -> bool {
+    summary.critical_findings > 0 || summary.warning_findings > 0
+}
+
+fn render_formal_summary(report: &AuditReport, summary: &FindingSummary) -> String {
+    let blocked = is_formal_audit_blocked(summary);
+    let state = if blocked { "BLOCKED" } else { "CLEAR" };
+    let mut lines = vec![format!(
+        "migration audit: {state} ({} critical, {} warnings, {} info)",
+        summary.critical_findings, summary.warning_findings, summary.info_findings
+    )];
+    lines.push(format!(
+        "coverage: {} configs, {} plugin directories, {} services, {} browser files, {} HAR requests",
+        report.summary.config_files,
+        report.summary.plugin_directories,
+        report.summary.services,
         report.browser_compatibility.asset_files_scanned,
         report.browser_compatibility.har_requests_scanned
-    );
-    Ok(())
+    ));
+    for (code, guidance) in &summary.guidance {
+        let severity = match guidance.severity {
+            Severity::Critical => "critical",
+            Severity::Warning => "warning",
+            Severity::Info => continue,
+        };
+        lines.push(format!(
+            "blocker: {code} ({severity}, {} occurrences)",
+            guidance.count
+        ));
+        lines.push(format!("action: {}", guidance.remediation));
+    }
+    lines.push(if blocked {
+        "next: report and evidence were written, but cannot satisfy GO; resolve every critical and warning finding, then rerun with new output paths".into()
+    } else {
+        "next: sign this clear migration evidence and continue the plugin matrix and Windows package gates; this audit alone is not GO".into()
+    });
+    lines.join("\n")
 }
 
 fn validate_formal_output_locations(
@@ -328,27 +447,8 @@ fn build_evidence(
     source: ssdev_release_manifest::SourceIdentity,
     report_sha256: String,
     environment: String,
+    finding_summary: &FindingSummary,
 ) -> Result<MigrationAuditEvidence, Box<dyn Error>> {
-    let mut finding_code_counts = BTreeMap::new();
-    let mut critical_findings = 0_u32;
-    let mut warning_findings = 0_u32;
-    let mut info_findings = 0_u32;
-    for finding in &report.findings {
-        let count = finding_code_counts
-            .entry(finding.code.to_owned())
-            .or_insert(0_u32);
-        *count = count
-            .checked_add(1)
-            .ok_or_else(|| invalid_input("finding count overflowed"))?;
-        let severity = match finding.severity {
-            Severity::Critical => &mut critical_findings,
-            Severity::Warning => &mut warning_findings,
-            Severity::Info => &mut info_findings,
-        };
-        *severity = severity
-            .checked_add(1)
-            .ok_or_else(|| invalid_input("severity count overflowed"))?;
-    }
     let executed_at_unix_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| invalid_input("system clock is before the Unix epoch"))?
@@ -415,10 +515,10 @@ fn build_evidence(
         desktop_callback_http_evidence: map_http_evidence(
             report.browser_compatibility.desktop_callback_http_evidence,
         ),
-        critical_findings,
-        warning_findings,
-        info_findings,
-        finding_code_counts,
+        critical_findings: finding_summary.critical_findings,
+        warning_findings: finding_summary.warning_findings,
+        info_findings: finding_summary.info_findings,
+        finding_code_counts: finding_summary.code_counts.clone(),
     })
 }
 
@@ -758,6 +858,84 @@ mod tests {
             &materials,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn formal_summary_is_actionable_path_free_and_fail_closed() {
+        let mut report = audit(&AuditInputs::default());
+        report.findings = vec![
+            ssdev_migration_audit::Finding {
+                severity: Severity::Critical,
+                code: "legacy-install-run",
+                source: PathBuf::from(r"C:\secret\hospital-a\api.json"),
+                message: "private endpoint http://10.17.5.57 must not escape".into(),
+                remediation: "remove automatic execution and move the reviewed step into controlled deployment",
+            },
+            ssdev_migration_audit::Finding {
+                severity: Severity::Critical,
+                code: "legacy-install-run",
+                source: PathBuf::from(r"D:\another-private-path\api.json"),
+                message: "another sensitive finding".into(),
+                remediation: "remove automatic execution and move the reviewed step into controlled deployment",
+            },
+            ssdev_migration_audit::Finding {
+                severity: Severity::Info,
+                code: "legacy-insecure-business-origin-authorized",
+                source: PathBuf::from("private-config.json"),
+                message: "authorized private origin".into(),
+                remediation: "retain the signed policy binding",
+            },
+        ];
+        report.summary.critical_findings = 2;
+        report.summary.warning_findings = 0;
+
+        let summary = summarize_findings(&report).unwrap();
+        assert!(is_formal_audit_blocked(&summary));
+        assert_eq!(summary.critical_findings, 2);
+        assert_eq!(summary.info_findings, 1);
+        assert_eq!(summary.code_counts["legacy-install-run"], 2);
+        assert_eq!(summary.guidance["legacy-install-run"].count, 2);
+        let rendered = render_formal_summary(&report, &summary);
+        assert!(rendered.contains("migration audit: BLOCKED (2 critical, 0 warnings, 1 info)"));
+        assert!(rendered.contains("blocker: legacy-install-run (critical, 2 occurrences)"));
+        assert!(rendered.contains("action: remove automatic execution"));
+        assert!(rendered.contains("cannot satisfy GO"));
+        assert_eq!(rendered.matches("action:").count(), 1);
+        assert!(!rendered.contains("C:\\secret"));
+        assert!(!rendered.contains("10.17.5.57"));
+        assert!(!rendered.contains("another sensitive finding"));
+
+        let mut clear = audit(&AuditInputs::default());
+        clear.findings.clear();
+        clear.summary.critical_findings = 0;
+        clear.summary.warning_findings = 0;
+        let summary = summarize_findings(&clear).unwrap();
+        assert!(!is_formal_audit_blocked(&summary));
+        let rendered = render_formal_summary(&clear, &summary);
+        assert!(rendered.contains("migration audit: CLEAR (0 critical, 0 warnings, 0 info)"));
+        assert!(rendered.contains("this audit alone is not GO"));
+        assert!(!rendered.contains("blocker:"));
+
+        let mut inconsistent = audit(&AuditInputs::default());
+        inconsistent.findings = vec![
+            ssdev_migration_audit::Finding {
+                severity: Severity::Critical,
+                code: "legacy-install-run",
+                source: PathBuf::new(),
+                message: String::new(),
+                remediation: "first action",
+            },
+            ssdev_migration_audit::Finding {
+                severity: Severity::Warning,
+                code: "legacy-install-run",
+                source: PathBuf::new(),
+                message: String::new(),
+                remediation: "first action",
+            },
+        ];
+        inconsistent.summary.critical_findings = 1;
+        inconsistent.summary.warning_findings = 1;
+        assert!(summarize_findings(&inconsistent).is_err());
     }
 
     #[test]

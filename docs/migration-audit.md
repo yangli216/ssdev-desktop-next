@@ -19,6 +19,10 @@ cargo run --locked -p ssdev-migration-audit -- `
 
 工具先严格复验 schema 2 试点报告、manifest 与全部材料，要求 `intakeComplete: true`，再从 manifest 的 `migrationAuditBindings` 精确派生五类审计输入和签名来源策略三件套。正式模式禁止同时提供任何手工 `--config`、`--plugins`、`--keymap`、`--browser-assets`、`--browser-har` 或策略参数；审计完成后还会再次复验材料、报告、源码和策略输入，期间发生变化即失败。正式报告与证据必须同时位于源码工作区和试点材料根目录之外，且只创建、不覆盖。
 
+正式审计始终先写出完整报告和精简证据，再按 critical/warning code 聚合输出不含来源路径和 finding 消息的处理摘要。零 critical/warning 时显示 `CLEAR` 并返回 `0`；存在任一 critical 或 warning 时显示 `BLOCKED`、逐项输出 `blocker`、出现次数和固定 `action`，随后返回 `3`。退出码 `3` 表示审计本身成功且阻塞证据已经留存，自动签名或发布步骤必须停止，修正后使用新的输出路径重跑；参数、签名、I/O 或输入漂移等执行失败返回 `2`。`CLEAR` 也只允许继续插件矩阵和 Windows 包门禁，不代表最终 `GO`。
+
+相同 finding code 必须保持同一严重级别和处理动作；code 使用有界 ASCII 标识，处理动作有长度和控制字符限制。若工具内部新增了不一致或无法安全展示的 finding，正式输出会在写文件前失败，而不会退化为只有数量、需要实施人员打开 JSON 猜测。
+
 schema 4 完整报告绑定 `materialSetSha256` 和 `migrationAuditBindingsSha256`。schema 3 迁移证据继续绑定完整报告和来源策略 SHA-256，并新增同一个试点材料集合摘要。后续 schema 7 Go/No-Go 策略必须精确指定该材料集合，Windows 包 schema 7 继续绑定同一来源策略、上一生产 bundle、独立回退、应用状态保留结果和近期深度部署记录，因此不能用一套材料完成移交、再用另一套较小样本、其他低版本或未打开真实业务页的结果通过审计与升级。
 
 ## 探索性盘点
