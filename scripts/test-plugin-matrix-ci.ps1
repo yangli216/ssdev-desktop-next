@@ -153,6 +153,12 @@ try {
     --plugin-root $pluginRoot
   Assert-ExternalCommand "synthetic release set materialization"
 
+  $sourceStatus = @(git -C $workspace status --porcelain=v1 --untracked-files=normal -- .)
+  Assert-ExternalCommand "source cleanliness check before plugin evidence"
+  if ($sourceStatus.Count -ne 0) {
+    throw "Synthetic plugin evidence requires a clean source workspace; changed paths: $($sourceStatus -join ', ')"
+  }
+
   $evidence = Join-Path $root "plugin-matrix-evidence.json"
   & (Join-Path $PSScriptRoot "test-plugin-matrix.ps1") `
     -PluginRoot $pluginRoot `
@@ -167,22 +173,22 @@ try {
   $report = Get-Content -LiteralPath $evidence -Raw | ConvertFrom-Json
   $expectedX86HostSha256 = (Get-FileHash -LiteralPath $x86HostPath -Algorithm SHA256).Hash.ToLowerInvariant()
   $expectedX64HostSha256 = (Get-FileHash -LiteralPath $x64HostPath -Algorithm SHA256).Hash.ToLowerInvariant()
-  if (
-    $report.schemaVersion -ne 2 -or
-    $report.evidenceType -ne "plugin-matrix" -or
-    $report.environment -ne "ci-windows-native" -or
-    $report.runnerOs -ne "windows" -or
-    $report.runnerArchitecture -ne "x86_64" -or
-    $report.sourceDirty -ne $false -or
-    $report.pluginCount -ne 2 -or
-    $report.serviceCount -ne 2 -or
-    $report.methodCount -ne 2 -or
-    $report.enabledCaseCount -ne 2 -or
-    $report.passed -ne $true -or
-    $report.x86HostSha256 -ne $expectedX86HostSha256 -or
-    $report.x64HostSha256 -ne $expectedX64HostSha256
-  ) {
-    throw "Synthetic dual-architecture plugin matrix evidence is incomplete or bound to different hosts."
+  $mismatches = @()
+  if ([int]$report.schemaVersion -ne 2) { $mismatches += "schemaVersion" }
+  if (-not [String]::Equals([string]$report.evidenceType, "plugin-matrix", [StringComparison]::Ordinal)) { $mismatches += "evidenceType" }
+  if (-not [String]::Equals([string]$report.environment, "ci-windows-native", [StringComparison]::Ordinal)) { $mismatches += "environment" }
+  if (-not [String]::Equals([string]$report.runnerOs, "windows", [StringComparison]::Ordinal)) { $mismatches += "runnerOs" }
+  if (-not [String]::Equals([string]$report.runnerArchitecture, "x86_64", [StringComparison]::Ordinal)) { $mismatches += "runnerArchitecture" }
+  if ([bool]$report.sourceDirty) { $mismatches += "sourceDirty" }
+  if ([int]$report.pluginCount -ne 2) { $mismatches += "pluginCount" }
+  if ([int]$report.serviceCount -ne 2) { $mismatches += "serviceCount" }
+  if ([int]$report.methodCount -ne 2) { $mismatches += "methodCount" }
+  if ([int]$report.enabledCaseCount -ne 2) { $mismatches += "enabledCaseCount" }
+  if (-not [bool]$report.passed) { $mismatches += "passed" }
+  if (-not [String]::Equals([string]$report.x86HostSha256, $expectedX86HostSha256, [StringComparison]::Ordinal)) { $mismatches += "x86HostSha256" }
+  if (-not [String]::Equals([string]$report.x64HostSha256, $expectedX64HostSha256, [StringComparison]::Ordinal)) { $mismatches += "x64HostSha256" }
+  if ($mismatches.Count -ne 0) {
+    throw "Synthetic dual-architecture plugin matrix evidence mismatch: $($mismatches -join ', ')."
   }
 
   Write-Host "Synthetic signed x86/x64 plugin release set passed through the production matrix wrapper."
