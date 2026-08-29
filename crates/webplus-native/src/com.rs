@@ -229,6 +229,12 @@ mod platform {
             for definition in &method.parameters {
                 let raw_name = definition.name();
                 if let Some(name) = raw_name.strip_prefix('$') {
+                    if name.is_empty() || name.starts_with('$') {
+                        return Err(NativeError::InvalidParameter {
+                            name: raw_name.into(),
+                            message: "output parameter must use exactly one leading $".into(),
+                        });
+                    }
                     let mut output = OutputBinding::new(name, declared_type(definition))?;
                     arguments.push(output.byref_variant());
                     outputs.push(output);

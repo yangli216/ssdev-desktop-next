@@ -21,6 +21,7 @@ const MAX_METHODS_PER_SERVICE: usize = 1024;
 const MAX_PARAMETERS_PER_METHOD: usize = 256;
 const MAX_PROPERTIES_PER_METHOD: usize = 256;
 const MAX_DEPENDENCIES_PER_SERVICE: usize = 256;
+const MAX_DLL_ARGUMENTS: usize = 12;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PluginManifest {
@@ -634,6 +635,97 @@ where
     }
 }
 
+/// Validates the bounded word-based DLL ABI implemented by `webplus-native`.
+///
+/// This check is intentionally platform-independent so plugin preparation,
+/// signing, desktop loading, and the native host all reject the same
+/// declarations before any vendor export is called.
+pub fn validate_dll_abi(service: &ServiceDefinition) -> Result<(), String> {
+    match service
+        .calling_convention
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "c" | "cdecl" | "system" | "stdcall" | "winapi" => {}
+        other => return Err(format!("unsupported DLL calling convention [{other}]")),
+    }
+    for method in &service.methods {
+        if !method.props.is_empty() {
+            return Err(format!(
+                "DLL method [{}] cannot declare COM properties",
+                method.name
+            ));
+        }
+        if method.parameters.len() > MAX_DLL_ARGUMENTS {
+            return Err(format!(
+                "DLL method [{}] has {} arguments; maximum is {MAX_DLL_ARGUMENTS}",
+                method.name,
+                method.parameters.len()
+            ));
+        }
+        match method.return_type.trim().to_ascii_lowercase().as_str() {
+            "" | "void" | "string" | "char*" | "pointer_string" | "bool" | "boolean" | "int"
+            | "int32" | "long" | "uint" | "uint32" | "dword" | "pointer" | "uintptr" | "usize" => {}
+            "float" | "double" => {
+                return Err(format!(
+                    "DLL method [{}] uses a floating-point return that requires a typed ABI",
+                    method.name
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "DLL method [{}] has unsupported return type [{other}]",
+                    method.name
+                ));
+            }
+        }
+        for parameter in &method.parameters {
+            let name = parameter.name();
+            if name
+                .strip_prefix('$')
+                .is_some_and(|output| output.is_empty() || output.starts_with('$'))
+            {
+                return Err(format!(
+                    "DLL method [{}] parameter [{}] has an invalid output name",
+                    method.name, name
+                ));
+            }
+            let ParameterDefinition::Detailed(detail) = parameter else {
+                continue;
+            };
+            let output = detail.name.starts_with('$');
+            let kind = detail.parameter_type.trim().to_ascii_lowercase();
+            let supported = if output {
+                matches!(
+                    kind.as_str(),
+                    "" | "inferred" | "string" | "buffer" | "int" | "int32" | "long"
+                ) && (!matches!(kind.as_str(), "" | "inferred" | "string" | "buffer")
+                    || (1..=1024 * 1024).contains(&detail.len))
+            } else {
+                matches!(
+                    kind.as_str(),
+                    "" | "inferred"
+                        | "string"
+                        | "bool"
+                        | "int"
+                        | "int32"
+                        | "long"
+                        | "uint"
+                        | "uint32"
+                )
+            };
+            if !supported {
+                return Err(format!(
+                    "DLL method [{}] parameter [{}] has an unsupported ABI declaration",
+                    method.name, detail.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_manifest(plugin_id: &str, services: &[ServiceDefinition]) -> Result<(), ConfigError> {
     validate_plugin_id(plugin_id)?;
     if services.is_empty() {
@@ -776,6 +868,12 @@ fn validate_service<'a>(
         for parameter in &method.parameters {
             let parameter_name = parameter.name();
             let normalized_name = parameter_name.strip_prefix('$').unwrap_or(parameter_name);
+            if normalized_name.starts_with('$') {
+                return Err(ConfigError::Validation(format!(
+                    "method [{}] output parameter [{}] must use exactly one leading $",
+                    method.name, parameter_name
+                )));
+            }
             if normalized_name.trim().is_empty()
                 || normalized_name.chars().count() > 256
                 || !parameter_names.insert(normalized_name)
@@ -812,6 +910,9 @@ fn validate_service<'a>(
                 )));
             }
         }
+    }
+    if main_type == "dll" {
+        validate_dll_abi(service).map_err(ConfigError::Validation)?;
     }
     Ok(())
 }
@@ -1060,6 +1161,68 @@ mod tests {
 
         let manifest = PluginManifest::load("reader", root.path()).unwrap();
         assert_eq!(manifest.services[0].methods[0].props, ["Count"]);
+    }
+
+    #[test]
+    fn dll_abi_rejects_shapes_the_word_call_stub_cannot_express() {
+        let cases = [
+            (
+                r#"{"serviceId":"reader","mainClass":"reader.dll","callingConvention":"vectorcall","methods":[{"name":"read"}]}"#,
+                "unsupported DLL calling convention",
+            ),
+            (
+                r#"{"serviceId":"reader","mainClass":"reader.dll","methods":[{"name":"read","returnType":"double"}]}"#,
+                "floating-point return",
+            ),
+            (
+                r#"{"serviceId":"reader","mainClass":"reader.dll","methods":[{"name":"read","parameters":[{"name":"ratio","type":"double"}]}]}"#,
+                "unsupported ABI declaration",
+            ),
+            (
+                r#"{"serviceId":"reader","mainClass":"reader.dll","methods":[{"name":"read","parameters":[{"name":"$ready","type":"bool"}]}]}"#,
+                "unsupported ABI declaration",
+            ),
+            (
+                r#"{"serviceId":"reader","mainClass":"reader.dll","methods":[{"name":"read","parameters":[{"name":"$text","type":"buffer","len":0}]}]}"#,
+                "unsupported ABI declaration",
+            ),
+            (
+                r#"{"serviceId":"reader","mainClass":"reader.dll","methods":[{"name":"read","parameters":["a","b","c","d","e","f","g","h","i","j","k","l","m"]}]}"#,
+                "maximum is 12",
+            ),
+            (
+                r#"{"serviceId":"reader","mainClass":"reader.dll","methods":[{"name":"read","parameters":["$$status"]}]}"#,
+                "must use exactly one leading $",
+            ),
+            (
+                r#"{"serviceId":"reader","mainClass":"reader.dll","methods":[{"name":"read","props":["Count"]}]}"#,
+                "cannot declare COM properties",
+            ),
+        ];
+
+        for (api, expected) in cases {
+            let root = tempdir().unwrap();
+            fs::write(root.path().join(API_FILENAME), api).unwrap();
+
+            let error = PluginManifest::load("reader", root.path()).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected [{expected}] in [{error}]"
+            );
+        }
+    }
+
+    #[test]
+    fn dll_abi_normalizes_supported_type_spelling_cross_platform() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join(API_FILENAME),
+            r#"{"serviceId":"reader","mainClass":"reader.dll","callingConvention":" CDECL ","methods":[{"name":"read","returnType":" POINTER ","parameters":[{"name":"value","type":" InFeRrEd "},{"name":"$text","type":" STRING ","len":32},{"name":"$code","type":" INT32 "}]}]}"#,
+        )
+        .unwrap();
+
+        let manifest = PluginManifest::load("reader", root.path()).unwrap();
+        validate_dll_abi(&manifest.services[0]).unwrap();
     }
 
     #[test]

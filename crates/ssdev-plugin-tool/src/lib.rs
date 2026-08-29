@@ -2803,6 +2803,41 @@ mod tests {
     }
 
     #[test]
+    fn prepare_rejects_unsupported_dll_abi_before_signing_material_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let source = source(root.path());
+        fs::write(
+            source.join("api.json"),
+            r#"{"serviceId":"reader","mainClass":"reader.dll","architecture":"x86","methods":[{"name":"read","returnType":"double"}]}"#,
+        )
+        .unwrap();
+        let trust = trust_store(root.path(), &SigningKey::from_bytes(&[47; 32]), None);
+        let staging = root.path().join("stage");
+        let request = root.path().join("request.json");
+        let matrix = root.path().join("matrix.json");
+
+        let error = prepare(&PrepareOptions {
+            source: &source,
+            staging: &staging,
+            request: &request,
+            matrix_template: &matrix,
+            plugin_id: "reader-plugin",
+            version: "1.0.0",
+            desktop_version_requirement: ">=0.1.0, <0.2.0",
+            display_name: "Reader",
+            key_id: "test-key",
+            trust_store: &trust,
+            matrix_seed: None,
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("floating-point return"));
+        assert!(!staging.exists());
+        assert!(!request.exists());
+        assert!(!matrix.exists());
+    }
+
+    #[test]
     fn prepare_rejects_a_retired_key_before_creating_signing_material() {
         let root = tempfile::tempdir().unwrap();
         let source = source(root.path());

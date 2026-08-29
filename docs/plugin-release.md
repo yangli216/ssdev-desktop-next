@@ -41,6 +41,7 @@ cargo run --locked -p ssdev-plugin-tool -- prepare `
 - 超过 4,096 个文件或 512 MiB；
 - 非 SemVer 版本、无效或超过 128 字符的 Desktop SemVer requirement、无调用方法的服务、缺失入口或显式依赖；
 - DLL/EXE 的 PE 位数与 `architecture` 不一致；
+- 超过 12 个机器字参数、浮点参数/返回、不受支持的输出缓冲区或调用约定等通用 DLL 适配器无法表达的静态 ABI；
 - 仍声明非空 `installRun` 的旧插件。
 
 COM/OCX 的 ProgID 和真实注册状态无法在离线准备阶段验证，必须进入 Windows 候选宿主预检和真实黄金矩阵。
@@ -65,7 +66,7 @@ cargo run --locked -p ssdev-plugin-tool -- matrix-check `
 
 `--plugin-dir` 用于检查一个包含规范化 `plugin.json` 的 `prepare` 暂存目录；多插件联合矩阵则改用 `--plugin-root C:\secure-test-inputs\plugins`，其直接子目录必须是各插件 ID。命令检查严格 schema、可选的插件身份/版本绑定、草稿/复核/占位符状态、全部用例路由、输入字段精确一致性、忽略 ASCII 大小写后的插件 ID 冲突、跨插件 `serviceId` 冲突和启用用例全方法覆盖，并输出插件、服务、方法、用例计数及 `identityBound`。旧矩阵可在缺少身份绑定时继续做语义和实机回归，但新的正式发布候选不能省略绑定。
 
-这只是无需 Windows 的快速失败门禁，不验证插件签名、厂商 ABI 或设备响应。正式 Windows 运行器会在验签插件后再次调用同一份共享校验逻辑，再启动 x86/x64 宿主，避免离线工具与实机规则漂移。
+这只是无需 Windows 的快速失败门禁：它会用共享规则拒绝通用适配器无法表达的静态 DLL ABI，但不能证明声明与厂商二进制真实签名一致，也不验证插件运行时签名状态或设备响应。正式 Windows 运行器会在验签插件后再次调用同一份规则，再启动 x86/x64 宿主，避免离线工具与实机规则漂移。
 
 ## 2. 外部签名
 

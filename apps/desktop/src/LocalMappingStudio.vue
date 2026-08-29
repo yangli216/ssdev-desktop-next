@@ -149,6 +149,9 @@ const notice = ref('')
 const service = computed(() => draft.value.services[serviceIndex.value])
 const method = computed(() => service.value?.methods[methodIndex.value])
 const callableParameters = computed(() => (method.value?.parameters ?? []).filter((item): item is ParameterDefinition => typeof item !== 'string' && !item.name.startsWith('$')))
+const returnTypeOptions = computed(() => service.value?.mainType === 'dll'
+  ? ['void', 'string', 'bool', 'int', 'uint', 'pointer']
+  : ['void', 'string', 'bool', 'int', 'uint', 'pointer', 'float', 'double'])
 const mappingIsInstalled = computed(() => inventory.value.mappings.some((item) => item.pluginId === draft.value.pluginId))
 const editingStoredCase = computed(() => draft.value.debugCases.some((item) => item.name === debugCaseName.value.trim()))
 
@@ -358,6 +361,11 @@ function removeMethod(index: number) {
 
 function addParameter() {
   method.value?.parameters.push({ name: '', type: 'string', len: 1024 })
+}
+
+function parameterTypeOptions(parameter: ParameterDefinition): string[] {
+  if (service.value?.mainType !== 'dll') return ['string', 'bool', 'int', 'uint', 'float', 'double', 'buffer']
+  return parameter.name.startsWith('$') ? ['string', 'int', 'buffer'] : ['string', 'bool', 'int', 'uint']
 }
 
 function removeParameter(index: number) {
@@ -830,20 +838,21 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
               <div class="field-grid four">
                 <label><span>原生函数名</span><input v-model.trim="method.name" required /></label>
                 <label><span>网页调用名（可选）</span><input v-model.trim="method.alias" /></label>
-                <label><span>返回类型</span><select v-model="method.returnType"><option>void</option><option>string</option><option>bool</option><option>int</option><option>uint</option><option>pointer</option><option>float</option><option>double</option></select></label>
+                <label><span>返回类型</span><select v-model="method.returnType"><option v-for="item in returnTypeOptions" :key="item">{{ item }}</option></select></label>
                 <label><span>超时覆盖 (ms)</span><input v-model.number="method.timeout" type="number" min="0" /></label>
               </div>
               <div class="parameter-table">
                 <div class="parameter-head"><span>参数名</span><span>类型</span><span>长度</span><span>字符集</span><span></span></div>
                 <div v-for="(_parameter, index) in method.parameters" :key="index" class="parameter-row">
                   <input v-model.trim="parameterAt(index).name" required placeholder="$name 表示输出参数" />
-                  <select v-model="parameterAt(index).type"><option>string</option><option>bool</option><option>int</option><option>uint</option><option>float</option><option>double</option><option>buffer</option></select>
+                  <select v-model="parameterAt(index).type"><option v-for="item in parameterTypeOptions(parameterAt(index))" :key="item">{{ item }}</option></select>
                   <input v-model.number="parameterAt(index).len" type="number" min="0" placeholder="0" />
                   <select v-model="parameterAt(index).charset"><option value="">继承</option><option value="utf8">UTF-8</option><option value="gbk">GBK</option></select>
                   <button type="button" @click="removeParameter(index)">移除</button>
                 </div>
                 <button type="button" @click="addParameter">＋ 添加参数</button>
               </div>
+              <p v-if="service.mainType === 'dll'" class="field-hint">DLL 使用最多 12 个机器字参数的受限 ABI：输入支持字符串、布尔和整数，输出支持字符串缓冲区和 32 位整数；浮点、结构体与回调需要专用 Rust 适配器。</p>
               <button class="danger-link" type="button" @click="removeMethod(methodIndex)">删除当前方法</button>
             </div>
           </div>

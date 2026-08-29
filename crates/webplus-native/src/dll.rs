@@ -1,5 +1,5 @@
 use serde_json::{Map, Value};
-use webplus_plugin_config::{MethodDefinition, ParameterDefinition, ServiceDefinition};
+use webplus_plugin_config::{validate_dll_abi, MethodDefinition, ServiceDefinition};
 use webplus_protocol::InvokeResponse;
 
 use crate::NativeError;
@@ -38,77 +38,7 @@ impl DllAdapter {
 }
 
 fn validate_dll_declaration(service: &ServiceDefinition) -> Result<(), NativeError> {
-    match service
-        .calling_convention
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "" | "c" | "cdecl" | "system" | "stdcall" | "winapi" => {}
-        other => {
-            return Err(NativeError::Dll(format!(
-                "unsupported calling convention [{other}]"
-            )))
-        }
-    }
-    for method in &service.methods {
-        if method.parameters.len() > 12 {
-            return Err(NativeError::Dll(format!(
-                "method [{}] has {} arguments; maximum is 12",
-                method.name,
-                method.parameters.len()
-            )));
-        }
-        match method.return_type.trim().to_ascii_lowercase().as_str() {
-            "" | "void" | "string" | "char*" | "pointer_string" | "bool" | "boolean" | "int"
-            | "int32" | "long" | "uint" | "uint32" | "dword" | "pointer" | "uintptr" | "usize" => {}
-            "float" | "double" => {
-                return Err(NativeError::Dll(format!(
-                    "method [{}] uses a floating-point return that requires a typed ABI",
-                    method.name
-                )))
-            }
-            other => {
-                return Err(NativeError::Dll(format!(
-                    "method [{}] has unsupported return type [{other}]",
-                    method.name
-                )))
-            }
-        }
-        for parameter in &method.parameters {
-            let ParameterDefinition::Detailed(detail) = parameter else {
-                continue;
-            };
-            let output = detail.name.starts_with('$');
-            let kind = detail.parameter_type.trim().to_ascii_lowercase();
-            let supported = if output {
-                matches!(
-                    kind.as_str(),
-                    "" | "inferred" | "string" | "buffer" | "int" | "int32" | "long"
-                ) && (!matches!(kind.as_str(), "" | "inferred" | "string" | "buffer")
-                    || (1..=1024 * 1024).contains(&detail.len))
-            } else {
-                matches!(
-                    kind.as_str(),
-                    "" | "inferred"
-                        | "string"
-                        | "bool"
-                        | "int"
-                        | "int32"
-                        | "long"
-                        | "uint"
-                        | "uint32"
-                )
-            };
-            if !supported {
-                return Err(NativeError::Dll(format!(
-                    "method [{}] parameter [{}] has an unsupported ABI declaration",
-                    method.name, detail.name
-                )));
-            }
-        }
-    }
-    Ok(())
+    validate_dll_abi(service).map_err(NativeError::Dll)
 }
 
 #[cfg(not(windows))]

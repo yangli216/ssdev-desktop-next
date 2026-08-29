@@ -89,6 +89,12 @@ impl PreparedArguments {
         };
 
         if let Some(name) = raw_name.strip_prefix('$') {
+            if name.is_empty() || name.starts_with('$') {
+                return Err(NativeError::InvalidParameter {
+                    name: raw_name.into(),
+                    message: "output parameter must use exactly one leading $".into(),
+                });
+            }
             return self.push_output(name, parameter_type, length, charset);
         }
         let value = values.get(raw_name).unwrap_or(&Value::Null);
@@ -102,7 +108,7 @@ impl PreparedArguments {
         length: usize,
         encoding: TextEncoding,
     ) -> Result<(), NativeError> {
-        let allocation = match parameter_type.to_ascii_lowercase().as_str() {
+        let allocation = match parameter_type.trim().to_ascii_lowercase().as_str() {
             "int" | "int32" | "long" => Allocation::I32(Box::new(0)),
             "string" | "buffer" | "inferred" | "" => {
                 if length == 0 || length > MAX_OUTPUT_BUFFER {
@@ -141,7 +147,8 @@ impl PreparedArguments {
         value: &Value,
         encoding: TextEncoding,
     ) -> Result<(), NativeError> {
-        let resolved_type = if parameter_type == "inferred" || parameter_type.is_empty() {
+        let normalized_type = parameter_type.trim().to_ascii_lowercase();
+        let resolved_type = if normalized_type.is_empty() || normalized_type == "inferred" {
             match value {
                 Value::String(_) | Value::Null => "string",
                 Value::Bool(_) => "bool",
@@ -149,9 +156,9 @@ impl PreparedArguments {
                 _ => "unsupported",
             }
         } else {
-            parameter_type
+            normalized_type.as_str()
         };
-        match resolved_type.to_ascii_lowercase().as_str() {
+        match resolved_type {
             "string" => {
                 let text = value.as_str().unwrap_or_default();
                 let allocation = Allocation::Bytes(encoding.encode_nul_terminated(text)?);
@@ -326,6 +333,48 @@ mod tests {
         let values = json!({"ratio": 1.5}).as_object().unwrap().clone();
 
         assert!(PreparedArguments::build(&service, &method, &values).is_err());
+    }
+
+    #[test]
+    fn normalizes_supported_dll_parameter_type_spelling() {
+        let (service, mut method) = definitions();
+        method.parameters = vec![
+            ParameterDefinition::Detailed(ParameterDetail {
+                name: "timeout".into(),
+                parameter_type: " InFeRrEd ".into(),
+                len: 0,
+                charset: None,
+                decode: None,
+                extensions: std::collections::HashMap::new(),
+            }),
+            ParameterDefinition::Detailed(ParameterDetail {
+                name: "$cardNo".into(),
+                parameter_type: " STRING ".into(),
+                len: 32,
+                charset: None,
+                decode: None,
+                extensions: std::collections::HashMap::new(),
+            }),
+        ];
+        let values = json!({"timeout": 30}).as_object().unwrap().clone();
+
+        let prepared = PreparedArguments::build(&service, &method, &values).unwrap();
+        assert_eq!(prepared.words[0], 30);
+        assert_eq!(prepared.collect_outputs().unwrap()["cardNo"], "");
+    }
+
+    #[test]
+    fn refuses_ambiguous_multi_prefix_output_names_at_runtime() {
+        let (service, mut method) = definitions();
+        method.parameters = vec![ParameterDefinition::Name("$$status".into())];
+
+        let error = PreparedArguments::build(&service, &method, &Map::new())
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            NativeError::InvalidParameter { ref name, .. } if name == "$$status"
+        ));
     }
 
     #[test]
