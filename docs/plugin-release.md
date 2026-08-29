@@ -243,7 +243,7 @@ cargo run --locked -p ssdev-plugin-tool -- release-set-materialize `
 
 ## 4. 实机门禁
 
-确定性封包只证明身份、完整性、清单和离线架构一致，不证明厂商 ABI 或硬件副作用正确。把验证后的插件安装到受控插件根目录，完成矩阵中的脱敏输入/响应，然后运行：
+确定性封包只证明身份、完整性、清单和离线架构一致，不证明厂商 ABI 或硬件副作用正确。先用正式发布参数执行 Windows 安装包构建，让 `build-windows.ps1` 生成并签名实际随包交付的 x86/x64 Release 宿主；把验证后的插件安装到受控插件根目录，完成矩阵中的脱敏输入/响应，然后运行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/test-plugin-matrix.ps1 `
@@ -251,12 +251,14 @@ powershell -ExecutionPolicy Bypass -File scripts/test-plugin-matrix.ps1 `
   -ReleaseSetSpec C:\secure-release\hospital-a-release-set.json `
   -TrustStore C:\secure-build-inputs\plugin-trust.json `
   -Matrix C:\secure-release\reader-2.3.1-matrix.json `
+  -X86Host C:\ssdev-source\target\i686-pc-windows-msvc\release\webplus-plugin-host.exe `
+  -X64Host C:\ssdev-source\target\x86_64-pc-windows-msvc\release\webplus-plugin-host.exe `
   -EvidenceOutput C:\secure-release\reader-2.3.1-evidence.json `
   -EvidenceEnvironment hospital-a-reader-lab
 ```
 
-`PluginRoot` 应直接使用上一节 `release-set-materialize` 生成的目录，并且必须是 `ReleaseSetSpec` 所批准包的精确安装结果，不能是另行复制或重新签名的暂存目录。运行器会逐项校验身份、版本、active 签名 keyId，并把根目录中的每个插件重新确定性封包；只有重建包 SHA-256 与发布集合完全相同才会接触硬件。因此，多包离线审批、现场安装内容和最终实机结论属于同一条可追溯链路。
+`PluginRoot` 应直接使用上一节 `release-set-materialize` 生成的目录，并且必须是 `ReleaseSetSpec` 所批准包的精确安装结果，不能是另行复制或重新签名的暂存目录。`X86Host` 与 `X64Host` 必须是本次候选安装包构建留下的精确已签名文件；脚本不再自行编译 Debug 宿主。运行器会逐项校验身份、版本、active 签名 keyId，并把根目录中的每个插件重新确定性封包；只有重建包 SHA-256 与发布集合完全相同才会接触硬件。因此，多包离线审批、现场安装内容、待交付宿主和最终实机结论属于同一条可追溯链路。
 
-矩阵必须由启用用例覆盖插件集合声明的每个方法；alias 会归一到对应真实方法。每个启用用例的输入字段必须与该方法声明的非 `$` 输入完全一致，未知字段、缺失字段和生成器保留占位符都会在宿主启动前失败。工具只在全部用例通过后生成 schema 2 证据，并绑定源码提交、发布集合规范与包集合、插件签名载荷集合、信任库、矩阵、x86/x64 宿主摘要及目标环境标签。任一输入在运行期间变化都会失败，已有证据文件不会被覆盖；旧 schema 1 插件矩阵证据不能人工升级，必须用批准的发布集合重新执行。
+矩阵必须由启用用例覆盖插件集合声明的每个方法；alias 会归一到对应真实方法。每个启用用例的输入字段必须与该方法声明的非 `$` 输入完全一致，未知字段、缺失字段和生成器保留占位符都会在宿主启动前失败。工具只在全部用例通过后生成 schema 2 证据，并绑定源码提交、发布集合规范与包集合、插件签名载荷集合、信任库、矩阵、x86/x64 待交付宿主摘要及目标环境标签。任一输入在运行期间变化都会失败，已有证据文件不会被覆盖；Windows 包验收随后从实际安装目录记录插件信任库及宿主摘要，生产 Go/No-Go 要求两份证据一致。旧 schema 1 插件矩阵证据不能人工升级，必须用批准的发布集合重新执行。
 
 每个正式版本应归档签名请求、签名审批记录、`.ssdev-plugin` SHA-256、非草稿黄金矩阵、生成的机器证据和目标 Windows/硬件环境审批；生产 DLL、患者数据和私钥不进入本仓库。

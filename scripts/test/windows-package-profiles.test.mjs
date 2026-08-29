@@ -4,6 +4,10 @@ import test from "node:test";
 
 const buildScriptUrl = new URL("../build-windows.ps1", import.meta.url);
 const packageTestUrl = new URL("../test-windows-package.ps1", import.meta.url);
+const pluginMatrixTestUrl = new URL(
+  "../test-plugin-matrix.ps1",
+  import.meta.url,
+);
 const workflowUrl = new URL("../../.github/workflows/ci.yml", import.meta.url);
 const tauriConfigUrl = new URL(
   "../../apps/desktop/src-tauri/tauri.conf.json",
@@ -124,4 +128,29 @@ test("Windows package smoke requires a rendered frontend IPC signal", async () =
   assert.match(packageTest, /resolvedByAppVersion/);
   assert.doesNotMatch(packageTest, /Get-StartupEventCount/);
   assert.match(controlHtml, /SSDEV Desktop 正在启动/);
+});
+
+test("production matrix and package evidence bind the same delivery hosts", async () => {
+  const [matrixTest, packageTest] = await Promise.all([
+    readFile(pluginMatrixTestUrl, "utf8"),
+    readFile(packageTestUrl, "utf8"),
+  ]);
+
+  assert.match(matrixTest, /\[string\]\$X86Host/);
+  assert.match(matrixTest, /\[string\]\$X64Host/);
+  assert.match(matrixTest, /\$x86HostPath \$x64HostPath \$pluginRootPath/);
+  assert.doesNotMatch(
+    matrixTest,
+    /cargo build[^\r\n]*webplus-plugin-host/,
+  );
+
+  assert.match(packageTest, /Capture-CandidateRuntimeHashes \$executable/);
+  assert.match(packageTest, /Capture-CandidateRuntimeHashes \$candidateExecutable/);
+  assert.match(packageTest, /\$pluginTrustStore = Join-Path[^\r\n]*plugin-trust\.json/);
+  assert.match(packageTest, /Get-FileHash -LiteralPath \$pluginTrustStore/);
+  assert.match(packageTest, /Get-FileHash -LiteralPath \$x86Host/);
+  assert.match(packageTest, /Get-FileHash -LiteralPath \$x64Host/);
+  assert.match(packageTest, /\$script:CandidatePluginTrustStoreSha256/);
+  assert.match(packageTest, /\$script:CandidateX86HostSha256/);
+  assert.match(packageTest, /\$script:CandidateX64HostSha256/);
 });

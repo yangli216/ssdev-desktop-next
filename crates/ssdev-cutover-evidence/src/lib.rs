@@ -14,7 +14,8 @@ use webplus_plugin_trust::{
 
 pub const EVIDENCE_SCHEMA_VERSION: u8 = 1;
 pub const PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION: u8 = 2;
-pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 2;
+pub const WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION: u8 = 2;
+pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 3;
 pub const CUTOVER_DECISION_SCHEMA_VERSION: u8 = 1;
 const MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
 const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
@@ -121,6 +122,9 @@ pub struct WindowsPackageEvidence {
     pub runner_architecture: String,
     pub release_metadata_sha256: String,
     pub artifact_manifest_sha256: String,
+    pub plugin_trust_store_sha256: String,
+    pub x86_host_sha256: String,
+    pub x64_host_sha256: String,
     pub app_version: String,
     pub authenticode_required: bool,
     pub authenticode_verified: bool,
@@ -153,8 +157,11 @@ pub struct ProductionCutoverPolicy {
     pub target_source_revision: String,
     pub expected_app_version: String,
     pub maximum_evidence_age_seconds: u64,
+    pub expected_windows_artifact_manifest_sha256: String,
     pub expected_plugin_release_set_spec_sha256: String,
     pub expected_plugin_package_set_sha256: String,
+    pub expected_plugin_trust_store_sha256: String,
+    pub expected_plugin_matrix_sha256: String,
     pub migration_coverage_minimums: MigrationCoverageMinimums,
     pub plugin_matrix_signer_key_id: String,
     pub migration_audit_signer_key_id: String,
@@ -178,11 +185,18 @@ impl ProductionCutoverPolicy {
                 "maximumEvidenceAgeSeconds must be between 60 seconds and 31 days".into(),
             ));
         }
-        if !is_sha256(&self.expected_plugin_release_set_spec_sha256)
-            || !is_sha256(&self.expected_plugin_package_set_sha256)
+        if [
+            &self.expected_windows_artifact_manifest_sha256,
+            &self.expected_plugin_release_set_spec_sha256,
+            &self.expected_plugin_package_set_sha256,
+            &self.expected_plugin_trust_store_sha256,
+            &self.expected_plugin_matrix_sha256,
+        ]
+        .into_iter()
+        .any(|digest| !is_sha256(digest))
         {
             return Err(EvidenceError::Invalid(
-                "expected plugin release-set hashes must be lowercase SHA-256 digests".into(),
+                "expected production input hashes must be lowercase SHA-256 digests".into(),
             ));
         }
         for key_id in [
@@ -293,7 +307,7 @@ impl CutoverDecision {
 
 impl WindowsPackageEvidence {
     pub fn validate(&self) -> Result<(), EvidenceError> {
-        if self.schema_version != EVIDENCE_SCHEMA_VERSION
+        if self.schema_version != WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION
             || self.evidence_type != EvidenceType::WindowsPackage
         {
             return Err(EvidenceError::Invalid(
@@ -312,10 +326,18 @@ impl WindowsPackageEvidence {
                 "Windows package evidence must be produced by a Windows x86_64 runner".into(),
             ));
         }
-        if !is_sha256(&self.release_metadata_sha256) || !is_sha256(&self.artifact_manifest_sha256) {
+        if [
+            &self.release_metadata_sha256,
+            &self.artifact_manifest_sha256,
+            &self.plugin_trust_store_sha256,
+            &self.x86_host_sha256,
+            &self.x64_host_sha256,
+        ]
+        .into_iter()
+        .any(|digest| !is_sha256(digest))
+        {
             return Err(EvidenceError::Invalid(
-                "release metadata and artifact manifest hashes must be lowercase SHA-256 digests"
-                    .into(),
+                "Windows package input hashes must be lowercase SHA-256 digests".into(),
             ));
         }
         let app_version = Version::parse(&self.app_version).map_err(|_| {
@@ -729,6 +751,12 @@ pub fn evaluate_production_cutover(
     if plugin.package_set_sha256 != policy.expected_plugin_package_set_sha256 {
         blockers.insert("plugin-package-set-mismatch".into());
     }
+    if plugin.trust_store_sha256 != policy.expected_plugin_trust_store_sha256 {
+        blockers.insert("plugin-trust-store-mismatch".into());
+    }
+    if plugin.matrix_sha256 != policy.expected_plugin_matrix_sha256 {
+        blockers.insert("plugin-matrix-mismatch".into());
+    }
     let minimums = &policy.migration_coverage_minimums;
     for (actual, minimum, blocker) in [
         (
@@ -796,6 +824,18 @@ pub fn evaluate_production_cutover(
     }
     if windows.app_version != policy.expected_app_version {
         blockers.insert("windows-app-version-mismatch".into());
+    }
+    if windows.artifact_manifest_sha256 != policy.expected_windows_artifact_manifest_sha256 {
+        blockers.insert("windows-artifact-manifest-mismatch".into());
+    }
+    if windows.plugin_trust_store_sha256 != plugin.trust_store_sha256 {
+        blockers.insert("windows-plugin-trust-store-mismatch".into());
+    }
+    if windows.x86_host_sha256 != plugin.x86_host_sha256 {
+        blockers.insert("windows-x86-host-mismatch".into());
+    }
+    if windows.x64_host_sha256 != plugin.x64_host_sha256 {
+        blockers.insert("windows-x64-host-mismatch".into());
     }
     if !windows.authenticode_required || !windows.authenticode_verified {
         blockers.insert("windows-authenticode-not-verified".into());
@@ -1113,7 +1153,7 @@ mod tests {
 
     fn valid_windows_package() -> WindowsPackageEvidence {
         WindowsPackageEvidence {
-            schema_version: EVIDENCE_SCHEMA_VERSION,
+            schema_version: WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION,
             evidence_type: EvidenceType::WindowsPackage,
             source_revision: "c".repeat(40),
             source_dirty: false,
@@ -1123,6 +1163,9 @@ mod tests {
             runner_architecture: "x86_64".into(),
             release_metadata_sha256: "7".repeat(64),
             artifact_manifest_sha256: "8".repeat(64),
+            plugin_trust_store_sha256: "2".repeat(64),
+            x86_host_sha256: "4".repeat(64),
+            x64_host_sha256: "5".repeat(64),
             app_version: "1.2.3".into(),
             authenticode_required: true,
             authenticode_verified: true,
@@ -1142,8 +1185,11 @@ mod tests {
             target_source_revision: revision,
             expected_app_version: "1.2.3".into(),
             maximum_evidence_age_seconds: 3600,
+            expected_windows_artifact_manifest_sha256: "8".repeat(64),
             expected_plugin_release_set_spec_sha256: "0".repeat(64),
             expected_plugin_package_set_sha256: "9".repeat(64),
+            expected_plugin_trust_store_sha256: "2".repeat(64),
+            expected_plugin_matrix_sha256: "3".repeat(64),
             migration_coverage_minimums: MigrationCoverageMinimums {
                 config_files: 1,
                 plugin_directories: 2,
@@ -1208,6 +1254,14 @@ mod tests {
         assert!(evidence.validate().is_err());
         evidence.authenticode_verified = false;
         evidence.validate().unwrap();
+
+        let mut legacy = valid_windows_package();
+        legacy.schema_version = EVIDENCE_SCHEMA_VERSION;
+        assert!(legacy.validate().is_err());
+
+        let mut unbound = valid_windows_package();
+        unbound.x86_host_sha256 = "not-a-digest".into();
+        assert!(unbound.validate().is_err());
     }
 
     #[test]
@@ -1283,7 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn production_gate_binds_the_approved_plugin_set_and_migration_inventory() {
+    fn production_gate_binds_approved_plugin_inputs_inventory_and_shipped_hosts() {
         let revision = "d".repeat(40);
         let mut policy = valid_policy(revision.clone());
         policy.migration_coverage_minimums.browser_asset_roots = 2;
@@ -1293,6 +1347,8 @@ mod tests {
         plugin.executed_at_unix_seconds = 1000;
         plugin.release_set_spec_sha256 = "a".repeat(64);
         plugin.package_set_sha256 = "b".repeat(64);
+        plugin.trust_store_sha256 = "c".repeat(64);
+        plugin.matrix_sha256 = "d".repeat(64);
         let mut migration = valid_migration();
         migration.source_revision = revision.clone();
         migration.executed_at_unix_seconds = 1000;
@@ -1310,6 +1366,10 @@ mod tests {
         let mut windows = valid_windows_package();
         windows.source_revision = revision;
         windows.executed_at_unix_seconds = 1000;
+        windows.artifact_manifest_sha256 = "6".repeat(64);
+        windows.plugin_trust_store_sha256 = "7".repeat(64);
+        windows.x86_host_sha256 = "e".repeat(64);
+        windows.x64_host_sha256 = "f".repeat(64);
 
         let decision = evaluate_production_cutover(
             ProductionCutoverInputs {
@@ -1340,8 +1400,14 @@ mod tests {
                 "migration-key-bindings-below-policy",
                 "migration-plugin-directories-below-policy",
                 "migration-services-below-policy",
+                "plugin-matrix-mismatch",
                 "plugin-package-set-mismatch",
                 "plugin-release-set-spec-mismatch",
+                "plugin-trust-store-mismatch",
+                "windows-artifact-manifest-mismatch",
+                "windows-plugin-trust-store-mismatch",
+                "windows-x64-host-mismatch",
+                "windows-x86-host-mismatch",
             ]
         );
     }
@@ -1374,7 +1440,7 @@ mod tests {
         assert!(policy.validate().is_err());
 
         let mut legacy = valid_policy("d".repeat(40));
-        legacy.schema_version = 1;
+        legacy.schema_version = 2;
         assert!(legacy.validate().is_err());
 
         let mut malformed = valid_policy("d".repeat(40));

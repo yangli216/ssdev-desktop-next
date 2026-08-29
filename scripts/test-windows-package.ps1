@@ -395,6 +395,22 @@ function Assert-InstalledLayout {
   }
 }
 
+function Capture-CandidateRuntimeHashes {
+  param([Parameter(Mandatory = $true)][string]$Executable)
+  $installRoot = Split-Path -Parent $Executable
+  $pluginTrustStore = Join-Path $installRoot "plugin-trust.json"
+  $x86Host = Join-Path $installRoot "windows/webplus-plugin-host-x86.exe"
+  $x64Host = Join-Path $installRoot "windows/webplus-plugin-host-x64.exe"
+  foreach ($runtimeFile in @($pluginTrustStore, $x86Host, $x64Host)) {
+    if (-not (Test-Path -LiteralPath $runtimeFile -PathType Leaf)) {
+      throw "Installed runtime identity file disappeared before final evidence capture."
+    }
+  }
+  $script:CandidatePluginTrustStoreSha256 = (Get-FileHash -LiteralPath $pluginTrustStore -Algorithm SHA256).Hash.ToLowerInvariant()
+  $script:CandidateX86HostSha256 = (Get-FileHash -LiteralPath $x86Host -Algorithm SHA256).Hash.ToLowerInvariant()
+  $script:CandidateX64HostSha256 = (Get-FileHash -LiteralPath $x64Host -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
 function Test-ReleaseTrustPolicies {
   param([Parameter(Mandatory = $true)][string]$ReleaseMetadataDirectory)
   $trustStore = Join-Path $ReleaseMetadataDirectory "plugin-trust.json"
@@ -771,6 +787,7 @@ function Test-Installer {
     $executable = Install-ApplicationPackage $Installer
     Assert-InstalledLayout $executable $metadataDirectory
     Invoke-ApplicationSmoke $executable $script:CandidateRelease.appVersion
+    Capture-CandidateRuntimeHashes $executable
     Uninstall-ApplicationPackage $executable
     $executable = $null
     Write-Host "PASS NSIS install, layout, launch, and uninstall"
@@ -824,6 +841,7 @@ function Test-Upgrade {
     if ((Get-OptionalProperty $preserved "upgradeSentinel") -ne $sentinel) {
       throw "NSIS candidate startup did not preserve unknown configuration fields."
     }
+    Capture-CandidateRuntimeHashes $candidateExecutable
 
     Uninstall-ApplicationPackage $candidateExecutable
     $activeExecutable = $null
@@ -842,6 +860,9 @@ function Test-Upgrade {
 }
 
 $script:CandidateRelease = $null
+$script:CandidatePluginTrustStoreSha256 = $null
+$script:CandidateX86HostSha256 = $null
+$script:CandidateX64HostSha256 = $null
 Test-ReleaseArtifactManifest $BundleRoot $metadataDirectory $script:ExpectedUpdatePublicKeyText
 Test-ReleaseTrustPolicies $metadataDirectory
 $script:CandidateRelease = Get-ReleaseMetadata $BundleRoot -VerifyCurrentSource
@@ -871,6 +892,13 @@ if ($PreviousBundleRoot) {
 if (Test-Path -LiteralPath $EvidenceOutput) {
   throw "EvidenceOutput appeared during package verification; refusing to overwrite it."
 }
+if (
+  $script:CandidatePluginTrustStoreSha256 -notmatch '^[0-9a-f]{64}$' -or
+  $script:CandidateX86HostSha256 -notmatch '^[0-9a-f]{64}$' -or
+  $script:CandidateX64HostSha256 -notmatch '^[0-9a-f]{64}$'
+) {
+  throw "Candidate installed runtime identity hashes were not captured during package verification."
+}
 $evidenceArguments = @(
   "run", "--quiet", "--locked", "--manifest-path", (Join-Path $workspace "Cargo.toml"),
   "-p", "ssdev-cutover-evidence", "--", "windows-package",
@@ -881,7 +909,10 @@ $evidenceArguments = @(
   $EvidenceEnvironment,
   "Nsis",
   (-not $SkipLaunch).ToString().ToLowerInvariant(),
-  $RequireAuthenticode.ToString().ToLowerInvariant()
+  $RequireAuthenticode.ToString().ToLowerInvariant(),
+  $script:CandidatePluginTrustStoreSha256,
+  $script:CandidateX86HostSha256,
+  $script:CandidateX64HostSha256
 )
 if ($PreviousBundleRoot) {
   $evidenceArguments += (Join-Path $previousMetadataDirectory "release.json")

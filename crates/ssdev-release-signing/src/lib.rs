@@ -141,6 +141,10 @@ pub enum ArtifactSummary {
     WindowsPackageEvidence {
         source_revision: String,
         app_version: String,
+        artifact_manifest_sha256: String,
+        plugin_trust_store_sha256: String,
+        x86_host_sha256: String,
+        x64_host_sha256: String,
         authenticode_verified: bool,
         nsis_install_verified: bool,
         msi_install_verified: bool,
@@ -457,6 +461,10 @@ fn prepare_material(
                 ArtifactSummary::WindowsPackageEvidence {
                     source_revision: evidence.source_revision,
                     app_version: evidence.app_version,
+                    artifact_manifest_sha256: evidence.artifact_manifest_sha256,
+                    plugin_trust_store_sha256: evidence.plugin_trust_store_sha256,
+                    x86_host_sha256: evidence.x86_host_sha256,
+                    x64_host_sha256: evidence.x64_host_sha256,
                     authenticode_verified: evidence.authenticode_verified,
                     nsis_install_verified: evidence.nsis_install_verified,
                     msi_install_verified: evidence.msi_install_verified,
@@ -758,7 +766,7 @@ mod tests {
             (
                 ArtifactKind::WindowsPackageEvidence,
                 serde_json::json!({
-                    "schemaVersion": 1,
+                    "schemaVersion": ssdev_cutover_evidence::WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION,
                     "evidenceType": "windows-package",
                     "sourceRevision": "aa".repeat(20),
                     "sourceDirty": false,
@@ -768,6 +776,9 @@ mod tests {
                     "runnerArchitecture": "x86_64",
                     "releaseMetadataSha256": "77".repeat(32),
                     "artifactManifestSha256": "88".repeat(32),
+                    "pluginTrustStoreSha256": "22".repeat(32),
+                    "x86HostSha256": "44".repeat(32),
+                    "x64HostSha256": "55".repeat(32),
                     "appVersion": "1.2.3",
                     "authenticodeRequired": true,
                     "authenticodeVerified": true,

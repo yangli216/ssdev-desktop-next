@@ -11,7 +11,7 @@ use ssdev_cutover_evidence::{
     load_production_cutover_policy, load_windows_package_evidence, prepare_new_output, sha256_file,
     verify_evidence_attestation, write_cutover_decision, write_windows_package_evidence,
     EvidenceAttestationKind, EvidenceType, ProductionCutoverInputs, WindowsPackageEvidence,
-    EVIDENCE_SCHEMA_VERSION,
+    WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION,
 };
 use ssdev_release_manifest::{capture_source_identity, verify_release_metadata, ReleaseMetadata};
 
@@ -39,7 +39,7 @@ fn run() -> Result<bool, Box<dyn Error>> {
 }
 
 fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
-    if !matches!(arguments.len(), 9 | 10) {
+    if !matches!(arguments.len(), 12 | 13) {
         return Err(usage().into());
     }
     if std::env::consts::OS != "windows" || std::env::consts::ARCH != "x86_64" {
@@ -81,8 +81,12 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
     let installer_kind = string_argument(arguments.get(6), "installer kind")?;
     let launch_verified = bool_argument(arguments.get(7), "launch verified")?;
     let authenticode_verified = bool_argument(arguments.get(8), "Authenticode verified")?;
+    let plugin_trust_store_sha256 =
+        string_argument(arguments.get(9), "installed plugin trust store SHA-256")?;
+    let x86_host_sha256 = string_argument(arguments.get(10), "x86 host SHA-256")?;
+    let x64_host_sha256 = string_argument(arguments.get(11), "x64 host SHA-256")?;
     let previous_metadata_path = arguments
-        .get(9)
+        .get(12)
         .map(|value| path_argument(Some(value), "previous release metadata"))
         .transpose()?
         .map(|path| canonical_regular_file(&path, "previous release metadata"))
@@ -132,7 +136,7 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
     write_windows_package_evidence(
         &output,
         &WindowsPackageEvidence {
-            schema_version: EVIDENCE_SCHEMA_VERSION,
+            schema_version: WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION,
             evidence_type: EvidenceType::WindowsPackage,
             source_revision: source_after.revision,
             source_dirty: source_after.dirty,
@@ -142,6 +146,9 @@ fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
             runner_architecture: std::env::consts::ARCH.into(),
             release_metadata_sha256: release_metadata_after,
             artifact_manifest_sha256: artifact_manifest_after,
+            plugin_trust_store_sha256,
+            x86_host_sha256,
+            x64_host_sha256,
             app_version: current.app_version,
             authenticode_required: current.authenticode_required,
             authenticode_verified,
@@ -325,5 +332,5 @@ fn invalid_input(message: &str) -> Box<dyn Error> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
+    "usage:\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <x86-host-sha256> <x64-host-sha256> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
 }

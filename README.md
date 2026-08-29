@@ -179,7 +179,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
   -ExpectedSignerSubject "<完整证书主题 DN>"
 ```
 
-该门禁先要求包内更新公钥与独立输入的组织公钥逐字节一致，再验证签名的全产物 SHA-256 清单、源码提交/锁文件/工具链溯源、Rust/npm CycloneDX SBOM、updater Minisign、信任密钥生命周期以及来源/可选进程策略的 active 密钥签名；随后安装 NSIS，验证 x64 主程序、x86/x64 宿主、注入策略及 Authenticode 发布者，启动到 `app-started` 诊断事件，最后静默卸载并确认程序与注册项清理完成。只有全部请求项成功后，才会以不覆盖方式在源码和 bundle 之外写出绑定发布元数据、产物清单、版本、安装器覆盖、启动、升级和签名结果的 Windows 包证据。
+该门禁先要求包内更新公钥与独立输入的组织公钥逐字节一致，再验证签名的全产物 SHA-256 清单、源码提交/锁文件/工具链溯源、Rust/npm CycloneDX SBOM、updater Minisign、信任密钥生命周期以及来源/可选进程策略的 active 密钥签名；随后安装 NSIS，验证 x64 主程序、x86/x64 宿主、注入策略及 Authenticode 发布者，启动到 `app-started` 诊断事件，最后静默卸载并确认程序与注册项清理完成。只有全部请求项成功后，才会以不覆盖方式在源码和 bundle 之外写出绑定发布元数据、产物清单、版本、实际安装插件信任库与双宿主摘要、安装器覆盖、启动、升级和签名结果的 schema 2 Windows 包证据。
 
 若要验证覆盖升级，将上一正式版本解包目录作为额外输入：
 
@@ -199,7 +199,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
 
 ## 真实插件黄金矩阵
 
-仓库不会包含生产 DLL、OCX 或患者数据。`ssdev-plugin-tool prepare` 会按插件清单生成覆盖全部 service/method 的矩阵草稿；也可以从 [docs/plugin-matrix.example.json](docs/plugin-matrix.example.json) 手工建立。替换全部占位符并把 `draft` 改为 `false` 后，在 Windows x64 验证机执行：
+仓库不会包含生产 DLL、OCX 或患者数据。`ssdev-plugin-tool prepare` 会按插件清单生成覆盖全部 service/method 的矩阵草稿；也可以从 [docs/plugin-matrix.example.json](docs/plugin-matrix.example.json) 手工建立。替换全部占位符并把 `draft` 改为 `false` 后，先用正式参数构建候选 Windows 安装包，再在 Windows x64 验证机让矩阵直接使用构建脚本已签名并复制进该安装包的宿主文件：
 
 在占用 Windows 实机前，可先在任意开发平台运行 `ssdev-plugin-tool matrix-check --plugin-dir <prepare暂存目录> --matrix <定稿矩阵>`；多插件联合矩阵使用 `--plugin-root <插件根目录>`。封包后，单插件运行 `release-check --package ...`；多插件项目则用 [发布集合规范](docs/plugin-release-set.example.json) 运行 `release-set-check --spec ...`。两者都用实际包内清单联合验签并绑定包、信任库和矩阵摘要，与正式运行器共享 schema、路由、精确输入、占位符、复核标记和全方法覆盖规则，但不会加载组件或替代硬件验证。审批通过后使用 `release-set-materialize --spec ... --trust-store ... --matrix ... --plugin-root <全新目录>` 一次生成验收目录，避免人工逐包装载导致漏包或错版。
 
@@ -209,12 +209,14 @@ powershell -ExecutionPolicy Bypass -File scripts/test-plugin-matrix.ps1 `
   -ReleaseSetSpec C:\secure-release\hospital-a-release-set.json `
   -TrustStore C:\secure-test-inputs\plugin-trust.json `
   -Matrix C:\secure-test-inputs\plugin-matrix.json `
+  -X86Host C:\ssdev-source\target\i686-pc-windows-msvc\release\webplus-plugin-host.exe `
+  -X64Host C:\ssdev-source\target\x86_64-pc-windows-msvc\release\webplus-plugin-host.exe `
   -EvidenceOutput C:\secure-release\reader-lab-evidence.json `
   -EvidenceEnvironment hospital-a-reader-lab
 ```
 
-矩阵运行器会在启动 controller 和接触硬件前拒绝草稿、尚未解除的 `reviewRequired`、生成器保留占位符、无效或不完整输入、重复名称、未知路由，或未覆盖任一已声明 service/method 的矩阵；还会把插件根目录中的每个已安装插件重新确定性封包，要求插件身份、版本、签名 keyId 和包 SHA-256 与批准的发布集合逐项一致。随后由 x64 控制器分别拉起真实 x86/x64 宿主，逐项对 `ResCode` 和 `ResData` 做精确黄金比对。全部通过且源码、发布集合、插件、信任库、矩阵和两个宿主在执行前后保持一致时，才以不覆盖方式写出绑定这些 SHA-256、源码提交、环境标签和覆盖计数的 schema 2 机器证据。任何无效插件、签名问题、输入变化、宿主崩溃、超时或结果差异都会使门禁失败。
+矩阵运行器不会自行编译方便但不同字节的 Debug 宿主；`X86Host` 与 `X64Host` 必须是本次候选安装包构建留下的精确 Release/签名文件。运行器会在启动 controller 和接触硬件前拒绝草稿、尚未解除的 `reviewRequired`、生成器保留占位符、无效或不完整输入、重复名称、未知路由，或未覆盖任一已声明 service/method 的矩阵；还会把插件根目录中的每个已安装插件重新确定性封包，要求插件身份、版本、签名 keyId 和包 SHA-256 与批准的发布集合逐项一致。随后由 x64 控制器分别拉起这两个待交付宿主，逐项对 `ResCode` 和 `ResData` 做精确黄金比对。全部通过且源码、发布集合、插件、信任库、矩阵和两个宿主在执行前后保持一致时，才以不覆盖方式写出绑定这些 SHA-256、源码提交、环境标签和覆盖计数的 schema 2 机器证据。Windows 包验收的 schema 2 证据会从实际安装目录记录同一对宿主摘要；最终 Go/No-Go 要求二者逐字节一致。任何无效插件、签名问题、输入变化、宿主不一致、崩溃、超时或结果差异都会使门禁失败。
 
 ## 生产切换判定
 
-正式迁移审计、真实插件矩阵和 Windows 包验收各自生成不可覆盖的精简证据，并由对应 QA 环境使用 `cutover-evidence` 用途密钥签名。使用 [生产切换证据与 Go/No-Go](docs/cutover-evidence.md) 中的严格判定器按策略指定 keyId 验证三份封套，确认三者来自同一 clean commit、仍在有效期内，插件发布集合精确匹配审批输入，旧配置/插件/快捷键/前端/HAR 覆盖达到项目下限，且 HTTP 清理、迁移 finding、NSIS 安装、签名、启动和跨版本升级全部满足。`NO-GO` 会留存阻塞码并返回非零状态；只有 `GO` 文档能由另一把具备独立 `cutover-decision` 用途的组织 KMS/HSM 密钥签发最终审批封套。
+正式迁移审计、真实插件矩阵和 Windows 包验收各自生成不可覆盖的精简证据，并由对应 QA 环境使用 `cutover-evidence` 用途密钥签名。使用 [生产切换证据与 Go/No-Go](docs/cutover-evidence.md) 中的严格判定器按策略指定 keyId 验证三份封套，确认三者来自同一 clean commit、仍在有效期内，最终 Windows 产物清单和插件发布集合、信任库、黄金矩阵精确匹配审批输入，实机测试信任库/宿主与安装包实际内容逐字节一致，旧配置/插件/快捷键/前端/HAR 覆盖达到项目下限，且 HTTP 清理、迁移 finding、NSIS 安装、签名、启动和跨版本升级全部满足。`NO-GO` 会留存阻塞码并返回非零状态；只有 `GO` 文档能由另一把具备独立 `cutover-decision` 用途的组织 KMS/HSM 密钥签发最终审批封套。
