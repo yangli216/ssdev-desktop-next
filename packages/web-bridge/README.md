@@ -72,6 +72,6 @@ if (canRetryPluginInvocationWithBackoff(response)) {
 
 签名插件安装或热更新排空期间，只有发往目标插件的新请求返回 `{ ResCode: -32010, ResData: "native plugin controller is reloading; request was not executed" }`，其他插件继续服务；显式完整重新扫描时该错误可能覆盖全部插件。请求不会跨越一次路由/插件版本切换后再意外执行；业务页可以在维护结束后重新发起，但必须有退避上限，不能持续轮询压测客户端。
 
-尚未接入组织 npm 仓库时，主分支默认 CI 会上传保留 14 天的 `ssdev-web-bridge-sdk` 平台无关制品。目录固定只包含可安装 `.tgz` 和 `ssdev-web-bridge-sdk.json`，清单绑定包名、版本、大小、归档 SHA-256，以及 README、共享契约、锁文件、package manifest、TypeScript 源码和编译配置的有序联合摘要；Pull Request 只构建验证，不上传未合并制品。业务项目应从目标提交对应的 Actions run 下载整个目录，核对清单后用 `.tgz` 安装，并把精确归档摘要纳入自己的依赖评审，不能只按仍处于开发期的 `0.1.0` 文件名判断内容。
+尚未接入组织 npm 仓库时，主分支默认 CI 会上传保留 14 天的 `ssdev-web-bridge-sdk` 平台无关制品。目录固定只包含可安装 `.tgz` 和 `ssdev-web-bridge-sdk.json`，清单绑定包名、版本、大小、归档 SHA-256，以及 README、共享契约、锁文件、package manifest、TypeScript 源码和编译配置的有序联合摘要；Pull Request 只构建验证，不上传未合并制品。打包流程还会在临时业务项目中禁用生命周期脚本、强制离线安装刚生成的 `.tgz`，实际执行 ESM fixture 调用并用仓库锁定的 TypeScript 编译器检查公开类型，全部成功后才会原子发布目录，清单中的 `consumerSmokeVerified` 记录该次构建证据。业务项目应从目标提交对应的 Actions run 下载整个目录，核对清单后用 `.tgz` 安装，并把精确归档摘要纳入自己的依赖评审，不能只按仍处于开发期的 `0.1.0` 文件名判断内容。
 
 本地或受控流水线可运行 `node scripts/web-bridge-package.mjs build --output <新目录>`；业务接收前用 `verify --directory <目录>` 重算固定文件集、归档和当前锁定源码摘要。构建器先执行 TypeScript 编译，使用 `npm pack` 生成可重复归档，在同一临时目录完成自检后才原子发布目标目录。SDK 回归仍会执行 `npm pack --dry-run`，固定包内只能包含 README、共享契约、编译后的 ESM/类型声明和 package manifest，不得夹带源码、测试或 `node_modules`。该 CI 制品没有组织签名，不是正式 npm 发布；发布到组织内部 npm 仓库前再由批准的版本治理变更移除 `private` 并接入组织签名，当前仓库保持 `private: true`，避免误发公共 registry。

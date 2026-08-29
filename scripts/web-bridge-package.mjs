@@ -10,6 +10,7 @@ import {
   rm,
   writeFile,
 } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -49,17 +50,26 @@ function npmExecutable() {
   return process.platform === 'win32' ? 'npm.cmd' : 'npm'
 }
 
-function runNpm(arguments_, options = {}) {
-  const result = spawnSync(npmExecutable(), arguments_, {
-    cwd: packageDirectory,
+function runProcess(executable, arguments_, options = {}) {
+  const { role = executable, ...spawnOptions } = options
+  const result = spawnSync(executable, arguments_, {
     encoding: 'utf8',
-    ...options,
+    ...spawnOptions,
   })
   if (result.error) throw result.error
   if (result.status !== 0) {
-    throw new Error(`npm ${arguments_[0]} failed with exit code ${result.status}: ${(result.stderr ?? '').trim()}`)
+    const detail = `${result.stderr ?? ''}\n${result.stdout ?? ''}`.trim()
+    throw new Error(`${role} failed with exit code ${result.status}: ${detail}`)
   }
   return result
+}
+
+function runNpm(arguments_, options = {}) {
+  return runProcess(npmExecutable(), arguments_, {
+    cwd: packageDirectory,
+    role: `npm ${arguments_[0]}`,
+    ...options,
+  })
 }
 
 function sha256(bytes) {
@@ -138,6 +148,93 @@ async function readPackageIdentity() {
   return { name: document.name, version: document.version }
 }
 
+async function smokeTestPackagedConsumer(archivePath) {
+  await regularFile(archivePath, maxArchiveBytes, 'SDK consumer smoke archive')
+  const typescriptCompiler = join(packageDirectory, 'node_modules', 'typescript', 'bin', 'tsc')
+  await regularFile(typescriptCompiler, maxSourceInputBytes, 'pinned TypeScript compiler')
+
+  const consumer = await mkdtemp(join(tmpdir(), 'ssdev-web-bridge-consumer-'))
+  try {
+    await writeFile(
+      join(consumer, 'package.json'),
+      `${JSON.stringify({ private: true, type: 'module' }, null, 2)}\n`,
+      { encoding: 'utf8', flag: 'wx' },
+    )
+    runProcess(npmExecutable(), [
+      'install',
+      '--offline',
+      '--ignore-scripts',
+      '--no-audit',
+      '--no-fund',
+      '--package-lock=false',
+      archivePath,
+    ], { cwd: consumer, role: 'offline SDK consumer install' })
+
+    const runtimeSmokePath = join(consumer, 'runtime-smoke.mjs')
+    await writeFile(runtimeSmokePath, `import {
+  CURRENT_BRIDGE_PROTOCOL_VERSION,
+  createPluginFixtureInvoker,
+} from '@bsoft/ssdev-web-bridge'
+
+if (CURRENT_BRIDGE_PROTOCOL_VERSION !== 1) throw new Error('unexpected bridge protocol version')
+const invoker = createPluginFixtureInvoker([{
+  serviceId: 'consumer-smoke',
+  method: 'health',
+  response: { ResCode: 0, ResData: { ready: true } },
+}])
+const response = await invoker.invokePlugin('consumer-smoke', 'health')
+if (response.ResCode !== 0 || response.ResData?.ready !== true) {
+  throw new Error('packaged ESM runtime invocation failed')
+}
+`, { encoding: 'utf8', flag: 'wx' })
+    runProcess(process.execPath, [runtimeSmokePath], {
+      cwd: consumer,
+      role: 'packaged SDK ESM runtime smoke',
+    })
+
+    const typeSmokePath = join(consumer, 'type-smoke.ts')
+    await writeFile(typeSmokePath, `import {
+  createPluginFixtureInvoker,
+  type InvokeResponse,
+  type PluginInvocationFixture,
+  type PluginInvoker,
+} from '@bsoft/ssdev-web-bridge'
+
+type Health = { ready: boolean }
+const fixture: PluginInvocationFixture<Health> = {
+  serviceId: 'consumer-smoke',
+  method: 'health',
+  response: { ResCode: 0, ResData: { ready: true } },
+}
+const invoker: PluginInvoker = createPluginFixtureInvoker([fixture])
+const consume = async (): Promise<InvokeResponse<Health>> =>
+  invoker.invokePlugin<Health>('consumer-smoke', 'health')
+void consume()
+`, { encoding: 'utf8', flag: 'wx' })
+    await writeFile(join(consumer, 'tsconfig.json'), `${JSON.stringify({
+      compilerOptions: {
+        target: 'ES2022',
+        module: 'NodeNext',
+        moduleResolution: 'NodeNext',
+        lib: ['ES2022', 'DOM'],
+        noEmit: true,
+        strict: true,
+        exactOptionalPropertyTypes: true,
+        noUncheckedIndexedAccess: true,
+        skipLibCheck: false,
+      },
+      files: ['type-smoke.ts'],
+    }, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' })
+    runProcess(process.execPath, [typescriptCompiler, '--project', join(consumer, 'tsconfig.json')], {
+      cwd: consumer,
+      role: 'packaged SDK TypeScript consumer smoke',
+    })
+    return true
+  } finally {
+    await rm(consumer, { recursive: true, force: true })
+  }
+}
+
 async function verifyArtifactDirectory(directory) {
   await realDirectory(directory, 'SDK artifact directory')
   const entries = (await readdir(directory)).sort()
@@ -158,6 +255,7 @@ async function verifyArtifactDirectory(directory) {
     'sha256',
     'sourceFileCount',
     'sourceSha256',
+    'consumerSmokeVerified',
   ]
   if (!hasExactKeys(manifest, fields) || manifest.schemaVersion !== 1) {
     throw new Error('SDK artifact manifest schema is invalid')
@@ -173,6 +271,7 @@ async function verifyArtifactDirectory(directory) {
       || manifest.bytes < 1
       || manifest.bytes > maxArchiveBytes
       || manifest.sourceFileCount !== sourceFiles.length
+      || manifest.consumerSmokeVerified !== true
       || !isLowercaseSha256(manifest.sha256)
       || !isLowercaseSha256(manifest.sourceSha256)) {
     throw new Error('SDK artifact identity or bounded metadata is invalid')
@@ -211,6 +310,7 @@ async function buildArtifactDirectory(output) {
     const archivePath = join(temporary, expectedArchive)
     const metadata = await regularFile(archivePath, maxArchiveBytes, 'SDK archive')
     const archiveBytes = await readFile(archivePath)
+    const consumerSmokeVerified = await smokeTestPackagedConsumer(archivePath)
     const manifest = {
       schemaVersion: 1,
       packageName: identity.name,
@@ -220,6 +320,7 @@ async function buildArtifactDirectory(output) {
       sha256: sha256(archiveBytes),
       sourceFileCount: sourceFiles.length,
       sourceSha256: await sourceDigest(),
+      consumerSmokeVerified,
     }
     await writeFile(
       join(temporary, artifactManifestName),

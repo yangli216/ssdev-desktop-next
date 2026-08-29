@@ -35,6 +35,7 @@ test('builds and verifies a reproducible bounded Web Bridge SDK artifact', async
   assert.equal(firstManifest.packageName, '@bsoft/ssdev-web-bridge')
   assert.equal(firstManifest.packageVersion, '0.1.0')
   assert.equal(firstManifest.sourceFileCount, 6)
+  assert.equal(firstManifest.consumerSmokeVerified, true)
   assert.match(firstManifest.sha256, /^[0-9a-f]{64}$/)
   assert.match(firstManifest.sourceSha256, /^[0-9a-f]{64}$/)
 
@@ -42,6 +43,7 @@ test('builds and verifies a reproducible bounded Web Bridge SDK artifact', async
   assert.equal(verification.status, 0, verification.stderr)
   const report = JSON.parse(verification.stdout)
   assert.equal(report.verified, true)
+  assert.equal(report.consumerSmokeVerified, true)
   assert.equal(report.sha256, firstManifest.sha256)
   assert.equal(Object.hasOwn(report, 'directory'), false)
   assert.equal(Object.hasOwn(report, 'output'), false)
@@ -67,6 +69,14 @@ test('builds and verifies a reproducible bounded Web Bridge SDK artifact', async
   const unknownField = run('verify', '--directory', second)
   assert.notEqual(unknownField.status, 0)
   assert.match(unknownField.stderr, /schema is invalid/)
+
+  await writeFile(manifestPath, `${JSON.stringify({
+    ...secondManifest,
+    consumerSmokeVerified: false,
+  }, null, 2)}\n`)
+  const missingConsumerSmoke = run('verify', '--directory', second)
+  assert.notEqual(missingConsumerSmoke.status, 0)
+  assert.match(missingConsumerSmoke.stderr, /identity or bounded metadata is invalid/)
 })
 
 test('default CI uploads only a successfully verified platform-neutral SDK handoff', async () => {
