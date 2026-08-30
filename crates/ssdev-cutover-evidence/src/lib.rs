@@ -1168,6 +1168,36 @@ pub fn verify_evidence_attestation(
     Ok(())
 }
 
+/// Revalidates an archived evidence attestation against the trust store that is
+/// authoritative at deployment time. Unlike issuance verification, retired
+/// keys remain valid for historical signatures while revoked keys are rejected.
+pub fn verify_evidence_attestation_with_current_trust(
+    kind: EvidenceAttestationKind,
+    evidence_path: &Path,
+    envelope_path: &Path,
+    current_trust_store_path: &Path,
+    expected_key_id: &str,
+) -> Result<(), EvidenceError> {
+    validate_signing_key_id(expected_key_id)?;
+    let document = read_bounded_bytes(evidence_path, MAX_EVIDENCE_BYTES)?;
+    let payload = evidence_attestation_signing_payload(kind, &document)?;
+    let envelope: DetachedSignatureDocument =
+        serde_json::from_slice(&read_bounded_bytes(envelope_path, MAX_EVIDENCE_BYTES)?)?;
+    envelope.validate()?;
+    if envelope.key_id != expected_key_id {
+        return Err(EvidenceError::Invalid(
+            "evidence attestation signer does not match the production policy".into(),
+        ));
+    }
+    TrustStore::load(current_trust_store_path)?.verify_detached(
+        TrustPurpose::CutoverEvidence,
+        &envelope.key_id,
+        &payload,
+        &envelope.signature,
+    )?;
+    Ok(())
+}
+
 pub fn verify_production_cutover_policy_attestation(
     policy_path: &Path,
     envelope_path: &Path,
@@ -1198,6 +1228,34 @@ pub fn verify_production_cutover_policy_attestation(
     Ok(policy)
 }
 
+/// Revalidates the archived production policy against the approval trust store
+/// that is authoritative at deployment time. The current store is intentionally
+/// not required to match the archived store byte-for-byte so that key revocation
+/// can take effect after approval.
+pub fn verify_production_cutover_policy_attestation_with_current_trust(
+    policy_path: &Path,
+    envelope_path: &Path,
+    current_trust_store_path: &Path,
+) -> Result<ProductionCutoverPolicy, EvidenceError> {
+    let document = read_bounded_bytes(policy_path, MAX_EVIDENCE_BYTES)?;
+    let policy = ProductionCutoverPolicy::from_bytes_for_signing(&document)?;
+    let envelope: DetachedSignatureDocument =
+        serde_json::from_slice(&read_bounded_bytes(envelope_path, MAX_EVIDENCE_BYTES)?)?;
+    envelope.validate()?;
+    if envelope.key_id != policy.cutover_decision_signer_key_id {
+        return Err(EvidenceError::Invalid(
+            "cutover policy signer does not match the approved release duty".into(),
+        ));
+    }
+    TrustStore::load(current_trust_store_path)?.verify_detached(
+        TrustPurpose::CutoverDecision,
+        &envelope.key_id,
+        &cutover_policy_signing_payload(&document)?,
+        &envelope.signature,
+    )?;
+    Ok(policy)
+}
+
 pub fn verify_production_cutover_decision_attestation(
     decision_path: &Path,
     envelope_path: &Path,
@@ -1219,6 +1277,33 @@ pub fn verify_production_cutover_decision_attestation(
         ));
     }
     TrustStore::load(trust_store_path)?.verify_detached_for_issuance(
+        TrustPurpose::CutoverDecision,
+        &envelope.key_id,
+        &cutover_decision_signing_payload(&document),
+        &envelope.signature,
+    )?;
+    Ok(decision)
+}
+
+/// Revalidates the archived GO decision against the approval trust store that
+/// is authoritative at deployment time. Retired signing keys remain compatible;
+/// revoked keys fail closed.
+pub fn verify_production_cutover_decision_attestation_with_current_trust(
+    decision_path: &Path,
+    envelope_path: &Path,
+    current_trust_store_path: &Path,
+) -> Result<CutoverDecision, EvidenceError> {
+    let document = read_bounded_bytes(decision_path, MAX_EVIDENCE_BYTES)?;
+    let decision = CutoverDecision::from_bytes_for_signing(&document)?;
+    let envelope: DetachedSignatureDocument =
+        serde_json::from_slice(&read_bounded_bytes(envelope_path, MAX_EVIDENCE_BYTES)?)?;
+    envelope.validate()?;
+    if envelope.key_id != decision.approval_signer_key_id {
+        return Err(EvidenceError::Invalid(
+            "cutover decision signer does not match the approved release duty".into(),
+        ));
+    }
+    TrustStore::load(current_trust_store_path)?.verify_detached(
         TrustPurpose::CutoverDecision,
         &envelope.key_id,
         &cutover_decision_signing_payload(&document),
