@@ -39,6 +39,8 @@ if (outcome.state === 'completed') {
 | `completedWithoutResult` | 已知操作完成或同 ID 已使用，但响应因重启、过期、过大或缓存淘汰不可恢复 | 通过业务/设备状态对账，不能重放 |
 | `unknown` | 当前保留窗口内没有该操作的证据 | 不代表设备未执行；只能由业务规则决定是否创建新的逻辑操作 |
 
+业务项目不需要重复手写这张状态表。`classifyTrackedInvocationStatus(status)` 会返回稳定的 `execution` 与 `next`：`pending` 只查询同一 operation ID，`completed` 处理原响应，`indeterminate` 和 `completedWithoutResult` 都要求先对账，`unknown` 进入项目自己的恢复策略。所有结果都固定返回 `automaticReplay: 'forbidden'`。该纯函数不保存 ID、不发起查询、不轮询，也不会依据 `ResCode` 替业务创建另一笔逻辑操作。
+
 页面刷新后可以使用相同来源、路由和操作 ID 查询：
 
 ```ts

@@ -21,6 +21,7 @@ import {
   UnexpectedPluginInvocationError,
   canRetryPluginInvocationWithBackoff,
   classifyPluginInvocationResponse,
+  classifyTrackedInvocationStatus,
   connectDesktop,
   createPluginFixtureInvoker,
   createPluginOperationId,
@@ -180,6 +181,35 @@ test('keeps tracked invocations additive for older desktop clients', () => {
 test('creates canonical random operation IDs when tracked calls are available', () => {
   const operationId = createPluginOperationId()
   assert.match(operationId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+})
+
+test('classifies every tracked outcome without permitting automatic replay', () => {
+  const cases = [
+    ['unknown', 'unknown', 'apply-business-recovery-policy'],
+    ['pending', 'in-progress', 'query-same-operation'],
+    ['completed', 'completed', 'handle-response'],
+    ['indeterminate', 'possibly-executed', 'reconcile-before-new-operation'],
+    ['completedWithoutResult', 'possibly-executed', 'reconcile-before-new-operation'],
+  ]
+
+  for (const [state, execution, next] of cases) {
+    const disposition = classifyTrackedInvocationStatus({ state })
+    assert.deepEqual(disposition, {
+      kind: state,
+      execution,
+      next,
+      automaticReplay: 'forbidden',
+    })
+    assert.equal(Object.isFrozen(disposition), true)
+  }
+
+  for (const invalid of [null, {}, { state: 'completed-without-result' }, { state: 1 }]) {
+    assert.throws(
+      () => classifyTrackedInvocationStatus(invalid),
+      (error) => error instanceof TypeError
+        && error.message === 'SSDEV tracked invocation status is invalid',
+    )
+  }
 })
 
 test('fixture invoker matches exact routes and canonical JSON parameters', async () => {

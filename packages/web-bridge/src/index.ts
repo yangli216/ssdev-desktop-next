@@ -228,6 +228,78 @@ export type TrackedInvocationStatus<T = JsonValue> =
   | { state: 'indeterminate' }
   | { state: 'completedWithoutResult' }
 
+export type TrackedInvocationDisposition = Readonly<
+  | {
+      kind: 'unknown'
+      execution: 'unknown'
+      next: 'apply-business-recovery-policy'
+      automaticReplay: 'forbidden'
+    }
+  | {
+      kind: 'pending'
+      execution: 'in-progress'
+      next: 'query-same-operation'
+      automaticReplay: 'forbidden'
+    }
+  | {
+      kind: 'completed'
+      execution: 'completed'
+      next: 'handle-response'
+      automaticReplay: 'forbidden'
+    }
+  | {
+      kind: 'indeterminate' | 'completedWithoutResult'
+      execution: 'possibly-executed'
+      next: 'reconcile-before-new-operation'
+      automaticReplay: 'forbidden'
+    }
+>
+
+const TRACKED_INVOCATION_DISPOSITIONS = Object.freeze({
+  unknown: Object.freeze({
+    kind: 'unknown',
+    execution: 'unknown',
+    next: 'apply-business-recovery-policy',
+    automaticReplay: 'forbidden',
+  }),
+  pending: Object.freeze({
+    kind: 'pending',
+    execution: 'in-progress',
+    next: 'query-same-operation',
+    automaticReplay: 'forbidden',
+  }),
+  completed: Object.freeze({
+    kind: 'completed',
+    execution: 'completed',
+    next: 'handle-response',
+    automaticReplay: 'forbidden',
+  }),
+  indeterminate: Object.freeze({
+    kind: 'indeterminate',
+    execution: 'possibly-executed',
+    next: 'reconcile-before-new-operation',
+    automaticReplay: 'forbidden',
+  }),
+  completedWithoutResult: Object.freeze({
+    kind: 'completedWithoutResult',
+    execution: 'possibly-executed',
+    next: 'reconcile-before-new-operation',
+    automaticReplay: 'forbidden',
+  }),
+} as const satisfies Record<TrackedInvocationStatus['state'], TrackedInvocationDisposition>)
+
+export function classifyTrackedInvocationStatus(
+  status: Pick<TrackedInvocationStatus, 'state'>,
+): TrackedInvocationDisposition {
+  const state: unknown = (status as { state?: unknown } | null)?.state
+  if (typeof state !== 'string' || !Object.hasOwn(TRACKED_INVOCATION_DISPOSITIONS, state)) {
+    throw new TypeError('SSDEV tracked invocation status is invalid')
+  }
+  return TRACKED_INVOCATION_DISPOSITIONS[
+    state as TrackedInvocationStatus['state']
+  ]
+}
+
 export interface TrackedInvocationLimits {
   maxRuntimeOperations: number
   maxRetainedResponseBytes: number

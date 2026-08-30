@@ -173,10 +173,16 @@ async function smokeTestPackagedConsumer(archivePath) {
     const runtimeSmokePath = join(consumer, 'runtime-smoke.mjs')
     await writeFile(runtimeSmokePath, `import {
   CURRENT_BRIDGE_PROTOCOL_VERSION,
+  classifyTrackedInvocationStatus,
   createPluginFixtureInvoker,
 } from '@bsoft/ssdev-web-bridge'
 
 if (CURRENT_BRIDGE_PROTOCOL_VERSION !== 1) throw new Error('unexpected bridge protocol version')
+const trackedDisposition = classifyTrackedInvocationStatus({ state: 'indeterminate' })
+if (trackedDisposition.next !== 'reconcile-before-new-operation'
+    || trackedDisposition.automaticReplay !== 'forbidden') {
+  throw new Error('packaged tracked status classifier is unsafe')
+}
 const invoker = createPluginFixtureInvoker([{
   serviceId: 'consumer-smoke',
   method: 'health',
@@ -194,10 +200,13 @@ if (response.ResCode !== 0 || response.ResData?.ready !== true) {
 
     const typeSmokePath = join(consumer, 'type-smoke.ts')
     await writeFile(typeSmokePath, `import {
+  classifyTrackedInvocationStatus,
   createPluginFixtureInvoker,
   type InvokeResponse,
   type PluginInvocationFixture,
   type PluginInvoker,
+  type TrackedInvocationDisposition,
+  type TrackedInvocationStatus,
 } from '@bsoft/ssdev-web-bridge'
 
 type Health = { ready: boolean }
@@ -207,8 +216,13 @@ const fixture: PluginInvocationFixture<Health> = {
   response: { ResCode: 0, ResData: { ready: true } },
 }
 const invoker: PluginInvoker = createPluginFixtureInvoker([fixture])
+const trackedStatus: TrackedInvocationStatus<Health> = { state: 'pending' }
+const trackedDisposition: TrackedInvocationDisposition = classifyTrackedInvocationStatus(trackedStatus)
 const consume = async (): Promise<InvokeResponse<Health>> =>
   invoker.invokePlugin<Health>('consumer-smoke', 'health')
+if (trackedDisposition.kind === 'pending') {
+  trackedDisposition.next satisfies 'query-same-operation'
+}
 void consume()
 `, { encoding: 'utf8', flag: 'wx' })
     await writeFile(join(consumer, 'tsconfig.json'), `${JSON.stringify({
