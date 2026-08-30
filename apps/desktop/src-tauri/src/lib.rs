@@ -2881,6 +2881,7 @@ struct PluginRollbackOption {
 #[serde(rename_all = "kebab-case")]
 enum PluginInstallBlocker {
     LocalMappingConflict,
+    IdentityCasingConflict,
     InvalidTargetState,
 }
 
@@ -3099,12 +3100,16 @@ async fn install_plugin_from_catalog(
         ));
     }
     let installed_manifest = installed.manifests.iter().find(|manifest| {
-        manifest.plugin_id == plugin_id
+        normalized_plugin_id(&manifest.plugin_id) == normalized_plugin_id(&entry.plugin_id)
             && !is_local_manifest(manifest, &bridge_state.local_mapping_root)
     });
+    ensure_catalog_plugin_id_matches_installed(&entry.plugin_id, installed_manifest)?;
+    let state_plugin_id = installed_manifest
+        .map(|manifest| manifest.plugin_id.as_str())
+        .unwrap_or(&entry.plugin_id);
     let current_state_sha256 = plugin_update_installed_state_digest(
         &bridge_state.plugin_root,
-        &plugin_id,
+        state_plugin_id,
         installed_manifest,
     )?;
     let actual_plan_id = plugin_update_plan_id(
@@ -3224,28 +3229,50 @@ fn collect_plugin_updates(
     desktop_version: &semver::Version,
 ) -> Result<Vec<PluginUpdateItem>, String> {
     let mut plugin_ids = if let Some(plugin_id) = requested_plugin_id {
-        vec![plugin_id.to_owned()]
+        let installed_plugin_id = installed.manifests.iter().find_map(|manifest| {
+            (!is_local_manifest(manifest, local_mapping_root)
+                && normalized_plugin_id(&manifest.plugin_id) == normalized_plugin_id(plugin_id))
+            .then_some(manifest.plugin_id.clone())
+        });
+        let catalog_plugin_id = catalog
+            .select(plugin_id, None)
+            .map(|entry| entry.plugin_id.clone());
+        vec![installed_plugin_id
+            .or(catalog_plugin_id)
+            .unwrap_or_else(|| plugin_id.to_owned())]
     } else {
-        installed
+        let mut plugin_ids_by_identity = std::collections::BTreeMap::new();
+        for entry in catalog.entries() {
+            plugin_ids_by_identity.insert(
+                normalized_plugin_id(&entry.plugin_id),
+                entry.plugin_id.clone(),
+            );
+        }
+        for manifest in installed
             .manifests
             .iter()
             .filter(|manifest| !is_local_manifest(manifest, local_mapping_root))
-            .map(|manifest| manifest.plugin_id.clone())
-            .chain(
-                catalog
-                    .entries()
-                    .iter()
-                    .map(|entry| entry.plugin_id.clone()),
-            )
-            .collect()
+        {
+            plugin_ids_by_identity.insert(
+                normalized_plugin_id(&manifest.plugin_id),
+                manifest.plugin_id.clone(),
+            );
+        }
+        plugin_ids_by_identity.into_values().collect()
     };
     plugin_ids.sort();
-    plugin_ids.dedup();
     plugin_ids
         .into_iter()
         .map(|plugin_id| {
             let installed_manifest = installed.manifests.iter().find(|manifest| {
-                manifest.plugin_id == plugin_id && !is_local_manifest(manifest, local_mapping_root)
+                normalized_plugin_id(&manifest.plugin_id) == normalized_plugin_id(&plugin_id)
+                    && !is_local_manifest(manifest, local_mapping_root)
+            });
+            let catalog_plugin_id = catalog
+                .select(&plugin_id, None)
+                .map(|entry| entry.plugin_id.as_str());
+            let identity_casing_conflict = installed_manifest.is_some_and(|manifest| {
+                catalog_plugin_id.is_some_and(|catalog_id| manifest.plugin_id != catalog_id)
             });
             let local_mapping_conflict =
                 contains_plugin_id(&installed.local_mapping_ids, &plugin_id);
@@ -3266,7 +3293,8 @@ fn collect_plugin_updates(
                         .entries()
                         .iter()
                         .filter(|entry| {
-                            entry.plugin_id == plugin_id
+                            normalized_plugin_id(&entry.plugin_id)
+                                == normalized_plugin_id(&plugin_id)
                                 && entry.version < *installed_version
                                 && entry
                                     .desktop_version_requirement
@@ -3290,6 +3318,13 @@ fn collect_plugin_updates(
                         false,
                         None,
                         Some(PluginInstallBlocker::LocalMappingConflict),
+                        Vec::new(),
+                    )
+                } else if identity_casing_conflict {
+                    (
+                        false,
+                        None,
+                        Some(PluginInstallBlocker::IdentityCasingConflict),
                         Vec::new(),
                     )
                 } else {
@@ -3372,6 +3407,21 @@ fn collect_plugin_updates(
             })
         })
         .collect()
+}
+
+fn ensure_catalog_plugin_id_matches_installed(
+    catalog_plugin_id: &str,
+    installed_manifest: Option<&PluginManifest>,
+) -> Result<(), String> {
+    if let Some(installed) = installed_manifest {
+        if installed.plugin_id != catalog_plugin_id {
+            return Err(format!(
+                "签名仓库插件 ID [{catalog_plugin_id}] 与已安装插件 [{}] 仅大小写不同；请统一仓库和插件包的 ID 大小写后重新发布",
+                installed.plugin_id
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn is_plugin_update_available(
@@ -6777,34 +6827,35 @@ mod tests {
     use super::{
         classify_local_plugin_install_action, classify_project_component_action,
         collect_plugin_updates, desktop, early_startup_log_dir,
-        ensure_config_signed_plugin_route_coverage, ensure_exact_project_component_set,
-        ensure_local_mapping_import_plan_matches, ensure_local_mapping_removal_plan_matches,
-        ensure_local_plugin_install_plan_matches, ensure_plugin_reload_candidate_state_matches,
-        ensure_plugin_reload_plan_matches, ensure_plugin_update_plan_matches,
-        ensure_plugin_version_change_allowed, ensure_project_component_manifests_match,
-        ensure_project_delivery_identity, ensure_project_export_active_manifests_match,
-        ensure_project_export_runtime_matches, ensure_project_import_baseline_matches,
-        ensure_signed_plugin_compatible, ensure_signed_plugin_route_coverage,
-        ensure_signed_plugin_uninstall_plan_matches, ensure_upgrade_allowed, inspect_all_plugins,
-        is_lowercase_sha256, is_plugin_update_available, legacy_config_candidates,
-        local_mapping_directory_state_digest, local_mapping_import_plan_id,
-        local_mapping_import_state_digest, local_mapping_removal_plan_id, local_mappings,
-        local_plugin_install_plan_id, open_project_bundle_for_mode,
-        persist_startup_failure_document, plugin_reload_active_state_digest,
-        plugin_reload_candidate_state_digest, plugin_reload_impact, plugin_reload_plan_id,
-        plugin_update_installed_state_digest, plugin_update_plan_id, preflight_failure_message,
-        prepare_plugin_removal, project_bundle, project_import_plan_id,
-        project_import_state_digest, resolve_startup_failure_document, same_manifest_contracts,
-        select_runtime_path, service_inventory_item, signed_plugin_api_change_summary,
-        signed_plugin_directory_state_digest, signed_plugin_route_policy_coverage,
-        signed_plugin_uninstall_plan_id, startup_failure_message,
-        validate_signed_plugin_activation_routes, validate_signed_plugin_api_changes,
-        webview2_startup_failure, BridgePluginHostHealth, CatalogWithdrawalReason, FrontendRuntime,
-        InspectedPlugins, LocalMappingImportPreview, LocalMappingImportServicePreview,
-        LocalMappingRemovalPreview, OfflineRuntimeProbe, PluginInstallBlocker, PluginInstallSource,
-        PluginPackagePreview, PluginPackageServicePreview, PluginReloadPreview,
-        ProjectBundlePreview, SignedPluginUninstallPreview, StartupFailureDocument, StartupStage,
-        APP_DATA_DIRECTORY, FRONTEND_READY_TIMEOUT,
+        ensure_catalog_plugin_id_matches_installed, ensure_config_signed_plugin_route_coverage,
+        ensure_exact_project_component_set, ensure_local_mapping_import_plan_matches,
+        ensure_local_mapping_removal_plan_matches, ensure_local_plugin_install_plan_matches,
+        ensure_plugin_reload_candidate_state_matches, ensure_plugin_reload_plan_matches,
+        ensure_plugin_update_plan_matches, ensure_plugin_version_change_allowed,
+        ensure_project_component_manifests_match, ensure_project_delivery_identity,
+        ensure_project_export_active_manifests_match, ensure_project_export_runtime_matches,
+        ensure_project_import_baseline_matches, ensure_signed_plugin_compatible,
+        ensure_signed_plugin_route_coverage, ensure_signed_plugin_uninstall_plan_matches,
+        ensure_upgrade_allowed, inspect_all_plugins, is_lowercase_sha256,
+        is_plugin_update_available, legacy_config_candidates, local_mapping_directory_state_digest,
+        local_mapping_import_plan_id, local_mapping_import_state_digest,
+        local_mapping_removal_plan_id, local_mappings, local_plugin_install_plan_id,
+        open_project_bundle_for_mode, persist_startup_failure_document,
+        plugin_reload_active_state_digest, plugin_reload_candidate_state_digest,
+        plugin_reload_impact, plugin_reload_plan_id, plugin_update_installed_state_digest,
+        plugin_update_plan_id, preflight_failure_message, prepare_plugin_removal, project_bundle,
+        project_import_plan_id, project_import_state_digest, resolve_startup_failure_document,
+        same_manifest_contracts, select_runtime_path, service_inventory_item,
+        signed_plugin_api_change_summary, signed_plugin_directory_state_digest,
+        signed_plugin_route_policy_coverage, signed_plugin_uninstall_plan_id,
+        startup_failure_message, validate_signed_plugin_activation_routes,
+        validate_signed_plugin_api_changes, webview2_startup_failure, BridgePluginHostHealth,
+        CatalogWithdrawalReason, FrontendRuntime, InspectedPlugins, LocalMappingImportPreview,
+        LocalMappingImportServicePreview, LocalMappingRemovalPreview, OfflineRuntimeProbe,
+        PluginInstallBlocker, PluginInstallSource, PluginPackagePreview,
+        PluginPackageServicePreview, PluginReloadPreview, ProjectBundlePreview,
+        SignedPluginUninstallPreview, StartupFailureDocument, StartupStage, APP_DATA_DIRECTORY,
+        FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -7634,6 +7685,74 @@ mod tests {
         assert!(updates[0].update_available);
         assert_eq!(updates[0].rollback_version_count, 0);
         assert!(updates[0].rollback_versions.is_empty());
+    }
+
+    #[test]
+    fn plugin_update_check_blocks_catalog_identity_casing_drift() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_root = root.path().join("plugins");
+        let local_root = root.path().join("local-mappings");
+        let plugin = plugin_root.join("Reader");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::create_dir_all(&local_root).unwrap();
+        fs::write(
+            plugin.join(API_FILENAME),
+            r#"{"serviceId":"reader","mainClass":"reader.dll"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin.join("plugin.json"),
+            r#"{"schemaVersion":1,"pluginId":"Reader","version":"1.0.0","desktopVersionRequirement":">=0.1.0, <0.2.0"}"#,
+        )
+        .unwrap();
+        let installed_manifest = PluginManifest::load("Reader", &plugin).unwrap();
+        let installed = inspected_plugins(vec![installed_manifest.clone()], HashSet::new());
+        let catalog = PluginCatalog::from_unsigned_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "issuedAt": 1_700_000_000_u64,
+                "expiresAt": 1_700_003_600_u64,
+                "entries": [{
+                    "pluginId": "reader",
+                    "version": "1.1.0",
+                    "desktopVersionRequirement": ">=0.1.0, <0.2.0",
+                    "url": "https://plugins.example.test/reader-1.1.0.ssdev-plugin",
+                    "sha256": "11".repeat(32),
+                    "size": 10
+                }]
+            }))
+            .unwrap(),
+            UNIX_EPOCH + Duration::from_secs(1_700_000_100),
+        )
+        .unwrap();
+
+        let updates = collect_plugin_updates(
+            &installed,
+            &plugin_root,
+            &local_root,
+            &catalog,
+            "catalog-key",
+            None,
+            &Version::new(0, 1, 5),
+        )
+        .unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].plugin_id, "Reader");
+        assert_eq!(
+            updates[0].install_blocker,
+            Some(PluginInstallBlocker::IdentityCasingConflict)
+        );
+        assert!(!updates[0].update_available);
+        assert!(updates[0].install_plan_id.is_none());
+
+        assert!(
+            ensure_catalog_plugin_id_matches_installed("reader", Some(&installed_manifest))
+                .unwrap_err()
+                .contains("仅大小写不同")
+        );
+        assert!(
+            ensure_catalog_plugin_id_matches_installed("Reader", Some(&installed_manifest)).is_ok()
+        );
     }
 
     #[test]

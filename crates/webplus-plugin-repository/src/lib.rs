@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -121,12 +121,17 @@ impl PluginCatalog {
                 "catalog is not currently valid; check clock or refresh catalog".into(),
             ));
         }
+        let mut canonical_plugin_ids = HashMap::new();
         let mut identities = HashSet::new();
         for entry in &document.entries {
             validate_entry(entry)?;
-            if !identities.insert((entry.plugin_id.clone(), entry.version.clone())) {
+            record_canonical_plugin_id(&mut canonical_plugin_ids, &entry.plugin_id)?;
+            if !identities.insert((
+                normalized_plugin_id(&entry.plugin_id),
+                entry.version.clone(),
+            )) {
                 return Err(RepositoryError::Invalid(format!(
-                    "duplicate catalog entry [{} {}]",
+                    "duplicate Windows plugin identity in catalog entry [{} {}]",
                     entry.plugin_id, entry.version
                 )));
             }
@@ -134,10 +139,14 @@ impl PluginCatalog {
         let mut withdrawn_identities = HashSet::new();
         for withdrawal in &document.withdrawals {
             validate_withdrawal(withdrawal)?;
-            let identity = (withdrawal.plugin_id.clone(), withdrawal.version.clone());
+            record_canonical_plugin_id(&mut canonical_plugin_ids, &withdrawal.plugin_id)?;
+            let identity = (
+                normalized_plugin_id(&withdrawal.plugin_id),
+                withdrawal.version.clone(),
+            );
             if !withdrawn_identities.insert(identity.clone()) {
                 return Err(RepositoryError::Invalid(format!(
-                    "duplicate catalog withdrawal [{} {}]",
+                    "duplicate Windows plugin identity in catalog withdrawal [{} {}]",
                     withdrawal.plugin_id, withdrawal.version
                 )));
             }
@@ -161,7 +170,7 @@ impl PluginCatalog {
         self.entries
             .iter()
             .filter(|entry| {
-                entry.plugin_id == plugin_id
+                entry.plugin_id.eq_ignore_ascii_case(plugin_id)
                     && version.is_none_or(|version| &entry.version == version)
             })
             .max_by(|left, right| left.version.cmp(&right.version))
@@ -176,7 +185,7 @@ impl PluginCatalog {
         self.entries
             .iter()
             .filter(|entry| {
-                entry.plugin_id == plugin_id
+                entry.plugin_id.eq_ignore_ascii_case(plugin_id)
                     && version.is_none_or(|version| &entry.version == version)
                     && entry
                         .desktop_version_requirement
@@ -195,9 +204,9 @@ impl PluginCatalog {
     }
 
     pub fn withdrawal(&self, plugin_id: &str, version: &Version) -> Option<&CatalogWithdrawal> {
-        self.withdrawals
-            .iter()
-            .find(|withdrawal| withdrawal.plugin_id == plugin_id && &withdrawal.version == version)
+        self.withdrawals.iter().find(|withdrawal| {
+            withdrawal.plugin_id.eq_ignore_ascii_case(plugin_id) && &withdrawal.version == version
+        })
     }
 
     /// Rejects legacy catalog entries that do not bind a signed plugin release
@@ -271,13 +280,13 @@ pub fn encode_catalog_document_with_withdrawals(
     now: SystemTime,
 ) -> Result<Vec<u8>, RepositoryError> {
     entries.sort_by(|left, right| {
-        left.plugin_id
-            .cmp(&right.plugin_id)
+        normalized_plugin_id(&left.plugin_id)
+            .cmp(&normalized_plugin_id(&right.plugin_id))
             .then_with(|| left.version.cmp(&right.version))
     });
     withdrawals.sort_by(|left, right| {
-        left.plugin_id
-            .cmp(&right.plugin_id)
+        normalized_plugin_id(&left.plugin_id)
+            .cmp(&normalized_plugin_id(&right.plugin_id))
             .then_with(|| left.version.cmp(&right.version))
     });
     let document = CatalogDocument {
@@ -474,6 +483,27 @@ fn validate_plugin_id(plugin_id: &str) -> Result<(), RepositoryError> {
     })
 }
 
+fn normalized_plugin_id(plugin_id: &str) -> String {
+    plugin_id.to_ascii_lowercase()
+}
+
+fn record_canonical_plugin_id(
+    canonical_plugin_ids: &mut HashMap<String, String>,
+    plugin_id: &str,
+) -> Result<(), RepositoryError> {
+    let normalized = normalized_plugin_id(plugin_id);
+    if let Some(canonical) = canonical_plugin_ids.get(&normalized) {
+        if canonical != plugin_id {
+            return Err(RepositoryError::Invalid(format!(
+                "catalog plugin ID [{plugin_id}] uses inconsistent ASCII casing; expected [{canonical}]"
+            )));
+        }
+    } else {
+        canonical_plugin_ids.insert(normalized, plugin_id.to_owned());
+    }
+    Ok(())
+}
+
 fn require_https(url: &Url) -> Result<(), RepositoryError> {
     if url.scheme() != "https" || url.host_str().is_none() {
         return Err(RepositoryError::Invalid(format!(
@@ -526,6 +556,46 @@ mod tests {
                 "accepted {plugin_id}"
             );
         }
+    }
+
+    #[test]
+    fn catalog_requires_one_ascii_spelling_for_each_windows_identity() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+        let entry = |plugin_id: &str, version: &str| {
+            serde_json::json!({
+                "pluginId": plugin_id,
+                "version": version,
+                "desktopVersionRequirement": ">=0.1.0, <0.2.0",
+                "url": format!("https://plugins.example.test/{plugin_id}-{version}.ssdev-plugin"),
+                "sha256": "ab".repeat(32),
+                "size": 1024
+            })
+        };
+        let document = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1,
+            "issuedAt": 1_700_000_000_u64,
+            "expiresAt": 1_700_003_600_u64,
+            "entries": [entry("reader-plugin", "1.0.0"), entry("Reader-Plugin", "2.0.0")],
+            "withdrawals": []
+        }))
+        .unwrap();
+        let error = PluginCatalog::from_unsigned_bytes(&document, now).unwrap_err();
+        assert!(error.to_string().contains("inconsistent ASCII casing"));
+
+        let document = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1,
+            "issuedAt": 1_700_000_000_u64,
+            "expiresAt": 1_700_003_600_u64,
+            "entries": [entry("reader-plugin", "1.0.0")],
+            "withdrawals": [{
+                "pluginId": "Reader-Plugin",
+                "version": "0.9.0",
+                "reason": "defective"
+            }]
+        }))
+        .unwrap();
+        let error = PluginCatalog::from_unsigned_bytes(&document, now).unwrap_err();
+        assert!(error.to_string().contains("inconsistent ASCII casing"));
     }
 
     fn signed_catalog(expires_at: u64) -> (TrustStore, Vec<u8>, Vec<u8>) {
@@ -586,6 +656,10 @@ mod tests {
         assert_eq!(catalog.signing_key_id(), Some("catalog-key"));
         assert_eq!(
             catalog.select("reader-plugin", None).unwrap().version,
+            Version::new(2, 2, 0)
+        );
+        assert_eq!(
+            catalog.select("READER-PLUGIN", None).unwrap().version,
             Version::new(2, 2, 0)
         );
         assert_eq!(
@@ -714,6 +788,12 @@ mod tests {
         assert_eq!(
             catalog
                 .withdrawal("reader-plugin", &Version::new(1, 0, 0))
+                .map(|withdrawal| withdrawal.reason),
+            Some(CatalogWithdrawalReason::Security)
+        );
+        assert_eq!(
+            catalog
+                .withdrawal("READER-PLUGIN", &Version::new(1, 0, 0))
                 .map(|withdrawal| withdrawal.reason),
             Some(CatalogWithdrawalReason::Security)
         );
