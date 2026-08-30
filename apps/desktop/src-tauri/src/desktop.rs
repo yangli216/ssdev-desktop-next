@@ -492,12 +492,17 @@ pub(crate) struct ConfigImportEnvironmentPreview {
 pub(crate) struct ConfigChangePreview {
     pub(crate) config_changed: bool,
     pub(crate) business_surface_reset_required: bool,
+    pub(crate) project_identity_changed: bool,
     pub(crate) default_website_changed: bool,
     pub(crate) tenant_changed: bool,
     pub(crate) allow_switch_changed: bool,
     pub(crate) auto_close_changed: bool,
     pub(crate) auto_start_changed: bool,
     pub(crate) plugin_catalog_changed: bool,
+    pub(crate) current_project_id: String,
+    pub(crate) current_project_name: String,
+    pub(crate) candidate_project_id: String,
+    pub(crate) candidate_project_name: String,
     pub(crate) candidate_default_website: Option<String>,
     pub(crate) candidate_allow_switch: bool,
     pub(crate) candidate_auto_close: bool,
@@ -719,6 +724,8 @@ pub(crate) fn build_config_change_preview(
     Ok(ConfigChangePreview {
         config_changed: current != candidate,
         business_surface_reset_required: business_surface_reset_required(current, candidate),
+        project_identity_changed: current.project_id != candidate.project_id
+            || current.project_name != candidate.project_name,
         default_website_changed: current.website != candidate.website,
         tenant_changed: current.tenant_id != candidate.tenant_id,
         allow_switch_changed: current.allow_switch != candidate.allow_switch,
@@ -726,6 +733,10 @@ pub(crate) fn build_config_change_preview(
         auto_start_changed: current.auto_start != candidate.auto_start,
         plugin_catalog_changed: current.plugin_catalog_url != candidate.plugin_catalog_url
             || current.plugin_catalog_signature_url != candidate.plugin_catalog_signature_url,
+        current_project_id: current.project_id.clone(),
+        current_project_name: current.project_name.clone(),
+        candidate_project_id: candidate.project_id.clone(),
+        candidate_project_name: candidate.project_name.clone(),
         candidate_default_website: candidate.website.clone(),
         candidate_allow_switch: candidate.allow_switch,
         candidate_auto_close: candidate.auto_close,
@@ -755,6 +766,12 @@ pub(crate) fn build_config_change_preview(
 
 fn business_surface_reset_required(current: &DesktopConfig, candidate: &DesktopConfig) -> bool {
     let mut normalized_candidate = candidate.clone();
+    normalized_candidate
+        .project_id
+        .clone_from(&current.project_id);
+    normalized_candidate
+        .project_name
+        .clone_from(&current.project_name);
     normalized_candidate.allow_switch = current.allow_switch;
     normalized_candidate.auto_close = current.auto_close;
     normalized_candidate.auto_start = current.auto_start;
@@ -2350,6 +2367,8 @@ mod tests {
             ..DesktopConfig::default()
         };
         let candidate = DesktopConfig {
+            project_id: "hospital-a-outpatient".into(),
+            project_name: "A 院门诊项目".into(),
             website: Some("https://candidate.example.test/app".into()),
             auto_start: true,
             ..DesktopConfig::default()
@@ -2385,6 +2404,8 @@ mod tests {
             ..DesktopConfig::default()
         };
         let candidate = DesktopConfig {
+            project_id: "hospital-a-outpatient".into(),
+            project_name: "A 院门诊项目".into(),
             website: Some("https://candidate.example.test/app".into()),
             environments: vec![ssdev_config::EnvironmentConfig {
                 name: "验收环境".into(),
@@ -2404,6 +2425,11 @@ mod tests {
 
         assert!(preview.config_changed);
         assert!(preview.business_surface_reset_required);
+        assert!(preview.project_identity_changed);
+        assert_eq!(preview.current_project_id, "");
+        assert_eq!(preview.current_project_name, "");
+        assert_eq!(preview.candidate_project_id, "hospital-a-outpatient");
+        assert_eq!(preview.candidate_project_name, "A 院门诊项目");
         assert!(preview.default_website_changed);
         assert!(preview.tenant_changed);
         assert!(preview.allow_switch_changed);
@@ -2439,6 +2465,14 @@ mod tests {
         };
 
         assert!(!business_surface_reset_required(&current, &desktop_only));
+
+        let mut changed_identity = desktop_only.clone();
+        changed_identity.project_id = "hospital-a-outpatient".into();
+        changed_identity.project_name = "A 院门诊项目".into();
+        assert!(!business_surface_reset_required(
+            &current,
+            &changed_identity
+        ));
 
         let mut changed_entry = desktop_only.clone();
         changed_entry.website = Some("https://business.example.test/next".into());

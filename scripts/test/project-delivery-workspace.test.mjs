@@ -3,6 +3,10 @@ import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 const controlFrontendUrl = new URL('../../apps/desktop/src/App.vue', import.meta.url)
+const configCoreUrl = new URL('../../crates/ssdev-config/src/lib.rs', import.meta.url)
+const desktopCoreUrl = new URL('../../apps/desktop/src-tauri/src/lib.rs', import.meta.url)
+const deploymentCheckUrl = new URL('../../apps/desktop/src-tauri/src/deployment_check.rs', import.meta.url)
+const cutoverEvidenceUrl = new URL('../../crates/ssdev-cutover-evidence/src/lib.rs', import.meta.url)
 
 test('project packaging and deep validation live in one task-based workspace', async () => {
   const source = await readFile(controlFrontendUrl, 'utf8')
@@ -40,4 +44,26 @@ test('project packaging and deep validation live in one task-based workspace', a
   assert.doesNotMatch(securityWorkspace, /@click="exportDeploymentCheck"/)
   assert.match(securityWorkspace, /@click="openDiagnosticsDirectory">打开日志目录/)
   assert.match(securityWorkspace, /@click="exportDiagnostics">导出脱敏诊断包/)
+})
+
+test('project identity is visible, signed with delivery state, and required for handoff', async () => {
+  const [frontend, config, desktop, deployment, evidence] = await Promise.all([
+    readFile(controlFrontendUrl, 'utf8'),
+    readFile(configCoreUrl, 'utf8'),
+    readFile(desktopCoreUrl, 'utf8'),
+    readFile(deploymentCheckUrl, 'utf8'),
+    readFile(cutoverEvidenceUrl, 'utf8'),
+  ])
+
+  assert.match(config, /pub project_id: String/)
+  assert.match(config, /pub project_name: String/)
+  assert.match(config, /project ID and project name must be configured together/)
+  assert.match(frontend, /<h1 id="overview-title">\{\{ activeProjectName \}\}<\/h1>/)
+  assert.match(frontend, /项目标识：\{\{ activeProjectId \}\}/)
+  assert.match(frontend, /项目身份\{\{ configImportPreview\.projectIdentityChanged/)
+  assert.match(frontend, /项目身份\{\{ projectBundlePreview\.configPreview\.projectIdentityChanged/)
+  assert.match(desktop, /ensure_project_delivery_identity\(&config\)\?/)
+  assert.match(desktop, /ensure_project_delivery_identity\(&opened\.config\)\?/)
+  assert.match(deployment, /"project-identity"[\s\S]+DeploymentCheckStatus::Fail/)
+  assert.match(evidence, /item\.id == "project-identity" && item\.status == DeploymentCheckRecordStatus::Pass/)
 })

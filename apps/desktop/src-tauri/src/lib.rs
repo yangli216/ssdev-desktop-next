@@ -735,6 +735,7 @@ async fn run_deployment_check(
         deep_preflighted_hosts,
         deep_preflight_failure,
         config_error,
+        project_identity_configured: config.project_identity_configured(),
         business_origin_count,
         business_window_count: business_frontend.active_windows,
         business_loading_windows: business_frontend.loading_windows,
@@ -1118,6 +1119,7 @@ async fn export_project_bundle(
     recover_plugin_store(&state)?;
     let config = desktop_state.config.snapshot();
     desktop_state.authorize_config(&config)?;
+    ensure_project_delivery_identity(&config)?;
     let inspected = inspect_all_plugins(
         &state.plugin_root,
         &state.local_mapping_root,
@@ -1471,6 +1473,7 @@ async fn prepare_project_bundle(
         .await
         .map_err(|_| "项目包读取任务异常终止".to_owned())??;
     desktop_state.authorize_config(&opened.config)?;
+    ensure_project_delivery_identity(&opened.config)?;
     let business_origins = opened
         .config
         .business_origins()
@@ -2200,6 +2203,17 @@ fn ensure_project_export_active_manifests_match(matches: bool) -> Result<(), Str
         );
     }
     Ok(())
+}
+
+fn ensure_project_delivery_identity(config: &ssdev_config::DesktopConfig) -> Result<(), String> {
+    if config.project_identity_configured() {
+        Ok(())
+    } else {
+        Err(
+            "项目交付要求同时配置项目名称和稳定项目标识；请在“项目配置”中补充后重新生成项目包"
+                .into(),
+        )
+    }
 }
 
 async fn preflight_manifests(
@@ -6554,28 +6568,29 @@ mod tests {
         ensure_local_mapping_removal_plan_matches, ensure_local_plugin_install_plan_matches,
         ensure_plugin_reload_candidate_state_matches, ensure_plugin_reload_plan_matches,
         ensure_plugin_update_plan_matches, ensure_plugin_version_change_allowed,
-        ensure_project_export_active_manifests_match, ensure_project_export_runtime_matches,
-        ensure_signed_plugin_compatible, ensure_signed_plugin_route_coverage,
-        ensure_signed_plugin_uninstall_plan_matches, ensure_upgrade_allowed, inspect_all_plugins,
-        is_lowercase_sha256, is_plugin_update_available, legacy_config_candidates,
-        local_mapping_directory_state_digest, local_mapping_import_plan_id,
-        local_mapping_import_state_digest, local_mapping_removal_plan_id, local_mappings,
-        local_plugin_install_plan_id, open_project_bundle_for_mode,
-        persist_startup_failure_document, plugin_reload_active_state_digest,
-        plugin_reload_candidate_state_digest, plugin_reload_impact, plugin_reload_plan_id,
-        plugin_update_installed_state_digest, plugin_update_plan_id, preflight_failure_message,
-        prepare_plugin_removal, project_bundle, project_import_plan_id,
-        project_import_state_digest, resolve_startup_failure_document, same_manifest_contracts,
-        select_runtime_path, service_inventory_item, signed_plugin_api_change_summary,
-        signed_plugin_directory_state_digest, signed_plugin_route_policy_coverage,
-        signed_plugin_uninstall_plan_id, startup_failure_message,
-        validate_signed_plugin_activation_routes, validate_signed_plugin_api_changes,
-        webview2_startup_failure, BridgePluginHostHealth, CatalogWithdrawalReason, FrontendRuntime,
-        InspectedPlugins, LocalMappingImportPreview, LocalMappingImportServicePreview,
-        LocalMappingRemovalPreview, OfflineRuntimeProbe, PluginInstallBlocker, PluginInstallSource,
-        PluginPackagePreview, PluginPackageServicePreview, PluginReloadPreview,
-        ProjectBundlePreview, SignedPluginUninstallPreview, StartupFailureDocument, StartupStage,
-        APP_DATA_DIRECTORY, FRONTEND_READY_TIMEOUT,
+        ensure_project_delivery_identity, ensure_project_export_active_manifests_match,
+        ensure_project_export_runtime_matches, ensure_signed_plugin_compatible,
+        ensure_signed_plugin_route_coverage, ensure_signed_plugin_uninstall_plan_matches,
+        ensure_upgrade_allowed, inspect_all_plugins, is_lowercase_sha256,
+        is_plugin_update_available, legacy_config_candidates, local_mapping_directory_state_digest,
+        local_mapping_import_plan_id, local_mapping_import_state_digest,
+        local_mapping_removal_plan_id, local_mappings, local_plugin_install_plan_id,
+        open_project_bundle_for_mode, persist_startup_failure_document,
+        plugin_reload_active_state_digest, plugin_reload_candidate_state_digest,
+        plugin_reload_impact, plugin_reload_plan_id, plugin_update_installed_state_digest,
+        plugin_update_plan_id, preflight_failure_message, prepare_plugin_removal, project_bundle,
+        project_import_plan_id, project_import_state_digest, resolve_startup_failure_document,
+        same_manifest_contracts, select_runtime_path, service_inventory_item,
+        signed_plugin_api_change_summary, signed_plugin_directory_state_digest,
+        signed_plugin_route_policy_coverage, signed_plugin_uninstall_plan_id,
+        startup_failure_message, validate_signed_plugin_activation_routes,
+        validate_signed_plugin_api_changes, webview2_startup_failure, BridgePluginHostHealth,
+        CatalogWithdrawalReason, FrontendRuntime, InspectedPlugins, LocalMappingImportPreview,
+        LocalMappingImportServicePreview, LocalMappingRemovalPreview, OfflineRuntimeProbe,
+        PluginInstallBlocker, PluginInstallSource, PluginPackagePreview,
+        PluginPackageServicePreview, PluginReloadPreview, ProjectBundlePreview,
+        SignedPluginUninstallPreview, StartupFailureDocument, StartupStage, APP_DATA_DIRECTORY,
+        FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -7068,6 +7083,8 @@ mod tests {
             ..ssdev_config::DesktopConfig::default()
         };
         let candidate = ssdev_config::DesktopConfig {
+            project_id: "hospital-a".into(),
+            project_name: "A 院项目".into(),
             website: Some("https://candidate.example.test/app".into()),
             environments: vec![ssdev_config::EnvironmentConfig {
                 name: "生产环境".into(),
@@ -7101,6 +7118,9 @@ mod tests {
         assert!(value.get("configChanged").is_none());
         assert_eq!(value["configPreview"]["configChanged"], true);
         assert_eq!(value["configPreview"]["businessSurfaceResetRequired"], true);
+        assert_eq!(value["configPreview"]["projectIdentityChanged"], true);
+        assert_eq!(value["configPreview"]["candidateProjectId"], "hospital-a");
+        assert_eq!(value["configPreview"]["candidateProjectName"], "A 院项目");
         assert_eq!(
             value["configPreview"]["candidateDefaultWebsite"],
             "https://candidate.example.test/app"
@@ -7121,6 +7141,18 @@ mod tests {
         assert!(ensure_project_export_active_manifests_match(false)
             .unwrap_err()
             .contains("完整清单"));
+    }
+
+    #[test]
+    fn project_delivery_rejects_anonymous_legacy_configuration() {
+        assert!(ensure_project_delivery_identity(&ssdev_config::DesktopConfig::default()).is_err());
+
+        let identified = ssdev_config::DesktopConfig {
+            project_id: "hospital-a".into(),
+            project_name: "A 院项目".into(),
+            ..ssdev_config::DesktopConfig::default()
+        };
+        assert!(ensure_project_delivery_identity(&identified).is_ok());
     }
 
     #[test]

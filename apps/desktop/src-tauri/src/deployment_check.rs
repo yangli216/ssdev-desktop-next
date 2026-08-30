@@ -14,6 +14,7 @@ pub(crate) struct DeploymentCheckFacts {
     pub(crate) deep_preflighted_hosts: usize,
     pub(crate) deep_preflight_failure: Option<DeploymentPreflightFailure>,
     pub(crate) config_error: Option<String>,
+    pub(crate) project_identity_configured: bool,
     pub(crate) business_origin_count: usize,
     pub(crate) business_window_count: usize,
     pub(crate) business_loading_windows: usize,
@@ -159,7 +160,7 @@ pub(crate) fn persist_export_document(destination: &Path, bytes: &[u8]) -> Resul
 }
 
 pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
-    let mut items = Vec::with_capacity(13);
+    let mut items = Vec::with_capacity(14);
 
     items.push(item(
         "webview-runtime",
@@ -224,6 +225,24 @@ pub(crate) fn evaluate(facts: &DeploymentCheckFacts) -> DeploymentCheckReport {
             DeploymentCheckStatus::Info,
             "尚未启动业务窗口；日常检查不阻断，正式交付前应执行深度检查。",
             None,
+        ));
+    }
+
+    if facts.project_identity_configured {
+        items.push(item(
+            "project-identity",
+            "项目身份",
+            DeploymentCheckStatus::Pass,
+            "项目名称和稳定标识已配置。",
+            None,
+        ));
+    } else {
+        items.push(item(
+            "project-identity",
+            "项目身份",
+            DeploymentCheckStatus::Fail,
+            "尚未配置可复核的项目名称和稳定标识。",
+            Some("进入“项目配置”同时填写项目名称和项目标识，然后保存并重新检查。"),
         ));
     }
 
@@ -660,6 +679,7 @@ mod tests {
             deep_preflighted_hosts: 3,
             deep_preflight_failure: None,
             config_error: None,
+            project_identity_configured: true,
             business_origin_count: 2,
             business_window_count: 1,
             business_loading_windows: 0,
@@ -705,6 +725,22 @@ mod tests {
         assert_eq!(report.failures, 0);
         assert!(report.passed >= 8);
         assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn unnamed_legacy_project_can_run_but_cannot_be_reported_as_deliverable() {
+        let mut facts = healthy_facts();
+        facts.project_identity_configured = false;
+
+        let report = evaluate(&facts);
+
+        assert!(!report.ready);
+        assert!(!report.delivery_ready);
+        assert!(report.items.iter().any(|item| {
+            item.id == "project-identity"
+                && item.status == DeploymentCheckStatus::Fail
+                && item.action.is_some()
+        }));
     }
 
     #[test]

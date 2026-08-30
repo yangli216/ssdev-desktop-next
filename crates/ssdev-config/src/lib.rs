@@ -15,6 +15,12 @@ const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopConfig {
+    /// Stable, portable identity used to distinguish customer/project deliveries.
+    #[serde(default)]
+    pub project_id: String,
+    /// Human-readable project name shown to operators and implementation engineers.
+    #[serde(default)]
+    pub project_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub website: Option<String>,
     #[serde(default)]
@@ -54,6 +60,8 @@ pub struct DesktopConfig {
 impl Default for DesktopConfig {
     fn default() -> Self {
         Self {
+            project_id: String::new(),
+            project_name: String::new(),
             website: None,
             environments: Vec::new(),
             allow_switch: true,
@@ -84,6 +92,7 @@ impl DesktopConfig {
                 MAX_CONFIG_FILE_BYTES
             )));
         }
+        self.validate_project_identity()?;
         if let Some(website) = self
             .website
             .as_deref()
@@ -186,6 +195,48 @@ impl DesktopConfig {
                     "duplicate managed process ID [{process_id}]"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    pub fn project_identity_configured(&self) -> bool {
+        !self.project_id.trim().is_empty() && !self.project_name.trim().is_empty()
+    }
+
+    fn validate_project_identity(&self) -> Result<(), ConfigError> {
+        let project_id = self.project_id.trim();
+        let project_name = self.project_name.trim();
+        if project_id.is_empty() && project_name.is_empty() {
+            // Existing installations remain readable. Delivery checks require an
+            // explicit identity before a project can be packaged or handed over.
+            return Ok(());
+        }
+        if project_id.is_empty() || project_name.is_empty() {
+            return Err(ConfigError::Validation(
+                "project ID and project name must be configured together".into(),
+            ));
+        }
+        if project_id != self.project_id
+            || project_id.len() > 64
+            || !project_id
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            || !project_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(ConfigError::Validation(
+                "project ID must contain 1 to 64 portable ASCII letters, digits, dots, dashes or underscores, start with a letter or digit, and have no surrounding spaces".into(),
+            ));
+        }
+        if project_name != self.project_name
+            || project_name.chars().count() > 128
+            || project_name.chars().any(char::is_control)
+        {
+            return Err(ConfigError::Validation(
+                "project name must contain 1 to 128 characters without surrounding spaces or control characters".into(),
+            ));
         }
         Ok(())
     }
@@ -647,8 +698,45 @@ mod tests {
 
         assert_eq!(store.migrated_from(), Some(legacy.as_path()));
         assert_eq!(store.snapshot().tenant_id, "hospital-a");
+        assert!(!store.snapshot().project_identity_configured());
         assert_eq!(store.snapshot().extensions["customFlag"], 7);
         assert!(target.is_file());
+    }
+
+    #[test]
+    fn project_identity_is_optional_for_legacy_configs_but_complete_and_portable_when_set() {
+        assert!(DesktopConfig::default().validate().is_ok());
+
+        let valid = DesktopConfig {
+            project_id: "hospital-a-outpatient".into(),
+            project_name: "A 院门诊项目".into(),
+            ..DesktopConfig::default()
+        };
+        assert!(valid.validate().is_ok());
+        assert!(valid.project_identity_configured());
+
+        for invalid in [
+            DesktopConfig {
+                project_id: "hospital-a".into(),
+                ..DesktopConfig::default()
+            },
+            DesktopConfig {
+                project_name: "A 院项目".into(),
+                ..DesktopConfig::default()
+            },
+            DesktopConfig {
+                project_id: "hospital a".into(),
+                project_name: "A 院项目".into(),
+                ..DesktopConfig::default()
+            },
+            DesktopConfig {
+                project_id: "hospital-a".into(),
+                project_name: " A 院项目".into(),
+                ..DesktopConfig::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
     }
 
     #[test]

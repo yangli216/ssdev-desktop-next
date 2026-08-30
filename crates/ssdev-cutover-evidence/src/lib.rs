@@ -824,7 +824,7 @@ impl DeploymentCheckRecord {
             || !report.ready
             || !report.delivery_ready
             || report.failures != 0
-            || report.items.len() != 13
+            || report.items.len() != 14
         {
             return Err(EvidenceError::Invalid(
                 "deployment check record is not a passing Windows deep delivery check".into(),
@@ -853,6 +853,7 @@ impl DeploymentCheckRecord {
         let expected_ids = BTreeSet::from([
             "webview-runtime",
             "business-frontend",
+            "project-identity",
             "project-config",
             "origin-policy",
             "plugin-trust",
@@ -871,6 +872,9 @@ impl DeploymentCheckRecord {
             .map(|item| item.id.as_str())
             .collect::<BTreeSet<_>>();
         if actual_ids != expected_ids
+            || !report.items.iter().any(|item| {
+                item.id == "project-identity" && item.status == DeploymentCheckRecordStatus::Pass
+            })
             || !report.items.iter().any(|item| {
                 item.id == "business-frontend" && item.status == DeploymentCheckRecordStatus::Pass
             })
@@ -1994,6 +1998,7 @@ mod tests {
         let items = [
             "webview-runtime",
             "business-frontend",
+            "project-identity",
             "project-config",
             "origin-policy",
             "plugin-trust",
@@ -2177,6 +2182,18 @@ mod tests {
         assert!(no_business_handshake
             .validate_for_delivery("1.2.3")
             .is_err());
+
+        let mut no_project_identity = record.clone();
+        let identity = no_project_identity
+            .report
+            .items
+            .iter_mut()
+            .find(|item| item.id == "project-identity")
+            .unwrap();
+        identity.status = DeploymentCheckRecordStatus::Warning;
+        no_project_identity.report.passed -= 1;
+        no_project_identity.report.warnings = 1;
+        assert!(no_project_identity.validate_for_delivery("1.2.3").is_err());
 
         let mut wrong_version = record.clone();
         wrong_version.desktop_version = "1.2.4".into();

@@ -151,6 +151,13 @@ button:disabled { cursor: wait !important; opacity: .5; }
 .warning { color: #7c4d2b !important; background: #fff2df !important; }
 .operations form { display: grid; gap: 16px; }
 .operations form > label, .form-columns label, .advanced-settings label { display: grid; gap: 7px; color: #4c5d53; font-size: 12px; font-weight: 700; }
+.project-identity { display: grid; gap: 10px; margin: 0; padding: 16px; border: 1px solid #b8c9bc; border-radius: 10px; background: #f4f8f3; }
+.project-identity legend { padding: 0 6px; color: #365a47; font-size: 12px; font-weight: 750; }
+.project-identity > p { margin: 0; color: #718078; font-size: 11px; line-height: 1.55; }
+.project-identity > div { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.project-identity label { display: grid; gap: 7px; color: #4c5d53; font-size: 12px; font-weight: 700; }
+.project-identity-note { color: #6d755f; font-size: 10px; }
+.project-identity-error { color: #8a3f2c; font-size: 10px; font-weight: 700; }
 .operations input[type="text"], .operations input[type="url"], .operations textarea, .operations select { width: 100%; padding: 11px 13px; border: 1px solid #bfc9c1; border-radius: 9px; outline: none; background: #fff; color: #13231c; }
 .operations textarea { min-height: 84px; resize: vertical; }
 .operations input:focus, .operations textarea:focus, .operations select:focus { border-color: #2f654b; box-shadow: 0 0 0 3px rgba(47,101,75,.12); }
@@ -374,6 +381,7 @@ button:disabled { cursor: wait !important; opacity: .5; }
   .delivery-steps { grid-template-columns: 1fr; }
   .attention-panel, .boundary { grid-template-columns: 1fr; gap: 24px; }
   .form-columns { grid-template-columns: 1fr; }
+  .project-identity > div { grid-template-columns: 1fr; }
   .managed-process-options { grid-template-columns: 1fr; }
   .shortcut-editor-heading { flex-direction: column; }
   .shortcut-row { grid-template-columns: auto minmax(0, 1fr) auto; }

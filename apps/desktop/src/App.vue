@@ -196,6 +196,8 @@ type KeyBindingConfig = {
 }
 
 type DesktopConfig = {
+  projectId: string
+  projectName: string
   website?: string
   environments: EnvironmentConfig[]
   allowSwitch: boolean
@@ -233,12 +235,17 @@ type ConfigImportResult = ConfigSnapshot & BusinessSurfaceCloseResult
 type ConfigChangePreview = {
   configChanged: boolean
   businessSurfaceResetRequired: boolean
+  projectIdentityChanged: boolean
   defaultWebsiteChanged: boolean
   tenantChanged: boolean
   allowSwitchChanged: boolean
   autoCloseChanged: boolean
   autoStartChanged: boolean
   pluginCatalogChanged: boolean
+  currentProjectId: string
+  currentProjectName: string
+  candidateProjectId: string
+  candidateProjectName: string
   candidateDefaultWebsite?: string
   candidateAllowSwitch: boolean
   candidateAutoClose: boolean
@@ -520,6 +527,25 @@ const shortcutConfigError = computed(() => {
   }
   return ''
 })
+const projectIdentityError = computed(() => {
+  const projectId = snapshot.value?.config.projectId.trim() ?? ''
+  const projectName = snapshot.value?.config.projectName.trim() ?? ''
+  if (!projectId && !projectName) return ''
+  if (!projectId || !projectName) return '项目名称和项目标识必须同时填写。'
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(projectId)) {
+    return '项目标识须为 1–64 位字母、数字、点、短横线或下划线，且必须以字母或数字开头。'
+  }
+  if (projectName.length > 128 || /[\u0000-\u001f\u007f]/.test(projectName)) {
+    return '项目名称须为 1–128 个可显示字符。'
+  }
+  return ''
+})
+const activeProjectName = computed(() => (
+  snapshot.value?.config.projectName.trim() || '未命名项目'
+))
+const activeProjectId = computed(() => (
+  snapshot.value?.config.projectId.trim() || '尚未配置项目标识'
+))
 const deploymentReadiness = computed(() => {
   if (controlLoadFailed.value) {
     return {
@@ -1691,8 +1717,8 @@ async function exportDeploymentCheck() {
         <header class="page-hero">
           <div>
             <p class="eyebrow">WORKSPACE OVERVIEW</p>
-            <h1 id="overview-title">本地能力控制台</h1>
-            <p class="lede">集中查看运行状态，并快速进入当前项目或专业配置工作区。</p>
+            <h1 id="overview-title">{{ activeProjectName }}</h1>
+            <p class="lede">项目标识：{{ activeProjectId }}。集中查看运行状态，并快速进入业务系统或专业配置工作区。</p>
           </div>
           <span class="phase">{{ controlLoadFailed ? '初始化失败' : runtimeStatusStale ? '状态不可用' : controlRefreshIncomplete ? '状态待刷新' : mappingWorkspaceUnverified ? '映射待复核' : managedProcessRestartRequired ? '等待重启' : status?.acceptingPluginInvocations ? '服务就绪' : '正在初始化' }}</span>
         </header>
@@ -1708,7 +1734,7 @@ async function exportDeploymentCheck() {
           <section class="launch-panel">
             <div>
               <p class="eyebrow">QUICK START</p>
-              <h2>进入业务系统</h2>
+              <h2>进入 {{ activeProjectName }}</h2>
               <p>{{ snapshot?.config.website || '尚未配置默认业务地址' }}</p>
             </div>
             <button class="primary large" type="button" :disabled="busy || controlLoadFailed || controlRefreshIncomplete || runtimeStatusStale || managedProcessRestartRequired || configDraftDirty || !snapshot?.config.website" @click="openBusiness">启动默认环境</button>
@@ -1771,6 +1797,7 @@ async function exportDeploymentCheck() {
             <div><p class="eyebrow">CONFIG IMPORT PLAN</p><h2>{{ configImportPreview.configChanged ? '核对配置变更' : '配置内容没有变化' }}</h2><p>确认时会重新读取文件并核对当前已保存配置；任一变化都会要求重新预检。</p></div>
             <div class="config-import-actions"><button type="button" :disabled="busy" @click="cancelConfigImport">取消</button><button class="primary" type="button" :disabled="busy || controlStateUnverified" @click="confirmConfigImport">{{ configImportPreview.configChanged ? '确认并应用配置' : '确认无须替换' }}</button></div>
           </header>
+          <div class="config-import-target"><span>目标项目</span><strong>{{ configImportPreview.candidateProjectName || '未命名项目' }} · {{ configImportPreview.candidateProjectId || '未配置标识' }}</strong></div>
           <div class="config-import-target"><span>目标默认入口</span><strong>{{ configImportPreview.candidateDefaultWebsite || '未配置' }}</strong></div>
           <div class="config-import-counts">
             <span><small>业务环境</small><strong>{{ configImportPreview.currentEnvironmentCount }} → {{ configImportPreview.candidateEnvironmentCount }}</strong></span>
@@ -1781,6 +1808,7 @@ async function exportDeploymentCheck() {
             <span><small>启用快捷键</small><strong>{{ configImportPreview.currentEnabledShortcutCount }} → {{ configImportPreview.candidateEnabledShortcutCount }}</strong></span>
           </div>
           <div class="project-change-summary">
+            <span :class="{ changed: configImportPreview.projectIdentityChanged }">项目身份{{ configImportPreview.projectIdentityChanged ? '变更' : '不变' }}</span>
             <span :class="{ changed: configImportPreview.defaultWebsiteChanged }">默认入口{{ configImportPreview.defaultWebsiteChanged ? '变更' : '不变' }}</span>
             <span :class="{ changed: configImportPreview.tenantChanged }">租户{{ configImportPreview.tenantChanged ? '变更' : '不变' }}</span>
             <span :class="{ changed: configImportPreview.allowSwitchChanged }">环境切换：{{ configImportPreview.candidateAllowSwitch ? '启用' : '关闭' }}</span>
@@ -1799,6 +1827,7 @@ async function exportDeploymentCheck() {
             <div class="bundle-summary"><span><strong>{{ projectBundlePreview.businessOrigins }}</strong>业务来源</span><span><strong>{{ projectBundlePreview.signedPlugins }}</strong>签名插件</span><span><strong>{{ projectBundlePreview.localMappings }}</strong>本地映射</span><span><strong>{{ projectBundlePreview.serviceCount }}</strong>原生服务</span><span><strong>{{ projectBundlePreview.preflightedHosts }}</strong>宿主预检</span></div>
             <div class="project-change-summary"><span :class="{ changed: projectBundlePreview.configPreview.configChanged }">配置{{ projectBundlePreview.configPreview.configChanged ? '更新' : '不变' }}</span><span>新增 {{ projectBundlePreview.installCount }}</span><span>升级 {{ projectBundlePreview.upgradeCount }}</span><span>修复/替换 {{ projectBundlePreview.replaceCount }}</span><span>保留本机 {{ projectBundlePreview.retainedCount }}</span><span class="changed">业务页面：切换后关闭</span></div>
             <h3>目标项目配置</h3>
+            <div class="config-import-target"><span>目标项目</span><strong>{{ projectBundlePreview.configPreview.candidateProjectName }} · {{ projectBundlePreview.configPreview.candidateProjectId }}</strong></div>
             <div class="config-import-target"><span>默认业务入口</span><strong>{{ projectBundlePreview.configPreview.candidateDefaultWebsite || '未配置' }}</strong></div>
             <div class="config-import-counts">
               <span><small>业务环境</small><strong>{{ projectBundlePreview.configPreview.currentEnvironmentCount }} → {{ projectBundlePreview.configPreview.candidateEnvironmentCount }}</strong></span>
@@ -1809,6 +1838,7 @@ async function exportDeploymentCheck() {
               <span><small>启用快捷键</small><strong>{{ projectBundlePreview.configPreview.currentEnabledShortcutCount }} → {{ projectBundlePreview.configPreview.candidateEnabledShortcutCount }}</strong></span>
             </div>
             <div class="project-change-summary">
+              <span :class="{ changed: projectBundlePreview.configPreview.projectIdentityChanged }">项目身份{{ projectBundlePreview.configPreview.projectIdentityChanged ? '变更' : '不变' }}</span>
               <span :class="{ changed: projectBundlePreview.configPreview.defaultWebsiteChanged }">默认入口{{ projectBundlePreview.configPreview.defaultWebsiteChanged ? '变更' : '不变' }}</span>
               <span :class="{ changed: projectBundlePreview.configPreview.tenantChanged }">租户{{ projectBundlePreview.configPreview.tenantChanged ? '变更' : '不变' }}</span>
               <span :class="{ changed: projectBundlePreview.configPreview.allowSwitchChanged }">环境切换：{{ projectBundlePreview.configPreview.candidateAllowSwitch ? '启用' : '关闭' }}</span>
@@ -1842,6 +1872,16 @@ async function exportDeploymentCheck() {
             <p v-if="snapshot?.migrationWarnings.length" class="migration warning">有 {{ snapshot.migrationWarnings.length }} 项旧配置未能自动读取，请查看运行日志并人工核对。</p>
           </div>
           <form v-if="snapshot" :inert="busy || controlStateUnverified || Boolean(configImportPreview)" @submit.prevent="saveConfig">
+            <fieldset class="project-identity">
+              <legend>项目身份</legend>
+              <p>用于在首页、导入预览和签名项目包中确认当前交付对象；不会作为业务登录凭据。</p>
+              <div>
+                <label><span>项目名称</span><input v-model.trim="snapshot.config.projectName" type="text" maxlength="128" placeholder="例如：A 院门诊项目" /></label>
+                <label><span>项目标识</span><input v-model.trim="snapshot.config.projectId" type="text" maxlength="64" placeholder="例如：hospital-a-outpatient" /></label>
+              </div>
+              <small v-if="projectIdentityError" class="project-identity-error" role="alert">{{ projectIdentityError }}</small>
+              <small v-else-if="!snapshot.config.projectId" class="project-identity-note">旧配置可以继续运行，但项目交付和深度自检前必须补充名称与标识。</small>
+            </fieldset>
             <label><span>业务系统地址</span><input v-model.trim="snapshot.config.website" type="url" maxlength="4096" placeholder="http://project.internal" /></label>
             <label><span>默认租户</span><input v-model.trim="snapshot.config.tenantId" type="text" placeholder="可选" /></label>
             <fieldset class="environments">
@@ -1897,7 +1937,7 @@ async function exportDeploymentCheck() {
               <label><span>仓库索引签名</span><input v-model.trim="snapshot.config.pluginCatalogSignatureUrl" type="url" placeholder="https://plugins.example/catalog.sig.json" /></label>
             </details>
             <div class="toggles"><label><input v-model="snapshot.config.allowSwitch" type="checkbox" />允许环境切换</label><label><input v-model="snapshot.config.autoClose" type="checkbox" />关闭前确认</label><label><input v-model="snapshot.config.autoStart" type="checkbox" />开机自动启动</label></div>
-            <div class="actions"><button class="primary" type="submit" :disabled="busy || controlStateUnverified || Boolean(shortcutConfigError) || !configDraftDirty">保存配置</button><button v-if="configDraftDirty" type="button" :disabled="busy || controlStateUnverified" @click="discardConfigChanges">放弃更改</button><button type="button" :disabled="busy || controlStateUnverified || managedProcessRestartRequired || configDraftDirty" @click="openBusiness">进入业务系统</button></div>
+            <div class="actions"><button class="primary" type="submit" :disabled="busy || controlStateUnverified || Boolean(projectIdentityError) || Boolean(shortcutConfigError) || !configDraftDirty">保存配置</button><button v-if="configDraftDirty" type="button" :disabled="busy || controlStateUnverified" @click="discardConfigChanges">放弃更改</button><button type="button" :disabled="busy || controlStateUnverified || managedProcessRestartRequired || configDraftDirty" @click="openBusiness">进入业务系统</button></div>
             <small class="config-path">配置位置：{{ snapshot.path }}</small>
           </form>
         </section>
