@@ -30,7 +30,7 @@ schema 2 manifest 还必须填写 `migrationAuditBindings`，明确正式迁移�
 - `signed-origin-policy`：候选来源策略、旁签封套和发布信任库；
 - `plugin-release-set`：批准发布集合规范及其确定性插件包目录；
 - `organization-public-trust`：插件、策略、项目、应用更新、Authenticode 和三类 QA 证据所需的公钥、证书及流程说明，其中必须包含供 `prepare-policy` 精确选择的 evidence trust store。私钥、令牌和口令不得进入材料目录；工具会阻断常见私钥容器扩展名和 PEM 私钥标记，但这不是秘密扫描器，材料提供方仍需承担脱敏责任；
-- `previous-windows-release`：上一正式版本的完整已验签 bundle 根目录，至少保留 `metadata/release.json`、`metadata/artifacts.json` 及其签名、NSIS 安装器和 updater 产物；不能只交一个安装器或从其他低版本临时补齐；
+- `previous-windows-release`：上一正式版本的完整已验签 bundle 根目录，至少保留 `metadata/release.json`、`metadata/artifacts.json` 及其签名、NSIS 安装器和 updater 产物；预检会按 `artifacts.json` 复算完整文件集合、大小和 SHA-256，并要求恰好一个顶层 NSIS，缺失、额外或被替换的文件都会阻断，不能只交一个安装器或从其他低版本临时补齐；
 - `windows-hardware-plan`：x86/x64、COM/OCX、硬件/驱动、院内网络/证书、升级、回退和卸载的责任人及执行环境计划。
 
 `legacy-keymap`、`legacy-processes` 和 `external-local-http-callers` 是条件类别。存在时提供输入；确认不存在时使用 `notApplicable`，同时填写只允许字母、数字、点、横线和下划线的审批引用。工具只在报告中保存该引用的 SHA-256，防止“不记得有没有”被当成零资产。
@@ -60,7 +60,7 @@ cargo run --locked -p ssdev-pilot-readiness -- `
 
 退出码 `0` 表示材料清单完整；`3` 表示报告已写出但仍有稳定阻断码；`1` 表示 manifest、路径或 I/O 本身无效。schema 2 报告会同时记录 `migrationAuditBindingsSha256`；材料内容、类别身份或审计角色变化都会改变总 `materialSetSha256`，后续移交应记录这个总摘要。
 
-`check`、`create` 与 JSON 报告使用同一组已经排序的稳定阻断码。材料不齐时会为每项连续输出 `blocker: <code>` 和 `action: <稳定处理动作>`；`check` 要求修正后重复草稿检查，`create` 则要求使用新的报告路径再次执行，因为原报告不会覆盖。处理动作覆盖固定类别缺失/重复、审计角色不一致、路径、符号链接、材料变化、私钥误入、上一 Windows bundle 布局等所有合法阻断码；每项有长度上限且不包含目录、文件名、项目标签或审批引用。报告加载还要求每个合法阻断码存在对应处理动作，未来新增码不能静默退化为只有内部名称。`create` 材料齐全时才输出 `material set sha256`，并明确下一步是把同一材料根、manifest 和报告交给接收方独立执行 `verify`。这些摘要便于现场处理，但草稿检查不能替代报告，正式摘要也不能替代 JSON 报告的归档和复验。
+`check`、`create` 与 JSON 报告使用同一组已经排序的稳定阻断码。材料不齐时会为每项连续输出 `blocker: <code>` 和 `action: <稳定处理动作>`；`check` 要求修正后重复草稿检查，`create` 则要求使用新的报告路径再次执行，因为原报告不会覆盖。处理动作覆盖固定类别缺失/重复、审计角色不一致、路径、符号链接、材料变化、私钥误入、上一 Windows bundle 清单或布局异常等所有合法阻断码；每项有长度上限且不包含目录、文件名、项目标签或审批引用。报告加载还要求每个合法阻断码存在对应处理动作，未来新增码不能静默退化为只有内部名称。`create` 材料齐全时才输出 `material set sha256`，并明确下一步是把同一材料根、manifest 和报告交给接收方独立执行 `verify`。这些摘要便于现场处理，但草稿检查不能替代报告，正式摘要也不能替代 JSON 报告的归档和复验。
 
 接收方不能只查看对方提供的摘要，应对收到的同一 manifest 和材料目录独立复验：
 

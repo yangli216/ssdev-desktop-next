@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use ssdev_release_manifest::verify_manifest;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
@@ -1019,7 +1020,7 @@ fn previous_windows_bundle_layout_is_valid(
                     .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_file())
         })
         .count();
-    installers == 1
+    installers == 1 && verify_manifest(&bundle, "metadata/artifacts.json").is_ok()
 }
 
 fn normalize_relative_path(raw: &str) -> Result<String, ScanFailure> {
@@ -1411,6 +1412,7 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ssdev_release_manifest::create_manifest;
     use std::fs;
     use tempfile::tempdir;
 
@@ -1420,13 +1422,13 @@ mod tests {
         fs::create_dir_all(bundle.join("nsis")).unwrap();
         for file in [
             "metadata/release.json",
-            "metadata/artifacts.json",
             "metadata/artifacts.json.sig",
             "metadata/app-update.json",
             "nsis/ssdev-setup.exe",
         ] {
             fs::write(bundle.join(file), file).unwrap();
         }
+        create_manifest(&bundle, "metadata/artifacts.json").unwrap();
     }
 
     #[test]
@@ -1636,18 +1638,44 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert!(resolved[0].is_dir());
         assert!(resolve_material_category_inputs(temp.path(), &manifest, "unknown").is_err());
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        assert!(
+            inspect_materials(temp.path(), &manifest, &bytes)
+                .unwrap()
+                .intake_complete
+        );
         let previous = manifest
             .categories
             .iter()
             .find(|category| category.id == "previous-windows-release")
             .unwrap();
+        let installer = temp
+            .path()
+            .join(&previous.inputs[0])
+            .join("nsis/ssdev-setup.exe");
+        fs::write(&installer, b"tampered installer").unwrap();
+        let report = inspect_materials(temp.path(), &manifest, &bytes).unwrap();
+        assert!(!report.intake_complete);
+        assert!(report
+            .blocker_codes
+            .contains(&"previous-windows-release-layout-invalid".into()));
+
+        fs::write(&installer, "nsis/ssdev-setup.exe").unwrap();
+        let unexpected = temp.path().join(&previous.inputs[0]).join("unexpected.bin");
+        fs::write(&unexpected, b"unlisted bundle content").unwrap();
+        let report = inspect_materials(temp.path(), &manifest, &bytes).unwrap();
+        assert!(!report.intake_complete);
+        assert!(report
+            .blocker_codes
+            .contains(&"previous-windows-release-layout-invalid".into()));
+
+        fs::remove_file(unexpected).unwrap();
         fs::remove_file(
             temp.path()
                 .join(&previous.inputs[0])
                 .join("metadata/artifacts.json.sig"),
         )
         .unwrap();
-        let bytes = serde_json::to_vec(&manifest).unwrap();
         let report = inspect_materials(temp.path(), &manifest, &bytes).unwrap();
         assert!(!report.intake_complete);
         assert!(report

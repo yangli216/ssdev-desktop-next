@@ -4531,6 +4531,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "ssdev-release-manifest",
  "tempfile",
  "thiserror 2.0.20",
 ]

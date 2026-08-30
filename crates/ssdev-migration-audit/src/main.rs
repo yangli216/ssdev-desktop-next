@@ -963,13 +963,13 @@ mod tests {
                 fs::create_dir_all(path.join("nsis")).unwrap();
                 for file in [
                     "metadata/release.json",
-                    "metadata/artifacts.json",
                     "metadata/artifacts.json.sig",
                     "metadata/app-update.json",
                     "nsis/ssdev-setup.exe",
                 ] {
                     fs::write(path.join(file), file).unwrap();
                 }
+                ssdev_release_manifest::create_manifest(&path, "metadata/artifacts.json").unwrap();
             } else {
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(path, b"{}\n").unwrap();
