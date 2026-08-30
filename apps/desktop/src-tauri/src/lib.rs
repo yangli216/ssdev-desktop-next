@@ -6287,11 +6287,11 @@ fn inspect_all_plugins(
     let mut signed = inspect_plugins(plugin_root, trust_store, desktop_version)?;
     let local = inspect_plugins(local_mapping_root, None, desktop_version)?;
     signed.local_mapping_ids = local.discovered_plugin_ids.clone();
-    let mut plugin_ids = signed
-        .manifests
-        .iter()
-        .map(|manifest| normalized_plugin_id(&manifest.plugin_id))
-        .collect::<std::collections::HashSet<_>>();
+    // A quarantined signed directory must retain its identity reservation.
+    // Otherwise a same-ID development mapping could silently take over the
+    // public routes precisely when signature, compatibility, or manifest
+    // validation removes the signed plugin from the active set.
+    let mut plugin_ids = signed.discovered_plugin_ids.clone();
     for manifest in local.manifests {
         if let Err(error) = local_mappings::validate_installed_manifest(&manifest) {
             signed.failures.push(format!(
@@ -8070,6 +8070,72 @@ mod tests {
         );
         assert!(!updates[0].update_available);
         assert!(updates[0].install_plan_id.is_none());
+    }
+
+    #[test]
+    fn quarantined_signed_identity_blocks_local_mapping_takeover() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_root = root.path().join("plugins");
+        let local_root = root.path().join("local-mappings");
+        let invalid_signed = plugin_root.join("reader");
+        fs::create_dir_all(&invalid_signed).unwrap();
+        fs::write(invalid_signed.join(API_FILENAME), b"not-json").unwrap();
+
+        let definition: local_mappings::LocalMappingDefinition =
+            serde_json::from_value(serde_json::json!({
+                "schemaVersion": 1,
+                "pluginId": "Reader",
+                "displayName": "Reader development mapping",
+                "services": [{
+                    "serviceId": "reader.local",
+                    "mainClass": "Example.ReaderAutomation",
+                    "mainType": "com",
+                    "architecture": "x86",
+                    "methods": []
+                }],
+                "debugCases": []
+            }))
+            .unwrap();
+        local_mappings::prepare(&local_root, definition)
+            .unwrap()
+            .activate(&local_root)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let unrelated: local_mappings::LocalMappingDefinition =
+            serde_json::from_value(serde_json::json!({
+                "schemaVersion": 1,
+                "pluginId": "scanner",
+                "displayName": "Scanner development mapping",
+                "services": [{
+                    "serviceId": "scanner.local",
+                    "mainClass": "Example.ScannerAutomation",
+                    "mainType": "com",
+                    "architecture": "x86",
+                    "methods": []
+                }],
+                "debugCases": []
+            }))
+            .unwrap();
+        local_mappings::prepare(&local_root, unrelated)
+            .unwrap()
+            .activate(&local_root)
+            .unwrap()
+            .commit()
+            .unwrap();
+
+        let inspected =
+            inspect_all_plugins(&plugin_root, &local_root, None, &Version::new(0, 1, 5)).unwrap();
+
+        assert_eq!(inspected.manifests.len(), 1);
+        assert_eq!(inspected.manifests[0].plugin_id, "scanner");
+        assert!(inspected.discovered_plugin_ids.contains("reader"));
+        assert!(inspected.local_mapping_ids.contains("reader"));
+        assert_eq!(inspected.failures.len(), 2);
+        assert!(inspected
+            .failures
+            .iter()
+            .any(|failure| failure.contains("与签名插件 ID 冲突")));
     }
 
     #[test]
