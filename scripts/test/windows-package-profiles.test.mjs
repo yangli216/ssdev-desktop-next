@@ -8,6 +8,10 @@ const pluginMatrixTestUrl = new URL(
   "../test-plugin-matrix.ps1",
   import.meta.url,
 );
+const pluginMatrixRunnerUrl = new URL(
+  "../../crates/webplus-controller/examples/plugin_matrix.rs",
+  import.meta.url,
+);
 const workflowUrl = new URL("../../.github/workflows/ci.yml", import.meta.url);
 const tauriConfigUrl = new URL(
   "../../apps/desktop/src-tauri/tauri.conf.json",
@@ -256,4 +260,32 @@ test("production evidence binds delivery hosts, trust store, and origin policy",
   assert.match(packageTest, /DeploymentCheckRecord.*deep deployment-check JSON file/);
   assert.match(packageTest, /else \{ "none" \}/);
   assert.match(cutoverEvidenceMain, /application_state_preservation_verified/);
+});
+
+test("formal plugin matrix fails closed without logging case data or input paths", async () => {
+  const [matrixTest, matrixRunner] = await Promise.all([
+    readFile(pluginMatrixTestUrl, "utf8"),
+    readFile(pluginMatrixRunnerUrl, "utf8"),
+  ]);
+
+  assert.match(matrixTest, /cargo build --locked --release/);
+  assert.match(matrixTest, /& \$matrixRunner/);
+  assert.doesNotMatch(matrixTest, /cargo run/);
+  assert.match(matrixTest, /plugin matrix: BLOCKED/);
+  assert.match(matrixTest, /blocker: \$Code/);
+  assert.match(matrixTest, /evidence: not produced/);
+  assert.match(matrixRunner, /async fn main\(\) -> ExitCode/);
+  assert.match(matrixRunner, /matrix-golden-case-failed/);
+  assert.match(matrixRunner, /matrix-runner-failed/);
+  assert.match(matrixRunner, /install_redacted_panic_hook/);
+  assert.match(matrixRunner, /affected-count:/);
+  assert.match(matrixRunner, /plugin matrix: CLEAR/);
+  assert.doesNotMatch(matrixRunner, /failure\.plugin_id/);
+  assert.doesNotMatch(matrixRunner, /failure\.path/);
+  assert.doesNotMatch(matrixRunner, /failure\.error/);
+  assert.doesNotMatch(matrixRunner, /case\.name/);
+  assert.doesNotMatch(matrixRunner, /expected \{:\?\}/);
+  assert.doesNotMatch(matrixRunner, /received \{:\?\}/);
+  assert.doesNotMatch(matrixRunner, /println!\("PASS/);
+  assert.doesNotMatch(matrixRunner, /println!\("SKIP/);
 });

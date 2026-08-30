@@ -1,5 +1,7 @@
 use std::error::Error;
+use std::io::Write;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -35,50 +37,232 @@ struct EvidenceFiles<'a> {
     matrix: &'a std::path::Path,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatrixBlocker {
+    ArgumentsInvalid,
+    RunnerUnsupported,
+    RunnerFailed,
+    EvidenceOutputInvalid,
+    TrustStoreInvalid,
+    PluginDiscoveryFailed,
+    PluginVerificationFailed,
+    MatrixDefinitionInvalid,
+    ReleaseInputsInvalid,
+    HostPreflightFailed,
+    GoldenCaseFailed,
+    InputsChanged,
+    RunnerClockInvalid,
+    EvidenceWriteFailed,
+}
+
+impl MatrixBlocker {
+    #[cfg(test)]
+    const ALL: [Self; 14] = [
+        Self::ArgumentsInvalid,
+        Self::RunnerUnsupported,
+        Self::RunnerFailed,
+        Self::EvidenceOutputInvalid,
+        Self::TrustStoreInvalid,
+        Self::PluginDiscoveryFailed,
+        Self::PluginVerificationFailed,
+        Self::MatrixDefinitionInvalid,
+        Self::ReleaseInputsInvalid,
+        Self::HostPreflightFailed,
+        Self::GoldenCaseFailed,
+        Self::InputsChanged,
+        Self::RunnerClockInvalid,
+        Self::EvidenceWriteFailed,
+    ];
+
+    const fn code(self) -> &'static str {
+        match self {
+            Self::ArgumentsInvalid => "matrix-arguments-invalid",
+            Self::RunnerUnsupported => "matrix-runner-unsupported",
+            Self::RunnerFailed => "matrix-runner-failed",
+            Self::EvidenceOutputInvalid => "matrix-evidence-output-invalid",
+            Self::TrustStoreInvalid => "matrix-trust-store-invalid",
+            Self::PluginDiscoveryFailed => "matrix-plugin-discovery-failed",
+            Self::PluginVerificationFailed => "matrix-plugin-verification-failed",
+            Self::MatrixDefinitionInvalid => "matrix-definition-invalid",
+            Self::ReleaseInputsInvalid => "matrix-release-inputs-invalid",
+            Self::HostPreflightFailed => "matrix-host-preflight-failed",
+            Self::GoldenCaseFailed => "matrix-golden-case-failed",
+            Self::InputsChanged => "matrix-inputs-changed",
+            Self::RunnerClockInvalid => "matrix-runner-clock-invalid",
+            Self::EvidenceWriteFailed => "matrix-evidence-write-failed",
+        }
+    }
+
+    const fn action(self) -> &'static str {
+        match self {
+            Self::ArgumentsInvalid => {
+                "Use the documented wrapper with every required argument; do not invoke the example directly."
+            }
+            Self::RunnerUnsupported => {
+                "Run the formal matrix on an approved Windows x64 validation machine."
+            }
+            Self::RunnerFailed => {
+                "Discard this run, preserve the controlled inputs, and inspect the validation machine before retrying."
+            }
+            Self::EvidenceOutputInvalid => {
+                "Choose a new evidence file outside the source workspace and verified plugin root."
+            }
+            Self::TrustStoreInvalid => {
+                "Restore the approved active plugin trust store, then repeat the release-set check."
+            }
+            Self::PluginDiscoveryFailed => {
+                "Re-materialize the approved release set into a new plugin root; do not repair it in place."
+            }
+            Self::PluginVerificationFailed => {
+                "Re-materialize plugins from the approved signed packages and trust store."
+            }
+            Self::MatrixDefinitionInvalid => {
+                "Run matrix-check, complete every required review, and approve a fully covered non-draft matrix."
+            }
+            Self::ReleaseInputsInvalid => {
+                "Repeat release-set-check and materialization with the approved packages, trust store, and matrix."
+            }
+            Self::HostPreflightFailed => {
+                "Verify both signed delivery hosts and native dependencies on the validation machine before retrying."
+            }
+            Self::GoldenCaseFailed => {
+                "Stop release approval, reconcile device results in the controlled matrix workspace, then run a new matrix."
+            }
+            Self::InputsChanged => {
+                "Discard this run, restore immutable approved inputs, and execute the complete matrix again."
+            }
+            Self::RunnerClockInvalid => {
+                "Correct and synchronize the validation machine clock before running the matrix again."
+            }
+            Self::EvidenceWriteFailed => {
+                "Use a new writable evidence destination and rerun the complete matrix; do not reconstruct evidence manually."
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MatrixRunFailure {
+    blocker: MatrixBlocker,
+    affected_count: Option<usize>,
+}
+
+impl MatrixRunFailure {
+    const fn new(blocker: MatrixBlocker) -> Self {
+        Self {
+            blocker,
+            affected_count: None,
+        }
+    }
+
+    const fn with_count(blocker: MatrixBlocker, affected_count: usize) -> Self {
+        Self {
+            blocker,
+            affected_count: Some(affected_count),
+        }
+    }
+
+    fn emit(&self) {
+        let stderr = std::io::stderr();
+        let mut output = stderr.lock();
+        let _ = writeln!(output, "plugin matrix: BLOCKED");
+        let _ = writeln!(output, "blocker: {}", self.blocker.code());
+        if let Some(affected_count) = self.affected_count {
+            let _ = writeln!(output, "affected-count: {affected_count}");
+        }
+        let _ = writeln!(output, "action: {}", self.blocker.action());
+        let _ = writeln!(output, "evidence: not produced");
+    }
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct MatrixTally {
+    executed: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+impl MatrixTally {
+    fn record_skipped(&mut self) {
+        self.skipped += 1;
+    }
+
+    fn record_executed(&mut self, passed: bool) {
+        self.executed += 1;
+        if !passed {
+            self.failed += 1;
+        }
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> ExitCode {
+    install_redacted_panic_hook();
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(failure) => {
+            failure.emit();
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn run() -> Result<(), MatrixRunFailure> {
     let mut arguments = std::env::args_os().skip(1);
-    let x86_host = required(&mut arguments, "x86 plugin host")?;
-    let x64_host = required(&mut arguments, "x64 plugin host")?;
-    let plugin_root = required(&mut arguments, "plugin root")?;
-    let release_set_spec = required(&mut arguments, "release set spec")?;
-    let trust_store_path = required(&mut arguments, "trust store")?;
-    let matrix_path = required(&mut arguments, "matrix JSON")?;
-    let workspace = required(&mut arguments, "source workspace")?;
-    let evidence_output = required(&mut arguments, "evidence output")?;
-    let environment = required_string(&mut arguments, "evidence environment")?;
+    let arguments_invalid = || MatrixRunFailure::new(MatrixBlocker::ArgumentsInvalid);
+    let x86_host = required(&mut arguments, "x86 plugin host").map_err(|_| arguments_invalid())?;
+    let x64_host = required(&mut arguments, "x64 plugin host").map_err(|_| arguments_invalid())?;
+    let plugin_root = required(&mut arguments, "plugin root").map_err(|_| arguments_invalid())?;
+    let release_set_spec =
+        required(&mut arguments, "release set spec").map_err(|_| arguments_invalid())?;
+    let trust_store_path =
+        required(&mut arguments, "trust store").map_err(|_| arguments_invalid())?;
+    let matrix_path = required(&mut arguments, "matrix JSON").map_err(|_| arguments_invalid())?;
+    let workspace =
+        required(&mut arguments, "source workspace").map_err(|_| arguments_invalid())?;
+    let evidence_output =
+        required(&mut arguments, "evidence output").map_err(|_| arguments_invalid())?;
+    let environment =
+        required_string(&mut arguments, "evidence environment").map_err(|_| arguments_invalid())?;
     if arguments.next().is_some() {
-        return Err("too many arguments".into());
+        return Err(arguments_invalid());
     }
     if std::env::consts::OS != "windows" || std::env::consts::ARCH != "x86_64" {
-        return Err("real plugin evidence requires a Windows x86_64 runner".into());
+        return Err(MatrixRunFailure::new(MatrixBlocker::RunnerUnsupported));
     }
-    let evidence_output = prepare_new_output(&evidence_output)?;
-    let plugin_root_canonical = plugin_root.canonicalize()?;
-    let workspace_canonical = workspace.canonicalize()?;
+    let evidence_output = prepare_new_output(&evidence_output)
+        .map_err(|_| MatrixRunFailure::new(MatrixBlocker::EvidenceOutputInvalid))?;
+    let plugin_root_canonical = plugin_root
+        .canonicalize()
+        .map_err(|_| MatrixRunFailure::new(MatrixBlocker::EvidenceOutputInvalid))?;
+    let workspace_canonical = workspace
+        .canonicalize()
+        .map_err(|_| MatrixRunFailure::new(MatrixBlocker::EvidenceOutputInvalid))?;
     if evidence_output.starts_with(&plugin_root_canonical) {
-        return Err("evidence output must stay outside the verified plugin root".into());
+        return Err(MatrixRunFailure::new(MatrixBlocker::EvidenceOutputInvalid));
     }
     if evidence_output.starts_with(&workspace_canonical) {
-        return Err("evidence output must stay outside the source workspace".into());
+        return Err(MatrixRunFailure::new(MatrixBlocker::EvidenceOutputInvalid));
     }
 
-    let trust_store = TrustStore::load(&trust_store_path)?;
-    let discovery = discover_plugins(&plugin_root)?;
+    let trust_store = TrustStore::load(&trust_store_path)
+        .map_err(|_| MatrixRunFailure::new(MatrixBlocker::TrustStoreInvalid))?;
+    let discovery = discover_plugins(&plugin_root)
+        .map_err(|_| MatrixRunFailure::new(MatrixBlocker::PluginDiscoveryFailed))?;
     if !discovery.failures.is_empty() {
-        for failure in discovery.failures {
-            eprintln!(
-                "plugin discovery failed for [{}] at {:?}: {}",
-                failure.plugin_id, failure.path, failure.error
-            );
-        }
-        return Err("plugin discovery did not produce a clean matrix".into());
+        return Err(MatrixRunFailure::with_count(
+            MatrixBlocker::PluginDiscoveryFailed,
+            discovery.failures.len(),
+        ));
     }
     for manifest in &discovery.manifests {
-        trust_store.verify(manifest)?;
+        trust_store
+            .verify(manifest)
+            .map_err(|_| MatrixRunFailure::new(MatrixBlocker::PluginVerificationFailed))?;
     }
 
-    let (matrix, coverage) = validate_executable_matrix(&matrix_path, &discovery.manifests)?;
+    let (matrix, coverage) = validate_executable_matrix(&matrix_path, &discovery.manifests)
+        .map_err(|_| MatrixRunFailure::new(MatrixBlocker::MatrixDefinitionInvalid))?;
     let evidence_files = EvidenceFiles {
         workspace: &workspace,
         x86_host: &x86_host,
@@ -88,87 +272,113 @@ async fn main() -> Result<(), Box<dyn Error>> {
         trust_store: &trust_store_path,
         matrix: &matrix_path,
     };
-    let evidence_before = capture_evidence_inputs(&evidence_files, &discovery.manifests)?;
+    let evidence_before = capture_evidence_inputs(&evidence_files, &discovery.manifests)
+        .map_err(|_| MatrixRunFailure::new(MatrixBlocker::ReleaseInputsInvalid))?;
 
-    let controller = Arc::new(PluginController::new(SupervisorConfig {
-        x86_host: x86_host.clone(),
-        x64_host: x64_host.clone(),
-        request_timeout: Duration::from_secs(30),
-        max_in_flight_invocations: webplus_controller::DEFAULT_MAX_IN_FLIGHT_INVOCATIONS,
-        plugin_trust: PluginTrust::Strict {
-            trust_store: trust_store_path.clone(),
-        },
-    })?);
-    controller.replace_manifests(&discovery.manifests).await?;
+    let controller = Arc::new(
+        PluginController::new(SupervisorConfig {
+            x86_host: x86_host.clone(),
+            x64_host: x64_host.clone(),
+            request_timeout: Duration::from_secs(30),
+            max_in_flight_invocations: webplus_controller::DEFAULT_MAX_IN_FLIGHT_INVOCATIONS,
+            plugin_trust: PluginTrust::Strict {
+                trust_store: trust_store_path.clone(),
+            },
+        })
+        .map_err(|_| MatrixRunFailure::new(MatrixBlocker::HostPreflightFailed))?,
+    );
+    if controller
+        .replace_manifests(&discovery.manifests)
+        .await
+        .is_err()
+    {
+        controller.shutdown().await;
+        return Err(MatrixRunFailure::new(MatrixBlocker::HostPreflightFailed));
+    }
 
-    let mut failures = Vec::new();
+    let mut tally = MatrixTally::default();
     for case in matrix.cases {
         if !case.enabled {
-            println!("SKIP {}", case.name);
+            tally.record_skipped();
             continue;
         }
         let actual = controller.invoke(case.request).await;
-        if actual == case.expected {
-            println!("PASS {}", case.name);
-        } else {
-            failures.push(format!(
-                "{}: expected {:?}, received {:?}",
-                case.name, case.expected, actual
-            ));
-        }
+        tally.record_executed(actual == case.expected);
     }
     controller.shutdown().await;
-    if failures.is_empty() {
-        let evidence_after = capture_evidence_inputs(&evidence_files, &discovery.manifests)?;
-        if evidence_before != evidence_after {
-            return Err(
-                "source, release set, plugins, trust, matrix, or hosts changed during execution"
-                    .into(),
-            );
-        }
-        let executed_at_unix_seconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "system clock is before the Unix epoch")?
-            .as_secs();
-        write_plugin_matrix_evidence(
-            &evidence_output,
-            &PluginMatrixEvidence {
-                schema_version: PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION,
-                evidence_type: EvidenceType::PluginMatrix,
-                source_revision: evidence_after.source.revision,
-                source_dirty: evidence_after.source.dirty,
-                executed_at_unix_seconds,
-                environment,
-                runner_os: std::env::consts::OS.into(),
-                runner_architecture: std::env::consts::ARCH.into(),
-                release_set_spec_sha256: evidence_after.release_set_spec_sha256,
-                package_set_sha256: evidence_after.package_set_sha256,
-                plugin_set_sha256: evidence_after.plugin_set_sha256,
-                trust_store_sha256: evidence_after.trust_store_sha256,
-                matrix_sha256: evidence_after.matrix_sha256,
-                x86_host_sha256: evidence_after.x86_host_sha256,
-                x64_host_sha256: evidence_after.x64_host_sha256,
-                plugin_count: u32::try_from(coverage.plugin_count)?,
-                service_count: u32::try_from(coverage.service_count)?,
-                method_count: u32::try_from(coverage.method_count)?,
-                enabled_case_count: u32::try_from(coverage.enabled_case_count)?,
-                passed: true,
-            },
-        )?;
-        println!(
-            "all {} enabled golden cases passed and covered {} methods across {} services in {} plugins",
-            coverage.enabled_case_count,
-            coverage.method_count,
-            coverage.service_count,
-            coverage.plugin_count
-        );
-        Ok(())
-    } else {
-        for failure in &failures {
-            eprintln!("FAIL {failure}");
-        }
-        Err(format!("{} golden case(s) failed", failures.len()).into())
+    if tally.executed != coverage.enabled_case_count {
+        return Err(MatrixRunFailure::new(
+            MatrixBlocker::MatrixDefinitionInvalid,
+        ));
     }
+    if tally.failed > 0 {
+        return Err(MatrixRunFailure::with_count(
+            MatrixBlocker::GoldenCaseFailed,
+            tally.failed,
+        ));
+    }
+
+    let evidence_after = capture_evidence_inputs(&evidence_files, &discovery.manifests)
+        .map_err(|_| MatrixRunFailure::new(MatrixBlocker::InputsChanged))?;
+    if evidence_before != evidence_after {
+        return Err(MatrixRunFailure::new(MatrixBlocker::InputsChanged));
+    }
+    let executed_at_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| MatrixRunFailure::new(MatrixBlocker::RunnerClockInvalid))?
+        .as_secs();
+    let evidence_count = |value| {
+        u32::try_from(value).map_err(|_| MatrixRunFailure::new(MatrixBlocker::EvidenceWriteFailed))
+    };
+    write_plugin_matrix_evidence(
+        &evidence_output,
+        &PluginMatrixEvidence {
+            schema_version: PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION,
+            evidence_type: EvidenceType::PluginMatrix,
+            source_revision: evidence_after.source.revision,
+            source_dirty: evidence_after.source.dirty,
+            executed_at_unix_seconds,
+            environment,
+            runner_os: std::env::consts::OS.into(),
+            runner_architecture: std::env::consts::ARCH.into(),
+            release_set_spec_sha256: evidence_after.release_set_spec_sha256,
+            package_set_sha256: evidence_after.package_set_sha256,
+            plugin_set_sha256: evidence_after.plugin_set_sha256,
+            trust_store_sha256: evidence_after.trust_store_sha256,
+            matrix_sha256: evidence_after.matrix_sha256,
+            x86_host_sha256: evidence_after.x86_host_sha256,
+            x64_host_sha256: evidence_after.x64_host_sha256,
+            plugin_count: evidence_count(coverage.plugin_count)?,
+            service_count: evidence_count(coverage.service_count)?,
+            method_count: evidence_count(coverage.method_count)?,
+            enabled_case_count: evidence_count(coverage.enabled_case_count)?,
+            passed: true,
+        },
+    )
+    .map_err(|_| MatrixRunFailure::new(MatrixBlocker::EvidenceWriteFailed))?;
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    let _ = writeln!(output, "plugin matrix: CLEAR");
+    let _ = writeln!(
+        output,
+        "coverage: {} enabled cases, {} skipped cases, {} methods, {} services, {} plugins",
+        tally.executed,
+        tally.skipped,
+        coverage.method_count,
+        coverage.service_count,
+        coverage.plugin_count
+    );
+    let _ = writeln!(
+        output,
+        "next: archive this evidence and continue the independent Windows package and Go/No-Go gates"
+    );
+    Ok(())
+}
+
+fn install_redacted_panic_hook() {
+    std::panic::set_hook(Box::new(|_| {
+        MatrixRunFailure::new(MatrixBlocker::RunnerFailed).emit();
+    }));
 }
 
 fn capture_evidence_inputs(
@@ -233,4 +443,51 @@ fn required_string(
         .and_then(|value| value.into_string().ok())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("missing or non-Unicode {name} argument").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocker_codes_and_actions_are_stable_bounded_and_portable() {
+        for blocker in MatrixBlocker::ALL {
+            let code = blocker.code();
+            let action = blocker.action();
+            assert!(!code.is_empty());
+            assert!(code.bytes().all(|value| value.is_ascii_lowercase()
+                || value.is_ascii_digit()
+                || value == b'-'));
+            assert!(!action.is_empty());
+            assert!(action.len() <= 240);
+            assert!(!action.chars().any(char::is_control));
+        }
+    }
+
+    #[test]
+    fn matrix_tally_keeps_only_aggregate_results() {
+        let mut tally = MatrixTally::default();
+        tally.record_skipped();
+        tally.record_executed(true);
+        tally.record_executed(false);
+
+        assert_eq!(
+            tally,
+            MatrixTally {
+                executed: 2,
+                skipped: 1,
+                failed: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn golden_failure_exposes_only_code_action_and_count() {
+        let failure = MatrixRunFailure::with_count(MatrixBlocker::GoldenCaseFailed, 3);
+
+        assert_eq!(failure.blocker.code(), "matrix-golden-case-failed");
+        assert_eq!(failure.affected_count, Some(3));
+        assert!(!failure.blocker.action().contains('{'));
+        assert!(!failure.blocker.action().contains('['));
+    }
 }
