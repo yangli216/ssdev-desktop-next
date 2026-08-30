@@ -117,6 +117,61 @@ test('packaged Windows package gate uses verified adjacent tools without Rust', 
   assert.match(releaseManifestMain, /verify_update_artifact_files/)
 })
 
+test('Windows package gate reports stable actionable blockers without raw failures', async () => {
+  const wrapper = await readFile(packageWrapperUrl, 'utf8')
+  const blockerStart = wrapper.indexOf('function Get-WindowsPackageBlocker')
+  const blockerEnd = wrapper.indexOf('\ntrap {', blockerStart)
+  assert.ok(blockerStart >= 0 && blockerEnd > blockerStart)
+  const blockerSource = wrapper.slice(blockerStart, blockerEnd)
+  const codes = [...blockerSource.matchAll(/Code = "([a-z0-9-]+)"/g)].map(
+    (match) => match[1],
+  )
+  const actions = [...blockerSource.matchAll(/Action = "([^"]+)"/g)].map(
+    (match) => match[1],
+  )
+
+  assert.deepEqual(codes, [
+    'windows-package-toolkit-source-invalid',
+    'windows-package-inputs-invalid',
+    'windows-package-business-probe-failed',
+    'windows-package-candidate-invalid',
+    'windows-package-previous-invalid',
+    'windows-package-install-validation-failed',
+    'windows-package-upgrade-rollback-failed',
+    'windows-package-evidence-failed',
+    'windows-package-validation-failed',
+  ])
+  assert.equal(new Set(codes).size, codes.length)
+  assert.equal(actions.length, codes.length)
+  for (const action of actions) {
+    assert.ok(action.length > 0 && action.length <= 240)
+    assert.doesNotMatch(action, /[\r\n\x00-\x1f]|[A-Za-z]:\\|\/Users\/|\$\w+/)
+  }
+  for (const phase of [
+    'toolkit-source',
+    'arguments',
+    'business-probe',
+    'candidate-release',
+    'previous-release',
+    'install',
+    'upgrade-rollback',
+    'evidence',
+  ]) {
+    assert.match(wrapper, new RegExp(`PackageGatePhase = "${phase}"`))
+  }
+
+  const trapStart = wrapper.indexOf('trap {')
+  const trapEnd = wrapper.indexOf('\nif (-not $PreviousExpectedWebViewInstallMode)', trapStart)
+  assert.ok(trapStart >= 0 && trapEnd > trapStart)
+  const trap = wrapper.slice(trapStart, trapEnd)
+  assert.match(trap, /windows package: BLOCKED/)
+  assert.match(trap, /blocker: \$\(\$blocker\.Code\)/)
+  assert.match(trap, /action: \$\(\$blocker\.Action\)/)
+  assert.match(trap, /evidence: not produced/)
+  assert.doesNotMatch(trap, /\$_|Exception|InvocationInfo|ScriptStackTrace|Write-Error/)
+  assert.match(wrapper, /windows package: CLEAR/)
+})
+
 test('Windows CI publishes one x64 delivery toolkit without changing platform package defaults', async () => {
   const workflow = await readFile(workflowUrl, 'utf8')
 

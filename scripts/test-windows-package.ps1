@@ -31,6 +31,77 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+$script:PackageGatePhase = "toolkit-source"
+
+function Get-WindowsPackageBlocker {
+  param([Parameter(Mandatory = $true)][string]$Phase)
+  switch ($Phase) {
+    "toolkit-source" {
+      return [pscustomobject]@{
+        Code = "windows-package-toolkit-source-invalid"
+        Action = "Restore the complete approved delivery toolkit and the clean candidate source workspace from the same revision."
+      }
+    }
+    "arguments" {
+      return [pscustomobject]@{
+        Code = "windows-package-inputs-invalid"
+        Action = "Supply complete bundle roots, independent update trust, an isolated account, and a new evidence destination, then retry."
+      }
+    }
+    "business-probe" {
+      return [pscustomobject]@{
+        Code = "windows-package-business-probe-failed"
+        Action = "Use an unused approved loopback probe port with Node.js, or test an inert page in the actual target environment."
+      }
+    }
+    "candidate-release" {
+      return [pscustomobject]@{
+        Code = "windows-package-candidate-invalid"
+        Action = "Restore the complete candidate bundle and its approved update, trust, policy, provenance, profile, and SBOM inputs."
+      }
+    }
+    "previous-release" {
+      return [pscustomobject]@{
+        Code = "windows-package-previous-invalid"
+        Action = "Restore the exact lower-version production bundle and its historical signer and update trust inputs."
+      }
+    }
+    "install" {
+      return [pscustomobject]@{
+        Code = "windows-package-install-validation-failed"
+        Action = "Use a clean Windows validation account, repair installation prerequisites, and rerun the complete candidate installation check."
+      }
+    }
+    "upgrade-rollback" {
+      return [pscustomobject]@{
+        Code = "windows-package-upgrade-rollback-failed"
+        Action = "Restore both approved bundles, clear only the isolated validation account, and rerun the full upgrade and rollback sequence."
+      }
+    }
+    "evidence" {
+      return [pscustomobject]@{
+        Code = "windows-package-evidence-failed"
+        Action = "Keep all verified inputs unchanged, choose a new controlled evidence file, and rerun the complete package validation."
+      }
+    }
+    default {
+      return [pscustomobject]@{
+        Code = "windows-package-validation-failed"
+        Action = "Restore the approved validation inputs and rerun the complete Windows package gate."
+      }
+    }
+  }
+}
+
+trap {
+  $blocker = Get-WindowsPackageBlocker $script:PackageGatePhase
+  [Console]::Error.WriteLine("windows package: BLOCKED")
+  [Console]::Error.WriteLine("blocker: $($blocker.Code)")
+  [Console]::Error.WriteLine("action: $($blocker.Action)")
+  [Console]::Error.WriteLine("evidence: not produced")
+  exit 1
+}
+
 if (-not $PreviousExpectedWebViewInstallMode) {
   $PreviousExpectedWebViewInstallMode = $ExpectedWebViewInstallMode
 }
@@ -125,6 +196,8 @@ function Invoke-CutoverEvidenceTool {
   }
   return $LASTEXITCODE
 }
+
+$script:PackageGatePhase = "arguments"
 
 if (-not $BundleRoot) {
   $BundleRoot = Join-Path $workspace "target/$DesktopTarget/release/bundle"
@@ -1149,10 +1222,12 @@ function Test-Upgrade {
 
 $businessProbeProcess = $null
 try {
+$script:PackageGatePhase = "business-probe"
 if ($ServeBusinessProbePage) {
   $businessProbeProcess = Start-BusinessPageProbe $businessStartupUri
 }
 
+$script:PackageGatePhase = "candidate-release"
 $script:CandidateRelease = $null
 $script:CandidatePluginTrustStoreSha256 = $null
 $script:CandidateX86HostSha256 = $null
@@ -1164,6 +1239,7 @@ $script:CandidateRelease = Get-ReleaseMetadata $BundleRoot -VerifyCurrentSource
 Test-UpdaterSignatures $BundleRoot $metadataDirectory $script:ExpectedUpdatePublicKeyText
 
 if ($PreviousBundleRoot) {
+  $script:PackageGatePhase = "previous-release"
   $previousMetadataDirectory = Join-Path $PreviousBundleRoot "metadata"
   Test-ReleaseArtifactManifest $PreviousBundleRoot $previousMetadataDirectory $script:PreviousExpectedUpdatePublicKeyText $PreviousExpectedWebViewInstallMode
   Test-ReleaseTrustPolicies $previousMetadataDirectory
@@ -1176,14 +1252,19 @@ if ($PreviousBundleRoot) {
   Test-UpdaterSignatures $PreviousBundleRoot $previousMetadataDirectory $script:PreviousExpectedUpdatePublicKeyText
 }
 
+$script:PackageGatePhase = "candidate-release"
 $nsisInstaller = Get-SingleArtifact (Join-Path $BundleRoot "nsis") "*-setup.exe" "NSIS"
 if ($PreviousBundleRoot) {
+  $script:PackageGatePhase = "previous-release"
   $previousNsisInstaller = Get-SingleArtifact (Join-Path $PreviousBundleRoot "nsis") "*-setup.exe" "previous NSIS"
+  $script:PackageGatePhase = "upgrade-rollback"
   Test-Upgrade $previousNsisInstaller $nsisInstaller $previousMetadataDirectory
 } else {
+  $script:PackageGatePhase = "install"
   Test-Installer $nsisInstaller
 }
 
+$script:PackageGatePhase = "evidence"
 if (Test-Path -LiteralPath $EvidenceOutput) {
   throw "EvidenceOutput appeared during package verification; refusing to overwrite it."
 }
@@ -1223,6 +1304,7 @@ if ((Invoke-CutoverEvidenceTool $evidenceArguments) -ne 0 -or -not (Test-Path -L
   throw "Windows package smoke passed, but its machine-verifiable evidence was not created."
 }
 
+Write-Host "windows package: CLEAR"
 Write-Host "All requested Windows package smoke tests passed."
 } finally {
   Stop-BusinessPageProbe $businessProbeProcess

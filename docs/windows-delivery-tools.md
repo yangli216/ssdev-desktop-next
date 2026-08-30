@@ -98,6 +98,21 @@ Get-Content .\release.json
 
 正式验收应先在目标网络打开实际业务页面并导出同版本深度检查记录。`-ServeBusinessProbePage` 仅供构建链使用：它还需要验证机具有 Node.js，且只允许精确的 `http://127.0.0.1:<port>/`；它不证明目标网络、账号或真实业务可用。工具包脚本保留源码模式回退，仓库 CI 仍可直接运行 `scripts/test-windows-package.ps1`，但相邻工具包模式不会执行 `cargo`。
 
+工具包模式进入验收流程后的失败不回显 PowerShell 异常、文件路径、证书状态原文或安装位置，而是输出 `windows package: BLOCKED`、一个稳定 `blocker`、固定 `action` 和 `evidence: not produced`。PowerShell 自身在脚本开始前产生的参数绑定错误不属于这份摘要，仍应按上方固定命令模板调用。当前阶段如下：
+
+| blocker | 处理方向 |
+| --- | --- |
+| `windows-package-toolkit-source-invalid` | 恢复完整获批工具包以及同提交的干净候选源码工作区 |
+| `windows-package-inputs-invalid` | 修复 bundle、独立更新信任、隔离账号或新证据目标等基础输入 |
+| `windows-package-business-probe-failed` | 更换未占用的获准回环端口并检查 Node.js，或改用目标环境惰性页面 |
+| `windows-package-candidate-invalid` | 恢复候选完整清单、策略、updater、溯源、包型和 SBOM |
+| `windows-package-previous-invalid` | 恢复精确的较低生产版本及其历史签名和更新信任锚 |
+| `windows-package-install-validation-failed` | 在干净 Windows 验证账户修复安装前置条件后重跑候选安装 |
+| `windows-package-upgrade-rollback-failed` | 恢复两份获批 bundle，清理隔离测试账户并重跑完整升级回退链 |
+| `windows-package-evidence-failed` | 保持已验证输入不变，选择新证据文件并从头重跑 |
+
+未知阶段只返回通用 `windows-package-validation-failed`，不会把新异常原文直接带进受控日志。成功固定输出 `windows package: CLEAR`，但仍只代表所请求的 Windows 包门禁完成；没有近期真实业务深度记录时不能进入生产 GO。
+
 ## 构建与签名
 
 构建机必须使用锁定依赖，并预装精确版本 `cargo-cyclonedx 0.5.9`。脚本从锁定的 `webview2-com-sys` 依赖复制 x64 `WebView2Loader.dll`，复验其 Microsoft Authenticode、复制前后 SHA-256 和证书身份，并实际要求 Doctor 在构建用户会话发现 WebView2 Runtime；这项工具包复制动作不改变普通 Desktop 安装包的内容或体积。脚本会拒绝构建前残留的目标 SBOM，生成后清理临时源文件，并在封装前再次确认提交未变化且工作区仍为 clean。CI 使用下面的测试模式生成独立无签名制品：
