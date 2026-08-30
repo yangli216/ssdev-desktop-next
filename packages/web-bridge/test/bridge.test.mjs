@@ -12,6 +12,7 @@ import {
   CURRENT_BRIDGE_PROTOCOL_VERSION,
   CURRENT_PROTOCOL_VERSION,
   DesktopBridgeUnavailableError,
+  InvalidPluginOperationIdError,
   InvalidPluginFixtureError,
   InvalidDesktopDeclarationError,
   PLUGIN_INVOCATION_CONTROL_CODES,
@@ -26,7 +27,9 @@ import {
   createPluginFixtureInvoker,
   createPluginOperationId,
   getTrackedInvocationCapabilities,
+  isPluginOperationId,
   isDesktopBridgeAvailable,
+  parsePluginOperationId,
   requireDesktopBridge,
   requireTrackedPluginInvocations,
   supportsTrackedPluginInvocations,
@@ -181,6 +184,34 @@ test('keeps tracked invocations additive for older desktop clients', () => {
 test('creates canonical random operation IDs when tracked calls are available', () => {
   const operationId = createPluginOperationId()
   assert.match(operationId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  assert.equal(isPluginOperationId(operationId), true)
+  assert.equal(parsePluginOperationId(operationId), operationId)
+})
+
+test('accepts only canonical UUID v4 operation IDs recovered from storage', () => {
+  const canonical = '123e4567-e89b-42d3-a456-426614174000'
+  assert.equal(isPluginOperationId(canonical), true)
+  assert.equal(parsePluginOperationId(canonical), canonical)
+
+  const invalid = [
+    null,
+    1,
+    '',
+    canonical.toUpperCase(),
+    canonical.replaceAll('-', ''),
+    '123e4567-e89b-12d3-a456-426614174000',
+    '123e4567-e89b-42d3-7456-426614174000',
+    `${canonical}-secret-suffix`,
+  ]
+  for (const value of invalid) {
+    assert.equal(isPluginOperationId(value), false)
+    assert.throws(
+      () => parsePluginOperationId(value),
+      (error) => error instanceof InvalidPluginOperationIdError
+        && error.message === 'SSDEV plugin operation ID must be a canonical UUID v4'
+        && !error.message.includes('secret-suffix'),
+    )
+  }
 })
 
 test('classifies every tracked outcome without permitting automatic replay', () => {

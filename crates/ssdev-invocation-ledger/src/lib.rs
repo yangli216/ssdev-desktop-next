@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
-use uuid::Uuid;
+use uuid::{Uuid, Variant};
 use webplus_protocol::InvokeRequest;
 
 const SCHEMA_VERSION: u8 = 1;
@@ -646,7 +646,10 @@ fn stored_from_record(record: &LedgerRecord) -> StoredOperation {
 fn validate_operation_id(value: &str) -> Result<String, LedgerError> {
     let parsed = Uuid::parse_str(value).map_err(|_| LedgerError::InvalidOperationId)?;
     let canonical = parsed.hyphenated().to_string();
-    if parsed.get_version_num() != 4 || value != canonical {
+    if parsed.get_version_num() != 4
+        || parsed.get_variant() != Variant::RFC4122
+        || value != canonical
+    {
         return Err(LedgerError::InvalidOperationId);
     }
     Ok(canonical)
@@ -870,6 +873,7 @@ mod tests {
     fn rejects_noncanonical_or_nonrandom_operation_ids() {
         for invalid in [
             "123e4567-e89b-12d3-a456-426614174000",
+            "123e4567-e89b-42d3-7456-426614174000",
             "123E4567-E89B-42D3-A456-426614174000",
             "not-a-uuid",
         ] {

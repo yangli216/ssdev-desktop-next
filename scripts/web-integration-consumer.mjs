@@ -337,6 +337,7 @@ async function verifyConsumers(options) {
     await writeFile(runtimePath, `import {
   UnexpectedPluginInvocationError,
   createPluginFixtureInvoker,
+  parsePluginOperationId,
 } from '@bsoft/ssdev-web-bridge'
 
 ${runtimeImports}
@@ -416,7 +417,7 @@ for (const integration of integrations) {
   if (trackedExports.length !== 1) {
     throw new Error(\`Web kit [\${integration.pluginId}] must export exactly one generated tracked API\`)
   }
-  const operationId = '123e4567-e89b-42d3-a456-426614174000'
+  const operationId = parsePluginOperationId('123e4567-e89b-42d3-a456-426614174000')
   const trackedCalls = []
   const trackedBridge = {
     async invokePluginTracked(actualOperationId, serviceId, method, parameters = {}) {

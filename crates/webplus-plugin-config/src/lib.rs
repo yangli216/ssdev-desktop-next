@@ -45,7 +45,7 @@ pub fn generate_typescript_client(
 ) -> Result<String, serde_json::Error> {
     let mut output = String::from(
         "// Generated from an SSDEV plugin manifest. Regenerate after API changes.\n\
-import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker, TrackedInvocationBridge, TrackedInvocationStatus } from '@bsoft/ssdev-web-bridge'\n\n",
+import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker, PluginOperationId, TrackedInvocationBridge, TrackedInvocationStatus } from '@bsoft/ssdev-web-bridge'\n\n",
     );
     let methods = typescript_method_plans(services);
     for plan in &methods {
@@ -128,7 +128,7 @@ import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker, TrackedInvoc
             " = {}"
         };
         output.push_str(&format!(
-            "    {}(operationId: string, parameters: {}{}): Promise<TrackedInvocationStatus<{}>> {{\n      return bridge.invokePluginTracked<{}>(operationId, {}, {}, parameters)\n    }},\n    {}(operationId: string): Promise<TrackedInvocationStatus<{}>> {{\n      return bridge.getPluginInvocation<{}>(operationId, {}, {})\n    }},\n\n",
+            "    {}(operationId: PluginOperationId, parameters: {}{}): Promise<TrackedInvocationStatus<{}>> {{\n      return bridge.invokePluginTracked<{}>(operationId, {}, {}, parameters)\n    }},\n    {}(operationId: PluginOperationId): Promise<TrackedInvocationStatus<{}>> {{\n      return bridge.getPluginInvocation<{}>(operationId, {}, {})\n    }},\n\n",
             plan.client_method,
             plan.parameters_type,
             default_parameters,
@@ -1851,12 +1851,13 @@ mod tests {
 
         let source = generate_typescript_client("Card Reader", &services).unwrap();
         assert!(source.contains("export class CardReaderClient"));
-        assert!(source.contains("TrackedInvocationBridge, TrackedInvocationStatus"));
+        assert!(source.contains("PluginOperationId, TrackedInvocationBridge"));
         assert!(source.contains("export function createCardReaderTrackedApi"));
         assert!(source.contains("readerCardRead(parameters: ReaderCardReadParameters)"));
-        assert!(source
-            .contains("readerCardRead(operationId: string, parameters: ReaderCardReadParameters)"));
-        assert!(source.contains("getReaderCardReadStatus(operationId: string)"));
+        assert!(source.contains(
+            "readerCardRead(operationId: PluginOperationId, parameters: ReaderCardReadParameters)"
+        ));
+        assert!(source.contains("getReaderCardReadStatus(operationId: PluginOperationId)"));
         assert!(source.contains("\"port\": string"));
         assert!(source.contains("\"cardNo\": string"));
         assert!(source.contains("ReturnValue: number"));
@@ -1886,12 +1887,13 @@ mod tests {
         .unwrap();
 
         let source = generate_typescript_client("Reader", &services).unwrap();
-        assert!(source.contains("read(operationId: string, parameters: ReadParameters = {})"));
+        assert!(source
+            .contains("read(operationId: PluginOperationId, parameters: ReadParameters = {})"));
         assert!(source.contains(
-            "getReadStatus(operationId: string, parameters: GetReadStatusParameters = {})"
+            "getReadStatus(operationId: PluginOperationId, parameters: GetReadStatusParameters = {})"
         ));
-        assert!(source.contains("getReadStatus2(operationId: string)"));
-        assert!(source.contains("getGetReadStatusStatus(operationId: string)"));
+        assert!(source.contains("getReadStatus2(operationId: PluginOperationId)"));
+        assert!(source.contains("getGetReadStatusStatus(operationId: PluginOperationId)"));
     }
 
     #[test]

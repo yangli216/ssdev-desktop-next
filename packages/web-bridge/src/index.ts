@@ -7,6 +7,11 @@ export type JsonPrimitive = string | number | boolean | null
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue }
 export type JsonObject = { [key: string]: JsonValue }
 
+declare const PLUGIN_OPERATION_ID_BRAND: unique symbol
+export type PluginOperationId = string & {
+  readonly [PLUGIN_OPERATION_ID_BRAND]: true
+}
+
 export interface InvokeResponse<T = JsonValue> {
   ResCode: number
   ResData: T
@@ -468,6 +473,14 @@ export class TrackedInvocationsUnavailableError extends Error {
   }
 }
 
+export class InvalidPluginOperationIdError extends Error {
+  override readonly name = 'InvalidPluginOperationIdError'
+
+  constructor() {
+    super('SSDEV plugin operation ID must be a canonical UUID v4')
+  }
+}
+
 export type TrackedInvocationBridge = SsdevDesktopBridge & {
   invokePluginTracked: NonNullable<SsdevDesktopBridge['invokePluginTracked']>
   getPluginInvocation: NonNullable<SsdevDesktopBridge['getPluginInvocation']>
@@ -548,12 +561,25 @@ export function getTrackedInvocationCapabilities(
     : null
 }
 
-export function createPluginOperationId(): string {
+const PLUGIN_OPERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+export function isPluginOperationId(value: unknown): value is PluginOperationId {
+  return typeof value === 'string' && PLUGIN_OPERATION_ID_PATTERN.test(value)
+}
+
+export function parsePluginOperationId(value: unknown): PluginOperationId {
+  if (!isPluginOperationId(value)) {
+    throw new InvalidPluginOperationIdError()
+  }
+  return value
+}
+
+export function createPluginOperationId(): PluginOperationId {
   const randomUUID = globalThis.crypto?.randomUUID
   if (typeof randomUUID !== 'function') {
     throw new TrackedInvocationsUnavailableError()
   }
-  return randomUUID.call(globalThis.crypto)
+  return parsePluginOperationId(randomUUID.call(globalThis.crypto))
 }
 
 type UnknownRecord = Record<string, unknown>

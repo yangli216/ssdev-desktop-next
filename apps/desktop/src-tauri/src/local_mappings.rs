@@ -2290,6 +2290,7 @@ mod tests {
         let source = generate_typescript(&definition).unwrap();
         assert!(source.contains("from '@bsoft/ssdev-web-bridge'"));
         assert!(source.contains("PluginInvoker"));
+        assert!(source.contains("PluginOperationId"));
         assert!(source.contains("TrackedInvocationBridge"));
         assert!(source.contains("TrackedInvocationStatus"));
         assert!(!source.contains("SsdevDesktopBridge"));

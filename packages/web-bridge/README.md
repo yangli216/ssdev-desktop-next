@@ -31,13 +31,14 @@ const reader = new ReaderPluginClient(invoker)
 
 fixture 按 service、method 和完整 JSON 参数精确匹配，对象键顺序不影响结果；省略参数与 `{}` 等价。重复定义、非 JSON 数据、超出 JavaScript 安全范围的整数和未声明调用都会显式失败，错误不复制参数内容；精确 64 位整数应按插件契约使用字符串。每次调用返回独立副本，测试代码修改结果不会污染下一用例。该工具不会写入 `window.ssdevDesktop`，也不模拟持久操作 ID、超时、重试、DLL/COM 行为或硬件副作用，只用于业务前端单元测试，不能替代 Windows 插件黄金矩阵。
 
-同一生成文件还会导出独立的 `create<Plugin>TrackedApi()`。打印、写卡等非幂等方法应把 `requireTrackedPluginInvocations(connection.bridge, connection.system)` 的结果传入该工厂，从而继续使用生成的参数/响应类型和固定路由，而不是在业务代码里重新手抄 `serviceId`、`method`。tracked API 为每个公开方法生成调用和状态查询两个方法；操作 ID 仍必须由业务流程持久保存。SDK 的 `classifyTrackedInvocationStatus()` 会把五种结果收敛成稳定后续动作，且每种结果都明确 `automaticReplay: 'forbidden'`；它不会自动轮询、重试或替业务完成设备对账。
+同一生成文件还会导出独立的 `create<Plugin>TrackedApi()`。打印、写卡等非幂等方法应把 `requireTrackedPluginInvocations(connection.bridge, connection.system)` 的结果传入该工厂，从而继续使用生成的参数/响应类型和固定路由，而不是在业务代码里重新手抄 `serviceId`、`method`。tracked API 为每个公开方法生成调用和状态查询两个方法，并要求 `PluginOperationId`：新动作使用 `createPluginOperationId()`，页面刷新后从业务存储恢复的未知字符串先经过 `parsePluginOperationId()`，损坏、非 v4、非 RFC 4122 variant、非小写规范格式都会在调用前固定失败。底层桥继续接受 `string` 以兼容旧代码。操作 ID 仍必须由业务流程在调用前持久保存。SDK 的 `classifyTrackedInvocationStatus()` 会把五种结果收敛成稳定后续动作，且每种结果都明确 `automaticReplay: 'forbidden'`；它不会提供存储、自动轮询、重试或替业务完成设备对账。
 
 ```ts
 import {
   classifyTrackedInvocationStatus,
   connectDesktop,
   createPluginOperationId,
+  parsePluginOperationId,
   requireTrackedPluginInvocations,
 } from '@bsoft/ssdev-web-bridge'
 import { createReaderPluginTrackedApi } from './generated/reader-plugin-client'
@@ -51,6 +52,12 @@ const outcome = await trackedReader.readCard(operationId, { timeout: 30 })
 const disposition = classifyTrackedInvocationStatus(outcome)
 // pending 时继续使用 operationId 调用 getReadCardStatus(operationId)；
 // 不确定结果必须对账，任何状态都不能自动生成新 ID 重放。
+
+// 页面刷新后，从业务流程自己的持久记录恢复并重新校验：
+async function restoreReadCardOperation(restoredValue: unknown) {
+  const restoredOperationId = parsePluginOperationId(restoredValue)
+  return trackedReader.getReadCardStatus(restoredOperationId)
+}
 ```
 
 已经完成脱敏、精确响应复核并绑定插件版本的正式黄金矩阵，可以通过 `ssdev-plugin-tool web-fixtures` 生成上述数组，避免业务项目再次手抄 route 和数据。生成器拒绝草稿、占位符、未解除复核项和同输入多响应歧义；输出仍包含矩阵原始测试数据，提交前必须单独评审。
@@ -105,7 +112,7 @@ if (canRetryPluginInvocationWithBackoff(response)) {
 
 页面导航、组件卸载或业务代码丢弃 Promise 只会让页面停止等待结果，不会撤销已经被桌面端接纳的原生调用。桌面端会让该调用独立执行到正常响应或受控超时，以保持命名管道请求/响应顺序；调用方不得把“没有继续等待”视为“设备没有执行”，也不得因此自动重试。当前契约没有提供硬件操作取消能力。
 
-对打印、写卡等非幂等操作，优先使用可选的 `invokePluginTracked` 和 `getPluginInvocation`。用 `createPluginOperationId()` 为一次逻辑动作生成 UUID v4，并在页面刷新、重复提交和查询时复用；桌面端会在执行前持久记录该 ID，相同来源和完整请求只执行一次，同 ID 改参数会失败。`indeterminate` 与 `completedWithoutResult` 都表示不能自动重放；保留窗口、崩溃边界和完整示例见 SSDEV Desktop 主仓库的 `docs/tracked-invocations.md`。
+对打印、写卡等非幂等操作，优先使用可选的 `invokePluginTracked` 和 `getPluginInvocation`。用 `createPluginOperationId()` 为一次逻辑动作生成 UUID v4，并在页面刷新、重复提交和查询时复用；从 IndexedDB 或业务后端等项目自有存储恢复时，先用 `parsePluginOperationId()` 得到经过验证的 `PluginOperationId`，不要把任意字符串直接交给生成客户端。桌面端会在执行前持久记录该 ID，相同来源和完整请求只执行一次，同 ID 改参数会失败。`indeterminate` 与 `completedWithoutResult` 都表示不能自动重放；保留窗口、崩溃边界和完整示例见 SSDEV Desktop 主仓库的 `docs/tracked-invocations.md`。
 
 判断该能力时应使用 `supportsTrackedPluginInvocations(connection.bridge, connection.system)`，或把同样两个值传给 `requireTrackedPluginInvocations`。`system.capabilities.trackedInvocations` 会区分客户端是否支持、账本是否成功启动以及当前是否仍接收新操作，并声明容量和保留边界；省略 `system` 只能兼容性地检查方法是否存在，不能证明运行时可用。
 

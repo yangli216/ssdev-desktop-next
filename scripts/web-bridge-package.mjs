@@ -175,9 +175,15 @@ async function smokeTestPackagedConsumer(archivePath) {
   CURRENT_BRIDGE_PROTOCOL_VERSION,
   classifyTrackedInvocationStatus,
   createPluginFixtureInvoker,
+  isPluginOperationId,
+  parsePluginOperationId,
 } from '@bsoft/ssdev-web-bridge'
 
 if (CURRENT_BRIDGE_PROTOCOL_VERSION !== 1) throw new Error('unexpected bridge protocol version')
+const restoredOperationId = parsePluginOperationId('123e4567-e89b-42d3-a456-426614174000')
+if (!isPluginOperationId(restoredOperationId)) {
+  throw new Error('packaged operation ID validator rejected a canonical UUID v4')
+}
 const trackedDisposition = classifyTrackedInvocationStatus({ state: 'indeterminate' })
 if (trackedDisposition.next !== 'reconcile-before-new-operation'
     || trackedDisposition.automaticReplay !== 'forbidden') {
@@ -205,8 +211,10 @@ if (response.ResCode !== 0 || response.ResData?.ready !== true) {
   type InvokeResponse,
   type PluginInvocationFixture,
   type PluginInvoker,
+  type PluginOperationId,
   type TrackedInvocationDisposition,
   type TrackedInvocationStatus,
+  parsePluginOperationId,
 } from '@bsoft/ssdev-web-bridge'
 
 type Health = { ready: boolean }
@@ -216,6 +224,10 @@ const fixture: PluginInvocationFixture<Health> = {
   response: { ResCode: 0, ResData: { ready: true } },
 }
 const invoker: PluginInvoker = createPluginFixtureInvoker([fixture])
+const restoredOperationId: PluginOperationId = parsePluginOperationId(
+  '123e4567-e89b-42d3-a456-426614174000',
+)
+const bridgeOperationId: string = restoredOperationId
 const trackedStatus: TrackedInvocationStatus<Health> = { state: 'pending' }
 const trackedDisposition: TrackedInvocationDisposition = classifyTrackedInvocationStatus(trackedStatus)
 const consume = async (): Promise<InvokeResponse<Health>> =>
@@ -223,6 +235,7 @@ const consume = async (): Promise<InvokeResponse<Health>> =>
 if (trackedDisposition.kind === 'pending') {
   trackedDisposition.next satisfies 'query-same-operation'
 }
+void bridgeOperationId
 void consume()
 `, { encoding: 'utf8', flag: 'wx' })
     await writeFile(join(consumer, 'tsconfig.json'), `${JSON.stringify({

@@ -6,6 +6,7 @@
 import {
   connectDesktop,
   createPluginOperationId,
+  parsePluginOperationId,
   requireTrackedPluginInvocations,
 } from '@bsoft/ssdev-web-bridge'
 
@@ -28,6 +29,8 @@ if (outcome.state === 'completed') {
 ```
 
 操作 ID 必须由安全随机源生成，并由业务流程保存。一个 ID 只能绑定同一来源、`serviceId`、`method` 和完整参数；重复提交相同内容会等待或返回同一次执行结果，换参数、换方法或换授权范围会硬失败。不要为同一个业务动作在超时或刷新后自动生成新 ID。
+
+`createPluginOperationId()` 返回带品牌的 `PluginOperationId`。页面刷新后，从 IndexedDB、业务后端或其他项目自有持久记录取回的值仍是未知输入，必须先调用 `parsePluginOperationId(restoredValue)`；它只接受规范小写、带连字符、版本 4 且为 RFC 4122 variant 的 UUID，并以不包含输入值的固定错误拒绝损坏记录。生成的 `create<Plugin>TrackedApi()` 只接受这一品牌类型，避免在业务代码中把订单号、空值或旧字段误当 operation ID；底层桥的 `string` 参数保持兼容。SDK 不提供通用存储层，也不会替项目决定 ID 应与哪一笔业务记录绑定。
 
 ## 状态语义
 
