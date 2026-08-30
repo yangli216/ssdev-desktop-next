@@ -71,7 +71,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .trust_store
             .as_deref()
             .ok_or("signed plugin hosts require --trust-store")?;
-        let trust_store = TrustStore::load(std::path::Path::new(&trust_store_path))?;
+        let expected_trust_store_sha256 = arguments
+            .trust_store_sha256
+            .as_deref()
+            .ok_or("signed plugin hosts require --trust-store-sha256")?;
+        let trust_store = load_pinned_trust_store(
+            std::path::Path::new(&trust_store_path),
+            expected_trust_store_sha256,
+        )?;
         Some(trust_store.verify_with_file_inventory(&manifest)?)
     };
     let allowed_services = manifest
@@ -165,6 +172,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn load_pinned_trust_store(
+    path: &Path,
+    expected_sha256: &str,
+) -> Result<TrustStore, Box<dyn std::error::Error>> {
+    let trust_store = TrustStore::load(path)?;
+    if trust_store.document_sha256() != expected_sha256 {
+        return Err("plugin trust store changed after desktop startup".into());
+    }
+    Ok(trust_store)
+}
+
 fn compiled_architecture() -> PluginArchitecture {
     if cfg!(target_pointer_width = "32") {
         PluginArchitecture::X86
@@ -209,6 +227,7 @@ struct HostArguments {
     plugin_dir: String,
     architecture: PluginArchitecture,
     trust_store: Option<String>,
+    trust_store_sha256: Option<String>,
     allow_unsigned: bool,
     local_mapping_root: Option<String>,
     local_mapping_integrity_sha256: Option<String>,
@@ -225,6 +244,7 @@ impl HostArguments {
         let mut plugin_dir = None;
         let mut architecture = None;
         let mut trust_store = None;
+        let mut trust_store_sha256 = None;
         let mut allow_unsigned = false;
         let mut allow_local_mapping = false;
         let mut local_mapping_root = None;
@@ -255,6 +275,11 @@ impl HostArguments {
                     &mut trust_store,
                     "--trust-store",
                     take_value(&mut arguments, "--trust-store")?,
+                )?,
+                "--trust-store-sha256" => set_once(
+                    &mut trust_store_sha256,
+                    "--trust-store-sha256",
+                    take_value(&mut arguments, "--trust-store-sha256")?,
                 )?,
                 "--allow-unsigned" if !allow_unsigned => allow_unsigned = true,
                 "--allow-unsigned" => return Err("duplicate argument --allow-unsigned".into()),
@@ -304,13 +329,18 @@ impl HostArguments {
             );
         }
         if let Some(digest) = local_mapping_integrity_sha256.as_deref() {
-            if digest.len() != 64
-                || !digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            {
+            if !is_lowercase_sha256(digest) {
                 return Err("--local-mapping-integrity-sha256 must be lowercase SHA-256".into());
             }
+        }
+        if trust_store.is_some() != trust_store_sha256.is_some() {
+            return Err("--trust-store and --trust-store-sha256 must be supplied together".into());
+        }
+        if trust_store_sha256
+            .as_deref()
+            .is_some_and(|digest| !is_lowercase_sha256(digest))
+        {
+            return Err("--trust-store-sha256 must be lowercase SHA-256".into());
         }
         if trust_store.is_some() && (allow_unsigned || allow_local_mapping) {
             return Err("trust modes are mutually exclusive".into());
@@ -327,6 +357,7 @@ impl HostArguments {
                 _ => return Err("--architecture must be x86 or x64".into()),
             },
             trust_store,
+            trust_store_sha256,
             allow_unsigned,
             local_mapping_root,
             local_mapping_integrity_sha256,
@@ -336,6 +367,13 @@ impl HostArguments {
             controller_pid,
         })
     }
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn require_local_mapping_path(plugin_dir: &Path, root: &Path) -> Result<(), String> {
@@ -576,6 +614,64 @@ mod tests {
             "trust.json".into(),
         ];
         assert!(HostArguments::parse(conflicting).is_err());
+    }
+
+    #[test]
+    fn signed_mode_requires_a_pinned_trust_store_identity() {
+        let mut valid = vec![
+            "--plugin-id".into(),
+            "reader".into(),
+            "--plugin-dir".into(),
+            "fixture".into(),
+            "--trust-store".into(),
+            "trust.json".into(),
+            "--trust-store-sha256".into(),
+            "a".repeat(64),
+        ];
+        valid.extend(required_platform_arguments());
+        let parsed = HostArguments::parse(valid).unwrap();
+        assert_eq!(parsed.trust_store.as_deref(), Some("trust.json"));
+        assert_eq!(
+            parsed.trust_store_sha256.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+
+        let mut missing_identity = vec![
+            "--plugin-id".into(),
+            "reader".into(),
+            "--plugin-dir".into(),
+            "fixture".into(),
+            "--trust-store".into(),
+            "trust.json".into(),
+        ];
+        missing_identity.extend(required_platform_arguments());
+        assert!(HostArguments::parse(missing_identity).is_err());
+
+        let mut invalid_identity = vec![
+            "--plugin-id".into(),
+            "reader".into(),
+            "--plugin-dir".into(),
+            "fixture".into(),
+            "--trust-store".into(),
+            "trust.json".into(),
+            "--trust-store-sha256".into(),
+            "A".repeat(64),
+        ];
+        invalid_identity.extend(required_platform_arguments());
+        assert!(HostArguments::parse(invalid_identity).is_err());
+    }
+
+    #[test]
+    fn signed_mode_rejects_a_trust_store_replaced_after_approval() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("trust.json");
+        std::fs::write(&path, br#"{"schemaVersion":2,"keys":[]}"#).unwrap();
+        let approved = TrustStore::load(&path).unwrap();
+        let expected = approved.document_sha256().to_owned();
+        assert!(load_pinned_trust_store(&path, &expected).is_ok());
+
+        std::fs::write(&path, b"{\n  \"schemaVersion\": 2,\n  \"keys\": []\n}\n").unwrap();
+        assert!(load_pinned_trust_store(&path, &expected).is_err());
     }
 
     #[test]

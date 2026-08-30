@@ -101,6 +101,7 @@ struct TrustedKey {
 #[derive(Debug, Clone)]
 pub struct TrustStore {
     keys: HashMap<String, TrustedKey>,
+    document_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -127,6 +128,7 @@ impl TrustStore {
             path: path.to_path_buf(),
             source,
         })?;
+        let document_sha256 = digest_hex(Sha256::digest(&bytes));
         let document: TrustStoreDocument =
             serde_json::from_slice(&bytes).map_err(|source| TrustError::Json {
                 path: path.to_path_buf(),
@@ -211,7 +213,17 @@ impl TrustStore {
                 )));
             }
         }
-        Ok(Self { keys })
+        Ok(Self {
+            keys,
+            document_sha256,
+        })
+    }
+
+    /// Returns the SHA-256 identity of the exact trust-store document loaded
+    /// into this instance. Callers can pin this identity across process
+    /// boundaries so a later path replacement cannot silently change roots.
+    pub fn document_sha256(&self) -> &str {
+        &self.document_sha256
     }
 
     pub fn stats(&self) -> TrustStoreStats {
@@ -962,6 +974,20 @@ mod tests {
         assert!(active
             .ensure_release_ready(&[TrustPurpose::OriginPolicy])
             .is_err());
+    }
+
+    #[test]
+    fn trust_store_retains_the_exact_loaded_document_identity() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("trust.json");
+        let first = br#"{"schemaVersion":2,"keys":[]}"#;
+        fs::write(&path, first).unwrap();
+        let trust = TrustStore::load(&path).unwrap();
+        assert_eq!(trust.document_sha256(), digest_hex(Sha256::digest(first)));
+
+        fs::write(&path, b"{\n  \"schemaVersion\": 2,\n  \"keys\": []\n}\n").unwrap();
+        let changed = TrustStore::load(&path).unwrap();
+        assert_ne!(trust.document_sha256(), changed.document_sha256());
     }
 
     #[test]

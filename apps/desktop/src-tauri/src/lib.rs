@@ -5839,10 +5839,13 @@ pub fn run() {
                 );
                 (None, PluginTrust::AllowUnsigned)
             } else {
+                let trust_store = Arc::new(TrustStore::load(&trust_store_path)?);
+                let trust_store_sha256 = trust_store.document_sha256().to_owned();
                 (
-                    Some(Arc::new(TrustStore::load(&trust_store_path)?)),
+                    Some(trust_store),
                     PluginTrust::StrictWithLocalMappings {
                         trust_store: trust_store_path.clone(),
+                        trust_store_sha256,
                         local_mapping_root: local_mapping_root.clone(),
                     },
                 )
@@ -5928,6 +5931,7 @@ pub fn run() {
             let managed_process_startup = launch_managed_processes(
                 &resource_dir,
                 &trust_store_path,
+                trust_store.as_deref(),
                 &initial_config.managed_processes,
             );
             let repository_client = secure_http_client().map_err(std::io::Error::other)?;
@@ -6695,6 +6699,7 @@ fn load_origin_policy(
 fn launch_managed_processes(
     resource_dir: &std::path::Path,
     trust_store_path: &std::path::Path,
+    trust_store: Option<&TrustStore>,
     selected: &[String],
 ) -> ManagedProcessStartup {
     let policy_path = select_runtime_path(
@@ -6721,12 +6726,17 @@ fn launch_managed_processes(
             error: Some("process-policy-not-installed"),
         };
     }
-    let policy = TrustStore::load(trust_store_path)
-        .map_err(|error| error.to_string())
-        .and_then(|trust| {
-            ProcessPolicy::load(&policy_path, &signature_path, &trust)
-                .map_err(|error| error.to_string())
-        });
+    let policy = if let Some(trust_store) = trust_store {
+        ProcessPolicy::load(&policy_path, &signature_path, trust_store)
+            .map_err(|error| error.to_string())
+    } else {
+        TrustStore::load(trust_store_path)
+            .map_err(|error| error.to_string())
+            .and_then(|trust| {
+                ProcessPolicy::load(&policy_path, &signature_path, &trust)
+                    .map_err(|error| error.to_string())
+            })
+    };
     let policy = match policy {
         Ok(policy) => policy,
         Err(_) => {

@@ -58,9 +58,11 @@ pub struct SupervisorConfig {
 pub enum PluginTrust {
     Strict {
         trust_store: PathBuf,
+        trust_store_sha256: String,
     },
     StrictWithLocalMappings {
         trust_store: PathBuf,
+        trust_store_sha256: String,
         local_mapping_root: PathBuf,
     },
     AllowUnsigned,
@@ -195,6 +197,18 @@ impl PluginController {
                 actual: config.max_in_flight_invocations,
                 maximum: MAX_IN_FLIGHT_INVOCATIONS_LIMIT,
             });
+        }
+        let trust_store_sha256 = match &config.plugin_trust {
+            PluginTrust::Strict {
+                trust_store_sha256, ..
+            }
+            | PluginTrust::StrictWithLocalMappings {
+                trust_store_sha256, ..
+            } => Some(trust_store_sha256.as_str()),
+            PluginTrust::AllowUnsigned => None,
+        };
+        if trust_store_sha256.is_some_and(|digest| !is_lowercase_sha256(digest)) {
+            return Err(ControllerError::InvalidTrustStoreIdentity);
         }
         let max_in_flight_invocations = config.max_in_flight_invocations;
         Ok(Self {
@@ -1459,11 +1473,19 @@ impl PluginWorker {
                 PluginArchitecture::X64 => "x64",
             });
         match plugin_trust {
-            PluginTrust::Strict { trust_store } => {
-                command.arg("--trust-store").arg(trust_store);
+            PluginTrust::Strict {
+                trust_store,
+                trust_store_sha256,
+            } => {
+                command
+                    .arg("--trust-store")
+                    .arg(trust_store)
+                    .arg("--trust-store-sha256")
+                    .arg(trust_store_sha256);
             }
             PluginTrust::StrictWithLocalMappings {
                 trust_store,
+                trust_store_sha256,
                 local_mapping_root,
             } => {
                 if is_within_root(&descriptor.plugin_dir, local_mapping_root) {
@@ -1482,7 +1504,11 @@ impl PluginWorker {
                         .arg("--local-mapping-integrity-sha256")
                         .arg(integrity);
                 } else {
-                    command.arg("--trust-store").arg(trust_store);
+                    command
+                        .arg("--trust-store")
+                        .arg(trust_store)
+                        .arg("--trust-store-sha256")
+                        .arg(trust_store_sha256);
                 }
             }
             PluginTrust::AllowUnsigned => {
@@ -1668,6 +1694,13 @@ fn is_within_root(path: &Path, root: &Path) -> bool {
     path != root && path.starts_with(root)
 }
 
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 fn validate_response(
     expected_request_id: u64,
     response: HostResponse,
@@ -1707,6 +1740,8 @@ fn validate_payload(
 pub enum ControllerError {
     #[error("max_in_flight_invocations must be between 1 and {maximum}, got {actual}")]
     InvalidInvocationLimit { actual: usize, maximum: usize },
+    #[error("strict plugin trust requires a lowercase SHA-256 trust-store identity")]
+    InvalidTrustStoreIdentity,
     #[error("serviceId must not be empty")]
     EmptyServiceId,
     #[error("plugin ID must not be empty")]
@@ -1784,6 +1819,7 @@ impl ControllerError {
     pub fn diagnostic_code(&self) -> &'static str {
         match self {
             Self::InvalidInvocationLimit { .. } => "invalid-invocation-limit",
+            Self::InvalidTrustStoreIdentity => "invalid-trust-store-identity",
             Self::EmptyServiceId => "empty-service-id",
             Self::EmptyPluginId => "empty-plugin-id",
             Self::InvalidPluginId => "invalid-plugin-id",
@@ -1949,6 +1985,19 @@ mod tests {
                 Err(ControllerError::InvalidInvocationLimit { actual, .. }) if actual == invalid
             ));
         }
+    }
+
+    #[test]
+    fn strict_plugin_trust_requires_a_pinned_sha256_identity() {
+        let mut config = config();
+        config.plugin_trust = PluginTrust::Strict {
+            trust_store: "trust.json".into(),
+            trust_store_sha256: "A".repeat(64),
+        };
+        assert!(matches!(
+            PluginController::new(config),
+            Err(ControllerError::InvalidTrustStoreIdentity)
+        ));
     }
 
     #[test]

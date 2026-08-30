@@ -283,6 +283,7 @@ async fn run() -> Result<(), MatrixRunFailure> {
             max_in_flight_invocations: webplus_controller::DEFAULT_MAX_IN_FLIGHT_INVOCATIONS,
             plugin_trust: PluginTrust::Strict {
                 trust_store: trust_store_path.clone(),
+                trust_store_sha256: trust_store.document_sha256().to_owned(),
             },
         })
         .map_err(|_| MatrixRunFailure::new(MatrixBlocker::HostPreflightFailed))?,
