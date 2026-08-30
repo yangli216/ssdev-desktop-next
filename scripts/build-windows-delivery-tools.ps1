@@ -20,6 +20,12 @@ $toolPackages = @(
   "ssdev-cutover-evidence",
   "ssdev-release-manifest"
 )
+$sbomRoots = @(
+  (Join-Path $workspace "apps"),
+  (Join-Path $workspace "crates")
+)
+$sbomPattern = "*_$Target.cdx.json"
+$generatedSbomsOwned = $false
 $outputPath = [System.IO.Path]::GetFullPath($OutputDirectory)
 $outputParent = Split-Path -Parent $outputPath
 if (-not $outputParent -or -not (Test-Path -LiteralPath $outputParent -PathType Container)) {
@@ -71,6 +77,19 @@ function Invoke-DeliveryToolSigning {
   }
 }
 
+function Assert-CycloneDxTool {
+  $version = (& cargo cyclonedx --version | Out-String).Trim()
+  if ($LASTEXITCODE -ne 0 -or $version -notmatch " 0\.5\.9$") {
+    throw "Windows delivery tools require cargo-cyclonedx 0.5.9."
+  }
+}
+
+function Remove-GeneratedSboms {
+  foreach ($generatedSbom in @(Get-ChildItem -Path $sbomRoots -Filter $sbomPattern -Recurse -File -ErrorAction SilentlyContinue)) {
+    Remove-Item -LiteralPath $generatedSbom.FullName -Force
+  }
+}
+
 Push-Location $workspace
 try {
   $revision = (& git rev-parse HEAD | Out-String).Trim()
@@ -84,6 +103,9 @@ try {
   if ($sourceChanges.Count -gt 0) {
     throw "Delivery tools require a clean source workspace."
   }
+  if (@(Get-ChildItem -Path $sbomRoots -Filter $sbomPattern -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0) {
+    throw "Delivery tool SBOM source outputs must not exist before the build."
+  }
 
   $cargoMetadataText = (& cargo metadata --locked --no-deps --format-version 1 | Out-String)
   if ($LASTEXITCODE -ne 0) {
@@ -96,6 +118,7 @@ try {
   }
   $toolkitVersion = [string]$versionEntry[0].version
 
+  Assert-CycloneDxTool
   & rustup target add $Target
   if ($LASTEXITCODE -ne 0) {
     throw "Unable to install the pinned Windows x64 Rust target."
@@ -139,6 +162,64 @@ try {
     Copy-Item -LiteralPath (Join-Path $workspace "scripts/test-plugin-matrix.ps1") -Destination (Join-Path $staging "run-plugin-matrix.ps1")
     Copy-Item -LiteralPath (Join-Path $workspace "docs/windows-delivery-tools.md") -Destination (Join-Path $staging "README.md")
 
+    $generatedSbomsOwned = $true
+    & cargo cyclonedx `
+      --manifest-path (Join-Path $workspace "Cargo.toml") `
+      --format json `
+      --target $Target `
+      --target-in-filename `
+      --spec-version 1.5
+    if ($LASTEXITCODE -ne 0) {
+      throw "Unable to generate the Windows delivery toolkit CycloneDX inputs."
+    }
+    $sbomDirectory = Join-Path $staging "sbom"
+    New-Item -ItemType Directory -Path $sbomDirectory | Out-Null
+    $sboms = [ordered]@{
+      "ssdev-pilot-readiness.cdx.json" = (Join-Path $workspace "crates/ssdev-pilot-readiness/ssdev-pilot-readiness_$Target.cdx.json")
+      "ssdev-migration-audit.cdx.json" = (Join-Path $workspace "crates/ssdev-migration-audit/ssdev-migration-audit_$Target.cdx.json")
+      "ssdev-plugin-tool.cdx.json" = (Join-Path $workspace "crates/ssdev-plugin-tool/ssdev-plugin-tool_$Target.cdx.json")
+      "ssdev-release-signing.cdx.json" = (Join-Path $workspace "crates/ssdev-release-signing/ssdev-release-signing_$Target.cdx.json")
+      "ssdev-cutover-evidence.cdx.json" = (Join-Path $workspace "crates/ssdev-cutover-evidence/ssdev-cutover-evidence_$Target.cdx.json")
+      "ssdev-release-manifest.cdx.json" = (Join-Path $workspace "crates/ssdev-release-manifest/ssdev-release-manifest_$Target.cdx.json")
+      "ssdev-plugin-matrix.cdx.json" = (Join-Path $workspace "crates/webplus-controller/webplus-controller_$Target.cdx.json")
+    }
+    foreach ($sbomName in $sboms.Keys) {
+      $rawSbom = $sboms[$sbomName]
+      if (-not (Test-Path -LiteralPath $rawSbom -PathType Leaf)) {
+        throw "Expected delivery toolkit SBOM input is missing for [$sbomName]."
+      }
+      $normalizedSbom = Join-Path $sbomDirectory $sbomName
+      & node (Join-Path $workspace "scripts/normalize-cyclonedx.mjs") $rawSbom $normalizedSbom $workspace
+      if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $normalizedSbom -PathType Leaf)) {
+        throw "Unable to normalize delivery toolkit SBOM [$sbomName]."
+      }
+      $bom = Get-Content -Raw -LiteralPath $normalizedSbom | ConvertFrom-Json
+      $targetProperty = @($bom.metadata.properties | Where-Object { $_.name -eq "cdx:rustc:sbom:target:triple" })
+      if (
+        $bom.bomFormat -ne "CycloneDX" -or
+        $bom.specVersion -ne "1.5" -or
+        [int]$bom.version -ne 1 -or
+        $targetProperty.Count -ne 1 -or
+        $targetProperty[0].value -ne $Target -or
+        @($bom.components).Count -lt 1 -or
+        @($bom.dependencies).Count -lt 1
+      ) {
+        throw "Delivery toolkit SBOM [$sbomName] is incomplete or targets the wrong platform."
+      }
+    }
+    Remove-GeneratedSboms
+    $generatedSbomsOwned = $false
+
+    $currentRevision = (& git rev-parse HEAD | Out-String).Trim()
+    $currentSourceChanges = @(& git status --porcelain --untracked-files=normal)
+    if (
+      $LASTEXITCODE -ne 0 -or
+      -not [String]::Equals($currentRevision, $revision, [StringComparison]::Ordinal) -or
+      $currentSourceChanges.Count -gt 0
+    ) {
+      throw "Delivery toolkit source changed while the build was running."
+    }
+
     if ($hasSigning) {
       foreach ($executable in $executables) {
         Invoke-DeliveryToolSigning $executable
@@ -153,6 +234,7 @@ try {
       sourceDirty = $false
       target = $Target
       executableCount = $executables.Count
+      sbomCount = $sboms.Count
       authenticodeVerified = $hasSigning
     }
     [System.IO.File]::WriteAllText(
@@ -179,6 +261,9 @@ try {
     }
   }
 } finally {
+  if ($generatedSbomsOwned) {
+    Remove-GeneratedSboms
+  }
   Pop-Location
 }
 

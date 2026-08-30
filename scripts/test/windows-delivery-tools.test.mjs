@@ -28,6 +28,10 @@ test('Windows delivery tools stay separate from the ordinary desktop installer',
   }
   assert.match(buildScript, /--example plugin_matrix/)
   assert.match(buildScript, /"ssdev-plugin-matrix\.exe"/)
+  assert.match(buildScript, /cargo-cyclonedx 0\.5\.9/)
+  assert.match(buildScript, /"ssdev-plugin-matrix\.cdx\.json"/)
+  assert.match(buildScript, /scripts\/normalize-cyclonedx\.mjs/)
+  assert.match(buildScript, /sbomCount = \$sboms\.Count/)
   assert.doesNotMatch(desktopBuild, /windows-delivery-tools|ssdev-plugin-matrix\.exe/)
 })
 
@@ -40,6 +44,10 @@ test('Windows delivery toolkit is source-bound, signed in production, and fully 
   assert.match(buildScript, /Production delivery tools require -WindowsSignCommand/)
   assert.match(buildScript, /Windows sign command must contain the %1 file placeholder/)
   assert.match(buildScript, /Delivery tools require a clean source workspace/)
+  assert.match(buildScript, /Delivery tool SBOM source outputs must not exist before the build/)
+  assert.match(buildScript, /\$generatedSbomsOwned = \$true/)
+  assert.match(buildScript, /if \(\$generatedSbomsOwned\)/)
+  assert.match(buildScript, /Delivery toolkit source changed while the build was running/)
   assert.match(buildScript, /Get-AuthenticodeSignature/)
   assert.match(buildScript, /SignerCertificate\.Subject/)
   assert.match(buildScript, /sourceRevision = \$revision/)
@@ -70,6 +78,7 @@ test('Windows CI publishes one x64 delivery toolkit without changing platform pa
   assert.equal((workflow.match(/Upload unsigned Windows x64 delivery toolkit/g) ?? []).length, 1)
   assert.equal((workflow.match(/ssdev-windows-delivery-tools-x64-unsigned/g) ?? []).length, 1)
   assert.match(workflow, /build-windows-delivery-tools\.ps1[\s\S]*?-AllowUnsignedTestBuild/)
+  assert.match(workflow, /cargo install cargo-cyclonedx --version 0\.5\.9 --locked/)
   assert.match(workflow, /workflow_dispatch:[\s\S]*?default: windows/)
 })
 
@@ -81,4 +90,7 @@ test('delivery toolkit documentation keeps unsigned CI output out of production'
   assert.match(documentation, /验证机无需安装 Rust/)
   assert.match(documentation, /仍必须提供与候选版本完全一致的干净源码工作区/)
   assert.match(documentation, /工具包不含私钥、令牌、业务材料/)
+  assert.match(documentation, /7 个可执行入口对应的.*Windows x64 CycloneDX 1\.5 JSON/)
+  assert.match(documentation, /`artifacts\.json` 覆盖.*全部可执行文件和 SBOM/)
+  assert.match(documentation, /预装精确版本 `cargo-cyclonedx 0\.5\.9`/)
 })

@@ -102,6 +102,8 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: .
+      - name: Install pinned CycloneDX generator for delivery tools
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
       - name: Run Windows native gate
         shell: powershell
         run: ./scripts/test-windows.ps1

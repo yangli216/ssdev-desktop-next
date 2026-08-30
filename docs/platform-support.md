@@ -10,7 +10,7 @@
 | macOS x64 | DMG | 开发预览 | 不支持 Windows DLL/COM |
 | Windows 7/8/8.1 | 不发布 | 实验性研究 | 当前安全工具链不承诺支持 |
 
-GitHub Actions 上传的安装包使用临时 updater 密钥且没有 Authenticode、Apple Developer ID 或 Linux 分发签名，只用于工程验证，不能作为正式发布包。独立 Windows 项目交付工具包同样以 `-unsigned` 标识，仅验证工具构建、源码绑定和完整清单；生产版本必须逐个完成组织 Authenticode。生产 Windows Desktop 发布使用 `scripts/build-windows.ps1` 注入组织策略、更新公钥和代码签名材料，交付工具使用 `scripts/build-windows-delivery-tools.ps1` 单独发布，二者不互相增大体积或权限。
+GitHub Actions 上传的安装包使用临时 updater 密钥且没有 Authenticode、Apple Developer ID 或 Linux 分发签名，只用于工程验证，不能作为正式发布包。独立 Windows 项目交付工具包同样以 `-unsigned` 标识，仅验证工具构建、源码绑定、路径脱敏 SBOM 和完整清单；生产版本必须逐个完成组织 Authenticode。生产 Windows Desktop 发布使用 `scripts/build-windows.ps1` 注入组织策略、更新公钥和代码签名材料，交付工具使用 `scripts/build-windows-delivery-tools.ps1` 单独发布，二者不互相增大体积或权限。
 
 ## 为什么不承诺 Windows 7
 
@@ -26,7 +26,7 @@ GitHub Actions 将离线版命名为 `ssdev-windows-<arch>-offline-unsigned`，�
 
 - Linux 上执行 Rust 格式、Clippy、测试、桌面安全边界和前端/SDK 测试；
 - Windows 上分别验证 x86/x64 DLL、COM 和插件宿主；
-- Windows x64 另外构建不进入普通用户 NSIS 的项目交付工具包，包含试点、迁移、插件发布、签名、切换判定及正式黄金矩阵工具，并用 `release.json` 和 `artifacts.json` 记录源码版本及完整文件集；生产分发另要求组织签名最终归档；
+- Windows x64 另外构建不进入普通用户 NSIS 的项目交付工具包，包含试点、迁移、插件发布、签名、切换判定及正式黄金矩阵工具，并用 `release.json`、7 份 CycloneDX 1.5 SBOM 和 `artifacts.json` 记录源码版本、依赖图及完整文件集；生产分发另要求组织签名最终归档；
 - 对 x64 与 x86 桌面各构建一套离线合成旧版本；离线候选执行原位升级与回退，在线轻量候选再从同一离线旧版执行跨 WebView2 供给模式升级，并在候选启动/卸载、旧版精确回装启动与最终卸载全程复核配置及插件/本地映射数据根哨兵；候选启动还配置策略允许的惰性测试地址并要求真实创建业务 WebView，上一生产版本不因缺少新诊断事件而失去回退兼容；
 - 默认只构建 Windows 安装包；手动触发并选择 `all` 时才额外构建 Linux DEB/AppImage 和 macOS DMG 开发预览包；
 - 主分支推送额外上传经过可重复打包、固定文件集、摘要复核及离线 ESM/TypeScript 消费者冒烟的平台无关 Web Bridge SDK `.tgz`，Pull Request 只验证而不上传；

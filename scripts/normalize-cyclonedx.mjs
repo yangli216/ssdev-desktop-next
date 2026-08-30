@@ -2,11 +2,28 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-function cargoPurl(component) {
+function cargoPurl(component, nestedTarget = false) {
   if (!component?.name || !component?.version) {
     throw new Error("path-based CycloneDX components require a name and version");
   }
-  return `pkg:cargo/${encodeURIComponent(component.name)}@${encodeURIComponent(component.version)}`;
+  const base = `pkg:cargo/${encodeURIComponent(component.name)}@${encodeURIComponent(component.version)}`;
+  if (!nestedTarget) return base;
+  const fragment = component.purl?.split("#", 2)[1];
+  const safeFragment = fragment && fragment.split("/").every(
+    (segment) => segment && segment !== "." && segment !== ".." && /^[A-Za-z0-9._~-]+$/.test(segment),
+  )
+    ? `#${fragment}`
+    : "";
+  return `${base}?target=${encodeURIComponent(component.name)}${safeFragment}`;
+}
+
+function collectComponents(component, nestedTarget = false, target = []) {
+  if (!component || typeof component !== "object" || Array.isArray(component)) return target;
+  target.push({ component, nestedTarget });
+  if (Array.isArray(component.components)) {
+    for (const child of component.components) collectComponents(child, true, target);
+  }
+  return target;
 }
 
 function visit(value, callback) {
@@ -38,7 +55,11 @@ export function normalizeCycloneDx(input, workspaceRoot) {
   delete bom.metadata.timestamp;
 
   const replacements = new Map();
-  for (const component of [bom.metadata.component, ...bom.components]) {
+  const describedComponents = [
+    ...collectComponents(bom.metadata.component),
+    ...bom.components.flatMap((component) => collectComponents(component)),
+  ];
+  for (const { component, nestedTarget } of describedComponents) {
     const reference = component["bom-ref"];
     const purl = component.purl;
     const isLocal =
@@ -46,7 +67,7 @@ export function normalizeCycloneDx(input, workspaceRoot) {
       purl?.includes("download_url=file:") ||
       purl?.includes("download_url=file%3A");
     if (isLocal) {
-      const canonical = cargoPurl(component);
+      const canonical = cargoPurl(component, nestedTarget);
       if (reference) {
         replacements.set(reference, canonical);
       }
@@ -63,7 +84,7 @@ export function normalizeCycloneDx(input, workspaceRoot) {
   });
 
   const componentReferences = new Set();
-  for (const component of bom.components) {
+  for (const { component } of describedComponents) {
     const reference = component["bom-ref"];
     if (!reference || componentReferences.has(reference)) {
       throw new Error("CycloneDX components must have unique canonical bom-ref values");

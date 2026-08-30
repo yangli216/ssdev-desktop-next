@@ -12,6 +12,8 @@
 - `ssdev-release-manifest.exe`：创建或复验完整文件清单；
 - `ssdev-plugin-matrix.exe` 与 `run-plugin-matrix.ps1`：在 Windows x64 实机调用候选安装包中的 x86/x64 宿主并生成黄金矩阵证据。
 
+`sbom/` 还包含与上述 7 个可执行入口对应的、已移除工作区绝对路径和随机标识的 Windows x64 CycloneDX 1.5 JSON。它用于依赖审计和事件响应，不替代源码提交、二进制签名或最终归档签名。
+
 ## 使用前复验
 
 解压后先在工具包目录执行：
@@ -21,7 +23,7 @@
 Get-Content .\release.json
 ```
 
-`artifacts.json` 覆盖 README、包装器、发布元数据和全部可执行文件；任何缺失、增加或字节变化都会失败。`release.json` 记录工具版本、完整源码提交、目标架构和 Authenticode 状态。生产工具包的所有 EXE 必须由组织 Windows 发布流程签名并显示 `authenticodeVerified: true`，最终目录归档还必须具有组织发布签名；未签名 JSON 清单本身不是发布信任根。GitHub Actions 中名称带 `unsigned` 的短期制品只用于验证构建链，不能进入生产交付。
+`artifacts.json` 覆盖 README、包装器、发布元数据、全部可执行文件和 SBOM；任何缺失、增加或字节变化都会失败。`release.json` 记录工具版本、完整源码提交、目标架构、SBOM 数量和 Authenticode 状态。生产工具包的所有 EXE 必须由组织 Windows 发布流程签名并显示 `authenticodeVerified: true`，最终目录归档还必须具有组织发布签名；未签名 JSON 清单本身不是发布信任根。GitHub Actions 中名称带 `unsigned` 的短期制品只用于验证构建链，不能进入生产交付。
 
 工具包不含私钥、令牌、业务材料、插件包、黄金矩阵、信任库或 Windows 客户端安装包。组织公开信任库仍应从受保护发布渠道提供，KMS/HSM 私钥不得复制到工具目录。
 
@@ -57,7 +59,7 @@ Get-Content .\release.json
 
 ## 构建与签名
 
-CI 使用下面的测试模式生成独立无签名制品：
+构建机必须使用锁定依赖，并预装精确版本 `cargo-cyclonedx 0.5.9`。脚本会拒绝构建前残留的目标 SBOM，生成后清理临时源文件，并在封装前再次确认提交未变化且工作区仍为 clean。CI 使用下面的测试模式生成独立无签名制品：
 
 ```powershell
 .\scripts\build-windows-delivery-tools.ps1 `

@@ -57,6 +57,33 @@ test("rejects duplicate canonical component identities", () => {
   );
 });
 
+test("canonicalizes nested Cargo targets without collapsing them into the parent crate", () => {
+  const input = fixture();
+  const parentRef = input.metadata.component["bom-ref"];
+  const binaryRef = `${parentRef} bin-target-0`;
+  input.metadata.component.components = [
+    {
+      type: "application",
+      "bom-ref": binaryRef,
+      name: "example",
+      version: "1.2.3",
+      purl: "pkg:cargo/example@1.2.3?download_url=file://.#src/main.rs",
+    },
+  ];
+  input.dependencies.push({ ref: binaryRef, dependsOn: [] });
+
+  const normalized = normalizeCycloneDx(input, "/build/ssdev");
+  const binary = normalized.metadata.component.components[0];
+  assert.equal(
+    binary["bom-ref"],
+    "pkg:cargo/example@1.2.3?target=example#src/main.rs",
+  );
+  assert.equal(binary.purl, binary["bom-ref"]);
+  assert.equal(normalized.dependencies[2].ref, binary["bom-ref"]);
+  assert.notEqual(binary["bom-ref"], normalized.metadata.component["bom-ref"]);
+  assert.doesNotMatch(JSON.stringify(normalized), /file:|\/build\/ssdev/);
+});
+
 test("rejects unsupported or incomplete documents", () => {
   const input = fixture();
   input.specVersion = "1.4";
