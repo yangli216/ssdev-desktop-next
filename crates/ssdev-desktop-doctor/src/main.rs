@@ -47,6 +47,9 @@ fn run(arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode, 
             );
             println!("logFiles: {}", summary.log_files);
             println!("logBytes: {}", summary.log_bytes);
+            println!("errorEvents: {}", summary.error_events);
+            println!("warningEvents: {}", summary.warning_events);
+            println!("invalidEventLines: {}", summary.invalid_event_lines);
             if let Some(failure) = &summary.startup_failure {
                 println!("startupFailureCode: {}", failure.error_code);
                 println!(
@@ -62,6 +65,22 @@ fn run(arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode, 
             } else {
                 println!("startupFailureState: none");
             }
+            for finding in &summary.findings {
+                println!(
+                    "finding: {} {}{} count={}",
+                    finding.level,
+                    finding.event_code,
+                    finding
+                        .error_code
+                        .as_ref()
+                        .map(|code| format!("/{code}"))
+                        .unwrap_or_default(),
+                    finding.count
+                );
+            }
+            if summary.omitted_finding_entries > 0 {
+                println!("omittedFindingEntries: {}", summary.omitted_finding_entries);
+            }
             if summary.requires_attention() {
                 println!("action: {}", summary.action());
                 Ok(ExitCode::from(3))
@@ -71,24 +90,15 @@ fn run(arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode, 
             }
         }
         Command::Collect { destination, .. } => {
-            let summary = inspect_offline_diagnostics(&log_dir).map_err(map_diagnostics_error)?;
-            if summary.log_bytes == 0
-                && summary.startup_failure.is_none()
-                && !summary.startup_failure_marker_invalid
-            {
-                return Err(CliError::new(
-                    "desktop-diagnostics-not-found",
-                    "先以发生故障的 Windows 用户运行客户端一次，再重新收集。",
-                ));
-            }
-            let bytes = export_offline_diagnostics(&log_dir, &destination)
+            let export = export_offline_diagnostics(&log_dir, &destination)
                 .map_err(map_diagnostics_error)?;
             println!("COLLECTED");
-            println!("archiveBytes: {bytes}");
-            println!("logFiles: {}", summary.log_files);
+            println!("archiveBytes: {}", export.archive_bytes);
+            println!("logFiles: {}", export.summary.log_files);
+            println!("errorEvents: {}", export.summary.error_events);
             println!(
                 "startupFailureIncluded: {}",
-                summary.startup_failure.is_some()
+                export.summary.startup_failure.is_some()
             );
             println!("action: 通过组织批准的支持渠道传输该诊断包。");
             Ok(ExitCode::SUCCESS)
@@ -162,6 +172,9 @@ fn map_diagnostics_error(error: ssdev_diagnostics::DiagnosticsError) -> CliError
         match error.code() {
             "diagnostics-destination-exists" => "选择一个尚不存在的新 ZIP 文件。",
             "diagnostics-invalid-destination" => "提供绝对路径、已存在父目录和 .zip 扩展名。",
+            "diagnostics-offline-data-unavailable" => {
+                "先以发生故障的 Windows 用户运行客户端一次，再重新收集。"
+            }
             "diagnostics-unsafe-log-entry" => {
                 "保留现场并检查日志目录中的链接或异常文件，不要绕过安全检查。"
             }

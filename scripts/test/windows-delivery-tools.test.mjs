@@ -101,4 +101,7 @@ test('delivery toolkit documentation keeps unsigned CI output out of production'
   assert.match(documentation, /ssdev-desktop-doctor\.exe inspect/)
   assert.match(documentation, /只读取当前用户应用数据目录下固定的 `logs\/ssdev\.log\*`/)
   assert.match(documentation, /不读取配置、插件、账本或业务缓存/)
+  assert.match(documentation, /最多 16 种最新 WARN\/ERROR/)
+  assert.match(documentation, /日志 `message`、其他字段.*都不进入控制台摘要/)
+  assert.match(documentation, /聚合结果和 ZIP 内日志来自同一次有界读取/)
 })

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -24,6 +25,8 @@ const DEFAULT_BACKUP_FILES: usize = 5;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_EXPORT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_STARTUP_FAILURE_BYTES: u64 = 4 * 1024;
+const MAX_OFFLINE_FINDING_KINDS: usize = 64;
+const MAX_REPORTED_OFFLINE_FINDINGS: usize = 16;
 const OVERSIZED_EVENT: &[u8] =
     b"{\"level\":\"WARN\",\"event_code\":\"diagnostic-event-oversized\"}\n";
 
@@ -51,18 +54,34 @@ pub struct OfflineStartupFailure {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OfflineDiagnosticFinding {
+    pub level: String,
+    pub event_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OfflineDiagnosticsSummary {
     pub log_files: usize,
     pub log_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_failure: Option<OfflineStartupFailure>,
     pub startup_failure_marker_invalid: bool,
+    pub error_events: u64,
+    pub warning_events: u64,
+    pub invalid_event_lines: u64,
+    pub omitted_finding_entries: usize,
+    pub findings: Vec<OfflineDiagnosticFinding>,
 }
 
 impl OfflineDiagnosticsSummary {
     pub fn requires_attention(&self) -> bool {
         self.log_bytes == 0
             || self.startup_failure_marker_invalid
+            || self.error_events > 0
             || self
                 .startup_failure
                 .as_ref()
@@ -78,10 +97,18 @@ impl OfflineDiagnosticsSummary {
             .is_some_and(|failure| !failure.resolved)
         {
             "按启动故障码处理后重试客户端；仍失败时导出诊断包。"
+        } else if self.error_events > 0 {
+            "按最近稳定错误码处理后重试客户端；仍失败时导出诊断包。"
         } else {
             "当前用户没有可读取的客户端日志；先运行客户端一次再检查。"
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineDiagnosticsExport {
+    pub archive_bytes: u64,
+    pub summary: OfflineDiagnosticsSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -319,39 +346,21 @@ pub fn inspect_offline_diagnostics(
     log_dir: &Path,
 ) -> Result<OfflineDiagnosticsSummary, DiagnosticsError> {
     if !ensure_log_directory_or_missing(log_dir)? {
-        return Ok(OfflineDiagnosticsSummary {
-            log_files: 0,
-            log_bytes: 0,
-            startup_failure: None,
-            startup_failure_marker_invalid: false,
-        });
+        return Ok(build_offline_summary(None, false, &[]));
     }
     let (startup_failure, startup_failure_marker_invalid) = read_startup_failure(log_dir)?;
-    let mut log_files = 0;
-    let mut log_bytes = 0_u64;
-    for index in 0..=DEFAULT_BACKUP_FILES {
-        let Some(log) = open_bounded_log(&log_path(log_dir, index))? else {
-            continue;
-        };
-        let metadata = log.metadata().map_err(|source| DiagnosticsError::Io {
-            operation: "inspect-offline-log",
-            source,
-        })?;
-        log_files += 1;
-        log_bytes = log_bytes.saturating_add(metadata.len().min(DEFAULT_MAX_FILE_BYTES));
-    }
-    Ok(OfflineDiagnosticsSummary {
-        log_files,
-        log_bytes,
+    let logs = read_offline_logs(log_dir)?;
+    Ok(build_offline_summary(
         startup_failure,
         startup_failure_marker_invalid,
-    })
+        &logs,
+    ))
 }
 
 pub fn export_offline_diagnostics(
     log_dir: &Path,
     destination: &Path,
-) -> Result<u64, DiagnosticsError> {
+) -> Result<OfflineDiagnosticsExport, DiagnosticsError> {
     validate_export_destination(destination)?;
     let log_directory_present = ensure_log_directory_or_missing(log_dir)?;
     let (startup_failure, startup_failure_marker_invalid) = if log_directory_present {
@@ -359,35 +368,18 @@ pub fn export_offline_diagnostics(
     } else {
         (None, false)
     };
-    let mut logs = Vec::new();
-    let mut exported_log_bytes = 0_u64;
-    if log_directory_present {
-        for index in 0..=DEFAULT_BACKUP_FILES {
-            let Some(log) = open_bounded_log(&log_path(log_dir, index))? else {
-                continue;
-            };
-            let remaining = MAX_EXPORT_BYTES.saturating_sub(exported_log_bytes);
-            if remaining == 0 {
-                break;
-            }
-            let take = remaining.min(DEFAULT_MAX_FILE_BYTES);
-            let mut bytes = Vec::with_capacity(take.min(1024 * 1024) as usize);
-            log.take(take)
-                .read_to_end(&mut bytes)
-                .map_err(|source| DiagnosticsError::Io {
-                    operation: "read-offline-log",
-                    source,
-                })?;
-            exported_log_bytes = exported_log_bytes.saturating_add(bytes.len() as u64);
-            logs.push((archive_log_name(index), bytes));
-        }
-    }
-    let summary = OfflineDiagnosticsSummary {
-        log_files: logs.len(),
-        log_bytes: exported_log_bytes,
-        startup_failure,
-        startup_failure_marker_invalid,
+    let logs = if log_directory_present {
+        read_offline_logs(log_dir)?
+    } else {
+        Vec::new()
     };
+    let summary = build_offline_summary(startup_failure, startup_failure_marker_invalid, &logs);
+    if summary.log_bytes == 0
+        && summary.startup_failure.is_none()
+        && !summary.startup_failure_marker_invalid
+    {
+        return Err(DiagnosticsError::OfflineDataUnavailable);
+    }
     let manifest = serde_json::to_vec_pretty(&OfflineDiagnosticManifest {
         schema_version: 1,
         collection_mode: "offline-startup",
@@ -415,9 +407,9 @@ pub fn export_offline_diagnostics(
             operation: "write-offline-manifest",
             source,
         })?;
-    for (name, bytes) in logs {
-        zip.start_file(format!("logs/{name}"), options)?;
-        zip.write_all(&bytes)
+    for log in logs {
+        zip.start_file(format!("logs/{}", log.name), options)?;
+        zip.write_all(&log.bytes)
             .map_err(|source| DiagnosticsError::Io {
                 operation: "write-offline-log",
                 source,
@@ -430,12 +422,197 @@ pub fn export_offline_diagnostics(
             operation: "persist-offline-export",
             source: error.error,
         })?;
-    fs::metadata(destination)
+    let archive_bytes = fs::metadata(destination)
         .map(|metadata| metadata.len())
         .map_err(|source| DiagnosticsError::Io {
             operation: "inspect-offline-export",
             source,
-        })
+        })?;
+    Ok(OfflineDiagnosticsExport {
+        archive_bytes,
+        summary,
+    })
+}
+
+struct OfflineLog {
+    index: usize,
+    name: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct FindingAggregate {
+    count: u64,
+    last_sequence: u64,
+}
+
+fn read_offline_logs(log_dir: &Path) -> Result<Vec<OfflineLog>, DiagnosticsError> {
+    let mut logs = Vec::new();
+    let mut exported_log_bytes = 0_u64;
+    for index in 0..=DEFAULT_BACKUP_FILES {
+        let Some(log) = open_bounded_log(&log_path(log_dir, index))? else {
+            continue;
+        };
+        let remaining = MAX_EXPORT_BYTES.saturating_sub(exported_log_bytes);
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(DEFAULT_MAX_FILE_BYTES);
+        let mut bytes = Vec::with_capacity(take.min(1024 * 1024) as usize);
+        log.take(take)
+            .read_to_end(&mut bytes)
+            .map_err(|source| DiagnosticsError::Io {
+                operation: "read-offline-log",
+                source,
+            })?;
+        exported_log_bytes = exported_log_bytes.saturating_add(bytes.len() as u64);
+        logs.push(OfflineLog {
+            index,
+            name: archive_log_name(index),
+            bytes,
+        });
+    }
+    Ok(logs)
+}
+
+fn build_offline_summary(
+    startup_failure: Option<OfflineStartupFailure>,
+    startup_failure_marker_invalid: bool,
+    logs: &[OfflineLog],
+) -> OfflineDiagnosticsSummary {
+    let log_bytes = logs
+        .iter()
+        .map(|log| log.bytes.len() as u64)
+        .fold(0_u64, u64::saturating_add);
+    let mut findings = BTreeMap::<(String, String, Option<String>), FindingAggregate>::new();
+    let mut error_events = 0_u64;
+    let mut warning_events = 0_u64;
+    let mut invalid_event_lines = 0_u64;
+    let mut omitted_finding_entries = 0_usize;
+    let mut sequence = 0_u64;
+    let mut ordered_logs = logs.iter().collect::<Vec<_>>();
+    ordered_logs.sort_by_key(|log| std::cmp::Reverse(log.index));
+    for log in ordered_logs {
+        for line in log.bytes.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            sequence = sequence.saturating_add(1);
+            if line.len() > MAX_EVENT_BYTES {
+                invalid_event_lines = invalid_event_lines.saturating_add(1);
+                continue;
+            }
+            let Ok(event) = serde_json::from_slice::<serde_json::Value>(line) else {
+                invalid_event_lines = invalid_event_lines.saturating_add(1);
+                continue;
+            };
+            let event_code = event
+                .get("event_code")
+                .and_then(serde_json::Value::as_str)
+                .filter(|code| is_safe_diagnostic_code(code));
+            if event_code == Some("frontend-ready")
+                && event.get("level").and_then(serde_json::Value::as_str) == Some("INFO")
+                && event
+                    .get("duplicate_signal")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+            {
+                findings.clear();
+                error_events = 0;
+                warning_events = 0;
+                invalid_event_lines = 0;
+                omitted_finding_entries = 0;
+                continue;
+            }
+            let Some(level @ ("ERROR" | "WARN")) =
+                event.get("level").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(event_code) = event_code else {
+                invalid_event_lines = invalid_event_lines.saturating_add(1);
+                continue;
+            };
+            let error_code = event
+                .get("error_code")
+                .and_then(serde_json::Value::as_str)
+                .filter(|code| is_safe_diagnostic_code(code))
+                .map(str::to_owned);
+            if level == "ERROR" {
+                error_events = error_events.saturating_add(1);
+            } else {
+                warning_events = warning_events.saturating_add(1);
+            }
+            let key = (level.to_owned(), event_code.to_owned(), error_code);
+            if let Some(aggregate) = findings.get_mut(&key) {
+                aggregate.count = aggregate.count.saturating_add(1);
+                aggregate.last_sequence = sequence;
+                continue;
+            }
+            if findings.len() == MAX_OFFLINE_FINDING_KINDS {
+                if let Some(oldest) = findings
+                    .iter()
+                    .min_by_key(|(_, aggregate)| aggregate.last_sequence)
+                    .map(|(key, _)| key.clone())
+                {
+                    findings.remove(&oldest);
+                    omitted_finding_entries = omitted_finding_entries.saturating_add(1);
+                }
+            }
+            findings.insert(
+                key,
+                FindingAggregate {
+                    count: 1,
+                    last_sequence: sequence,
+                },
+            );
+        }
+    }
+    let mut findings = findings.into_iter().collect::<Vec<_>>();
+    findings.sort_by(|left, right| {
+        right
+            .1
+            .last_sequence
+            .cmp(&left.1.last_sequence)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    if findings.len() > MAX_REPORTED_OFFLINE_FINDINGS {
+        omitted_finding_entries =
+            omitted_finding_entries.saturating_add(findings.len() - MAX_REPORTED_OFFLINE_FINDINGS);
+        findings.truncate(MAX_REPORTED_OFFLINE_FINDINGS);
+    }
+    let findings = findings
+        .into_iter()
+        .map(
+            |((level, event_code, error_code), aggregate)| OfflineDiagnosticFinding {
+                level,
+                event_code,
+                error_code,
+                count: aggregate.count,
+            },
+        )
+        .collect();
+    OfflineDiagnosticsSummary {
+        log_files: logs.len(),
+        log_bytes,
+        startup_failure,
+        startup_failure_marker_invalid,
+        error_events,
+        warning_events,
+        invalid_event_lines,
+        omitted_finding_entries,
+        findings,
+    }
+}
+
+fn is_safe_diagnostic_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 64
+        && !code.starts_with('-')
+        && !code.ends_with('-')
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn validate_export_destination(destination: &Path) -> Result<(), DiagnosticsError> {
@@ -767,6 +944,8 @@ pub enum DiagnosticsError {
     InvalidDestination,
     #[error("diagnostics export destination already exists")]
     DestinationExists,
+    #[error("offline diagnostics contain no usable startup marker or log data")]
+    OfflineDataUnavailable,
     #[error("diagnostics JSON encoding failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("diagnostics ZIP encoding failed: {0}")]
@@ -782,6 +961,7 @@ impl DiagnosticsError {
             Self::UnsafeLogEntry => "diagnostics-unsafe-log-entry",
             Self::InvalidDestination => "diagnostics-invalid-destination",
             Self::DestinationExists => "diagnostics-destination-exists",
+            Self::OfflineDataUnavailable => "diagnostics-offline-data-unavailable",
             Self::Json(_) => "diagnostics-json-failure",
             Self::Zip(_) => "diagnostics-zip-failure",
         }
@@ -1050,13 +1230,110 @@ mod tests {
     }
 
     #[test]
+    fn offline_summary_reports_only_bounded_codes_after_the_latest_real_frontend_recovery() {
+        let root = tempdir().unwrap();
+        let log_dir = root.path().join("logs");
+        fs::create_dir(&log_dir).unwrap();
+        fs::write(
+            log_dir.join(format!("{LOG_FILE_NAME}.1")),
+            concat!(
+                "not-json\n",
+                "{\"level\":\"ERROR\",\"event_code\":\"old-startup-error\"}\n",
+                "{\"level\":\"INFO\",\"event_code\":\"frontend-ready\",\"duplicate_signal\":false}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            log_dir.join(LOG_FILE_NAME),
+            concat!(
+                "{\"level\":\"ERROR\",\"event_code\":\"tracked-invocation-ledger-unavailable\",\"error_code\":\"operation-ledger-io\",\"message\":\"private path ignored\"}\n",
+                "{\"level\":\"ERROR\",\"event_code\":\"tracked-invocation-ledger-unavailable\",\"error_code\":\"operation-ledger-io\"}\n",
+                "{\"level\":\"ERROR\",\"event_code\":\"process-panic\"}\n",
+                "{\"level\":\"WARN\",\"event_code\":\"safe-warning\",\"error_code\":\"secret/path\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let summary = inspect_offline_diagnostics(&log_dir).unwrap();
+        assert_eq!(summary.error_events, 3);
+        assert_eq!(summary.warning_events, 1);
+        assert_eq!(summary.invalid_event_lines, 0);
+        assert!(summary.requires_attention());
+        assert_eq!(summary.findings.len(), 3);
+        assert_eq!(summary.findings[0].event_code, "safe-warning");
+        assert!(summary.findings[0].error_code.is_none());
+        assert_eq!(summary.findings[1].event_code, "process-panic");
+        assert_eq!(
+            summary.findings[2],
+            OfflineDiagnosticFinding {
+                level: "ERROR".into(),
+                event_code: "tracked-invocation-ledger-unavailable".into(),
+                error_code: Some("operation-ledger-io".into()),
+                count: 2,
+            }
+        );
+        let encoded = serde_json::to_string(&summary).unwrap();
+        assert!(!encoded.contains("private path"));
+        assert!(!encoded.contains("secret/path"));
+        assert!(!encoded.contains("old-startup-error"));
+    }
+
+    #[test]
+    fn a_later_nonduplicate_frontend_ready_clears_stale_offline_errors() {
+        let root = tempdir().unwrap();
+        let log_dir = root.path().join("logs");
+        fs::create_dir(&log_dir).unwrap();
+        fs::write(
+            log_dir.join(LOG_FILE_NAME),
+            concat!(
+                "{\"level\":\"ERROR\",\"event_code\":\"old-startup-error\"}\n",
+                "{\"level\":\"INFO\",\"event_code\":\"frontend-ready\",\"duplicate_signal\":true}\n",
+                "{\"level\":\"INFO\",\"event_code\":\"frontend-ready\"}\n",
+                "{\"level\":\"INFO\",\"event_code\":\"app-started\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let summary = inspect_offline_diagnostics(&log_dir).unwrap();
+        assert_eq!(summary.error_events, 0);
+        assert_eq!(summary.warning_events, 0);
+        assert_eq!(summary.invalid_event_lines, 0);
+        assert!(summary.findings.is_empty());
+        assert!(!summary.requires_attention());
+    }
+
+    #[test]
+    fn offline_finding_kinds_are_bounded_and_keep_the_latest_codes() {
+        let root = tempdir().unwrap();
+        let log_dir = root.path().join("logs");
+        fs::create_dir(&log_dir).unwrap();
+        let mut log = String::new();
+        for index in 0..80 {
+            use std::fmt::Write as _;
+            writeln!(
+                log,
+                "{{\"level\":\"ERROR\",\"event_code\":\"bounded-error-{index}\"}}"
+            )
+            .unwrap();
+        }
+        fs::write(log_dir.join(LOG_FILE_NAME), log).unwrap();
+
+        let summary = inspect_offline_diagnostics(&log_dir).unwrap();
+        assert_eq!(summary.error_events, 80);
+        assert_eq!(summary.findings.len(), MAX_REPORTED_OFFLINE_FINDINGS);
+        assert_eq!(summary.omitted_finding_entries, 64);
+        assert_eq!(summary.findings[0].event_code, "bounded-error-79");
+        assert_eq!(summary.findings[15].event_code, "bounded-error-64");
+    }
+
+    #[test]
     fn offline_export_sanitizes_the_startup_marker_and_never_overwrites() {
         let root = tempdir().unwrap();
         let log_dir = root.path().join("logs");
         fs::create_dir(&log_dir).unwrap();
         fs::write(
             log_dir.join(LOG_FILE_NAME),
-            b"{\"event_code\":\"desktop-startup-failed\"}\n",
+            b"{\"level\":\"ERROR\",\"event_code\":\"tracked-invocation-ledger-unavailable\",\"error_code\":\"operation-ledger-io\",\"message\":\"secret-log-message\"}\n",
         )
         .unwrap();
         fs::write(
@@ -1078,8 +1355,11 @@ mod tests {
         assert!(manifest.contains("\"collectionMode\": \"offline-startup\""));
         assert!(manifest.contains("\"errorCode\": \"startup-desktop-shell\""));
         assert!(manifest.contains("\"resolved\": true"));
+        assert!(manifest.contains("\"eventCode\": \"tracked-invocation-ledger-unavailable\""));
+        assert!(manifest.contains("\"errorCode\": \"operation-ledger-io\""));
         assert!(!manifest.contains("private"));
         assert!(!manifest.contains("secret-token"));
+        assert!(!manifest.contains("secret-log-message"));
         assert!(archive.by_name("startup-failure.json").is_err());
         assert!(matches!(
             export_offline_diagnostics(&log_dir, &destination),
@@ -1168,6 +1448,13 @@ mod tests {
             Err(DiagnosticsError::DestinationExists)
         ));
         assert_eq!(fs::read(existing).unwrap(), b"keep");
+
+        let empty_offline = root.path().join("empty-offline.zip");
+        assert!(matches!(
+            export_offline_diagnostics(&root.path().join("missing"), &empty_offline),
+            Err(DiagnosticsError::OfflineDataUnavailable)
+        ));
+        assert!(!empty_offline.exists());
     }
 
     #[cfg(unix)]
