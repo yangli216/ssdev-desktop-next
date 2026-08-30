@@ -139,6 +139,7 @@ async function readWebKit(kit) {
     'matrixSha256',
     'serviceCount',
     'methodCount',
+    'ordinaryMethodCount',
     'fixtureCount',
     'files',
   ]
@@ -146,7 +147,7 @@ async function readWebKit(kit) {
       || !hasExactKeys(manifest.files, ['client', 'fixtures'])
       || !hasExactKeys(manifest.files.client, ['path', 'sha256'])
       || !hasExactKeys(manifest.files.fixtures, ['path', 'sha256'])
-      || manifest.schemaVersion !== 1) {
+      || manifest.schemaVersion !== 2) {
     throw new Error('Web kit manifest schema is invalid')
   }
   if (typeof manifest.pluginId !== 'string'
@@ -164,9 +165,12 @@ async function readWebKit(kit) {
   }
   if (!Number.isSafeInteger(manifest.serviceCount)
       || !Number.isSafeInteger(manifest.methodCount)
+      || !Number.isSafeInteger(manifest.ordinaryMethodCount)
       || !Number.isSafeInteger(manifest.fixtureCount)
       || manifest.serviceCount < 1
       || manifest.serviceCount > manifest.methodCount
+      || manifest.ordinaryMethodCount < 0
+      || manifest.ordinaryMethodCount > manifest.methodCount
       || manifest.methodCount > manifest.fixtureCount
       || manifest.fixtureCount > maxCoverageCount) {
     throw new Error('Web kit coverage counts are invalid')
@@ -228,6 +232,7 @@ async function verifyConsumers(options) {
   const pluginIdentities = new Set()
   let serviceCount = 0
   let methodCount = 0
+  let ordinaryMethodCount = 0
   let fixtureCount = 0
   let typescriptBytes = 0
   for (const kit of kits) {
@@ -238,14 +243,17 @@ async function verifyConsumers(options) {
     pluginIdentities.add(identity)
     serviceCount += kit.manifest.serviceCount
     methodCount += kit.manifest.methodCount
+    ordinaryMethodCount += kit.manifest.ordinaryMethodCount
     fixtureCount += kit.manifest.fixtureCount
     typescriptBytes += kit.clientBytes.length + kit.fixturesBytes.length
   }
   if (!Number.isSafeInteger(serviceCount)
       || !Number.isSafeInteger(methodCount)
+      || !Number.isSafeInteger(ordinaryMethodCount)
       || !Number.isSafeInteger(fixtureCount)
       || serviceCount > maxCoverageCount
       || methodCount > maxCoverageCount
+      || ordinaryMethodCount > methodCount
       || fixtureCount > maxCombinedFixtureCount
       || typescriptBytes > maxCombinedTypescriptBytes) {
     throw new Error('Web kit set exceeds the combined consumer bounds')
@@ -333,6 +341,7 @@ async function verifyConsumers(options) {
     const runtimeIntegrations = kitFiles.map((entry, index) => `  {
     pluginId: ${JSON.stringify(entry.kit.manifest.pluginId)},
     methodCount: ${entry.kit.manifest.methodCount},
+    ordinaryMethodCount: ${entry.kit.manifest.ordinaryMethodCount},
     fixtureCount: ${entry.kit.manifest.fixtureCount},
     clientModule: clientModule${index},
     fixtures: pluginFixtures${index},
@@ -385,37 +394,39 @@ for (const fixture of allFixtures) {
 for (const integration of integrations) {
   const clientExports = Object.entries(integration.clientModule)
     .filter(([name, value]) => name.endsWith('Client') && typeof value === 'function')
-  if (clientExports.length !== 1) {
-    throw new Error(\`Web kit [\${integration.pluginId}] must export exactly one generated client\`)
-  }
-  const Client = clientExports[0][1]
-  const client = new Client(invoker)
-  const methods = Object.getOwnPropertyNames(Client.prototype)
-    .filter((name) => name !== 'constructor' && typeof client[name] === 'function')
   const fixtureRoutes = new Set(integration.fixtures.map(routeKey))
-  if (methods.length !== integration.methodCount) {
-    throw new Error(\`Web kit [\${integration.pluginId}] client method count does not match its manifest\`)
+  if (clientExports.length !== (integration.ordinaryMethodCount > 0 ? 1 : 0)) {
+    throw new Error(\`Web kit [\${integration.pluginId}] ordinary client presence does not match its manifest\`)
   }
-  const matchedRoutes = new Set()
-  for (const method of methods) {
-    let matched = false
-    for (const fixture of integration.fixtures) {
-      try {
-        const response = await client[method](fixture.parameters ?? {})
-        if (JSON.stringify(response) !== JSON.stringify(fixture.response)) {
-          throw new Error('generated client returned an unexpected fixture response')
-        }
-        matchedRoutes.add(routeKey(fixture))
-        matched = true
-        break
-      } catch (error) {
-        if (!(error instanceof UnexpectedPluginInvocationError)) throw error
-      }
+  if (integration.ordinaryMethodCount > 0) {
+    const Client = clientExports[0][1]
+    const client = new Client(invoker)
+    const methods = Object.getOwnPropertyNames(Client.prototype)
+      .filter((name) => name !== 'constructor' && typeof client[name] === 'function')
+    if (methods.length !== integration.ordinaryMethodCount) {
+      throw new Error(\`Web kit [\${integration.pluginId}] ordinary client method count does not match its manifest\`)
     }
-    if (!matched) throw new Error(\`generated client method [\${method}] has no matching fixture\`)
-  }
-  if (matchedRoutes.size !== fixtureRoutes.size) {
-    throw new Error(\`Web kit [\${integration.pluginId}] client does not cover every fixture route\`)
+    const matchedRoutes = new Set()
+    for (const method of methods) {
+      let matched = false
+      for (const fixture of integration.fixtures) {
+        try {
+          const response = await client[method](fixture.parameters ?? {})
+          if (JSON.stringify(response) !== JSON.stringify(fixture.response)) {
+            throw new Error('generated client returned an unexpected fixture response')
+          }
+          matchedRoutes.add(routeKey(fixture))
+          matched = true
+          break
+        } catch (error) {
+          if (!(error instanceof UnexpectedPluginInvocationError)) throw error
+        }
+      }
+      if (!matched) throw new Error(\`generated client method [\${method}] has no matching fixture\`)
+    }
+    if (matchedRoutes.size !== integration.ordinaryMethodCount) {
+      throw new Error(\`Web kit [\${integration.pluginId}] ordinary client route coverage is ambiguous\`)
+    }
   }
   const trackedExports = Object.entries(integration.clientModule)
     .filter(([name, value]) => name.endsWith('TrackedApi') && typeof value === 'function')
@@ -526,6 +537,7 @@ for (const integration of integrations) {
     kitCount: kits.length,
     serviceCount,
     methodCount,
+    ordinaryMethodCount,
     fixtureCount,
     kitSetSha256,
     sdkPackageName: sdk.packageName,

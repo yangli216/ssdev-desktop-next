@@ -33,6 +33,8 @@ if (settlement.kind === 'status' && settlement.status.state === 'completed') {
 
 操作 ID 必须由安全随机源生成，并由业务流程保存。一个 ID 只能绑定同一来源、`serviceId`、`method` 和完整参数；重复提交相同内容会等待或返回同一次执行结果，换参数、换方法或换授权范围会硬失败。不要为同一个业务动作在超时或刷新后自动生成新 ID。
 
+插件方法可以在签名覆盖的 `api.json` 中声明 `"trackedInvocationRequired": true`。该声明适用于打印、写卡等发布方已经确认不能安全重放的方法：普通 `invokePlugin` 会在进入插件宿主前以 `ResCode=-32004` 拒绝并保证没有执行，SDK 将其分类为 `retry: 'use-tracked-invocation'`；只有已经由持久账本接纳 operation ID 的 `invokePluginTracked` 可以进入原生宿主。账本不可用时，这类方法保持失败关闭，不能退回普通调用。字段缺省为 `false`，因此旧插件仍保持原行为；改变该字段会改变生成 API 和运行时准入，公共契约兼容检查会将任一方向的变化视为破坏性变更。
+
 `createPluginOperationId()` 返回带品牌的 `PluginOperationId`。页面刷新后，从 IndexedDB、业务后端或其他项目自有持久记录取回的值仍是未知输入，必须先调用 `parsePluginOperationId(restoredValue)`；它只接受规范小写、带连字符、版本 4 且为 RFC 4122 variant 的 UUID，并以不包含输入值的固定错误拒绝损坏记录。生成的 `create<Plugin>TrackedApi()` 只接受这一品牌类型，避免在业务代码中把订单号、空值或旧字段误当 operation ID；底层桥的 `string` 参数保持兼容。SDK 不提供通用存储层，也不会替项目决定 ID 应与哪一笔业务记录绑定。
 
 ## 状态语义
@@ -59,7 +61,7 @@ const statusSettlement = await settleTrackedInvocation(
 )
 ```
 
-由本地映射工作台或 `ssdev-plugin-tool client/web-kit` 生成的 TypeScript 文件会额外导出 `create<Plugin>TrackedApi()`。将上面的 `bridge` 传给该工厂后，每个公开方法同时拥有类型化调用和状态查询入口，继续绑定清单中的 service/method 和参数/响应类型；普通 `<Plugin>Client` 与现有 fixture 用法保持不变。生成 API 不替业务保存 operation ID，也不自动轮询或重试。
+由本地映射工作台或 `ssdev-plugin-tool client/web-kit` 生成的 TypeScript 文件会额外导出 `create<Plugin>TrackedApi()`。将上面的 `bridge` 传给该工厂后，每个公开方法都拥有类型化持久调用和状态查询入口，继续绑定清单中的 service/method 和参数/响应类型。未要求持久调用的方法继续进入普通 `<Plugin>Client` 和 fixture 路径；声明 `trackedInvocationRequired` 的方法不会生成普通调用方法，全插件均强制持久调用时也不会生成空的普通 Client。生成 API 不替业务保存 operation ID，也不自动轮询或重试。本地控制台的受控单次调试和正式黄金矩阵使用独立管理入口，可以验证这类方法，但不能由远程业务页调用该入口。
 
 ## 崩溃一致性边界
 

@@ -2740,6 +2740,7 @@ struct MethodInventoryItem {
     return_type: String,
     parameter_count: usize,
     timeout_ms: u64,
+    tracked_invocation_required: bool,
 }
 
 #[derive(Serialize)]
@@ -5703,6 +5704,7 @@ fn service_inventory_item(service: ServiceDefinition) -> ServiceInventoryItem {
             return_type: method.return_type,
             parameter_count: method.parameters.len(),
             timeout_ms: method.timeout,
+            tracked_invocation_required: method.tracked_invocation_required,
         })
         .collect::<Vec<_>>();
     ServiceInventoryItem {

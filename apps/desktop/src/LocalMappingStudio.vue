@@ -19,6 +19,7 @@ type MethodDefinition = {
   name: string
   alias?: string
   timeout: number
+  trackedInvocationRequired: boolean
   returnType: string
   parameters: Array<ParameterDefinition | string>
   props: string[]
@@ -190,7 +191,15 @@ const returnTypeOptions = computed(() => service.value?.mainType === 'dll'
 const editingStoredCase = computed(() => draft.value.debugCases.some((item) => item.name === debugCaseName.value.trim()))
 
 function newMethod(name = ''): MethodDefinition {
-  return { name, alias: '', timeout: 0, returnType: 'string', parameters: [], props: [] }
+  return {
+    name,
+    alias: '',
+    timeout: 0,
+    trackedInvocationRequired: false,
+    returnType: 'string',
+    parameters: [],
+    props: [],
+  }
 }
 
 function newService(): ServiceDefinition {
@@ -233,6 +242,7 @@ function normalizeMapping(mapping: LocalMappingDefinition): LocalMappingDefiniti
     item.callingConvention ||= 'system'
     for (const mappedMethod of item.methods) {
       mappedMethod.props ??= []
+      mappedMethod.trackedInvocationRequired ??= false
       mappedMethod.parameters = mappedMethod.parameters.map((parameter) =>
         typeof parameter === 'string'
           ? { name: parameter, type: 'string', len: 1024 }
@@ -1097,7 +1107,9 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
                 <label><span>网页调用名（可选）</span><input v-model.trim="method.alias" /></label>
                 <label><span>返回类型</span><select v-model="method.returnType"><option v-for="item in returnTypeOptions" :key="item">{{ item }}</option></select></label>
                 <label><span>超时覆盖 (ms)</span><input v-model.number="method.timeout" type="number" min="0" /></label>
+                <label class="checkbox"><input v-model="method.trackedInvocationRequired" type="checkbox" /><span>业务调用必须使用持久操作 ID</span></label>
               </div>
+              <p v-if="method.trackedInvocationRequired" class="field-hint">适用于打印、写卡等不可安全重放的方法。普通 Web Bridge 调用会在进入原生宿主前被拒绝；本页的受控调试与黄金矩阵仍可执行。</p>
               <div class="parameter-table">
                 <div class="parameter-head"><span>参数名</span><span>类型</span><span>长度</span><span>字符集</span><span></span></div>
                 <div v-for="(_parameter, index) in method.parameters" :key="index" class="parameter-row">

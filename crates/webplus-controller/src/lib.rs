@@ -24,6 +24,7 @@ use webplus_protocol::{
     INVOKE_CONTROLLER_STOPPING_CODE as CONTROLLER_STOPPING,
     INVOKE_EXECUTION_LANE_TIMEOUT_CODE as EXECUTION_LANE_TIMEOUT,
     INVOKE_PLUGIN_RELOADING_CODE as CONTROLLER_MAINTENANCE,
+    INVOKE_TRACKED_REQUIRED_CODE as TRACKED_INVOCATION_REQUIRED,
 };
 
 const INVALID_REQUEST: i32 = -32602;
@@ -119,6 +120,13 @@ pub enum InvocationExecutionState {
     Indeterminate,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InvocationAccess {
+    OrdinaryBusiness,
+    TrackedBusiness,
+    LocalAdministrative,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct InvocationOutcome {
     pub response: InvokeResponse,
@@ -207,6 +215,7 @@ struct ServiceRoute {
     manifest: Option<Arc<PluginManifest>>,
     default_timeout: Option<Duration>,
     method_timeouts: HashMap<String, Duration>,
+    tracked_invocation_required_methods: HashSet<String>,
 }
 
 struct PluginLifecycle {
@@ -304,6 +313,7 @@ impl PluginController {
                 manifest: None,
                 default_timeout: None,
                 method_timeouts: HashMap::new(),
+                tracked_invocation_required_methods: HashSet::new(),
             },
         );
         Ok(())
@@ -330,11 +340,22 @@ impl PluginController {
                 route.manifest = Some(Arc::clone(&snapshot));
                 route.default_timeout = configured_timeout(service.timeout);
                 route.method_timeouts.clear();
+                route.tracked_invocation_required_methods.clear();
                 for method in &service.methods {
                     if let Some(timeout) = configured_timeout(method.timeout) {
                         route.method_timeouts.insert(method.name.clone(), timeout);
                         if let Some(alias) = &method.alias {
                             route.method_timeouts.insert(alias.clone(), timeout);
+                        }
+                    }
+                    if method.tracked_invocation_required {
+                        route
+                            .tracked_invocation_required_methods
+                            .insert(method.name.clone());
+                        if let Some(alias) = &method.alias {
+                            route
+                                .tracked_invocation_required_methods
+                                .insert(alias.clone());
                         }
                     }
                 }
@@ -599,7 +620,17 @@ impl PluginController {
     /// waiting for its response. Dropping this future detaches the waiter but
     /// does not cancel a possibly non-idempotent hardware operation.
     pub async fn invoke(self: &Arc<Self>, request: InvokeRequest) -> InvokeResponse {
-        self.invoke_with_execution_state(request).await.response
+        self.invoke_with_access(request, InvocationAccess::OrdinaryBusiness)
+            .await
+            .response
+    }
+
+    /// Executes a request only after the caller has durably accepted its
+    /// operation identity in the tracked invocation ledger.
+    pub async fn invoke_tracked(self: &Arc<Self>, request: InvokeRequest) -> InvokeResponse {
+        self.invoke_with_access(request, InvocationAccess::TrackedBusiness)
+            .await
+            .response
     }
 
     /// Preserves whether a local administrative caller can prove that native
@@ -610,8 +641,17 @@ impl PluginController {
         self: &Arc<Self>,
         request: InvokeRequest,
     ) -> InvocationOutcome {
+        self.invoke_with_access(request, InvocationAccess::LocalAdministrative)
+            .await
+    }
+
+    async fn invoke_with_access(
+        self: &Arc<Self>,
+        request: InvokeRequest,
+        access: InvocationAccess,
+    ) -> InvocationOutcome {
         let controller = Arc::clone(self);
-        let task = tokio::spawn(async move { controller.invoke_inner(request).await });
+        let task = tokio::spawn(async move { controller.invoke_inner(request, access).await });
         let mut waiter = CallerWaitGuard::new(&self.caller_detachments);
         let result = task.await;
         waiter.complete();
@@ -630,7 +670,11 @@ impl PluginController {
         }
     }
 
-    async fn invoke_inner(&self, request: InvokeRequest) -> InvocationOutcome {
+    async fn invoke_inner(
+        &self,
+        request: InvokeRequest,
+        access: InvocationAccess,
+    ) -> InvocationOutcome {
         if let Err(error) = request.validate() {
             return InvocationOutcome::not_executed(InvokeResponse::error(
                 INVALID_REQUEST,
@@ -648,6 +692,18 @@ impl PluginController {
             let routes = self.routes.read().await;
             routes.get(&request.service_id).cloned()
         };
+        if access == InvocationAccess::OrdinaryBusiness
+            && route.as_ref().is_some_and(|route| {
+                route
+                    .tracked_invocation_required_methods
+                    .contains(&request.method)
+            })
+        {
+            return InvocationOutcome::not_executed(InvokeResponse::error(
+                TRACKED_INVOCATION_REQUIRED,
+                "native plugin method requires a tracked invocation operation ID; request was not executed",
+            ));
+        }
         let plugin_lifecycle = match &route {
             Some(route) => Some(self.plugin_lifecycle(&route.descriptor.plugin_id).await),
             None => None,
@@ -1083,11 +1139,18 @@ fn routes_from_manifests(
                 local_mapping_integrity_sha256: manifest.local_mapping_integrity_sha256.clone(),
             };
             let mut method_timeouts = HashMap::new();
+            let mut tracked_invocation_required_methods = HashSet::new();
             for method in &service.methods {
                 if let Some(timeout) = configured_timeout(method.timeout) {
                     method_timeouts.insert(method.name.clone(), timeout);
                     if let Some(alias) = &method.alias {
                         method_timeouts.insert(alias.clone(), timeout);
+                    }
+                }
+                if method.tracked_invocation_required {
+                    tracked_invocation_required_methods.insert(method.name.clone());
+                    if let Some(alias) = &method.alias {
+                        tracked_invocation_required_methods.insert(alias.clone());
                     }
                 }
             }
@@ -1099,6 +1162,7 @@ fn routes_from_manifests(
                         manifest: Some(Arc::clone(&snapshot)),
                         default_timeout: configured_timeout(service.timeout),
                         method_timeouts,
+                        tracked_invocation_required_methods,
                     },
                 )
                 .is_some()
@@ -2081,6 +2145,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tracked_required_methods_reject_only_ordinary_business_invocations() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("api.json"),
+            r#"{
+              "serviceId":"printer",
+              "mainClass":"printer.dll",
+              "methods":[{
+                "name":"PrintReceipt",
+                "alias":"print",
+                "trackedInvocationRequired":true
+              }]
+            }"#,
+        )
+        .unwrap();
+        let manifest = PluginManifest::load("printer-plugin", root.path()).unwrap();
+        let controller = Arc::new(PluginController::new(config()).unwrap());
+        controller.register_manifest(&manifest).await.unwrap();
+
+        for method in ["PrintReceipt", "print"] {
+            let response = controller
+                .invoke(InvokeRequest {
+                    service_id: "printer".into(),
+                    method: method.into(),
+                    parameters: Map::new(),
+                })
+                .await;
+            assert_eq!(response.res_code, TRACKED_INVOCATION_REQUIRED);
+            assert_eq!(controller.invocation_admission_stats().in_flight, 0);
+        }
+
+        let tracked = controller
+            .invoke_tracked(InvokeRequest {
+                service_id: "printer".into(),
+                method: "print".into(),
+                parameters: Map::new(),
+            })
+            .await;
+        assert_eq!(tracked.res_code, HOST_FAILURE);
+
+        let administrative = controller
+            .invoke_with_execution_state(InvokeRequest {
+                service_id: "printer".into(),
+                method: "print".into(),
+                parameters: Map::new(),
+            })
+            .await;
+        assert_eq!(administrative.response.res_code, HOST_FAILURE);
+        assert_eq!(
+            administrative.execution_state,
+            InvocationExecutionState::NotExecuted
+        );
+    }
+
+    #[tokio::test]
     async fn host_start_failure_is_proven_not_executed() {
         let controller = Arc::new(PluginController::new(config()).unwrap());
         controller
@@ -2618,6 +2737,7 @@ mod tests {
             SERVER_BUSY,
             CONTROLLER_STOPPING,
             EXECUTION_LANE_TIMEOUT,
+            TRACKED_INVOCATION_REQUIRED,
             CONTROLLER_MAINTENANCE,
         ] {
             let response = sanitize_host_invoke_response(InvokeResponse::error(code, "vendor"));

@@ -75,7 +75,7 @@ cargo run --locked -p ssdev-plugin-tool -- client `
 
 命令先使用运行时同源规则完整校验 `api.json`，再生成输入类型、`ReturnValue`、输出参数、COM 属性和固定的 service/method 路由。未提供 `--display-name` 时优先使用已有 `plugin.json` 的名称，否则使用插件 ID。输出必须是尚不存在的文件，并且必须位于待签名插件源目录之外，避免把业务 TypeScript 意外放入原生插件签名载荷。
 
-控制台本地映射工作台的“TS”按钮也调用同一个共享生成器，因此现场映射转成正式插件后不会产生另一套方法命名规则。生成文件保留依赖公开 `PluginInvoker` 的普通 Client，并额外导出依赖 `TrackedInvocationBridge` 的类型化 tracked API；打印、写卡业务可同时获得固定路由、参数类型、持久调用和状态查询，不必退回原始字符串调用。业务项目应把生成文件作为受控代码制品提交并随 `api.json` 变更一起评审。业务前端单元测试可向普通 Client 注入 SDK 的 `createPluginFixtureInvoker`；它严格匹配公开路由和完整 JSON 参数并隔离每次响应，但不会伪造桌面全局对象、持久调用、崩溃恢复或原生硬件语义，正式发布仍必须通过下方黄金矩阵。
+控制台本地映射工作台的“TS”按钮也调用同一个共享生成器，因此现场映射转成正式插件后不会产生另一套方法命名规则。生成文件对未声明强制持久调用的方法保留依赖公开 `PluginInvoker` 的普通 Client，并为全部方法导出依赖 `TrackedInvocationBridge` 的类型化 tracked API；打印、写卡方法应在 `api.json` 声明 `trackedInvocationRequired: true`，其普通 Client 入口会被移除，Desktop 运行时也会阻止普通业务调用进入宿主。该字段由插件包签名覆盖，任一方向变化都被公共契约门禁视为破坏性变更。业务项目应把生成文件作为受控代码制品提交并随 `api.json` 变更一起评审。业务前端单元测试可向普通 Client 注入 SDK 的 `createPluginFixtureInvoker`；它严格匹配普通路由和完整 JSON 参数并隔离每次响应，但不会伪造桌面全局对象、持久调用、崩溃恢复或原生硬件语义，正式发布仍必须通过下方黄金矩阵。
 
 正式黄金矩阵完成实机复核后，可以避免再次手抄同一份请求/响应。以下命令先复用完整矩阵门禁，再生成可直接传给 `createPluginFixtureInvoker` 的 TypeScript 数组：
 
@@ -99,7 +99,7 @@ cargo run --locked -p ssdev-plugin-tool -- web-kit `
   --destination C:\business-web\vendor\reader-2.3.1-web-kit
 ```
 
-目标必须是插件目录之外尚不存在的新目录。成功后固定只包含 `client.ts`、`fixtures.ts` 和 `ssdev-web-kit.json`：客户端使用同一清单生成，fixture 复用上述完整矩阵门禁，清单绑定插件 ID/版本、`api.json`、`plugin.json`、矩阵以及两份生成文件的 SHA-256。任一步失败或输入在生成期间变化都会删除整个半成品目录，避免业务仓库收到不同插件版本的客户端与测试数据。多插件项目仍按插件分别生成接入包，或只需要联合测试数组时继续使用 `web-fixtures --plugin-root`。
+目标必须是插件目录之外尚不存在的新目录。成功后固定只包含 `client.ts`、`fixtures.ts` 和 `ssdev-web-kit.json`：客户端使用同一清单生成，fixture 复用上述完整矩阵门禁，schema 2 清单绑定插件 ID/版本、全部方法数、普通方法数、`api.json`、`plugin.json`、矩阵以及两份生成文件的 SHA-256。离线联合消费者分别要求普通 Client 精确覆盖未强制持久调用的方法、tracked API 覆盖全部方法；全插件强制时要求不存在空普通 Client。任一步失败或输入在生成期间变化都会删除整个半成品目录，避免业务仓库收到不同插件版本的客户端与测试数据。多插件项目仍按插件分别生成接入包，或只需要联合测试数组时继续使用 `web-fixtures --plugin-root`。
 
 业务仓库接收并提交整个目录后，在 CI 中重复验证固定文件集和摘要：
 

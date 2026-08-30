@@ -11,7 +11,9 @@ use ssdev_cutover_evidence::{
 };
 use ssdev_plugin_tool::{check_release_root_against_set, validate_executable_matrix};
 use ssdev_release_manifest::{capture_source_identity, SourceIdentity};
-use webplus_controller::{PluginController, PluginTrust, SupervisorConfig};
+use webplus_controller::{
+    InvocationExecutionState, PluginController, PluginTrust, SupervisorConfig,
+};
 use webplus_plugin_config::{discover_plugins, PluginManifest};
 use webplus_plugin_trust::{prepare_signing_material, read_identity, TrustStore};
 
@@ -303,8 +305,11 @@ async fn run() -> Result<(), MatrixRunFailure> {
             tally.record_skipped();
             continue;
         }
-        let actual = controller.invoke(case.request).await;
-        tally.record_executed(actual == case.expected);
+        let outcome = controller.invoke_with_execution_state(case.request).await;
+        tally.record_executed(
+            outcome.execution_state == InvocationExecutionState::Completed
+                && outcome.response == case.expected,
+        );
     }
     controller.shutdown().await;
     if tally.executed != coverage.enabled_case_count {

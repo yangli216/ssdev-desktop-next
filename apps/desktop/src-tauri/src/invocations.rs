@@ -400,7 +400,7 @@ impl InvocationCoordinator {
     ) {
         match begin_durable(Arc::clone(&self.ledger), identity.clone()).await {
             Ok(BeginDecision::Started) => {
-                let response = Arc::new(controller.invoke(request).await);
+                let response = Arc::new(controller.invoke_tracked(request).await);
                 self.finish(runtime_key, identity, response).await;
             }
             Ok(BeginDecision::Indeterminate) => {

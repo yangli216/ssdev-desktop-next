@@ -17,6 +17,9 @@ pub const INVOKE_CAPACITY_BUSY_CODE: i32 = -32001;
 pub const INVOKE_CONTROLLER_STOPPING_CODE: i32 = -32002;
 /// Rejected before native execution because the per-plugin execution lane deadline elapsed.
 pub const INVOKE_EXECUTION_LANE_TIMEOUT_CODE: i32 = -32003;
+/// Rejected before native execution because the signed method contract requires
+/// a durable tracked invocation operation ID.
+pub const INVOKE_TRACKED_REQUIRED_CODE: i32 = -32004;
 /// Rejected before native execution because the selected plugin is in a maintenance generation.
 pub const INVOKE_PLUGIN_RELOADING_CODE: i32 = -32010;
 const MAX_ROUTING_FIELD_CHARS: usize = 256;
@@ -28,6 +31,7 @@ pub fn is_reserved_controller_invoke_code(code: i32) -> bool {
         INVOKE_CAPACITY_BUSY_CODE
             | INVOKE_CONTROLLER_STOPPING_CODE
             | INVOKE_EXECUTION_LANE_TIMEOUT_CODE
+            | INVOKE_TRACKED_REQUIRED_CODE
             | INVOKE_PLUGIN_RELOADING_CODE
     )
 }

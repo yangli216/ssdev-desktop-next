@@ -31,7 +31,7 @@ const reader = new ReaderPluginClient(invoker)
 
 fixture 按 service、method 和完整 JSON 参数精确匹配，对象键顺序不影响结果；省略参数与 `{}` 等价。重复定义、非 JSON 数据、超出 JavaScript 安全范围的整数和未声明调用都会显式失败，错误不复制参数内容；精确 64 位整数应按插件契约使用字符串。每次调用返回独立副本，测试代码修改结果不会污染下一用例。该工具不会写入 `window.ssdevDesktop`，也不模拟持久操作 ID、超时、重试、DLL/COM 行为或硬件副作用，只用于业务前端单元测试，不能替代 Windows 插件黄金矩阵。
 
-同一生成文件还会导出独立的 `create<Plugin>TrackedApi()`。打印、写卡等非幂等方法应把 `requireTrackedPluginInvocations(connection.bridge, connection.system)` 的结果传入该工厂，从而继续使用生成的参数/响应类型和固定路由，而不是在业务代码里重新手抄 `serviceId`、`method`。tracked API 为每个公开方法生成调用和状态查询两个方法，并要求 `PluginOperationId`：新动作使用 `createPluginOperationId()`，页面刷新后从业务存储恢复的未知字符串先经过 `parsePluginOperationId()`，损坏、非 v4、非 RFC 4122 variant、非小写规范格式都会在调用前固定失败。生成入口还会自动用 `parseTrackedInvocationStatus()` 校验 Desktop 返回的精确状态、响应和 `durable` 字段；底层桥继续接受 `string` 以兼容旧代码。操作 ID 仍必须由业务流程在调用前持久保存。
+同一生成文件还会导出独立的 `create<Plugin>TrackedApi()`。打印、写卡等非幂等方法应在签名 `api.json` 中声明 `trackedInvocationRequired: true`，并把 `requireTrackedPluginInvocations(connection.bridge, connection.system)` 的结果传入该工厂，从而继续使用生成的参数/响应类型和固定路由，而不是在业务代码里重新手抄 `serviceId`、`method`。tracked API 为每个公开方法生成调用和状态查询两个方法，并要求 `PluginOperationId`；被强制的方法不会出现在普通 Client，普通桥误调用也会在进入原生宿主前以 `ResCode=-32004` 拒绝。新动作使用 `createPluginOperationId()`，页面刷新后从业务存储恢复的未知字符串先经过 `parsePluginOperationId()`，损坏、非 v4、非 RFC 4122 variant、非小写规范格式都会在调用前固定失败。生成入口还会自动用 `parseTrackedInvocationStatus()` 校验 Desktop 返回的精确状态、响应和 `durable` 字段；底层桥继续接受 `string` 以兼容旧代码。操作 ID 仍必须由业务流程在调用前持久保存。
 
 业务默认把生成 API 的直接 Promise 交给 `settleTrackedInvocation()`。它在同一入口完成严格状态解析、成功分类和拒绝分类，返回冻结的 `{ kind: 'status', status, disposition }` 或 `{ kind: 'failure', disposition }`；结构化 Desktop 拒绝保留脱敏 phase/code，旧客户端异常、损坏状态或未知错误统一按“可能已执行”处理，原异常不会进入结果。`completed` 且 `durable=false` 会明确要求在处理响应时记录恢复风险。全部 disposition 都固定 `automaticReplay: 'forbidden'`。底层 `parseTrackedInvocationStatus()`、`classifyTrackedInvocationStatus()` 和 `classifyTrackedInvocationFailure()` 仍可单独组合，但不应让每个项目重复实现 try/catch 安全分支。SDK 不提供存储、自动轮询、重试或替业务完成设备对账。
 
@@ -98,7 +98,7 @@ node scripts/web-integration-consumer.mjs verify-set \
 
 SDK 显式导出 `CURRENT_BRIDGE_PROTOCOL_VERSION`；旧名称 `CURRENT_PROTOCOL_VERSION` 仅作为源码兼容别名保留。该版本只治理注入业务页面的公开桥接，不与 controller/plugin-host 的内部命名管道协议绑定。
 
-不要在业务代码中散落 `-32001` 等魔法数字。SDK 的 `classifyPluginInvocationResponse()` 会把四种由 controller 在原生执行前产生的拒绝分类为 `execution: 'not-executed'`；这些代码由 controller 独占，宿主或厂商组件返回同码会被改写成执行状态未知的一般宿主失败。`canRetryPluginInvocationWithBackoff()` 只对容量饱和、执行槽截止和插件维护返回 `true`，退出排空返回 `retry: 'after-restart'`。其他成功、厂商错误、宿主错误和一般超时都返回 `retry: 'never-automatically'`。这些函数只分类，不会自动循环重试。
+不要在业务代码中散落 `-32001` 等魔法数字。SDK 的 `classifyPluginInvocationResponse()` 会把五种由 controller 在原生执行前产生的拒绝分类为 `execution: 'not-executed'`；这些代码由 controller 独占，宿主或厂商组件返回同码会被改写成执行状态未知的一般宿主失败。`canRetryPluginInvocationWithBackoff()` 只对容量饱和、执行槽截止和插件维护返回 `true`，退出排空返回 `retry: 'after-restart'`，强制持久方法的普通调用返回 `retry: 'use-tracked-invocation'`。其他成功、厂商错误、宿主错误和一般超时都返回 `retry: 'never-automatically'`。这些函数只分类，不会自动循环重试。
 
 ```ts
 import {

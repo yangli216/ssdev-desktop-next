@@ -306,6 +306,7 @@ pub struct GenerateWebKitReport {
     pub plugin_version: String,
     pub service_count: usize,
     pub method_count: usize,
+    pub ordinary_method_count: usize,
     pub fixture_count: usize,
     pub file_count: usize,
     pub api_sha256: String,
@@ -325,6 +326,7 @@ pub struct WebKitCheckReport {
     pub plugin_version: String,
     pub service_count: usize,
     pub method_count: usize,
+    pub ordinary_method_count: usize,
     pub fixture_count: usize,
     pub file_count: usize,
     pub api_sha256: String,
@@ -513,6 +515,7 @@ struct WebKitManifest {
     matrix_sha256: String,
     service_count: usize,
     method_count: usize,
+    ordinary_method_count: usize,
     fixture_count: usize,
     files: WebKitFiles,
 }
@@ -1116,6 +1119,12 @@ pub fn generate_web_kit(
         .iter()
         .map(|service| service.methods.len())
         .sum();
+    let ordinary_method_count = manifest
+        .services
+        .iter()
+        .flat_map(|service| &service.methods)
+        .filter(|method| !method.tracked_invocation_required)
+        .count();
     let generated_client = generate_typescript_client(&display_name, &manifest.services)?;
     let client = format!(
         "// Web kit plugin: {plugin_id}@{plugin_version}\n\
@@ -1142,7 +1151,7 @@ pub fn generate_web_kit(
         let client_sha256 = sha256_hex(client.as_bytes());
         let fixtures_sha256 = fixtures.output_sha256;
         let kit_manifest = WebKitManifest {
-            schema_version: 1,
+            schema_version: 2,
             plugin_id: plugin_id.clone(),
             plugin_version: plugin_version.clone(),
             display_name: display_name.clone(),
@@ -1151,6 +1160,7 @@ pub fn generate_web_kit(
             matrix_sha256: matrix_sha256.clone(),
             service_count,
             method_count,
+            ordinary_method_count,
             fixture_count: fixtures.fixture_count,
             files: WebKitFiles {
                 client: WebKitFile {
@@ -1178,11 +1188,12 @@ pub fn generate_web_kit(
         }
 
         Ok(GenerateWebKitReport {
-            schema_version: 1,
+            schema_version: 2,
             plugin_id: plugin_id.clone(),
             plugin_version: plugin_version.clone(),
             service_count,
             method_count,
+            ordinary_method_count,
             fixture_count: fixtures.fixture_count,
             file_count: 3,
             api_sha256: api_sha256.clone(),
@@ -1232,14 +1243,14 @@ pub fn check_web_kit(kit: &Path) -> Result<WebKitCheckReport, ToolError> {
     let version = Version::parse(&manifest.plugin_version).map_err(|error| {
         ToolError::Invalid(format!("Web kit plugin version is not SemVer: {error}"))
     })?;
-    if manifest.schema_version != 1
+    if manifest.schema_version != 2
         || manifest.plugin_id.trim() != manifest.plugin_id
         || Path::new(&manifest.plugin_id).components().count() != 1
         || portable_plugin_path(Path::new(&manifest.plugin_id))? != manifest.plugin_id
         || version.to_string() != manifest.plugin_version
     {
         return Err(ToolError::Invalid(
-            "Web kit identity must use schema 1, a canonical portable plugin ID, and SemVer".into(),
+            "Web kit identity must use schema 2, a canonical portable plugin ID, and SemVer".into(),
         ));
     }
     if manifest.display_name.trim() != manifest.display_name
@@ -1254,6 +1265,7 @@ pub fn check_web_kit(kit: &Path) -> Result<WebKitCheckReport, ToolError> {
     }
     if manifest.service_count == 0
         || manifest.service_count > manifest.method_count
+        || manifest.ordinary_method_count > manifest.method_count
         || manifest.method_count > manifest.fixture_count
         || manifest.fixture_count > MAX_MATRIX_CASES
     {
@@ -1317,11 +1329,12 @@ pub fn check_web_kit(kit: &Path) -> Result<WebKitCheckReport, ToolError> {
     }
 
     Ok(WebKitCheckReport {
-        schema_version: 1,
+        schema_version: 2,
         plugin_id: manifest.plugin_id,
         plugin_version: manifest.plugin_version,
         service_count: manifest.service_count,
         method_count: manifest.method_count,
+        ordinary_method_count: manifest.ordinary_method_count,
         fixture_count: manifest.fixture_count,
         file_count: 3,
         api_sha256: manifest.api_sha256,
@@ -4250,6 +4263,7 @@ mod tests {
         assert_eq!(report.plugin_version, "2.3.1");
         assert_eq!(report.service_count, 1);
         assert_eq!(report.method_count, 1);
+        assert_eq!(report.ordinary_method_count, 1);
         assert_eq!(report.fixture_count, 1);
         assert_eq!(report.file_count, 3);
         assert_eq!(
@@ -4278,6 +4292,8 @@ mod tests {
         let kit_manifest: Value = serde_json::from_slice(&kit_manifest_bytes).unwrap();
         assert_eq!(kit_manifest["pluginId"], "reader-plugin");
         assert_eq!(kit_manifest["pluginVersion"], "2.3.1");
+        assert_eq!(kit_manifest["schemaVersion"], 2);
+        assert_eq!(kit_manifest["ordinaryMethodCount"], 1);
         assert_eq!(kit_manifest["matrixSha256"], report.matrix_sha256);
         assert_eq!(
             kit_manifest["files"]["client"]["path"],
@@ -4308,6 +4324,7 @@ mod tests {
         assert_eq!(checked.plugin_version, report.plugin_version);
         assert_eq!(checked.service_count, report.service_count);
         assert_eq!(checked.method_count, report.method_count);
+        assert_eq!(checked.ordinary_method_count, report.ordinary_method_count);
         assert_eq!(checked.fixture_count, report.fixture_count);
         assert_eq!(checked.api_sha256, report.api_sha256);
         assert_eq!(

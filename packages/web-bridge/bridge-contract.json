@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 6,
+  "schemaVersion": 7,
   "protocolVersion": 1,
   "methods": [
     "invokePlugin",
@@ -37,6 +37,7 @@
     "capacityBusy": -32001,
     "controllerStopping": -32002,
     "executionLaneTimeout": -32003,
+    "trackedInvocationRequired": -32004,
     "pluginReloading": -32010
   },
   "trackedInvocationError": {

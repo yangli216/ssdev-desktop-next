@@ -30,6 +30,7 @@ export const PLUGIN_INVOCATION_CONTROL_CODES = Object.freeze({
   capacityBusy: -32001,
   controllerStopping: -32002,
   executionLaneTimeout: -32003,
+  trackedInvocationRequired: -32004,
   pluginReloading: -32010,
 } as const)
 
@@ -43,6 +44,11 @@ export type PluginInvocationDisposition = Readonly<
       kind: 'controller-stopping'
       execution: 'not-executed'
       retry: 'after-restart'
+    }
+  | {
+      kind: 'tracked-invocation-required'
+      execution: 'not-executed'
+      retry: 'use-tracked-invocation'
     }
   | {
       kind: 'other'
@@ -67,6 +73,11 @@ const PLUGIN_INVOCATION_DISPOSITIONS = Object.freeze({
     execution: 'not-executed',
     retry: 'bounded-backoff',
   }),
+  trackedInvocationRequired: Object.freeze({
+    kind: 'tracked-invocation-required',
+    execution: 'not-executed',
+    retry: 'use-tracked-invocation',
+  }),
   pluginReloading: Object.freeze({
     kind: 'plugin-reloading',
     execution: 'not-executed',
@@ -89,6 +100,8 @@ export function classifyPluginInvocationResponse(
       return PLUGIN_INVOCATION_DISPOSITIONS.controllerStopping
     case PLUGIN_INVOCATION_CONTROL_CODES.executionLaneTimeout:
       return PLUGIN_INVOCATION_DISPOSITIONS.executionLaneTimeout
+    case PLUGIN_INVOCATION_CONTROL_CODES.trackedInvocationRequired:
+      return PLUGIN_INVOCATION_DISPOSITIONS.trackedInvocationRequired
     case PLUGIN_INVOCATION_CONTROL_CODES.pluginReloading:
       return PLUGIN_INVOCATION_DISPOSITIONS.pluginReloading
     default:

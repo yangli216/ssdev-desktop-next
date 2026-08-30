@@ -2688,7 +2688,7 @@ mod tests {
             "../../../../packages/web-bridge/bridge-contract.json"
         ))
         .expect("bridge contract must be valid JSON");
-        assert_eq!(contract["schemaVersion"], 6);
+        assert_eq!(contract["schemaVersion"], 7);
         assert_eq!(contract["protocolVersion"], crate::BRIDGE_PROTOCOL_VERSION);
         assert_eq!(
             contract["trackedInvocationError"]["schemaVersion"],
@@ -2717,6 +2717,10 @@ mod tests {
         assert_eq!(
             contract["pluginInvocationControlCodes"]["executionLaneTimeout"],
             webplus_protocol::INVOKE_EXECUTION_LANE_TIMEOUT_CODE
+        );
+        assert_eq!(
+            contract["pluginInvocationControlCodes"]["trackedInvocationRequired"],
+            webplus_protocol::INVOKE_TRACKED_REQUIRED_CODE
         );
         assert_eq!(
             contract["pluginInvocationControlCodes"]["pluginReloading"],

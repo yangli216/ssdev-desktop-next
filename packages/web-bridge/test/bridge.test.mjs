@@ -62,7 +62,7 @@ function clearBridge() {
 test.afterEach(clearBridge)
 
 test('matches the shared desktop bridge contract', () => {
-  assert.equal(contract.schemaVersion, 6)
+  assert.equal(contract.schemaVersion, 7)
   assert.equal(CURRENT_BRIDGE_PROTOCOL_VERSION, contract.protocolVersion)
   assert.equal(CURRENT_PROTOCOL_VERSION, contract.protocolVersion)
   assert.equal(CURRENT_DESKTOP_CAPABILITIES_SCHEMA_VERSION, contract.capabilities.schemaVersion)
@@ -99,6 +99,7 @@ test('classifies only controller rejections that prove native execution never st
     [-32001, 'capacity-busy', 'bounded-backoff'],
     [-32002, 'controller-stopping', 'after-restart'],
     [-32003, 'execution-lane-timeout', 'bounded-backoff'],
+    [-32004, 'tracked-invocation-required', 'use-tracked-invocation'],
     [-32010, 'plugin-reloading', 'bounded-backoff'],
   ]
   for (const [ResCode, kind, retry] of expected) {

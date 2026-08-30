@@ -43,12 +43,19 @@ pub fn generate_typescript_client(
     display_name: &str,
     services: &[ServiceDefinition],
 ) -> Result<String, serde_json::Error> {
+    let methods = typescript_method_plans(services);
+    let has_ordinary_methods = methods
+        .iter()
+        .any(|plan| !plan.method.tracked_invocation_required);
     let mut output = String::from(
         "// Generated from an SSDEV plugin manifest. Regenerate after API changes.\n\
-import { parseTrackedInvocationStatus } from '@bsoft/ssdev-web-bridge'\n\
-import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker, PluginOperationId, TrackedInvocationBridge, TrackedInvocationStatus } from '@bsoft/ssdev-web-bridge'\n\n",
+import { parseTrackedInvocationStatus } from '@bsoft/ssdev-web-bridge'\n",
     );
-    let methods = typescript_method_plans(services);
+    output.push_str(if has_ordinary_methods {
+        "import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker, PluginOperationId, TrackedInvocationBridge, TrackedInvocationStatus } from '@bsoft/ssdev-web-bridge'\n\n"
+    } else {
+        "import type { JsonObject, JsonValue, PluginOperationId, TrackedInvocationBridge, TrackedInvocationStatus } from '@bsoft/ssdev-web-bridge'\n\n"
+    });
     for plan in &methods {
         output.push_str(&format!(
             "export type {} = JsonObject & {{\n",
@@ -96,28 +103,33 @@ import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker, PluginOperat
         }
         output.push_str("}\n\n");
     }
-    output.push_str(&format!(
-        "export class {}Client {{\n  constructor(private readonly bridge: PluginInvoker) {{}}\n\n",
-        typescript_pascal_identifier(display_name)
-    ));
-    for plan in &methods {
-        let default_parameters = if plan.has_input_parameters {
-            ""
-        } else {
-            " = {}"
-        };
+    if has_ordinary_methods {
         output.push_str(&format!(
-            "  {}(parameters: {}{}): Promise<InvokeResponse<{}>> {{\n    return this.bridge.invokePlugin<{}>({}, {}, parameters)\n  }}\n\n",
-            plan.client_method,
-            plan.parameters_type,
-            default_parameters,
-            plan.data_type,
-            plan.data_type,
-            serde_json::to_string(&plan.service.service_id)?,
-            serde_json::to_string(plan.request_name)?,
+            "export class {}Client {{\n  constructor(private readonly bridge: PluginInvoker) {{}}\n\n",
+            typescript_pascal_identifier(display_name)
         ));
+        for plan in methods
+            .iter()
+            .filter(|plan| !plan.method.tracked_invocation_required)
+        {
+            let default_parameters = if plan.has_input_parameters {
+                ""
+            } else {
+                " = {}"
+            };
+            output.push_str(&format!(
+                "  {}(parameters: {}{}): Promise<InvokeResponse<{}>> {{\n    return this.bridge.invokePlugin<{}>({}, {}, parameters)\n  }}\n\n",
+                plan.client_method,
+                plan.parameters_type,
+                default_parameters,
+                plan.data_type,
+                plan.data_type,
+                serde_json::to_string(&plan.service.service_id)?,
+                serde_json::to_string(plan.request_name)?,
+            ));
+        }
+        output.push_str("}\n\n");
     }
-    output.push_str("}\n\n");
     output.push_str(&format!(
         "export function create{}TrackedApi(bridge: TrackedInvocationBridge) {{\n  return {{\n",
         typescript_pascal_identifier(display_name)
@@ -860,6 +872,15 @@ pub struct MethodDefinition {
     pub alias: Option<String>,
     #[serde(default)]
     pub timeout: u64,
+    /// Requires the public business bridge to persist a stable operation ID
+    /// before this method can enter the native host. Local administrative
+    /// debug and signed golden-matrix execution remain separate trusted paths.
+    #[serde(
+        rename = "trackedInvocationRequired",
+        default,
+        skip_serializing_if = "is_false"
+    )]
+    pub tracked_invocation_required: bool,
     #[serde(rename = "returnType", default)]
     pub return_type: String,
     #[serde(default)]
@@ -868,6 +889,10 @@ pub struct MethodDefinition {
     pub props: Vec<String>,
     #[serde(flatten)]
     pub extensions: HashMap<String, Value>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1118,6 +1143,16 @@ fn compare_method_contract(
     route: &str,
     changes: &mut ApiComparisonChanges,
 ) {
+    if baseline.tracked_invocation_required != candidate.tracked_invocation_required {
+        changes.breaking.push(public_api_change(
+            "tracked-invocation-policy-changed",
+            &baseline_service.service_id,
+            Some(route),
+            None,
+            Some(baseline.tracked_invocation_required.to_string()),
+            Some(candidate.tracked_invocation_required.to_string()),
+        ));
+    }
     let baseline_inputs = method_input_contract(baseline);
     let candidate_inputs = method_input_contract(candidate);
     for (field, baseline_type) in &baseline_inputs {
@@ -1899,6 +1934,105 @@ mod tests {
         ));
         assert!(source.contains("getReadStatus2(operationId: PluginOperationId)"));
         assert!(source.contains("getGetReadStatusStatus(operationId: PluginOperationId)"));
+    }
+
+    #[test]
+    fn tracked_required_methods_are_only_generated_on_the_tracked_api() {
+        let services: Vec<ServiceDefinition> = serde_json::from_value(serde_json::json!([{
+            "serviceId": "printer",
+            "mainClass": "printer.dll",
+            "methods": [
+                { "name": "Status", "alias": "status", "parameters": [] },
+                {
+                    "name": "PrintReceipt",
+                    "alias": "printReceipt",
+                    "trackedInvocationRequired": true,
+                    "parameters": [{ "name": "content", "type": "string" }]
+                }
+            ]
+        }]))
+        .unwrap();
+
+        let source = generate_typescript_client("Printer", &services).unwrap();
+        let ordinary_client = source
+            .split("export function createPrinterTrackedApi")
+            .next()
+            .unwrap();
+        assert!(ordinary_client.contains("status(parameters: StatusParameters = {})"));
+        assert!(!ordinary_client.contains("printReceipt(parameters:"));
+        assert!(source.contains("export type PrintReceiptParameters"));
+        assert!(source.contains(
+            "printReceipt(operationId: PluginOperationId, parameters: PrintReceiptParameters)"
+        ));
+        assert!(source.contains("getPrintReceiptStatus(operationId: PluginOperationId)"));
+
+        let all_tracked: Vec<ServiceDefinition> = serde_json::from_value(serde_json::json!([{
+            "serviceId": "writer",
+            "mainClass": "writer.dll",
+            "methods": [{
+                "name": "WriteCard",
+                "trackedInvocationRequired": true,
+                "parameters": []
+            }]
+        }]))
+        .unwrap();
+        let source = generate_typescript_client("Writer", &all_tracked).unwrap();
+        assert!(!source.contains("export class WriterClient"));
+        assert!(!source.contains("InvokeResponse"));
+        assert!(!source.contains("PluginInvoker"));
+        assert!(source.contains("export function createWriterTrackedApi"));
+        assert!(source.contains("writeCard(operationId: PluginOperationId"));
+    }
+
+    #[test]
+    fn tracked_invocation_requirement_serializes_only_when_enabled() {
+        let ordinary: MethodDefinition =
+            serde_json::from_value(serde_json::json!({ "name": "Status" })).unwrap();
+        let tracked: MethodDefinition = serde_json::from_value(serde_json::json!({
+            "name": "Print",
+            "trackedInvocationRequired": true
+        }))
+        .unwrap();
+
+        let ordinary = serde_json::to_value(ordinary).unwrap();
+        let tracked = serde_json::to_value(tracked).unwrap();
+        assert_eq!(ordinary.get("trackedInvocationRequired"), None);
+        assert_eq!(
+            tracked.get("trackedInvocationRequired"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn tracked_invocation_policy_changes_are_breaking() {
+        let baseline: Vec<ServiceDefinition> = serde_json::from_value(serde_json::json!([{
+            "serviceId": "printer",
+            "mainClass": "printer.dll",
+            "methods": [{ "name": "PrintReceipt" }]
+        }]))
+        .unwrap();
+        let candidate: Vec<ServiceDefinition> = serde_json::from_value(serde_json::json!([{
+            "serviceId": "printer",
+            "mainClass": "printer.dll",
+            "methods": [{ "name": "PrintReceipt", "trackedInvocationRequired": true }]
+        }]))
+        .unwrap();
+
+        let report = compare_public_api(&baseline, &candidate);
+        assert!(!report.compatible);
+        assert_eq!(report.breaking_changes.len(), 1);
+        assert_eq!(
+            report.breaking_changes[0].code,
+            "tracked-invocation-policy-changed"
+        );
+        assert_eq!(
+            report.breaking_changes[0].baseline.as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            report.breaking_changes[0].candidate.as_deref(),
+            Some("true")
+        );
     }
 
     #[test]

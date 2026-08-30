@@ -61,6 +61,7 @@ async function createGeneratedWebKit(root, options = {}) {
     serviceId = 'reader',
     nativeMethod = 'read',
     publicMethod = 'readCard',
+    trackedInvocationRequired = false,
   } = options
   const plugin = join(root, `${fixtureName}-plugin-source`)
   const kit = join(root, `${fixtureName}-web-kit`)
@@ -73,7 +74,12 @@ async function createGeneratedWebKit(root, options = {}) {
       serviceId,
       mainClass: nativeLibrary,
       architecture: 'x86',
-      methods: [{ name: nativeMethod, alias: publicMethod, parameters: ['timeout'] }],
+      methods: [{
+        name: nativeMethod,
+        alias: publicMethod,
+        parameters: ['timeout'],
+        trackedInvocationRequired,
+      }],
     }),
   )
   await writeFile(join(plugin, nativeLibrary), x86PeWithExport(nativeMethod))
@@ -178,6 +184,7 @@ test('builds and verifies a reproducible bounded Web Bridge SDK artifact', async
   assert.equal(consumerReport.pluginVersion, '2.3.1')
   assert.equal(consumerReport.sdkPackageName, '@bsoft/ssdev-web-bridge')
   assert.equal(consumerReport.sdkPackageVersion, '0.1.0')
+  assert.equal(consumerReport.ordinaryMethodCount, 1)
   assert.equal(consumerReport.sdkArchiveSha256, firstManifest.sha256)
   assert.equal(consumerReport.offlineInstallVerified, true)
   assert.equal(consumerReport.typescriptCompileVerified, true)
@@ -194,6 +201,7 @@ test('builds and verifies a reproducible bounded Web Bridge SDK artifact', async
     serviceId: 'writer',
     nativeMethod: 'write',
     publicMethod: 'writeCard',
+    trackedInvocationRequired: true,
   })
   const consumedSet = runConsumerSet([writerKit, kit], first)
   assert.equal(consumedSet.status, 0, consumedSet.stderr)
@@ -202,6 +210,7 @@ test('builds and verifies a reproducible bounded Web Bridge SDK artifact', async
   assert.equal(setReport.pluginCount, 2)
   assert.equal(setReport.serviceCount, 2)
   assert.equal(setReport.methodCount, 2)
+  assert.equal(setReport.ordinaryMethodCount, 1)
   assert.equal(setReport.fixtureCount, 2)
   assert.deepEqual(setReport.kits.map((entry) => entry.pluginId), [
     'reader-plugin',

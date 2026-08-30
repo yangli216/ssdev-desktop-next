@@ -352,6 +352,7 @@ type PluginInventory = {
         returnType: string
         parameterCount: number
         timeoutMs: number
+        trackedInvocationRequired: boolean
       }>
     }>
   }>
@@ -1987,7 +1988,7 @@ async function exportDeploymentCheck() {
             </div>
             <article v-for="plugin in inventory?.plugins ?? []" :key="plugin.pluginId">
               <header><span><strong>{{ plugin.displayName }}</strong><small>{{ plugin.pluginId }} · {{ plugin.source === 'local-mapping' ? '本机动态映射' : `${plugin.version ?? '未知版本'} · Desktop ${plugin.desktopVersionRequirement ?? '未声明'}` }}</small></span><div v-if="plugin.source === 'signed-package'" class="plugin-actions"><button type="button" :disabled="busy" @click="checkPluginUpdates(plugin.pluginId)">检查更新</button><button class="danger-link" type="button" :disabled="busy" @click="uninstallSignedPlugin(plugin.pluginId)">卸载</button></div></header>
-              <details v-for="service in plugin.services" :key="service.serviceId" class="service-mapping"><summary><code>{{ service.serviceId }}</code><span>{{ service.architecture }} / {{ service.mainType }} / {{ service.methodCount }} 个方法</span></summary><dl><div><dt>原生目标</dt><dd><code>{{ service.mainClass }}</code></dd></div><div><dt>调用约定</dt><dd>{{ service.callingConvention || '默认' }} · {{ service.charset || '默认字符集' }}</dd></div><div><dt>服务策略</dt><dd>{{ service.timeoutMs || '默认' }} ms · {{ service.cacheable ? '缓存实例' : '按需实例' }} · {{ service.dependencyCount }} 个依赖</dd></div></dl><div v-for="method in service.methods" :key="`${service.serviceId}:${method.requestName}`" class="method-mapping"><code>{{ method.requestName }}</code><span aria-hidden="true">→</span><code>{{ method.nativeName }}</code><small>{{ method.returnType || '默认返回类型' }} · {{ method.parameterCount }} 参数 · {{ method.timeoutMs || '默认' }} ms</small></div></details>
+              <details v-for="service in plugin.services" :key="service.serviceId" class="service-mapping"><summary><code>{{ service.serviceId }}</code><span>{{ service.architecture }} / {{ service.mainType }} / {{ service.methodCount }} 个方法</span></summary><dl><div><dt>原生目标</dt><dd><code>{{ service.mainClass }}</code></dd></div><div><dt>调用约定</dt><dd>{{ service.callingConvention || '默认' }} · {{ service.charset || '默认字符集' }}</dd></div><div><dt>服务策略</dt><dd>{{ service.timeoutMs || '默认' }} ms · {{ service.cacheable ? '缓存实例' : '按需实例' }} · {{ service.dependencyCount }} 个依赖</dd></div></dl><div v-for="method in service.methods" :key="`${service.serviceId}:${method.requestName}`" class="method-mapping"><code>{{ method.requestName }}</code><span aria-hidden="true">→</span><code>{{ method.nativeName }}</code><small>{{ method.returnType || '默认返回类型' }} · {{ method.parameterCount }} 参数 · {{ method.timeoutMs || '默认' }} ms<span v-if="method.trackedInvocationRequired"> · 强制持久调用</span></small></div></details>
             </article>
             <p v-if="inventory && inventory.plugins.length === 0" class="empty">尚未安装通过验签的插件。</p>
             <details v-if="inventory?.quarantined.length" class="quarantined" open><summary>{{ inventory.quarantined.length }} 个插件已隔离</summary><ul><li v-for="failure in inventory.quarantined" :key="failure">{{ failure }}</li></ul></details>
