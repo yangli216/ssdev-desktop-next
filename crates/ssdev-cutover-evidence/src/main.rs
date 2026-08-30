@@ -79,6 +79,7 @@ struct SignedCutoverArchiveHashes {
 struct VerifiedGoArchive {
     decision: CutoverDecision,
     policy: ProductionCutoverPolicy,
+    windows: WindowsPackageEvidence,
     hashes: SignedCutoverArchiveHashes,
 }
 
@@ -826,6 +827,7 @@ fn verify_go_archive(arguments: &[OsString]) -> Result<VerifiedGoArchive, Box<dy
     Ok(VerifiedGoArchive {
         decision,
         policy,
+        windows,
         hashes: verified_hashes,
     })
 }
@@ -840,7 +842,7 @@ fn run_verify_go(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> {
 }
 
 fn run_check_current_go(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> {
-    if arguments.len() != 15 {
+    if arguments.len() != 16 {
         return Err(usage().into());
     }
     let verified = verify_go_archive(&arguments[..13])?;
@@ -865,6 +867,10 @@ fn run_check_current_go(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> 
         path_argument(arguments.get(13), "current approval trust store")?;
     let current_evidence_trust_store_path =
         path_argument(arguments.get(14), "current evidence trust store")?;
+    let candidate_bundle_root = canonical_real_directory(
+        &path_argument(arguments.get(15), "candidate Windows bundle root")?,
+        "candidate Windows bundle root",
+    )?;
     let current_trust_hashes_before = (
         sha256_file(&current_approval_trust_store_path)?,
         sha256_file(&current_evidence_trust_store_path)?,
@@ -888,6 +894,17 @@ fn run_check_current_go(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> 
             "signed cutover archive changed before current trust verification",
         ));
     }
+    let candidate_bundle_before = match capture_bundle_policy_identity(&candidate_bundle_root, None)
+    {
+        Ok(identity) if candidate_bundle_matches_verified_go(&identity, &verified) => identity,
+        Ok(_) | Err(_) => {
+            print_current_go_blocker(
+                "cutover-candidate-bundle-mismatch",
+                "restore the exact protected candidate bundle bound by the signed Windows evidence and rerun the check before launching its NSIS installer",
+            );
+            return Ok(false);
+        }
+    };
     let current_trust_result = (|| {
         verify_production_cutover_decision_attestation_with_current_trust(
             &decision_path,
@@ -950,6 +967,13 @@ fn run_check_current_go(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> 
             "current cutover trust stores changed during verification",
         ));
     }
+    let candidate_bundle_after = capture_bundle_policy_identity(&candidate_bundle_root, None)
+        .map_err(|_| invalid_input("candidate Windows bundle changed during verification"))?;
+    if candidate_bundle_before != candidate_bundle_after {
+        return Err(invalid_input(
+            "candidate Windows bundle changed during verification",
+        ));
+    }
     if current_trust_result.is_err() {
         print_current_go_blocker(
             "cutover-current-trust-rejected",
@@ -970,15 +994,29 @@ fn run_check_current_go(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> 
         return Ok(false);
     }
     println!(
-        "CURRENT-GO: signed decision is inside the approved rollout window for {} at source {}",
-        verified.decision.app_version, verified.decision.target_source_revision
+        "CURRENT-GO: signed decision, current trust, and candidate Windows bundle {} are approved for {} at source {}",
+        candidate_bundle_after.artifact_manifest_sha256,
+        verified.decision.app_version,
+        verified.decision.target_source_revision
     );
     Ok(true)
 }
 
+fn candidate_bundle_matches_verified_go(
+    bundle: &BundlePolicyIdentity,
+    verified: &VerifiedGoArchive,
+) -> bool {
+    bundle.release_metadata_sha256 == verified.windows.release_metadata_sha256
+        && bundle.artifact_manifest_sha256 == verified.windows.artifact_manifest_sha256
+        && bundle.artifact_manifest_sha256
+            == verified.policy.expected_windows_artifact_manifest_sha256
+        && bundle.metadata.app_version == verified.decision.app_version
+        && bundle.metadata.source_revision == verified.decision.target_source_revision
+}
+
 fn print_current_go_blocker(code: &str, remediation: &str) {
     eprintln!(
-        "current cutover authorization: BLOCKED (1 blocker)\nblocker: {code}\naction: {remediation}\nnext: obtain a new signed GO and repeat check-current-go immediately before rollout"
+        "current cutover authorization: BLOCKED (1 blocker)\nblocker: {code}\naction: {remediation}\nnext: resolve the blocker and repeat check-current-go immediately before rollout"
     );
 }
 
@@ -1293,7 +1331,7 @@ fn invalid_input(message: &str) -> Box<dyn Error> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ssdev-cutover-evidence prepare-policy <workspace> <pilot-materials-root> <pilot-manifest.json> <pilot-report.json> <candidate-bundle-root> <evidence-trust.json> <policy-approval-inputs.json> <policy-output.json>\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> <deployment-check.json|none> <application-state-preservation-verified> [previous-release.json]\n  ssdev-cutover-evidence precheck <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <migration-evidence.json> <windows-evidence.json>\n  ssdev-cutover-evidence decide <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>\n  ssdev-cutover-evidence verify-go <cutover-decision.json> <cutover-decision.sig.json> <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json>\n  ssdev-cutover-evidence check-current-go <cutover-decision.json> <cutover-decision.sig.json> <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <current-approval-trust.json> <current-evidence-trust.json>"
+    "usage:\n  ssdev-cutover-evidence prepare-policy <workspace> <pilot-materials-root> <pilot-manifest.json> <pilot-report.json> <candidate-bundle-root> <evidence-trust.json> <policy-approval-inputs.json> <policy-output.json>\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> <deployment-check.json|none> <application-state-preservation-verified> [previous-release.json]\n  ssdev-cutover-evidence precheck <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <migration-evidence.json> <windows-evidence.json>\n  ssdev-cutover-evidence decide <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>\n  ssdev-cutover-evidence verify-go <cutover-decision.json> <cutover-decision.sig.json> <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json>\n  ssdev-cutover-evidence check-current-go <cutover-decision.json> <cutover-decision.sig.json> <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <current-approval-trust.json> <current-evidence-trust.json> <candidate-windows-bundle-root>"
 }
 
 #[cfg(test)]
@@ -1310,12 +1348,14 @@ mod tests {
         PluginMatrixEvidence, CUTOVER_DECISION_SCHEMA_VERSION, EVIDENCE_SCHEMA_VERSION,
         PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION,
     };
+    use ssdev_release_manifest::create_manifest;
     use tempfile::tempdir;
 
     struct SignedGoFixture {
         arguments: Vec<OsString>,
         approval_trust_path: PathBuf,
         evidence_trust_path: PathBuf,
+        candidate_bundle_root: PathBuf,
         windows_path: PathBuf,
         windows_signing_key: SigningKey,
         windows_attestation_path: PathBuf,
@@ -1325,6 +1365,59 @@ mod tests {
         let signature = BASE64.encode(signing_key.sign(payload).to_bytes());
         let envelope = DetachedSignatureDocument::new(key_id, &signature).unwrap();
         fs::write(path, envelope.to_pretty_json().unwrap()).unwrap();
+    }
+
+    fn write_test_candidate_bundle(
+        root: &Path,
+        source_revision: &str,
+        installer_bytes: &[u8],
+    ) -> BundlePolicyIdentity {
+        fs::create_dir_all(root.join("metadata")).unwrap();
+        fs::create_dir_all(root.join("nsis")).unwrap();
+        let release = ReleaseMetadata {
+            schema_version: 2,
+            app_version: "1.2.3".into(),
+            product_name: "SSDEV Desktop".into(),
+            identifier: "com.bsoft.ssdev.desktop".into(),
+            authenticode_required: true,
+            synthetic_version_override: false,
+            source_revision: source_revision.into(),
+            source_dirty: false,
+            source_inputs: BTreeMap::from([
+                ("Cargo.lock".into(), "1".repeat(64)),
+                ("rust-toolchain.toml".into(), "2".repeat(64)),
+                ("apps/desktop/package-lock.json".into(), "3".repeat(64)),
+                (
+                    "apps/desktop/src-tauri/tauri.conf.json".into(),
+                    "4".repeat(64),
+                ),
+                (
+                    "packages/web-bridge/package-lock.json".into(),
+                    "5".repeat(64),
+                ),
+            ]),
+            build_tools: BTreeMap::from([
+                ("cargo".into(), "cargo 1.90.0".into()),
+                ("cargoCyclonedx".into(), "cargo-cyclonedx 0.5.7".into()),
+                ("node".into(), "node 22.0.0".into()),
+                ("npm".into(), "npm 10.0.0".into()),
+                ("rustc".into(), "rustc 1.90.0".into()),
+            ]),
+        };
+        fs::write(
+            root.join("metadata/release.json"),
+            serde_json::to_vec_pretty(&release).unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("metadata/app-update.json"), b"test-update-policy").unwrap();
+        fs::write(root.join("nsis/ssdev-setup.exe"), installer_bytes).unwrap();
+        create_manifest(root, "metadata/artifacts.json").unwrap();
+        fs::write(
+            root.join("metadata/artifacts.json.sig"),
+            b"test-update-signature",
+        )
+        .unwrap();
+        capture_bundle_policy_identity(root, None).unwrap()
     }
 
     fn build_signed_go_fixture(root: &Path, evaluated_at: u64) -> SignedGoFixture {
@@ -1383,6 +1476,9 @@ mod tests {
         .unwrap();
         let approval_trust_sha256 = sha256_file(&approval_trust_path).unwrap();
         let evidence_trust_sha256 = sha256_file(&evidence_trust_path).unwrap();
+        let candidate_bundle_root = root.join("candidate-bundle");
+        let candidate_bundle =
+            write_test_candidate_bundle(&candidate_bundle_root, &revision, b"approved-installer");
 
         let policy_path = root.join("production-policy.json");
         let policy_attestation_path = root.join("production-policy.sig.json");
@@ -1393,7 +1489,9 @@ mod tests {
             expected_previous_app_version: "1.2.2".into(),
             maximum_evidence_age_seconds: 3_600,
             maximum_cutover_decision_age_seconds: 86_400,
-            expected_windows_artifact_manifest_sha256: "8".repeat(64),
+            expected_windows_artifact_manifest_sha256: candidate_bundle
+                .artifact_manifest_sha256
+                .clone(),
             expected_previous_windows_artifact_manifest_sha256: "d".repeat(64),
             expected_previous_release_metadata_sha256: "9".repeat(64),
             expected_plugin_release_set_spec_sha256: "0".repeat(64),
@@ -1519,8 +1617,8 @@ mod tests {
             environment: "windows-qa".into(),
             runner_os: "windows".into(),
             runner_architecture: "x86_64".into(),
-            release_metadata_sha256: "7".repeat(64),
-            artifact_manifest_sha256: "8".repeat(64),
+            release_metadata_sha256: candidate_bundle.release_metadata_sha256,
+            artifact_manifest_sha256: candidate_bundle.artifact_manifest_sha256,
             plugin_trust_store_sha256: approval_trust_sha256.clone(),
             origin_policy_sha256: "a".repeat(64),
             x86_host_sha256: "4".repeat(64),
@@ -1609,6 +1707,7 @@ mod tests {
             arguments,
             approval_trust_path,
             evidence_trust_path,
+            candidate_bundle_root,
             windows_path,
             windows_signing_key: windows_key,
             windows_attestation_path,
@@ -1627,6 +1726,7 @@ mod tests {
         arguments[0] = OsString::from("check-current-go");
         arguments.push(current_approval.clone().into_os_string());
         arguments.push(current_evidence.clone().into_os_string());
+        arguments.push(fixture.candidate_bundle_root.clone().into_os_string());
         (arguments, current_approval, current_evidence)
     }
 
@@ -1766,6 +1866,7 @@ mod tests {
         assert!(help[verify..].contains("<cutover-decision.sig.json>"));
         assert!(help[current..].contains("<current-approval-trust.json>"));
         assert!(help[current..].contains("<current-evidence-trust.json>"));
+        assert!(help[current..].contains("<candidate-windows-bundle-root>"));
     }
 
     #[test]
@@ -1849,7 +1950,7 @@ mod tests {
         let fixture = build_signed_go_fixture(root.path(), 1_000);
 
         assert!(run_verify_go(&fixture.arguments).unwrap());
-        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 12);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 13);
 
         let mut changed_windows: serde_json::Value =
             serde_json::from_slice(&fs::read(&fixture.windows_path).unwrap()).unwrap();
@@ -1875,7 +1976,7 @@ mod tests {
         assert!(error
             .to_string()
             .contains("does not reproduce from the supplied archive inputs"));
-        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 12);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 13);
     }
 
     #[test]
@@ -1888,13 +1989,13 @@ mod tests {
         let current = build_signed_go_fixture(current_root.path(), now);
         let (current_arguments, _, _) = current_go_arguments(&current, current_root.path());
         assert!(run_check_current_go(&current_arguments).unwrap());
-        assert_eq!(fs::read_dir(current_root.path()).unwrap().count(), 14);
+        assert_eq!(fs::read_dir(current_root.path()).unwrap().count(), 15);
 
         let stale_root = tempdir().unwrap();
         let stale = build_signed_go_fixture(stale_root.path(), now.saturating_sub(86_401));
         let (stale_arguments, _, _) = current_go_arguments(&stale, stale_root.path());
         assert!(!run_check_current_go(&stale_arguments).unwrap());
-        assert_eq!(fs::read_dir(stale_root.path()).unwrap().count(), 14);
+        assert_eq!(fs::read_dir(stale_root.path()).unwrap().count(), 15);
     }
 
     #[test]
@@ -1943,6 +2044,38 @@ mod tests {
         assert!(!run_check_current_go(&arguments).unwrap());
 
         assert!(run_verify_go(&fixture.arguments).unwrap());
-        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 14);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 15);
+    }
+
+    #[test]
+    fn check_current_go_blocks_a_different_valid_windows_bundle() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let root = tempdir().unwrap();
+        let fixture = build_signed_go_fixture(root.path(), now);
+        let (mut arguments, _, _) = current_go_arguments(&fixture, root.path());
+        let approved_identity =
+            capture_bundle_policy_identity(&fixture.candidate_bundle_root, None).unwrap();
+        let substitute = root.path().join("substitute-bundle");
+        let substitute_identity =
+            write_test_candidate_bundle(&substitute, &"d".repeat(40), b"different-valid-installer");
+        assert_ne!(
+            substitute_identity.artifact_manifest_sha256,
+            approved_identity.artifact_manifest_sha256
+        );
+        arguments[15] = substitute.into_os_string();
+
+        assert!(!run_check_current_go(&arguments).unwrap());
+        arguments[15] = fixture.candidate_bundle_root.clone().into_os_string();
+        fs::write(
+            fixture.candidate_bundle_root.join("nsis/ssdev-setup.exe"),
+            b"tampered-installer",
+        )
+        .unwrap();
+        assert!(!run_check_current_go(&arguments).unwrap());
+        assert!(run_verify_go(&fixture.arguments).unwrap());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 16);
     }
 }
