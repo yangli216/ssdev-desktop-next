@@ -20,6 +20,8 @@ param(
   [string]$EvidenceEnvironment,
   [string]$DeploymentCheckRecord,
   [string]$BusinessStartupUrl,
+  [switch]$RequireBusinessFrontendReady,
+  [switch]$ServeBusinessProbePage,
   [switch]$RequireAuthenticode,
   [switch]$SkipLaunch
 )
@@ -62,6 +64,7 @@ if ($DeploymentCheckRecord) {
   }
   $DeploymentCheckRecord = (Resolve-Path -LiteralPath $DeploymentCheckRecord).Path
 }
+$businessStartupUri = $null
 if ($BusinessStartupUrl) {
   if ($BusinessStartupUrl.Length -gt 4096) {
     throw "BusinessStartupUrl exceeds the desktop configuration limit."
@@ -75,6 +78,72 @@ if ($BusinessStartupUrl) {
     $businessStartupUri.Fragment
   ) {
     throw "BusinessStartupUrl must be an absolute HTTP(S) URL without credentials or a fragment."
+  }
+}
+if ($RequireBusinessFrontendReady -and -not $BusinessStartupUrl) {
+  throw "RequireBusinessFrontendReady requires BusinessStartupUrl."
+}
+if ($SkipLaunch -and ($RequireBusinessFrontendReady -or $ServeBusinessProbePage)) {
+  throw "Business frontend readiness cannot be required when application launch is skipped."
+}
+if ($ServeBusinessProbePage) {
+  if (-not $RequireBusinessFrontendReady) {
+    throw "ServeBusinessProbePage is only valid with RequireBusinessFrontendReady."
+  }
+  if (
+    $businessStartupUri.Scheme -ne "http" -or
+    $businessStartupUri.Host -ne "127.0.0.1" -or
+    $businessStartupUri.Port -lt 1024 -or
+    $businessStartupUri.AbsolutePath -ne "/" -or
+    $businessStartupUri.Query
+  ) {
+    throw "ServeBusinessProbePage requires an exact http://127.0.0.1:<1024-65535>/ BusinessStartupUrl."
+  }
+}
+
+function Stop-BusinessPageProbe {
+  param($Process)
+  if ($Process -and -not $Process.HasExited) {
+    Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+    $Process.WaitForExit(10000) | Out-Null
+  }
+}
+
+function Start-BusinessPageProbe {
+  param([Parameter(Mandatory = $true)][Uri]$Uri)
+  $serverScript = Join-Path $PSScriptRoot "business-page-probe-server.mjs"
+  if (-not (Test-Path -LiteralPath $serverScript -PathType Leaf)) {
+    throw "The deterministic business page probe server is missing."
+  }
+  $process = Start-Process `
+    -FilePath "node" `
+    -ArgumentList @($serverScript, "--port", ([string]$Uri.Port)) `
+    -WindowStyle Hidden `
+    -PassThru
+  try {
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+      $process.Refresh()
+      if ($process.HasExited) {
+        throw "The deterministic business page probe server exited with code $($process.ExitCode)."
+      }
+      try {
+        $response = Invoke-WebRequest -Uri $Uri.AbsoluteUri -UseBasicParsing -TimeoutSec 2
+        if (
+          $response.StatusCode -eq 200 -and
+          $response.Headers["X-SSDEV-Business-Probe"] -eq "1"
+        ) {
+          return $process
+        }
+      } catch {
+        # The listener may still be starting; retry until the bounded deadline.
+      }
+      Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "The deterministic business page probe server did not become ready."
+  } catch {
+    Stop-BusinessPageProbe $process
+    throw
   }
 }
 
@@ -792,7 +861,8 @@ function Invoke-ApplicationSmoke {
   param(
     [Parameter(Mandatory = $true)][string]$Executable,
     [Parameter(Mandatory = $true)][string]$ExpectedVersion,
-    [switch]$RequireBusinessWindow
+    [switch]$RequireBusinessWindow,
+    [switch]$RequireBusinessFrontendReady
   )
   if ($SkipLaunch) {
     return
@@ -807,11 +877,13 @@ function Invoke-ApplicationSmoke {
     $diagnosticLog = $dataPaths.DiagnosticLog
     $frontendEventsBefore = Get-DiagnosticEventCount $diagnosticLog $ExpectedVersion "frontend-ready"
     $businessWindowEventsBefore = Get-DiagnosticEventCount $diagnosticLog $ExpectedVersion "business-window-created"
+    $businessReadyEventsBefore = Get-DiagnosticEventCount $diagnosticLog $ExpectedVersion "business-frontend-ready"
     $startupFailureGeneratedAt = Write-UnresolvedStartupFailureMarker $dataPaths
     $application = Start-Process -FilePath $Executable -PassThru
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     $frontendReadyObserved = $false
     $businessWindowObserved = -not $RequireBusinessWindow
+    $businessFrontendReadyObserved = -not $RequireBusinessFrontendReady
     do {
       Start-Sleep -Milliseconds 250
       $application.Refresh()
@@ -828,13 +900,25 @@ function Invoke-ApplicationSmoke {
         ) {
           $businessWindowObserved = $true
         }
+        if (
+          $RequireBusinessFrontendReady -and
+          (Get-DiagnosticEventCount $diagnosticLog $ExpectedVersion "business-frontend-ready") -gt $businessReadyEventsBefore
+        ) {
+          $businessFrontendReadyObserved = $true
+        }
       }
-    } while ((-not $frontendReadyObserved -or -not $businessWindowObserved) -and [DateTime]::UtcNow -lt $deadline)
+    } while (
+      (-not $frontendReadyObserved -or -not $businessWindowObserved -or -not $businessFrontendReadyObserved) -and
+      [DateTime]::UtcNow -lt $deadline
+    )
     if (-not $frontendReadyObserved) {
       throw "Installed application stayed alive, but the control frontend did not mount and reach native IPC."
     }
     if (-not $businessWindowObserved) {
       throw "Installed candidate did not create the configured default business window."
+    }
+    if (-not $businessFrontendReadyObserved) {
+      throw "Installed candidate created the business window, but the page did not reach native IPC."
     }
     Assert-StartupFailureResolved $dataPaths $ExpectedVersion $startupFailureGeneratedAt
   } finally {
@@ -900,7 +984,11 @@ function Test-Installer {
   try {
     $executable = Install-ApplicationPackage $Installer
     Assert-InstalledLayout $executable $metadataDirectory
-    Invoke-ApplicationSmoke $executable $script:CandidateRelease.appVersion -RequireBusinessWindow:([bool]$BusinessStartupUrl)
+    Invoke-ApplicationSmoke `
+      $executable `
+      $script:CandidateRelease.appVersion `
+      -RequireBusinessWindow:([bool]$BusinessStartupUrl) `
+      -RequireBusinessFrontendReady:$RequireBusinessFrontendReady
     Capture-CandidateRuntimeHashes $executable
     Uninstall-ApplicationPackage $executable
     $executable = $null
@@ -942,7 +1030,11 @@ function Test-Upgrade {
     $activeInstaller = $CandidateInstaller
     Assert-InstalledLayout $candidateExecutable $metadataDirectory
     Assert-UpgradeStatePreserved $dataPaths $sentinel "NSIS candidate upgrade"
-    Invoke-ApplicationSmoke $candidateExecutable $script:CandidateRelease.appVersion -RequireBusinessWindow:([bool]$BusinessStartupUrl)
+    Invoke-ApplicationSmoke `
+      $candidateExecutable `
+      $script:CandidateRelease.appVersion `
+      -RequireBusinessWindow:([bool]$BusinessStartupUrl) `
+      -RequireBusinessFrontendReady:$RequireBusinessFrontendReady
     Assert-UpgradeStatePreserved $dataPaths $sentinel "Candidate startup"
     Capture-CandidateRuntimeHashes $candidateExecutable
 
@@ -973,6 +1065,12 @@ function Test-Upgrade {
     }
     Remove-OwnedApplicationData $dataPaths
   }
+}
+
+$businessProbeProcess = $null
+try {
+if ($ServeBusinessProbePage) {
+  $businessProbeProcess = Start-BusinessPageProbe $businessStartupUri
 }
 
 $script:CandidateRelease = $null
@@ -1048,3 +1146,6 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $EvidenceOutput -PathTy
 }
 
 Write-Host "All requested Windows package smoke tests passed."
+} finally {
+  Stop-BusinessPageProbe $businessProbeProcess
+}

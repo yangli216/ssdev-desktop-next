@@ -213,7 +213,7 @@ test("Windows package smoke requires a rendered frontend IPC signal", async () =
   assert.match(controlHtml, /SSDEV Desktop 正在启动/);
 });
 
-test("Windows candidate smoke proves the configured business window is created", async () => {
+test("Windows candidate smoke proves the configured business page reaches native IPC", async () => {
   const [packageTest, workflow, desktopRuntime] = await Promise.all([
     readFile(packageTestUrl, "utf8"),
     readFile(workflowUrl, "utf8"),
@@ -223,24 +223,46 @@ test("Windows candidate smoke proves the configured business window is created",
   assert.match(packageTest, /\[string\]\$BusinessStartupUrl/);
   assert.match(packageTest, /function Write-BusinessStartupConfig/);
   assert.match(packageTest, /"business-window-created"/);
+  assert.match(packageTest, /"business-frontend-ready"/);
   assert.match(packageTest, /\[switch\]\$RequireBusinessWindow/);
+  assert.match(packageTest, /\[switch\]\$RequireBusinessFrontendReady/);
+  assert.match(packageTest, /\[switch\]\$ServeBusinessProbePage/);
   assert.match(
     packageTest,
-    /Invoke-ApplicationSmoke \$candidateExecutable \$script:CandidateRelease\.appVersion -RequireBusinessWindow:\(\[bool\]\$BusinessStartupUrl\)/,
+    /\$candidateExecutable[\s\S]{0,300}-RequireBusinessFrontendReady:\$RequireBusinessFrontendReady/,
   );
   assert.match(
     packageTest,
     /Invoke-ApplicationSmoke \$rollbackExecutable \$script:PreviousRelease\.appVersion\r?\n/,
   );
   assert.equal(
-    (workflow.match(/-BusinessStartupUrl "https:\/\/business\.invalid\/"/g) ?? []).length,
+    (workflow.match(/-BusinessStartupUrl "http:\/\/127\.0\.0\.1:47831\/"/g) ?? []).length,
     2,
   );
+  assert.equal((workflow.match(/-RequireBusinessFrontendReady/g) ?? []).length, 2);
+  assert.equal((workflow.match(/-ServeBusinessProbePage/g) ?? []).length, 2);
+  assert.doesNotMatch(workflow, /business\.invalid/);
   const eventStart = desktopRuntime.indexOf('event_code = "business-window-created"');
   assert.ok(eventStart >= 0);
   const event = desktopRuntime.slice(eventStart, desktopRuntime.indexOf(");", eventStart));
   assert.match(event, /app_version/);
   assert.doesNotMatch(event, /url|origin|label/i);
+  const readyStart = desktopRuntime.indexOf('event_code = "business-frontend-ready"');
+  assert.ok(readyStart >= 0);
+  const readyEvent = desktopRuntime.slice(
+    readyStart,
+    desktopRuntime.indexOf(");", readyStart),
+  );
+  assert.match(readyEvent, /app_version/);
+  assert.doesNotMatch(readyEvent, /url|origin|label/i);
+  const timeoutStart = desktopRuntime.indexOf('event_code = "business-frontend-timeout"');
+  assert.ok(timeoutStart >= 0);
+  const timeoutEvent = desktopRuntime.slice(
+    timeoutStart,
+    desktopRuntime.indexOf(");", timeoutStart),
+  );
+  assert.match(timeoutEvent, /app_version/);
+  assert.doesNotMatch(timeoutEvent, /url|origin|label/i);
 });
 
 test("Windows upgrade gate reinstalls and launches the exact previous release", async () => {

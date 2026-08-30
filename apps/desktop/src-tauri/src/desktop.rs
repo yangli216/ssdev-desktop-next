@@ -1583,6 +1583,7 @@ pub(crate) fn require_business<R: tauri::Runtime>(
 #[tauri::command]
 pub(crate) fn business_frontend_ready(
     caller: WebviewWindow,
+    app: AppHandle,
     state: State<'_, DesktopState>,
 ) -> Result<(), String> {
     require_business(&caller, &state)?;
@@ -1590,11 +1591,13 @@ pub(crate) fn business_frontend_ready(
     if transition.recovered_after_timeout {
         tracing::info!(
             event_code = "business-frontend-recovered",
+            app_version = %app.package_info().version,
             "business frontend reached native IPC after a readiness timeout"
         );
     } else if !transition.duplicate_signal {
         tracing::info!(
             event_code = "business-frontend-ready",
+            app_version = %app.package_info().version,
             "business frontend reached native IPC"
         );
     }
@@ -1708,6 +1711,7 @@ fn start_business_frontend_watchdog(app: AppHandle, label: String, generation: u
         tracing::error!(
             event_code = "business-frontend-timeout",
             error_code = "business-frontend-not-ready",
+            app_version = %app.package_info().version,
             timeout_seconds = BUSINESS_FRONTEND_READY_TIMEOUT.as_secs(),
             "business frontend did not reach native IPC before the readiness deadline"
         );

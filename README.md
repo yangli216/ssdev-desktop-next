@@ -22,7 +22,7 @@ business webview -> narrow Tauri command -> Rust controller
 - controller 最多接受 8 个在途插件调用；容量饱和时在进入原生宿主前快速拒绝，不建立无界等待队列。
 - localhost HTTP 仅作为可关闭的旧浏览器兼容网关，不是新架构内部依赖。
 
-每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归；Windows 门禁还会实际生成并构建两种架构的最小 DLL 插件脚手架，用公开 RFC 8032 测试向量制作两个仅供 CI 的签名包，经过正式发布集合检查和物化后，由生产黄金矩阵包装器分别拉起已经构建的 Release x86/x64 宿主完成调用并核对 schema 2 证据。随后分别为 x64 与 x86 桌面构建 `0.0.1` 离线合成旧版本和当前候选版本，对离线 NSIS 执行原位升级、配置及本地能力数据根哨兵保留、布局/架构检查、候选启动、候选卸载、精确旧版回装、旧版启动和最终卸载；再额外构建在线轻量候选，并从同一离线旧版重复跨 WebView2 供给模式的完整升级与回退链。Linux DEB/AppImage 和 macOS DMG 仅在手动选择 `all` 平台时构建。Windows 原生门禁还单独生成 x64 项目交付工具包，把离线启动诊断、试点预检、迁移审计、插件发布、组织签名、切换判定和无需 Rust 的正式矩阵运行器放在普通用户安装包之外，并用完整文件清单记录源码提交、文件集和 8 份路径脱敏的 CycloneDX 1.5 SBOM。离线 Doctor 通过包内已复验的 Microsoft Loader 直接验证当前用户可发现的 WebView2 Runtime，不再把残留安装信息误当成可启动证明。CI 测试签名密钥、临时更新密钥均非生产信任材料，平台代码签名也被明确跳过，名称带 `unsigned` 的产物不能分发；生产工具包除逐个 EXE 的 Authenticode 外还必须由组织签名最终归档。生产硬件矩阵仍必须输入候选安装包构建留下的已签名宿主原文件，CI Release 宿主不能替代该身份门禁。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
+每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归；Windows 门禁还会实际生成并构建两种架构的最小 DLL 插件脚手架，用公开 RFC 8032 测试向量制作两个仅供 CI 的签名包，经过正式发布集合检查和物化后，由生产黄金矩阵包装器分别拉起已经构建的 Release x86/x64 宿主完成调用并核对 schema 2 证据。随后分别为 x64 与 x86 桌面构建 `0.0.1` 离线合成旧版本和当前候选版本，对离线 NSIS 执行原位升级、配置及本地能力数据根哨兵保留、布局/架构检查、候选启动、候选卸载、精确旧版回装、旧版启动和最终卸载；候选启动会加载仅绑定本机回环地址、没有页面脚本和设备副作用的确定性业务测试页，同时要求控制前端、业务窗口创建和业务页到 Rust IPC 三个事件全部到达。在线轻量候选再从同一离线旧版重复这条跨 WebView2 供给模式的完整升级与回退链。Linux DEB/AppImage 和 macOS DMG 仅在手动选择 `all` 平台时构建。Windows 原生门禁还单独生成 x64 项目交付工具包，把离线启动诊断、试点预检、迁移审计、插件发布、组织签名、切换判定和无需 Rust 的正式矩阵运行器放在普通用户安装包之外，并用完整文件清单记录源码提交、文件集和 8 份路径脱敏的 CycloneDX 1.5 SBOM。离线 Doctor 通过包内已复验的 Microsoft Loader 直接验证当前用户可发现的 WebView2 Runtime，不再把残留安装信息误当成可启动证明。CI 测试签名密钥、临时更新密钥均非生产信任材料，平台代码签名也被明确跳过，名称带 `unsigned` 的产物不能分发；生产工具包除逐个 EXE 的 Authenticode 外还必须由组织签名最终归档。生产硬件矩阵仍必须输入候选安装包构建留下的已签名宿主原文件，CI Release 宿主不能替代该身份门禁。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
 
 架构决策和迁移门槛见 [docs/adr/0001-target-architecture.md](docs/adr/0001-target-architecture.md)。
 
@@ -187,11 +187,12 @@ powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
   -EvidenceOutput D:\cutover-evidence\windows-package.json `
   -EvidenceEnvironment hospital-a-isolated-windows-lab `
   -BusinessStartupUrl "https://desktop-smoke.example.internal/" `
+  -RequireBusinessFrontendReady `
   -RequireAuthenticode `
   -ExpectedSignerSubject "<完整证书主题 DN>"
 ```
 
-该门禁先要求包内更新公钥与独立输入的组织公钥逐字节一致，再验证签名的全产物 SHA-256 清单、源码提交/锁文件/工具链溯源、Rust/npm CycloneDX SBOM、updater Minisign、信任密钥生命周期以及来源/可选进程策略的 active 密钥签名；随后安装 NSIS，验证 x64 主程序、x86/x64 宿主、注入策略及 Authenticode 发布者，启动到 `app-started` 诊断事件，并在提供 `-BusinessStartupUrl` 时要求候选创建签名策略允许的默认业务 WebView，最后静默卸载并确认程序与注册项清理完成。测试地址只用于验证业务优先首屏构造，不应触发真实业务或设备副作用；上一版本回装不要求实现新增诊断事件。机器证据生成器还会在自身读取前后重新按 `artifacts.json` 扫描候选及上一版本的完整 bundle；安装器、updater、策略、宿主、SBOM 或其他清单文件发生漂移时不写证据。只有全部请求项成功后，才会以不覆盖方式在源码和 bundle 之外写出绑定发布元数据、产物清单、版本、实际安装插件信任库、来源策略与双宿主摘要、安装器覆盖、启动、升级、回退、应用状态保留和签名结果的 schema 7 Windows 包证据；使用上一生产 bundle 时还绑定其版本、`release.json` 和 `artifacts.json` 摘要。正式验收另传 `-DeploymentCheckRecord`，把一小时内由同版本客户端导出的 Windows 深度检查摘要写入证据；普通 CI 不伪造真实业务页面结果，因此该字段为空且不能用于生产 GO。
+该门禁先要求包内更新公钥与独立输入的组织公钥逐字节一致，再验证签名的全产物 SHA-256 清单、源码提交/锁文件/工具链溯源、Rust/npm CycloneDX SBOM、updater Minisign、信任密钥生命周期以及来源/可选进程策略的 active 密钥签名；随后安装 NSIS，验证 x64 主程序、x86/x64 宿主、注入策略及 Authenticode 发布者，启动到 `app-started` 诊断事件，并在提供 `-BusinessStartupUrl` 时要求候选创建签名策略允许的默认业务 WebView；加上 `-RequireBusinessFrontendReady` 后还必须观察同版本 `business-frontend-ready`，证明页面实际执行了注入桥并到达 Rust IPC。测试地址必须是不会触发真实业务或设备副作用的专用页面；CI 的 `-ServeBusinessProbePage` 只在 `127.0.0.1` 提供无脚本静态页，用于验证安装包内的 WebView/IPC 链路，不是客户端本机 HTTP 通信或旧 WebPlus 兼容网关。上一版本回装不要求实现新增诊断事件。机器证据生成器还会在自身读取前后重新按 `artifacts.json` 扫描候选及上一版本的完整 bundle；安装器、updater、策略、宿主、SBOM 或其他清单文件发生漂移时不写证据。只有全部请求项成功后，才会以不覆盖方式在源码和 bundle 之外写出绑定发布元数据、产物清单、版本、实际安装插件信任库、来源策略与双宿主摘要、安装器覆盖、启动、升级、回退、应用状态保留和签名结果的 schema 7 Windows 包证据；使用上一生产 bundle 时还绑定其版本、`release.json` 和 `artifacts.json` 摘要。正式验收另传 `-DeploymentCheckRecord`，把一小时内由同版本客户端导出的 Windows 深度检查摘要写入证据；CI 测试页不能证明目标网络、账号或真实业务可用，普通 CI 的该字段仍为空，不能用于生产 GO。
 
 若要验证覆盖升级，将上一正式版本解包目录作为额外输入：
 
