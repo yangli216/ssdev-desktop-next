@@ -22,7 +22,7 @@ business webview -> narrow Tauri command -> Rust controller
 - controller 最多接受 8 个在途插件调用；容量饱和时在进入原生宿主前快速拒绝，不建立无界等待队列。
 - localhost HTTP 仅作为可关闭的旧浏览器兼容网关，不是新架构内部依赖。
 
-每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归；Windows 门禁还会实际生成并构建两种架构的最小 DLL 插件脚手架，用公开 RFC 8032 测试向量制作两个仅供 CI 的签名包，经过正式发布集合检查和物化后，由生产黄金矩阵包装器分别拉起已经构建的 Release x86/x64 宿主完成调用并核对 schema 2 证据。随后分别为 x64 与 x86 桌面构建 `0.0.1` 离线合成旧版本和当前候选版本，对离线 NSIS 执行原位升级、配置及本地能力数据根哨兵保留、布局/架构检查、候选启动、候选卸载、精确旧版回装、旧版启动和最终卸载；再额外构建在线轻量候选，并从同一离线旧版重复跨 WebView2 供给模式的完整升级与回退链。Linux DEB/AppImage 和 macOS DMG 仅在手动选择 `all` 平台时构建。Windows 原生门禁还单独生成 x64 项目交付工具包，把试点预检、迁移审计、插件发布、组织签名、切换判定和无需 Rust 的正式矩阵运行器放在普通用户安装包之外，并用完整文件清单记录源码提交、文件集和 7 份路径脱敏的 CycloneDX 1.5 SBOM。CI 测试签名密钥、临时更新密钥均非生产信任材料，平台代码签名也被明确跳过，名称带 `unsigned` 的产物不能分发；生产工具包除逐个 EXE 的 Authenticode 外还必须由组织签名最终归档。生产硬件矩阵仍必须输入候选安装包构建留下的已签名宿主原文件，CI Release 宿主不能替代该身份门禁。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
+每个提交由 `.github/workflows/ci.yml` 执行 Linux 质量门禁、Windows x86/x64 原生回归；Windows 门禁还会实际生成并构建两种架构的最小 DLL 插件脚手架，用公开 RFC 8032 测试向量制作两个仅供 CI 的签名包，经过正式发布集合检查和物化后，由生产黄金矩阵包装器分别拉起已经构建的 Release x86/x64 宿主完成调用并核对 schema 2 证据。随后分别为 x64 与 x86 桌面构建 `0.0.1` 离线合成旧版本和当前候选版本，对离线 NSIS 执行原位升级、配置及本地能力数据根哨兵保留、布局/架构检查、候选启动、候选卸载、精确旧版回装、旧版启动和最终卸载；再额外构建在线轻量候选，并从同一离线旧版重复跨 WebView2 供给模式的完整升级与回退链。Linux DEB/AppImage 和 macOS DMG 仅在手动选择 `all` 平台时构建。Windows 原生门禁还单独生成 x64 项目交付工具包，把离线启动诊断、试点预检、迁移审计、插件发布、组织签名、切换判定和无需 Rust 的正式矩阵运行器放在普通用户安装包之外，并用完整文件清单记录源码提交、文件集和 8 份路径脱敏的 CycloneDX 1.5 SBOM。CI 测试签名密钥、临时更新密钥均非生产信任材料，平台代码签名也被明确跳过，名称带 `unsigned` 的产物不能分发；生产工具包除逐个 EXE 的 Authenticode 外还必须由组织签名最终归档。生产硬件矩阵仍必须输入候选安装包构建留下的已签名宿主原文件，CI Release 宿主不能替代该身份门禁。平台支持边界见 [docs/platform-support.md](docs/platform-support.md)。
 
 架构决策和迁移门槛见 [docs/adr/0001-target-architecture.md](docs/adr/0001-target-architecture.md)。
 
@@ -34,7 +34,7 @@ business webview -> narrow Tauri command -> Rust controller
 
 真实项目开始前可使用 [试点材料预检](docs/pilot-readiness.md) 收齐生产组件、黄金用例、业务 HAR、签名公钥材料、上一 Windows 安装包和实机计划。`init` 会生成不可覆盖的固定类别与审计绑定，但不会伪造条件类别的“不适用”审批；schema 2 manifest 再把正式迁移审计的配置、插件、HAR 和签名策略角色精确绑定到这些材料。上一生产 Windows bundle 还会按 `artifacts.json` 复算完整清单并要求唯一顶层 NSIS，避免缺包或被替换的安装器拖到升级回退阶段才暴露。材料整理期间用不写报告和摘要的 `check` 重复获取脱敏稳定缺项及处理动作；就绪后才用 `create` 写出不可覆盖报告和材料集合摘要并指向接收方复验。这条入口不复制路径或材料内容，也不替代后续迁移审计、硬件矩阵和 Go/No-Go。
 
-项目实施和 QA 可使用独立的 [Windows 项目交付工具包](docs/windows-delivery-tools.md)，无需在验证机安装 Rust 即可运行上述 CLI 与正式黄金矩阵包装器。工具包附带 7 份 Windows x64 CycloneDX 1.5 SBOM，但不进入 Desktop NSIS，也不包含任何私钥、业务材料或生产插件；生产发布仍要求组织 Authenticode 和受保护渠道，CI 的 unsigned 工具包只能验证构建链。
+项目实施和 QA 可使用独立的 [Windows 项目交付工具包](docs/windows-delivery-tools.md)，无需在验证机安装 Rust 即可运行离线启动诊断、上述交付 CLI 与正式黄金矩阵包装器。工具包附带 8 份 Windows x64 CycloneDX 1.5 SBOM，但不进入 Desktop NSIS，也不包含任何私钥、业务材料或生产插件；生产发布仍要求组织 Authenticode 和受保护渠道，CI 的 unsigned 工具包只能验证构建链。
 
 业务页面从 localhost HTTP 切换到窄桥接接口的方式见 [docs/web-bridge-migration.md](docs/web-bridge-migration.md)。
 业务前端应通过 [packages/web-bridge](packages/web-bridge/README.md) 的类型化协议适配层接入，不直接依赖 Tauri 内部 API。SDK 会运行时校验系统声明并提供稳定错误分类；当前能力 schema 严格验证，未来未知 schema 保留但不会被误判为已经支持。主分支 CI 还会生成并自检固定 `.tgz + 摘要清单` 的平台无关 SDK 制品，并在离线临时消费者中验证安装、ESM 运行和 TypeScript 类型，业务项目不再需要从源码目录人工打包。

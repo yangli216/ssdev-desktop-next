@@ -17,6 +17,7 @@ test('Windows delivery tools stay separate from the ordinary desktop installer',
   assert.match(buildScript, /\[ValidateSet\("x86_64-pc-windows-msvc"\)\]/)
   assert.doesNotMatch(buildScript, /i686-pc-windows-msvc/)
   for (const binary of [
+    'ssdev-desktop-doctor',
     'ssdev-pilot-readiness',
     'ssdev-migration-audit',
     'ssdev-plugin-tool',
@@ -30,9 +31,13 @@ test('Windows delivery tools stay separate from the ordinary desktop installer',
   assert.match(buildScript, /"ssdev-plugin-matrix\.exe"/)
   assert.match(buildScript, /cargo-cyclonedx 0\.5\.9/)
   assert.match(buildScript, /"ssdev-plugin-matrix\.cdx\.json"/)
+  assert.match(buildScript, /"ssdev-desktop-doctor\.cdx\.json"/)
   assert.match(buildScript, /scripts\/normalize-cyclonedx\.mjs/)
   assert.match(buildScript, /sbomCount = \$sboms\.Count/)
-  assert.doesNotMatch(desktopBuild, /windows-delivery-tools|ssdev-plugin-matrix\.exe/)
+  assert.doesNotMatch(
+    desktopBuild,
+    /windows-delivery-tools|ssdev-plugin-matrix\.exe|ssdev-desktop-doctor/,
+  )
 })
 
 test('Windows delivery toolkit is source-bound, signed in production, and fully inventoried', async () => {
@@ -90,7 +95,10 @@ test('delivery toolkit documentation keeps unsigned CI output out of production'
   assert.match(documentation, /验证机无需安装 Rust/)
   assert.match(documentation, /仍必须提供与候选版本完全一致的干净源码工作区/)
   assert.match(documentation, /工具包不含私钥、令牌、业务材料/)
-  assert.match(documentation, /7 个可执行入口对应的.*Windows x64 CycloneDX 1\.5 JSON/)
+  assert.match(documentation, /8 个可执行入口对应的.*Windows x64 CycloneDX 1\.5 JSON/)
   assert.match(documentation, /`artifacts\.json` 覆盖.*全部可执行文件和 SBOM/)
   assert.match(documentation, /预装精确版本 `cargo-cyclonedx 0\.5\.9`/)
+  assert.match(documentation, /ssdev-desktop-doctor\.exe inspect/)
+  assert.match(documentation, /只读取当前用户应用数据目录下固定的 `logs\/ssdev\.log\*`/)
+  assert.match(documentation, /不读取配置、插件、账本或业务缓存/)
 })

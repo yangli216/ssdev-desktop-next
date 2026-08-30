@@ -4,6 +4,7 @@
 
 工具包包含：
 
+- `ssdev-desktop-doctor.exe`：客户端无法进入控制台时，只读检查当前 Windows 用户的启动标记并离线收集固定脱敏日志；
 - `ssdev-pilot-readiness.exe`：建立、检查和复验真实试点材料；
 - `ssdev-migration-audit.exe`：从已复验材料执行旧 WebPlus/Electron 迁移审计；
 - `ssdev-plugin-tool.exe`：插件源检查、客户端/fixture、签名准备、封包和发布集合；
@@ -12,7 +13,7 @@
 - `ssdev-release-manifest.exe`：创建或复验完整文件清单；
 - `ssdev-plugin-matrix.exe` 与 `run-plugin-matrix.ps1`：在 Windows x64 实机调用候选安装包中的 x86/x64 宿主并生成黄金矩阵证据。
 
-`sbom/` 还包含与上述 7 个可执行入口对应的、已移除工作区绝对路径和随机标识的 Windows x64 CycloneDX 1.5 JSON。它用于依赖审计和事件响应，不替代源码提交、二进制签名或最终归档签名。
+`sbom/` 还包含与上述 8 个可执行入口对应的、已移除工作区绝对路径和随机标识的 Windows x64 CycloneDX 1.5 JSON。它用于依赖审计和事件响应，不替代源码提交、二进制签名或最终归档签名。
 
 ## 使用前复验
 
@@ -26,6 +27,24 @@ Get-Content .\release.json
 `artifacts.json` 覆盖 README、包装器、发布元数据、全部可执行文件和 SBOM；任何缺失、增加或字节变化都会失败。`release.json` 记录工具版本、完整源码提交、目标架构、SBOM 数量和 Authenticode 状态。生产工具包的所有 EXE 必须由组织 Windows 发布流程签名并显示 `authenticodeVerified: true`，最终目录归档还必须具有组织发布签名；未签名 JSON 清单本身不是发布信任根。GitHub Actions 中名称带 `unsigned` 的短期制品只用于验证构建链，不能进入生产交付。
 
 工具包不含私钥、令牌、业务材料、插件包、黄金矩阵、信任库或 Windows 客户端安装包。组织公开信任库仍应从受保护发布渠道提供，KMS/HSM 私钥不得复制到工具目录。
+
+## 客户端无法启动时
+
+以发生故障的同一个 Windows 用户运行，先只读检查：
+
+```powershell
+.\ssdev-desktop-doctor.exe inspect
+```
+
+`CLEAR` 只表示没有未解决启动标记且存在可读日志，不代表业务页面、插件或硬件验收通过。`ATTENTION` 返回退出码 `3`，只显示已知稳定启动码、标记状态及日志数量，不回显日志目录、URL、配置、插件路径或原始错误。
+
+需要交给实施人员时，指定一个尚不存在的绝对 ZIP 路径：
+
+```powershell
+.\ssdev-desktop-doctor.exe collect D:\support\ssdev-startup-20260830.zip
+```
+
+工具只读取当前用户应用数据目录下固定的 `logs/ssdev.log*` 和最多 4 KiB 的启动标记；启动标记会解析为已知错误码和是否恢复，原始摘要不会直接复制进归档。日志目录、日志文件或启动标记是链接/异常类型时失败关闭，输出不覆盖已有文件，也不读取配置、插件、账本或业务缓存。只有在受控复制其他用户的完整应用数据后，才可用 `--data-root <绝对目录>` 指向该副本。诊断包仍按内部运维数据通过组织批准渠道传输。
 
 ## 推荐执行顺序
 

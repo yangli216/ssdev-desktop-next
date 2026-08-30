@@ -18,6 +18,6 @@
 
 Windows 发布包额外携带经路径脱敏的 CycloneDX 1.5 SBOM。Rust SBOM分别描述 x64 桌面主程序与 x86/x64 插件宿主的真实目标依赖图，npm SBOM从锁文件生成；安装验收不仅检查格式和目标三元组，还要求桌面 SBOM 明确包含持久调用账本与 controller、宿主 SBOM 包含原生执行与 IPC、npm SBOM 包含 Tauri API 与 Vue。schema 2 `release.json` 进一步绑定 Git 提交及脏状态、固定锁文件和配置摘要，以及 Rust/Node/npm/CycloneDX 工具版本；正式签名包拒绝脏源码和合成版本。所有溯源元数据、SBOM、安装器、更新包、签名和公开策略都被纳入同一份签名 SHA-256 产物清单。
 
-独立 Windows x64 项目交付工具包同样固定使用 `cargo-cyclonedx 0.5.9`，为 7 个可执行入口附带路径脱敏的 CycloneDX 1.5 SBOM。构建脚本拒绝预存生成文件，在生成后清理临时 SBOM 并重新确认 Git 提交和 clean 状态；最终 `artifacts.json` 覆盖全部 EXE、SBOM、包装器、说明及发布元数据。该清单用于完整性复验，不是独立信任根；生产仍必须逐个验证组织 Authenticode，并签名最终归档。
+独立 Windows x64 项目交付工具包同样固定使用 `cargo-cyclonedx 0.5.9`，为离线启动诊断和其他 7 个交付入口附带路径脱敏的 CycloneDX 1.5 SBOM。构建脚本拒绝预存生成文件，在生成后清理临时 SBOM 并重新确认 Git 提交和 clean 状态；最终 `artifacts.json` 覆盖全部 EXE、SBOM、包装器、说明及发布元数据。该清单用于完整性复验，不是独立信任根；生产仍必须逐个验证组织 Authenticode，并签名最终归档。
 
 当前不维护永久忽略列表。若公告确属不可达代码或上游暂时无修复，例外必须绑定具体公告编号、责任人和到期时间，不能只降低全局严重级别，也不能用 Cargo.lock 包含跨平台依赖作为笼统忽略理由。

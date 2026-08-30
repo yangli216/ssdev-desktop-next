@@ -28,6 +28,7 @@ try {
       -p webplus-plugin-package `
       -p webplus-plugin-trust `
       -p ssdev-plugin-tool `
+      -p ssdev-desktop-doctor `
       -p ssdev-windows-system-example `
       -p webplus-protocol `
       --all-targets `

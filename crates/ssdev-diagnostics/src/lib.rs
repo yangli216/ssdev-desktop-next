@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use tracing::Level;
@@ -18,10 +18,12 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 const LOG_FILE_NAME: &str = "ssdev.log";
+const STARTUP_FAILURE_FILE_NAME: &str = "startup-failure.json";
 const DEFAULT_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 const DEFAULT_BACKUP_FILES: usize = 5;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_EXPORT_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_STARTUP_FAILURE_BYTES: u64 = 4 * 1024;
 const OVERSIZED_EVENT: &[u8] =
     b"{\"level\":\"WARN\",\"event_code\":\"diagnostic-event-oversized\"}\n";
 
@@ -38,6 +40,67 @@ pub struct DiagnosticsStats {
     pub log_bytes: u64,
     pub oversized_events: u64,
     pub write_failures: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfflineStartupFailure {
+    pub error_code: String,
+    pub resolved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfflineDiagnosticsSummary {
+    pub log_files: usize,
+    pub log_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_failure: Option<OfflineStartupFailure>,
+    pub startup_failure_marker_invalid: bool,
+}
+
+impl OfflineDiagnosticsSummary {
+    pub fn requires_attention(&self) -> bool {
+        self.log_bytes == 0
+            || self.startup_failure_marker_invalid
+            || self
+                .startup_failure
+                .as_ref()
+                .is_some_and(|failure| !failure.resolved)
+    }
+
+    pub fn action(&self) -> &'static str {
+        if self.startup_failure_marker_invalid {
+            "保留现场并导出诊断包；启动故障标记无效，不要手工修复或删除。"
+        } else if self
+            .startup_failure
+            .as_ref()
+            .is_some_and(|failure| !failure.resolved)
+        {
+            "按启动故障码处理后重试客户端；仍失败时导出诊断包。"
+        } else {
+            "当前用户没有可读取的客户端日志；先运行客户端一次再检查。"
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfflineDiagnosticManifest<'a> {
+    schema_version: u8,
+    collection_mode: &'static str,
+    generated_at_unix_ms: u128,
+    #[serde(flatten)]
+    summary: &'a OfflineDiagnosticsSummary,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupFailureMarker {
+    schema_version: u8,
+    error_code: String,
+    #[serde(default)]
+    resolved_at_unix_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -250,6 +313,219 @@ impl DiagnosticsState {
             .len();
         Ok(size)
     }
+}
+
+pub fn inspect_offline_diagnostics(
+    log_dir: &Path,
+) -> Result<OfflineDiagnosticsSummary, DiagnosticsError> {
+    if !ensure_log_directory_or_missing(log_dir)? {
+        return Ok(OfflineDiagnosticsSummary {
+            log_files: 0,
+            log_bytes: 0,
+            startup_failure: None,
+            startup_failure_marker_invalid: false,
+        });
+    }
+    let (startup_failure, startup_failure_marker_invalid) = read_startup_failure(log_dir)?;
+    let mut log_files = 0;
+    let mut log_bytes = 0_u64;
+    for index in 0..=DEFAULT_BACKUP_FILES {
+        let Some(log) = open_bounded_log(&log_path(log_dir, index))? else {
+            continue;
+        };
+        let metadata = log.metadata().map_err(|source| DiagnosticsError::Io {
+            operation: "inspect-offline-log",
+            source,
+        })?;
+        log_files += 1;
+        log_bytes = log_bytes.saturating_add(metadata.len().min(DEFAULT_MAX_FILE_BYTES));
+    }
+    Ok(OfflineDiagnosticsSummary {
+        log_files,
+        log_bytes,
+        startup_failure,
+        startup_failure_marker_invalid,
+    })
+}
+
+pub fn export_offline_diagnostics(
+    log_dir: &Path,
+    destination: &Path,
+) -> Result<u64, DiagnosticsError> {
+    validate_export_destination(destination)?;
+    let log_directory_present = ensure_log_directory_or_missing(log_dir)?;
+    let (startup_failure, startup_failure_marker_invalid) = if log_directory_present {
+        read_startup_failure(log_dir)?
+    } else {
+        (None, false)
+    };
+    let mut logs = Vec::new();
+    let mut exported_log_bytes = 0_u64;
+    if log_directory_present {
+        for index in 0..=DEFAULT_BACKUP_FILES {
+            let Some(log) = open_bounded_log(&log_path(log_dir, index))? else {
+                continue;
+            };
+            let remaining = MAX_EXPORT_BYTES.saturating_sub(exported_log_bytes);
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(DEFAULT_MAX_FILE_BYTES);
+            let mut bytes = Vec::with_capacity(take.min(1024 * 1024) as usize);
+            log.take(take)
+                .read_to_end(&mut bytes)
+                .map_err(|source| DiagnosticsError::Io {
+                    operation: "read-offline-log",
+                    source,
+                })?;
+            exported_log_bytes = exported_log_bytes.saturating_add(bytes.len() as u64);
+            logs.push((archive_log_name(index), bytes));
+        }
+    }
+    let summary = OfflineDiagnosticsSummary {
+        log_files: logs.len(),
+        log_bytes: exported_log_bytes,
+        startup_failure,
+        startup_failure_marker_invalid,
+    };
+    let manifest = serde_json::to_vec_pretty(&OfflineDiagnosticManifest {
+        schema_version: 1,
+        collection_mode: "offline-startup",
+        generated_at_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        summary: &summary,
+    })?;
+    let parent = destination
+        .parent()
+        .filter(|path| path.is_dir())
+        .ok_or(DiagnosticsError::InvalidDestination)?;
+    let temporary = NamedTempFile::new_in(parent).map_err(|source| DiagnosticsError::Io {
+        operation: "create-offline-export",
+        source,
+    })?;
+    let mut zip = ZipWriter::new(temporary);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .unix_permissions(0o600);
+    zip.start_file("manifest.json", options)?;
+    zip.write_all(&manifest)
+        .map_err(|source| DiagnosticsError::Io {
+            operation: "write-offline-manifest",
+            source,
+        })?;
+    for (name, bytes) in logs {
+        zip.start_file(format!("logs/{name}"), options)?;
+        zip.write_all(&bytes)
+            .map_err(|source| DiagnosticsError::Io {
+                operation: "write-offline-log",
+                source,
+            })?;
+    }
+    let temporary = zip.finish()?;
+    temporary
+        .persist_noclobber(destination)
+        .map_err(|error| DiagnosticsError::Io {
+            operation: "persist-offline-export",
+            source: error.error,
+        })?;
+    fs::metadata(destination)
+        .map(|metadata| metadata.len())
+        .map_err(|source| DiagnosticsError::Io {
+            operation: "inspect-offline-export",
+            source,
+        })
+}
+
+fn validate_export_destination(destination: &Path) -> Result<(), DiagnosticsError> {
+    if !destination.is_absolute()
+        || destination.extension().and_then(|value| value.to_str()) != Some("zip")
+    {
+        return Err(DiagnosticsError::InvalidDestination);
+    }
+    if destination.exists() {
+        return Err(DiagnosticsError::DestinationExists);
+    }
+    Ok(())
+}
+
+fn ensure_log_directory_or_missing(log_dir: &Path) -> Result<bool, DiagnosticsError> {
+    match fs::symlink_metadata(log_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(DiagnosticsError::UnsafeLogEntry),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(DiagnosticsError::Io {
+            operation: "inspect-log-directory",
+            source,
+        }),
+    }
+}
+
+fn read_startup_failure(
+    log_dir: &Path,
+) -> Result<(Option<OfflineStartupFailure>, bool), DiagnosticsError> {
+    let path = log_dir.join(STARTUP_FAILURE_FILE_NAME);
+    ensure_regular_file_or_missing(&path)?;
+    let Some(file) = File::open(&path)
+        .map(Some)
+        .or_else(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|source| DiagnosticsError::Io {
+            operation: "open-startup-failure",
+            source,
+        })?
+    else {
+        return Ok((None, false));
+    };
+    let metadata = file.metadata().map_err(|source| DiagnosticsError::Io {
+        operation: "inspect-startup-failure",
+        source,
+    })?;
+    if metadata.len() > MAX_STARTUP_FAILURE_BYTES {
+        return Ok((None, true));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_STARTUP_FAILURE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| DiagnosticsError::Io {
+            operation: "read-startup-failure",
+            source,
+        })?;
+    let Ok(marker) = serde_json::from_slice::<StartupFailureMarker>(&bytes) else {
+        return Ok((None, true));
+    };
+    if !matches!(marker.schema_version, 1 | 2) || !is_known_startup_failure_code(&marker.error_code)
+    {
+        return Ok((None, true));
+    }
+    Ok((
+        Some(OfflineStartupFailure {
+            error_code: marker.error_code,
+            resolved: marker.resolved_at_unix_ms.is_some(),
+        }),
+        false,
+    ))
+}
+
+pub fn is_known_startup_failure_code(code: &str) -> bool {
+    matches!(
+        code,
+        "startup-framework"
+            | "startup-runtime-paths"
+            | "startup-diagnostics"
+            | "startup-local-storage"
+            | "startup-trust-policy"
+            | "startup-plugin-runtime"
+            | "startup-core-services"
+            | "startup-desktop-shell"
+            | "frontend-startup-timeout"
+    )
 }
 
 fn diagnostics_layer(writer: RotatingMakeWriter) -> impl Layer<Registry> + Send + Sync + 'static {
@@ -725,6 +1001,141 @@ mod tests {
         assert!(manifest.contains("\"preflightedPluginHostCount\": 5"));
         assert!(manifest.contains("\"pluginPreflightFailureCount\": 1"));
         assert!(archive.by_name("logs/ssdev.log").is_ok());
+    }
+
+    #[test]
+    fn offline_inspection_reports_only_a_known_startup_code_and_log_totals() {
+        let root = tempdir().unwrap();
+        let log_dir = root.path().join("logs");
+        fs::create_dir(&log_dir).unwrap();
+        fs::write(
+            log_dir.join(LOG_FILE_NAME),
+            b"{\"event_code\":\"desktop-process-panicked\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            log_dir.join(STARTUP_FAILURE_FILE_NAME),
+            br#"{"schemaVersion":2,"errorCode":"startup-core-services","summary":"must not be printed","action":"must not be printed"}"#,
+        )
+        .unwrap();
+
+        let summary = inspect_offline_diagnostics(&log_dir).unwrap();
+        assert_eq!(summary.log_files, 1);
+        assert!(summary.log_bytes > 0);
+        assert_eq!(
+            summary.startup_failure,
+            Some(OfflineStartupFailure {
+                error_code: "startup-core-services".into(),
+                resolved: false,
+            })
+        );
+        assert!(!summary.startup_failure_marker_invalid);
+        assert!(summary.requires_attention());
+    }
+
+    #[test]
+    fn missing_or_empty_logs_never_report_a_clear_offline_startup() {
+        let root = tempdir().unwrap();
+        let missing = inspect_offline_diagnostics(&root.path().join("missing")).unwrap();
+        assert_eq!(missing.log_files, 0);
+        assert!(missing.requires_attention());
+
+        let log_dir = root.path().join("logs");
+        fs::create_dir(&log_dir).unwrap();
+        fs::write(log_dir.join(LOG_FILE_NAME), b"").unwrap();
+        let empty = inspect_offline_diagnostics(&log_dir).unwrap();
+        assert_eq!(empty.log_files, 1);
+        assert_eq!(empty.log_bytes, 0);
+        assert!(empty.requires_attention());
+    }
+
+    #[test]
+    fn offline_export_sanitizes_the_startup_marker_and_never_overwrites() {
+        let root = tempdir().unwrap();
+        let log_dir = root.path().join("logs");
+        fs::create_dir(&log_dir).unwrap();
+        fs::write(
+            log_dir.join(LOG_FILE_NAME),
+            b"{\"event_code\":\"desktop-startup-failed\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            log_dir.join(STARTUP_FAILURE_FILE_NAME),
+            br#"{"schemaVersion":2,"errorCode":"startup-desktop-shell","summary":"C:\\private\\path","action":"secret-token","resolvedAtUnixMs":42}"#,
+        )
+        .unwrap();
+        let destination = root.path().join("offline.zip");
+
+        export_offline_diagnostics(&log_dir, &destination).unwrap();
+        let mut archive = ZipArchive::new(File::open(&destination).unwrap()).unwrap();
+        assert_eq!(archive.len(), 2);
+        let mut manifest = String::new();
+        archive
+            .by_name("manifest.json")
+            .unwrap()
+            .read_to_string(&mut manifest)
+            .unwrap();
+        assert!(manifest.contains("\"collectionMode\": \"offline-startup\""));
+        assert!(manifest.contains("\"errorCode\": \"startup-desktop-shell\""));
+        assert!(manifest.contains("\"resolved\": true"));
+        assert!(!manifest.contains("private"));
+        assert!(!manifest.contains("secret-token"));
+        assert!(archive.by_name("startup-failure.json").is_err());
+        assert!(matches!(
+            export_offline_diagnostics(&log_dir, &destination),
+            Err(DiagnosticsError::DestinationExists)
+        ));
+    }
+
+    #[test]
+    fn offline_inspection_marks_unknown_or_oversized_startup_markers_invalid() {
+        let root = tempdir().unwrap();
+        let log_dir = root.path().join("logs");
+        fs::create_dir(&log_dir).unwrap();
+        fs::write(
+            log_dir.join(STARTUP_FAILURE_FILE_NAME),
+            br#"{"schemaVersion":2,"errorCode":"attacker-controlled"}"#,
+        )
+        .unwrap();
+        let summary = inspect_offline_diagnostics(&log_dir).unwrap();
+        assert!(summary.startup_failure.is_none());
+        assert!(summary.startup_failure_marker_invalid);
+        assert!(summary.requires_attention());
+
+        fs::write(
+            log_dir.join(STARTUP_FAILURE_FILE_NAME),
+            vec![b'x'; MAX_STARTUP_FAILURE_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(
+            inspect_offline_diagnostics(&log_dir)
+                .unwrap()
+                .startup_failure_marker_invalid
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_collection_refuses_linked_log_roots_and_startup_markers() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let actual_logs = root.path().join("actual-logs");
+        fs::create_dir(&actual_logs).unwrap();
+        let linked_logs = root.path().join("linked-logs");
+        symlink(&actual_logs, &linked_logs).unwrap();
+        assert!(matches!(
+            inspect_offline_diagnostics(&linked_logs),
+            Err(DiagnosticsError::UnsafeLogEntry)
+        ));
+
+        let private = root.path().join("private.txt");
+        fs::write(&private, b"must-not-be-read").unwrap();
+        symlink(&private, actual_logs.join(STARTUP_FAILURE_FILE_NAME)).unwrap();
+        assert!(matches!(
+            inspect_offline_diagnostics(&actual_logs),
+            Err(DiagnosticsError::UnsafeLogEntry)
+        ));
     }
 
     #[test]

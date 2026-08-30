@@ -4463,6 +4463,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssdev-desktop-doctor"
+version = "0.1.0"
+dependencies = [
+ "ssdev-diagnostics",
+]
+
+[[package]]
 name = "ssdev-diagnostics"
 version = "0.1.0"
 dependencies = [

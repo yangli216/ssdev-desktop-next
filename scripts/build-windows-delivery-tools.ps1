@@ -13,6 +13,7 @@ Set-StrictMode -Version Latest
 
 $workspace = Split-Path -Parent $PSScriptRoot
 $toolPackages = @(
+  "ssdev-desktop-doctor",
   "ssdev-pilot-readiness",
   "ssdev-migration-audit",
   "ssdev-plugin-tool",
@@ -124,6 +125,7 @@ try {
     throw "Unable to install the pinned Windows x64 Rust target."
   }
   & cargo build --locked --release --target $Target `
+    -p ssdev-desktop-doctor `
     -p ssdev-pilot-readiness `
     -p ssdev-migration-audit `
     -p ssdev-plugin-tool `
@@ -175,6 +177,7 @@ try {
     $sbomDirectory = Join-Path $staging "sbom"
     New-Item -ItemType Directory -Path $sbomDirectory | Out-Null
     $sboms = [ordered]@{
+      "ssdev-desktop-doctor.cdx.json" = (Join-Path $workspace "crates/ssdev-desktop-doctor/ssdev-desktop-doctor_$Target.cdx.json")
       "ssdev-pilot-readiness.cdx.json" = (Join-Path $workspace "crates/ssdev-pilot-readiness/ssdev-pilot-readiness_$Target.cdx.json")
       "ssdev-migration-audit.cdx.json" = (Join-Path $workspace "crates/ssdev-migration-audit/ssdev-migration-audit_$Target.cdx.json")
       "ssdev-plugin-tool.cdx.json" = (Join-Path $workspace "crates/ssdev-plugin-tool/ssdev-plugin-tool_$Target.cdx.json")

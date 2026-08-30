@@ -35,7 +35,9 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ssdev_config::ConfigStore;
-use ssdev_diagnostics::{DiagnosticContext, DiagnosticsState, DiagnosticsStats};
+use ssdev_diagnostics::{
+    is_known_startup_failure_code, DiagnosticContext, DiagnosticsState, DiagnosticsStats,
+};
 use ssdev_invocation_ledger::{
     COMPLETED_OPERATION_RETENTION, INDETERMINATE_OPERATION_RETENTION, MAX_DURABLE_OPERATIONS,
     MAX_DURABLE_OPERATIONS_PER_SCOPE,
@@ -6254,21 +6256,6 @@ fn resolve_startup_failure_document(
     }
     persist_startup_failure_document(log_dir, &bytes)?;
     Ok(true)
-}
-
-fn is_known_startup_failure_code(code: &str) -> bool {
-    matches!(
-        code,
-        "startup-framework"
-            | "startup-runtime-paths"
-            | "startup-diagnostics"
-            | "startup-local-storage"
-            | "startup-trust-policy"
-            | "startup-plugin-runtime"
-            | "startup-core-services"
-            | "startup-desktop-shell"
-            | "frontend-startup-timeout"
-    )
 }
 
 fn unix_time_ms() -> u128 {

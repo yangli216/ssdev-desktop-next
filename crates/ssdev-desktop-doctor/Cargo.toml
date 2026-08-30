@@ -1,0 +1,10 @@
+[package]
+name = "ssdev-desktop-doctor"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+ssdev-diagnostics.workspace = true
