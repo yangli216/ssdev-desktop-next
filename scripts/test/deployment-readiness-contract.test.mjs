@@ -25,7 +25,8 @@ test("quick checks cannot be presented as Windows delivery readiness", async () 
   assert.match(controlFrontend, /if \(report\.deliveryReady\)/);
   assert.match(controlFrontend, /label: '待深度检查'/);
   assert.match(controlFrontend, /label: '开发预览'/);
-  assert.match(controlFrontend, /立即深度自检/);
+  assert.match(controlFrontend, /进入项目交付/);
+  assert.match(controlFrontend, /@click="runDeploymentCheck">深度自检/);
   assert.doesNotMatch(
     controlFrontend,
     /deploymentCheck \? deploymentCheck\.ready \? '可以交付'/,
