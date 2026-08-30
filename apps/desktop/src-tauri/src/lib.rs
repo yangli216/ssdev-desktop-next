@@ -25,6 +25,7 @@ const DESKTOP_CAPABILITIES_SCHEMA_VERSION: u16 = 1;
 #[doc(hidden)]
 pub use app_update::verify_update_artifact_files;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -503,7 +504,7 @@ async fn bridge_status(
     let plugin_api_baseline_count = state
         .plugin_api_baseline
         .lock()
-        .map_err(|_| "签名插件契约基线锁已损坏".to_owned())?
+        .map_err(|_| "插件能力基线锁已损坏".to_owned())?
         .entry_count();
     Ok(BridgeStatus {
         mode: "native-ipc",
@@ -626,12 +627,7 @@ async fn run_deployment_check(
     let business_origin_count = config.business_origins().map_or(0, |origins| origins.len());
     let origin = desktop_state.origin_policy_summary();
     let origin_policy_error = desktop_state.origin_policy_error();
-    let inspected = inspect_all_plugins(
-        &state.plugin_root,
-        &state.local_mapping_root,
-        state.trust_store.as_deref(),
-        &state.desktop_version,
-    );
+    let inspected = inspect_all_plugins_for_state(&state);
     let (manifests, plugin_failures, plugin_inventory_error) = match inspected {
         Ok(inspected) => (inspected.manifests, inspected.failures, None),
         Err(error) => (Vec::new(), Vec::new(), Some(error)),
@@ -655,12 +651,7 @@ async fn run_deployment_check(
         )
     } else {
         match preflight_manifests_detailed(&state, &manifests).await {
-            Ok(hosts) => match inspect_all_plugins(
-                &state.plugin_root,
-                &state.local_mapping_root,
-                state.trust_store.as_deref(),
-                &state.desktop_version,
-            ) {
+            Ok(hosts) => match inspect_all_plugins_for_state(&state) {
                 Ok(after)
                     if after.manifests == manifests
                         && same_plugin_failures(&plugin_failures, &after.failures) =>
@@ -1166,12 +1157,7 @@ async fn export_project_bundle(
     let config = desktop_state.config.snapshot();
     desktop_state.authorize_config(&config)?;
     ensure_project_delivery_identity(&config)?;
-    let inspected = inspect_all_plugins(
-        &state.plugin_root,
-        &state.local_mapping_root,
-        state.trust_store.as_deref(),
-        &state.desktop_version,
-    )?;
+    let inspected = inspect_all_plugins_for_state(&state)?;
     if !inspected.failures.is_empty() {
         return Err(format!(
             "当前有 {} 个插件或映射未通过校验，请先处理后再导出项目包",
@@ -1335,12 +1321,7 @@ async fn import_project_bundle(
         .map(|component| component.manifest().clone())
         .collect::<Vec<_>>();
     let previous_config = desktop_state.config.snapshot();
-    let previous_plugins = inspect_all_plugins(
-        &state.plugin_root,
-        &state.local_mapping_root,
-        state.trust_store.as_deref(),
-        &state.desktop_version,
-    )?;
+    let previous_plugins = inspect_all_plugins_for_state(&state)?;
     if !previous_plugins.failures.is_empty() {
         return Err("当前插件清单在项目预检后发生变化，请处理隔离项后重试".into());
     }
@@ -1454,7 +1435,7 @@ async fn import_project_bundle(
         }
     };
     let baseline_transition =
-        match SignedPluginApiBaselineTransition::prepare(&state, &installed.manifests) {
+        match PluginCapabilityBaselineTransition::prepare(&state, &installed.manifests) {
             Ok(transition) => transition,
             Err(error) => {
                 let rollback = rollback_project_components(transaction, activated);
@@ -1662,12 +1643,7 @@ async fn prepare_project_bundle(
             )
         })
         .collect::<Vec<_>>();
-    let current = inspect_all_plugins(
-        &state.plugin_root,
-        &state.local_mapping_root,
-        state.trust_store.as_deref(),
-        &state.desktop_version,
-    )?;
+    let current = inspect_all_plugins_for_state(state)?;
     if !current.failures.is_empty() {
         return Err(format!(
             "目标机器当前有 {} 个无效插件或映射，请先处理后再导入项目包",
@@ -2064,7 +2040,7 @@ fn signed_plugin_api_change_summary_for_state(
     let baseline = state
         .plugin_api_baseline
         .lock()
-        .map_err(|_| "签名插件契约基线锁已损坏".to_owned())?;
+        .map_err(|_| "插件能力基线锁已损坏".to_owned())?;
     let previous = baseline
         .baseline_services(&candidate.plugin_id)
         .or_else(|| fallback_previous.map(|manifest| manifest.services.as_slice()));
@@ -2108,7 +2084,7 @@ fn validate_signed_plugin_api_baseline(
     let blocked = state
         .plugin_api_baseline
         .lock()
-        .map_err(|_| "签名插件契约基线锁已损坏".to_owned())?
+        .map_err(|_| "插件能力基线锁已损坏".to_owned())?
         .breaking_plugin_ids_for_manifests(candidates, &state.local_mapping_root)?;
     if blocked.is_empty() {
         return Ok(());
@@ -2120,17 +2096,17 @@ fn validate_signed_plugin_api_baseline(
         "candidate signed plugin set violates the last accepted API baseline"
     );
     Err(format!(
-        "候选插件集合中有 {} 个签名插件会破坏上次已激活的 Web Bridge API；请恢复兼容版本或使用新的插件 ID",
+        "候选插件集合中有 {} 个签名插件会破坏上次已激活的 Web Bridge API 或替换能力类型；请恢复兼容版本、先显式移除原能力或使用新的插件 ID",
         blocked.len()
     ))
 }
 
-struct SignedPluginApiBaselineTransition<'a> {
+struct PluginCapabilityBaselineTransition<'a> {
     state: &'a BridgeState,
     finalized: bool,
 }
 
-impl<'a> SignedPluginApiBaselineTransition<'a> {
+impl<'a> PluginCapabilityBaselineTransition<'a> {
     fn prepare(state: &'a BridgeState, manifests: &[PluginManifest]) -> Result<Self, String> {
         Self::prepare_retiring(state, manifests, &[])
     }
@@ -2143,7 +2119,7 @@ impl<'a> SignedPluginApiBaselineTransition<'a> {
         let prepared = state
             .plugin_api_baseline
             .lock()
-            .map_err(|_| "签名插件契约基线锁已损坏".to_owned())
+            .map_err(|_| "插件能力基线锁已损坏".to_owned())
             .and_then(|mut baseline| {
                 if retired_plugin_ids.is_empty() {
                     baseline.prepare_transition(manifests, &state.local_mapping_root)
@@ -2157,7 +2133,7 @@ impl<'a> SignedPluginApiBaselineTransition<'a> {
             });
         if prepared.is_err() {
             record_plugin_api_baseline_failure(state, "plugin-api-baseline-prepare-failed");
-            return Err("无法写入签名插件契约切换准备记录；未提交插件变更".into());
+            return Err("无法写入插件能力切换准备记录；未提交能力变更".into());
         }
         Ok(Self {
             state,
@@ -2174,7 +2150,7 @@ impl<'a> SignedPluginApiBaselineTransition<'a> {
             .state
             .plugin_api_baseline
             .lock()
-            .map_err(|_| "签名插件契约基线锁已损坏".to_owned())
+            .map_err(|_| "插件能力基线锁已损坏".to_owned())
             .and_then(|mut baseline| baseline.commit_transition());
         self.finalized = true;
         if result.is_err() {
@@ -2187,7 +2163,7 @@ impl<'a> SignedPluginApiBaselineTransition<'a> {
             .state
             .plugin_api_baseline
             .lock()
-            .map_err(|_| "签名插件契约基线锁已损坏".to_owned())
+            .map_err(|_| "插件能力基线锁已损坏".to_owned())
             .and_then(|mut baseline| baseline.abort_transition());
         self.finalized = true;
         if result.is_err() {
@@ -2196,7 +2172,7 @@ impl<'a> SignedPluginApiBaselineTransition<'a> {
     }
 }
 
-impl Drop for SignedPluginApiBaselineTransition<'_> {
+impl Drop for PluginCapabilityBaselineTransition<'_> {
     fn drop(&mut self) {
         if !self.finalized {
             self.abort();
@@ -2211,7 +2187,7 @@ fn record_plugin_api_baseline_failure(state: &BridgeState, event_code: &'static 
     tracing::error!(
         event_code,
         error_code = "plugin-api-baseline-io",
-        "signed plugin API baseline transition could not be persisted"
+        "plugin capability baseline transition could not be persisted"
     );
 }
 
@@ -2222,7 +2198,7 @@ fn signed_plugin_baseline_version(
     Ok(state
         .plugin_api_baseline
         .lock()
-        .map_err(|_| "签名插件契约基线锁已损坏".to_owned())?
+        .map_err(|_| "插件能力基线锁已损坏".to_owned())?
         .baseline_version(plugin_id)
         .cloned())
 }
@@ -2912,8 +2888,7 @@ async fn inspect_plugin_package(
         Arc::clone(&trust_store),
     )
     .await?;
-    let context =
-        local_plugin_install_context(&state, &desktop_state, &trust_store, &prepared).await?;
+    let context = local_plugin_install_context(&state, &desktop_state, &prepared).await?;
     let candidate_payload = prepared_plugin_signing_payload(&prepared)?;
     let plan_id = local_plugin_install_plan_id(
         &candidate_payload,
@@ -3012,8 +2987,7 @@ async fn install_plugin_package(
         Arc::clone(&trust_store),
     )
     .await?;
-    let context =
-        local_plugin_install_context(&state, &desktop_state, &trust_store, &prepared).await?;
+    let context = local_plugin_install_context(&state, &desktop_state, &prepared).await?;
     let candidate_payload = prepared_plugin_signing_payload(&prepared)?;
     let actual_plan_id = local_plugin_install_plan_id(
         &candidate_payload,
@@ -3024,7 +2998,6 @@ async fn install_plugin_package(
     activate_prepared_plugin(
         &state,
         &desktop_state,
-        &trust_store,
         prepared,
         Some(&context.current_state_sha256),
         PluginInstallSource::LocalPackage,
@@ -3088,12 +3061,7 @@ async fn install_plugin_from_catalog(
             entry.plugin_id, entry.version, bridge_state.desktop_version, desktop_requirement
         ));
     }
-    let installed = inspect_all_plugins(
-        &bridge_state.plugin_root,
-        &bridge_state.local_mapping_root,
-        Some(&trust_store),
-        &bridge_state.desktop_version,
-    )?;
+    let installed = inspect_all_plugins_for_state(&bridge_state)?;
     if contains_plugin_id(&installed.local_mapping_ids, &plugin_id) {
         return Err(format!(
             "签名插件 ID [{plugin_id}] 与现有本地映射冲突，请重新检查仓库并先调整本地映射"
@@ -3148,7 +3116,6 @@ async fn install_plugin_from_catalog(
     activate_prepared_plugin(
         &bridge_state,
         &desktop_state,
-        &trust_store,
         prepared,
         Some(&current_state_sha256),
         PluginInstallSource::SignedCatalog,
@@ -3194,12 +3161,7 @@ async fn check_plugin_updates(
     )
     .await
     .map_err(|error| error.to_string())?;
-    let installed = inspect_all_plugins(
-        &bridge_state.plugin_root,
-        &bridge_state.local_mapping_root,
-        Some(&trust_store),
-        &bridge_state.desktop_version,
-    )?;
+    let installed = inspect_all_plugins_for_state(&bridge_state)?;
     let catalog_signing_key_id = catalog
         .signing_key_id()
         .ok_or_else(|| "签名插件仓库没有已验证的目录签名身份".to_owned())?;
@@ -3844,35 +3806,14 @@ fn prepared_plugin_signing_payload(prepared: &PreparedPlugin) -> Result<Vec<u8>,
 async fn local_plugin_install_context(
     state: &BridgeState,
     desktop_state: &desktop::DesktopState,
-    trust_store: &TrustStore,
     prepared: &PreparedPlugin,
 ) -> Result<LocalPluginInstallContext, String> {
     ensure_signed_plugin_compatible(prepared.manifest(), &state.desktop_version)?;
     let plugin_id = &prepared.identity().plugin_id;
-    let before = inspect_all_plugins(
-        &state.plugin_root,
-        &state.local_mapping_root,
-        Some(trust_store),
-        &state.desktop_version,
-    )?;
-    let offline_breaking_plugins = state
-        .plugin_api_baseline
-        .lock()
-        .map_err(|_| "签名插件契约基线锁已损坏".to_owned())?
-        .breaking_plugin_ids_for_manifests(&before.manifests, &state.local_mapping_root)?;
-    let active_candidate_manifests = before
-        .manifests
-        .iter()
-        .filter(|manifest| {
-            !offline_breaking_plugins
-                .iter()
-                .any(|plugin_id| plugin_id.eq_ignore_ascii_case(&manifest.plugin_id))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let before = inspect_all_plugins_for_state(state)?;
     let active_matches = state
         .controller
-        .manifests_match_active_routes(&active_candidate_manifests)
+        .manifests_match_active_routes(&before.manifests)
         .await
         .map_err(|error| format!("无法核对当前插件运行状态 ({})", error.diagnostic_code()))?;
     if !active_matches {
@@ -3975,7 +3916,6 @@ fn verify_catalog_identity(entry: &CatalogEntry, prepared: &PreparedPlugin) -> R
 async fn activate_prepared_plugin(
     state: &BridgeState,
     desktop_state: &desktop::DesktopState,
-    trust_store: &TrustStore,
     prepared: PreparedPlugin,
     expected_current_state_sha256: Option<&str>,
     install_source: PluginInstallSource,
@@ -3986,12 +3926,7 @@ async fn activate_prepared_plugin(
 
     let plugin_id = prepared.identity().plugin_id.clone();
     let plugin_version = prepared.metadata().version.clone();
-    let before = inspect_all_plugins(
-        &plugin_root,
-        &state.local_mapping_root,
-        Some(trust_store),
-        &state.desktop_version,
-    )?;
+    let before = inspect_all_plugins_for_state(state)?;
     let previous_manifest = before
         .manifests
         .iter()
@@ -4060,7 +3995,7 @@ async fn activate_prepared_plugin(
             ));
         }
     };
-    let baseline_transition = SignedPluginApiBaselineTransition::prepare(state, &candidates)?;
+    let baseline_transition = PluginCapabilityBaselineTransition::prepare(state, &candidates)?;
 
     let maintenance = state
         .controller
@@ -4073,12 +4008,7 @@ async fn activate_prepared_plugin(
             )
         })?;
     let activation = prepared.activate().map_err(|error| error.to_string())?;
-    let installed = match inspect_all_plugins(
-        &plugin_root,
-        &state.local_mapping_root,
-        Some(trust_store),
-        &state.desktop_version,
-    ) {
+    let installed = match inspect_all_plugins_for_state(state) {
         Ok(installed) => installed,
         Err(error) => {
             activation
@@ -4171,12 +4101,7 @@ async fn signed_plugin_uninstall_context(
     state: &BridgeState,
     plugin_id: &str,
 ) -> Result<SignedPluginUninstallContext, String> {
-    let inspected = inspect_all_plugins(
-        &state.plugin_root,
-        &state.local_mapping_root,
-        state.trust_store.as_deref(),
-        &state.desktop_version,
-    )?;
+    let inspected = inspect_all_plugins_for_state(state)?;
     let active_matches = state
         .controller
         .manifests_match_active_routes(&inspected.manifests)
@@ -4340,12 +4265,7 @@ async fn uninstall_signed_plugin(
             .map_err(|rollback| format!("{error}; 恢复原插件同时失败: {rollback}"))?;
         return Err(format!("{error}；已恢复原插件"));
     }
-    let installed = match inspect_all_plugins(
-        &state.plugin_root,
-        &state.local_mapping_root,
-        state.trust_store.as_deref(),
-        &state.desktop_version,
-    ) {
+    let installed = match inspect_all_plugins_for_state(&state) {
         Ok(installed) if same_plugin_failures(&baseline_failures, &installed.failures) => installed,
         Ok(_) => {
             removal.rollback().map_err(|rollback| {
@@ -4366,7 +4286,7 @@ async fn uninstall_signed_plugin(
             .map_err(|rollback| format!("{error}; 恢复原插件同时失败: {rollback}"))?;
         return Err(format!("{error}；已恢复原插件"));
     }
-    let baseline_transition = match SignedPluginApiBaselineTransition::prepare_retiring(
+    let baseline_transition = match PluginCapabilityBaselineTransition::prepare_retiring(
         &state,
         &installed.manifests,
         &[plugin_id.as_str()],
@@ -4538,7 +4458,7 @@ async fn reload_plugins(
     let candidate_manifests = verified.plugins.manifests;
     let expected_candidate_state_sha256 = verified.candidate_state_sha256;
     let baseline_transition =
-        SignedPluginApiBaselineTransition::prepare(&state, &candidate_manifests)?;
+        PluginCapabilityBaselineTransition::prepare(&state, &candidate_manifests)?;
     maintenance
         .replace_manifests(&candidate_manifests)
         .await
@@ -4631,29 +4551,7 @@ async fn plugin_inventory(
     desktop::require_control(&caller)?;
     let _install = state.install_lock.lock().await;
     recover_plugin_store(&state)?;
-    let mut inspected = inspect_all_plugins(
-        &state.plugin_root,
-        &state.local_mapping_root,
-        state.trust_store.as_deref(),
-        &state.desktop_version,
-    )?;
-    let offline_breaking_plugins = state
-        .plugin_api_baseline
-        .lock()
-        .map_err(|_| "签名插件契约基线锁已损坏".to_owned())?
-        .breaking_plugin_ids_for_manifests(&inspected.manifests, &state.local_mapping_root)?;
-    if !offline_breaking_plugins.is_empty() {
-        inspected.manifests.retain(|manifest| {
-            !offline_breaking_plugins
-                .iter()
-                .any(|plugin_id| plugin_id.eq_ignore_ascii_case(&manifest.plugin_id))
-        });
-        inspected
-            .failures
-            .extend(offline_breaking_plugins.into_iter().map(|plugin_id| {
-                format!("签名插件 [{plugin_id}] 相对上次已激活版本存在破坏性 Web Bridge API 变更")
-            }));
-    }
+    let inspected = inspect_all_plugins_for_state(&state)?;
     let plugins = inspected
         .manifests
         .into_iter()
@@ -4732,7 +4630,13 @@ async fn local_mapping_inventory(
 ) -> Result<LocalMappingInventoryResult, String> {
     desktop::require_control(&caller)?;
     let _install = state.install_lock.lock().await;
-    let inspected = inspect_plugins(&state.local_mapping_root, None, &state.desktop_version)?;
+    let mut inspected = inspect_plugins(&state.local_mapping_root, None, &state.desktop_version)?;
+    let blocked_local = state
+        .plugin_api_baseline
+        .lock()
+        .map_err(|_| "插件能力基线锁已损坏".to_owned())?
+        .changed_local_mapping_ids_for_manifests(&inspected.manifests, &state.local_mapping_root)?;
+    quarantine_plugin_capability_violations(&mut inspected, &BTreeSet::new(), &blocked_local);
     let mut mappings = Vec::new();
     let mut failures = inspected.failures;
     for manifest in inspected.manifests {
@@ -4920,12 +4824,7 @@ async fn local_mapping_import_context(
     prepared: &local_mappings::PreparedLocalMapping,
 ) -> Result<LocalMappingImportContext, String> {
     let plugin_id = prepared.plugin_id();
-    let current = inspect_all_plugins(
-        &state.plugin_root,
-        &state.local_mapping_root,
-        state.trust_store.as_deref(),
-        &state.desktop_version,
-    )?;
+    let current = inspect_all_plugins_for_state(state)?;
     let active_matches = state
         .controller
         .manifests_match_active_routes(&current.manifests)
@@ -4982,12 +4881,7 @@ async fn activate_prepared_local_mapping(
     expected_current_state_sha256: Option<&str>,
 ) -> Result<LocalMappingSaveResult, String> {
     let plugin_id = prepared.plugin_id().to_owned();
-    let current = inspect_all_plugins(
-        &state.plugin_root,
-        &state.local_mapping_root,
-        state.trust_store.as_deref(),
-        &state.desktop_version,
-    )?;
+    let current = inspect_all_plugins_for_state(state)?;
     let active_matches = state
         .controller
         .manifests_match_active_routes(&current.manifests)
@@ -5056,12 +4950,7 @@ async fn activate_prepared_local_mapping(
             )
         })?;
     if let Some(expected) = expected_current_state_sha256 {
-        let latest = inspect_all_plugins(
-            &state.plugin_root,
-            &state.local_mapping_root,
-            state.trust_store.as_deref(),
-            &state.desktop_version,
-        )?;
+        let latest = inspect_all_plugins_for_state(state)?;
         if contains_plugin_id(&latest.discovered_plugin_ids, &plugin_id) {
             return Err(format!(
                 "映射 ID [{plugin_id}] 在宿主预检期间与签名插件发生冲突，请重新预检"
@@ -5090,6 +4979,7 @@ async fn activate_prepared_local_mapping(
         )?;
         ensure_local_mapping_import_plan_matches(expected, &actual)?;
     }
+    let baseline_transition = PluginCapabilityBaselineTransition::prepare(state, &candidates)?;
     let maintenance = state
         .controller
         .begin_plugin_maintenance(&plugin_id)
@@ -5104,12 +4994,7 @@ async fn activate_prepared_local_mapping(
     let activated = tokio::task::spawn_blocking(move || prepared.activate(&root))
         .await
         .map_err(|_| "本地映射启用任务异常终止".to_owned())??;
-    let installed = match inspect_all_plugins(
-        &state.plugin_root,
-        &state.local_mapping_root,
-        state.trust_store.as_deref(),
-        &state.desktop_version,
-    ) {
+    let installed = match inspect_all_plugins_for_state(state) {
         Ok(installed) => installed,
         Err(error) => {
             activated
@@ -5175,6 +5060,7 @@ async fn activate_prepared_local_mapping(
             return Err(format!("映射事务提交失败: {error}"));
         }
     };
+    baseline_transition.commit();
     state
         .plugin_load_failures
         .store(installed.failures.len(), Ordering::Release);
@@ -5209,12 +5095,7 @@ async fn local_mapping_removal_context(
     state: &BridgeState,
     plugin_id: &str,
 ) -> Result<LocalMappingRemovalContext, String> {
-    let inspected = inspect_all_plugins(
-        &state.plugin_root,
-        &state.local_mapping_root,
-        state.trust_store.as_deref(),
-        &state.desktop_version,
-    )?;
+    let inspected = inspect_all_plugins_for_state(state)?;
     let active_matches = state
         .controller
         .manifests_match_active_routes(&inspected.manifests)
@@ -5371,12 +5252,7 @@ async fn delete_local_mapping(
             .map_err(|rollback| format!("{error}; 恢复原映射同时失败: {rollback}"))?;
         return Err(format!("{error}；已恢复原映射"));
     }
-    let installed = match inspect_all_plugins(
-        &state.plugin_root,
-        &state.local_mapping_root,
-        state.trust_store.as_deref(),
-        &state.desktop_version,
-    ) {
+    let installed = match inspect_all_plugins_for_state(&state) {
         Ok(installed) if same_plugin_failures(&baseline_failures, &installed.failures) => installed,
         Ok(_) => {
             removal.rollback().map_err(|rollback| {
@@ -5389,6 +5265,19 @@ async fn delete_local_mapping(
                 .rollback()
                 .map_err(|rollback| format!("{error}; 恢复原映射同时失败: {rollback}"))?;
             return Err(format!("无法验证删除后的插件清单，已恢复原映射: {error}"));
+        }
+    };
+    let baseline_transition = match PluginCapabilityBaselineTransition::prepare_retiring(
+        &state,
+        &installed.manifests,
+        &[plugin_id.as_str()],
+    ) {
+        Ok(transition) => transition,
+        Err(error) => {
+            removal
+                .rollback()
+                .map_err(|rollback| format!("{error}; 恢复原映射同时失败: {rollback}"))?;
+            return Err(format!("{error}，已恢复原映射"));
         }
     };
     if let Err(error) = maintenance.replace_manifest(None).await {
@@ -5410,6 +5299,7 @@ async fn delete_local_mapping(
             })?;
         return Err(format!("映射删除事务提交失败，已恢复原映射: {error}"));
     }
+    baseline_transition.commit();
     state
         .plugin_load_failures
         .store(installed.failures.len(), Ordering::Release);
@@ -5886,6 +5776,7 @@ pub fn run() {
             let (
                 plugin_api_baseline,
                 offline_breaking_plugins,
+                offline_changed_local_mappings,
                 recovered_api_baseline_transition,
             ) =
                 PluginApiBaselineStore::open(
@@ -5897,25 +5788,32 @@ pub fn run() {
             if recovered_api_baseline_transition {
                 tracing::info!(
                     event_code = "plugin-api-baseline-transition-recovered",
-                    "signed plugin API baseline transition recovered after plugin transactions"
+                    "plugin capability baseline transition recovered after plugin transactions"
+                );
+            }
+            if !offline_breaking_plugins.is_empty()
+                || !offline_changed_local_mappings.is_empty()
+            {
+                quarantine_plugin_capability_violations(
+                    &mut plugins,
+                    &offline_breaking_plugins,
+                    &offline_changed_local_mappings,
                 );
             }
             if !offline_breaking_plugins.is_empty() {
-                plugins.manifests.retain(|manifest| {
-                    !offline_breaking_plugins
-                        .iter()
-                        .any(|plugin_id| plugin_id.eq_ignore_ascii_case(&manifest.plugin_id))
-                });
-                plugins.failures.extend(offline_breaking_plugins.iter().map(|plugin_id| {
-                    format!(
-                        "签名插件 [{plugin_id}] 相对上次已激活版本存在破坏性 Web Bridge API 变更"
-                    )
-                }));
                 tracing::warn!(
                     event_code = "plugin-api-offline-replacement-blocked",
                     error_code = "plugin-api-breaking-change",
                     plugin_count = offline_breaking_plugins.len(),
                     "signed plugins changed incompatibly while the desktop was not running"
+                );
+            }
+            if !offline_changed_local_mappings.is_empty() {
+                tracing::warn!(
+                    event_code = "local-mapping-offline-replacement-blocked",
+                    error_code = "local-mapping-unapproved-change",
+                    plugin_count = offline_changed_local_mappings.len(),
+                    "local mappings changed while the desktop was not running"
                 );
             }
             if !plugins.failures.is_empty() {
@@ -6316,6 +6214,80 @@ fn inspect_all_plugins(
         .manifests
         .sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
     Ok(signed)
+}
+
+fn apply_plugin_capability_baseline(
+    state: &BridgeState,
+    inspected: &mut InspectedPlugins,
+) -> Result<(), String> {
+    let baseline = state
+        .plugin_api_baseline
+        .lock()
+        .map_err(|_| "插件能力基线锁已损坏".to_owned())?;
+    let blocked_signed = baseline
+        .breaking_plugin_ids_for_manifests(&inspected.manifests, &state.local_mapping_root)?;
+    let blocked_local = baseline
+        .changed_local_mapping_ids_for_manifests(&inspected.manifests, &state.local_mapping_root)?;
+    drop(baseline);
+
+    quarantine_plugin_capability_violations(inspected, &blocked_signed, &blocked_local);
+    if !blocked_signed.is_empty() {
+        tracing::warn!(
+            event_code = "plugin-api-offline-replacement-blocked",
+            error_code = "plugin-api-breaking-change",
+            plugin_count = blocked_signed.len(),
+            "signed plugins changed incompatibly outside a managed transition"
+        );
+    }
+    if !blocked_local.is_empty() {
+        tracing::warn!(
+            event_code = "local-mapping-offline-replacement-blocked",
+            error_code = "local-mapping-unapproved-change",
+            plugin_count = blocked_local.len(),
+            "local mappings changed outside a managed transition"
+        );
+    }
+    Ok(())
+}
+
+fn quarantine_plugin_capability_violations(
+    inspected: &mut InspectedPlugins,
+    blocked_signed: &BTreeSet<String>,
+    blocked_local: &BTreeSet<String>,
+) {
+    if !blocked_signed.is_empty() || !blocked_local.is_empty() {
+        inspected.manifests.retain(|manifest| {
+            !blocked_signed
+                .iter()
+                .chain(blocked_local.iter())
+                .any(|plugin_id| plugin_id.eq_ignore_ascii_case(&manifest.plugin_id))
+        });
+    }
+    inspected
+        .failures
+        .extend(blocked_signed.iter().map(|plugin_id| {
+            format!(
+                "签名插件 [{plugin_id}] 与上次批准能力不兼容（Web Bridge API 破坏或能力类型变化）"
+            )
+        }));
+    inspected
+        .failures
+        .extend(blocked_local.iter().map(|plugin_id| {
+            format!(
+                "本地映射 [{plugin_id}] 与上次通过工作台批准的内容不一致；请恢复原内容或在控制台检查重新扫描影响"
+            )
+        }));
+}
+
+fn inspect_all_plugins_for_state(state: &BridgeState) -> Result<InspectedPlugins, String> {
+    let mut inspected = inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+        &state.desktop_version,
+    )?;
+    apply_plugin_capability_baseline(state, &mut inspected)?;
+    Ok(inspected)
 }
 
 fn normalized_plugin_id(plugin_id: &str) -> String {
@@ -6854,7 +6826,8 @@ mod tests {
         plugin_reload_active_state_digest, plugin_reload_candidate_state_digest,
         plugin_reload_impact, plugin_reload_plan_id, plugin_update_installed_state_digest,
         plugin_update_plan_id, preflight_failure_message, prepare_plugin_removal, project_bundle,
-        project_import_plan_id, project_import_state_digest, resolve_startup_failure_document,
+        project_import_plan_id, project_import_state_digest,
+        quarantine_plugin_capability_violations, resolve_startup_failure_document,
         same_manifest_contracts, select_runtime_path, service_inventory_item,
         signed_plugin_api_change_summary, signed_plugin_directory_state_digest,
         signed_plugin_route_policy_coverage, signed_plugin_uninstall_plan_id,
@@ -6874,7 +6847,7 @@ mod tests {
     use ssdev_config::{ConfigStore, DesktopConfig};
     use ssdev_origin_policy::{InvocationPolicyCoverage, OriginPolicy};
     use std::{
-        collections::HashSet,
+        collections::{BTreeSet, HashSet},
         fs,
         path::PathBuf,
         time::{Duration, UNIX_EPOCH},
@@ -8613,6 +8586,69 @@ mod tests {
             plugin_reload_impact(&[replaced_local], &[replacement], &local_root);
         assert_eq!(replacement_impact.changed_route_plugin_count, 1);
         assert_eq!(replacement_impact.removed_local_mapping_count, 1);
+    }
+
+    #[test]
+    fn capability_baseline_quarantine_removes_only_blocked_routes() {
+        let root = tempfile::tempdir().unwrap();
+        let local_root = root.path().join("local-mappings");
+        let signed = plugin_manifest_with_service(
+            "reader",
+            root.path().join("plugins/reader"),
+            serde_json::json!({
+                "serviceId": "reader",
+                "mainClass": "reader.dll",
+                "methods": [{"name": "read"}]
+            }),
+        );
+        let mut local = plugin_manifest_with_service(
+            "printer",
+            local_root.join("printer"),
+            serde_json::json!({
+                "serviceId": "printer",
+                "mainClass": "printer.dll",
+                "methods": [{"name": "print"}]
+            }),
+        );
+        local.local_mapping_integrity_sha256 = Some("11".repeat(32));
+        let safe = plugin_manifest_with_service(
+            "scanner",
+            root.path().join("plugins/scanner"),
+            serde_json::json!({
+                "serviceId": "scanner",
+                "mainClass": "scanner.dll",
+                "methods": [{"name": "scan"}]
+            }),
+        );
+        let mut inspected = inspected_plugins(
+            vec![signed, local, safe],
+            HashSet::from(["printer".to_owned()]),
+        );
+
+        quarantine_plugin_capability_violations(
+            &mut inspected,
+            &BTreeSet::from(["reader".to_owned()]),
+            &BTreeSet::from(["printer".to_owned()]),
+        );
+
+        assert_eq!(
+            inspected
+                .manifests
+                .iter()
+                .map(|manifest| manifest.plugin_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["scanner"]
+        );
+        assert_eq!(inspected.failures.len(), 2);
+        assert!(inspected
+            .failures
+            .iter()
+            .any(|failure| { failure.contains("reader") && failure.contains("Web Bridge API") }));
+        assert!(inspected
+            .failures
+            .iter()
+            .any(|failure| { failure.contains("printer") && failure.contains("工作台批准") }));
+        assert!(inspected.local_mapping_ids.contains("printer"));
     }
 
     #[test]

@@ -48,7 +48,7 @@ Doctor 默认只读当前用户 `%LOCALAPPDATA%\com.bsoft.ssdev.desktop\logs`：
 
 本地控制台的“导出脱敏诊断包”会创建一个新的 `.zip` 文件，绝不覆盖已有文件。包内仅包含：
 
-- `manifest.json`：版本、平台、业务桥接协议版本、内部插件宿主协议版本、能力数量、签名策略状态、信任密钥总数及 active/retired/revoked 脱敏计数、业务来源/服务/方法授权数量、插件调用并发上限/当前占用/容量拒绝/执行槽超时/维护拒绝/退出期拒绝/调用方脱离等待计数、controller 当前准入状态、是否全局维护及正在维护的插件数量、持久调用协调可用性/当前准入/运行中/内存结果/账本记录/落盘失败计数、活动宿主数及累计启动成功/失败计数、当前运行累计恢复的插件安装事务数量、安装前成功预检的架构宿主数量、预检失败次数和日志健康计数；不包含具体 keyId、公钥、operationId、origin、pluginId、serviceId、method、请求、响应、插件目录或事务路径。签名插件契约基线条目数和本次运行累计落盘失败只在本地控制台显示，不把具体契约写入诊断包。
+- `manifest.json`：版本、平台、业务桥接协议版本、内部插件宿主协议版本、能力数量、签名策略状态、信任密钥总数及 active/retired/revoked 脱敏计数、业务来源/服务/方法授权数量、插件调用并发上限/当前占用/容量拒绝/执行槽超时/维护拒绝/退出期拒绝/调用方脱离等待计数、controller 当前准入状态、是否全局维护及正在维护的插件数量、持久调用协调可用性/当前准入/运行中/内存结果/账本记录/落盘失败计数、活动宿主数及累计启动成功/失败计数、当前运行累计恢复的插件安装事务数量、安装前成功预检的架构宿主数量、预检失败次数和日志健康计数；不包含具体 keyId、公钥、operationId、origin、pluginId、serviceId、method、请求、响应、插件目录或事务路径。签名插件与本地映射的能力基线条目数和本次运行累计落盘失败只在本地控制台显示，不把具体契约或摘要写入诊断包。
 
 启动期检测到离线替换造成公共 API 破坏时记录 `plugin-api-offline-replacement-blocked`，只包含被隔离插件数量；崩溃后完成或撤销 pending 时记录 `plugin-api-baseline-transition-recovered`。准备、提交后收尾或回滚清理无法落盘时分别记录 `plugin-api-baseline-prepare-failed`、`plugin-api-baseline-commit-deferred`、`plugin-api-baseline-abort-deferred`，统一使用稳定错误码 `plugin-api-baseline-io`。这些事件都不记录插件 ID、route、路径、候选契约或原始 I/O 文本。控制台插件清单会以本地可见的插件 ID 标记隔离项，方便用受控安装、仓库回退或显式卸载恢复。
 

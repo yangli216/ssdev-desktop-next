@@ -19,6 +19,7 @@ business webview -> narrow Tauri command -> Rust controller
 - 所有跨进程请求必须具有长度上限、超时、请求 ID 和确定的失败响应。
 - 业务 Web Bridge 与 controller/plugin-host 私有 IPC 使用独立版本域，任一侧演进都不强迫另一侧同步升级。
 - 每个签名插件必须声明经过验证的 Desktop SemVer 范围；安装、项目导入和应用更新都按该范围失败关闭。
+- 本地映射的 API 与运行时完整性摘要进入持久能力基线；完全退出期间替换组件和清单不会在下次启动被静默采用。
 - controller 最多接受 8 个在途插件调用；容量饱和时在进入原生宿主前快速拒绝，不建立无界等待队列。
 - localhost HTTP 仅作为可关闭的旧浏览器兼容网关，不是新架构内部依赖。
 

@@ -9,7 +9,7 @@ use webplus_plugin_config::{
     compare_public_api, validate_plugin_services, PluginManifest, ServiceDefinition,
 };
 
-const SCHEMA_VERSION: u8 = 2;
+const SCHEMA_VERSION: u8 = 3;
 const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PLUGINS: usize = 1024;
 
@@ -17,6 +17,7 @@ const MAX_PLUGINS: usize = 1024;
 pub(crate) struct PluginApiBaselineStore {
     path: PathBuf,
     pending_path: PathBuf,
+    schema_version: u8,
     entries: Vec<PluginApiBaselineEntry>,
     pending_entries: Option<Vec<PluginApiBaselineEntry>>,
 }
@@ -34,50 +35,71 @@ struct PluginApiBaselineEntry {
     plugin_id: String,
     version: semver::Version,
     services: Vec<ServiceDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_mapping_integrity_sha256: Option<String>,
     #[serde(default = "default_installed")]
     installed: bool,
 }
 
 impl PluginApiBaselineStore {
-    /// Opens the previous accepted contract set and reviews the signed plugins
-    /// currently present on disk. A missing document is a one-time adoption of
-    /// the already verified installation; later same-ID breaking changes are
-    /// returned for quarantine instead of being adopted.
+    /// Opens the previous accepted capability set and reviews the plugins and
+    /// local mappings currently present on disk. A legacy document performs a
+    /// one-time adoption of already verified local mappings. A missing document
+    /// adopts only verified signed plugins and quarantines local mappings until
+    /// an operator approves a managed reload, so deleting the baseline cannot
+    /// downgrade the local approval boundary.
     pub(crate) fn open(
         path: PathBuf,
         manifests: &[PluginManifest],
         local_mapping_root: &Path,
-    ) -> Result<(Self, BTreeSet<String>, bool), String> {
+    ) -> Result<(Self, BTreeSet<String>, BTreeSet<String>, bool), String> {
         let candidates = entries_from_manifests(manifests, local_mapping_root)?;
         let pending_path = pending_path(&path)?;
         let mut store = match read_document(&path)? {
             Some(document) => Self {
                 path,
                 pending_path,
+                schema_version: document.schema_version,
                 entries: document.plugins,
                 pending_entries: None,
             },
             None => {
                 if read_document(&pending_path)?.is_some() {
-                    return Err("签名插件契约基线缺失，但存在无法归属的待提交记录".into());
+                    return Err("插件能力基线缺失，但存在无法归属的待提交记录".into());
                 }
+                let blocked_local = candidates
+                    .iter()
+                    .filter(|candidate| candidate.local_mapping_integrity_sha256.is_some())
+                    .map(|candidate| candidate.plugin_id.clone())
+                    .collect::<BTreeSet<_>>();
+                let adopted_signed = candidates
+                    .into_iter()
+                    .filter(|candidate| candidate.local_mapping_integrity_sha256.is_none())
+                    .collect();
                 let store = Self {
                     path,
                     pending_path,
-                    entries: candidates,
+                    schema_version: SCHEMA_VERSION,
+                    entries: adopted_signed,
                     pending_entries: None,
                 };
                 store.persist()?;
-                return Ok((store, BTreeSet::new(), false));
+                return Ok((store, BTreeSet::new(), blocked_local, false));
             }
         };
         let recovered_transition = store.recover_pending_transition(&candidates)?;
-        let blocked = store.breaking_plugin_ids(&candidates);
-        let reviewed = merge_reviewed_entries(&store.entries, candidates, &blocked);
+        if store.schema_version < SCHEMA_VERSION {
+            adopt_legacy_local_mappings(&mut store.entries, &candidates);
+            store.schema_version = SCHEMA_VERSION;
+        }
+        let blocked_signed = store.breaking_plugin_ids(&candidates);
+        let blocked_local = store.changed_local_mapping_ids(&candidates);
+        let reviewed =
+            merge_reviewed_entries(&store.entries, candidates, &blocked_signed, &blocked_local);
         ensure_plugin_limit(&reviewed)?;
         store.entries = reviewed;
         store.persist()?;
-        Ok((store, blocked, recovered_transition))
+        Ok((store, blocked_signed, blocked_local, recovered_transition))
     }
 
     pub(crate) fn baseline_services(&self, plugin_id: &str) -> Option<&[ServiceDefinition]> {
@@ -105,6 +127,15 @@ impl PluginApiBaselineStore {
     ) -> Result<BTreeSet<String>, String> {
         let candidates = entries_from_manifests(manifests, local_mapping_root)?;
         Ok(self.breaking_plugin_ids(&candidates))
+    }
+
+    pub(crate) fn changed_local_mapping_ids_for_manifests(
+        &self,
+        manifests: &[PluginManifest],
+        local_mapping_root: &Path,
+    ) -> Result<BTreeSet<String>, String> {
+        let candidates = entries_from_manifests(manifests, local_mapping_root)?;
+        Ok(self.changed_local_mapping_ids(&candidates))
     }
 
     /// Persists the exact next accepted set before a plugin or project
@@ -144,7 +175,7 @@ impl PluginApiBaselineStore {
         ensure_plugin_limit(&entries)?;
         entries.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
         if self.pending_entries.is_some() || read_document(&self.pending_path)?.is_some() {
-            return Err("存在尚未完成的签名插件契约切换，请重新启动客户端完成恢复".into());
+            return Err("存在尚未完成的插件能力切换，请重新启动客户端完成恢复".into());
         }
         persist_document(
             &self.pending_path,
@@ -164,7 +195,7 @@ impl PluginApiBaselineStore {
         let entries = self
             .pending_entries
             .clone()
-            .ok_or("不存在待提交的签名插件契约切换")?;
+            .ok_or("不存在待提交的插件能力切换")?;
         persist_document(
             &self.path,
             &PluginApiBaselineDocument {
@@ -172,6 +203,7 @@ impl PluginApiBaselineStore {
                 plugins: entries.clone(),
             },
         )?;
+        self.schema_version = SCHEMA_VERSION;
         self.entries = entries;
         remove_regular_file(&self.pending_path)?;
         self.pending_entries = None;
@@ -196,10 +228,11 @@ impl PluginApiBaselineStore {
         let Some(pending) = read_document(&self.pending_path)? else {
             return Ok(false);
         };
-        if document_matches_candidates(&pending.plugins, candidates) {
+        if document_matches_candidates(&pending.plugins, candidates, pending.schema_version) {
+            self.schema_version = pending.schema_version;
             self.entries = pending.plugins;
             self.persist()?;
-        } else if !document_matches_candidates(&self.entries, candidates) {
+        } else if !document_matches_candidates(&self.entries, candidates, self.schema_version) {
             return Err("插件目录既不匹配已接受契约，也不匹配待提交契约；拒绝猜测恢复结果".into());
         }
         remove_regular_file(&self.pending_path)?;
@@ -207,15 +240,35 @@ impl PluginApiBaselineStore {
     }
 
     fn breaking_plugin_ids(&self, candidates: &[PluginApiBaselineEntry]) -> BTreeSet<String> {
-        let candidates = candidates
+        let baselines = self
+            .entries
             .iter()
             .map(|entry| (normalized_id(&entry.plugin_id), entry))
             .collect::<BTreeMap<_, _>>();
-        self.entries
+        candidates
             .iter()
-            .filter_map(|baseline| {
-                let candidate = candidates.get(&normalized_id(&baseline.plugin_id))?;
-                (!compare_public_api(&baseline.services, &candidate.services).compatible)
+            .filter(|candidate| candidate.local_mapping_integrity_sha256.is_none())
+            .filter_map(|candidate| {
+                let baseline = baselines.get(&normalized_id(&candidate.plugin_id))?;
+                (baseline.local_mapping_integrity_sha256.is_some()
+                    || !compare_public_api(&baseline.services, &candidate.services).compatible)
+                    .then(|| candidate.plugin_id.clone())
+            })
+            .collect()
+    }
+
+    fn changed_local_mapping_ids(&self, candidates: &[PluginApiBaselineEntry]) -> BTreeSet<String> {
+        let accepted = self.pending_entries.as_deref().unwrap_or(&self.entries);
+        let accepted = accepted
+            .iter()
+            .map(|entry| (normalized_id(&entry.plugin_id), entry))
+            .collect::<BTreeMap<_, _>>();
+        candidates
+            .iter()
+            .filter(|candidate| candidate.local_mapping_integrity_sha256.is_some())
+            .filter_map(|candidate| {
+                let baseline = accepted.get(&normalized_id(&candidate.plugin_id));
+                (!baseline.is_some_and(|baseline| same_capability(baseline, candidate)))
                     .then(|| candidate.plugin_id.clone())
             })
             .collect()
@@ -225,7 +278,7 @@ impl PluginApiBaselineStore {
         persist_document(
             &self.path,
             &PluginApiBaselineDocument {
-                schema_version: SCHEMA_VERSION,
+                schema_version: self.schema_version,
                 plugins: self.entries.clone(),
             },
         )
@@ -238,26 +291,40 @@ fn entries_from_manifests(
 ) -> Result<Vec<PluginApiBaselineEntry>, String> {
     let mut entries = Vec::new();
     let mut identities = BTreeSet::new();
-    for manifest in manifests
-        .iter()
-        .filter(|manifest| !manifest.plugin_dir.starts_with(local_mapping_root))
-    {
+    for manifest in manifests {
+        let is_local_mapping = manifest.plugin_dir.starts_with(local_mapping_root);
         validate_plugin_services(&manifest.plugin_id, &manifest.services)
-            .map_err(|error| format!("签名插件契约无效: {error}"))?;
+            .map_err(|error| format!("插件能力契约无效: {error}"))?;
         let metadata = manifest
             .metadata
             .as_ref()
-            .ok_or_else(|| format!("签名插件 [{}] 缺少版本元数据", manifest.plugin_id))?;
+            .ok_or_else(|| format!("插件 [{}] 缺少版本元数据", manifest.plugin_id))?;
         if metadata.plugin_id != manifest.plugin_id {
-            return Err("签名插件契约身份与版本元数据不一致".into());
+            return Err("插件能力身份与版本元数据不一致".into());
         }
         if !identities.insert(normalized_id(&manifest.plugin_id)) {
-            return Err("签名插件契约基线包含重复或大小写冲突的插件 ID".into());
+            return Err("插件能力基线包含重复或大小写冲突的插件 ID".into());
         }
+        let local_mapping_integrity_sha256 = if is_local_mapping {
+            let digest = manifest
+                .local_mapping_integrity_sha256
+                .clone()
+                .ok_or_else(|| format!("本地映射 [{}] 缺少运行时完整性摘要", manifest.plugin_id))?;
+            if !is_lowercase_sha256(&digest) {
+                return Err(format!(
+                    "本地映射 [{}] 的运行时完整性摘要无效",
+                    manifest.plugin_id
+                ));
+            }
+            Some(digest)
+        } else {
+            None
+        };
         entries.push(PluginApiBaselineEntry {
             plugin_id: manifest.plugin_id.clone(),
             version: metadata.version.clone(),
             services: manifest.services.clone(),
+            local_mapping_integrity_sha256,
             installed: true,
         });
     }
@@ -269,7 +336,8 @@ fn entries_from_manifests(
 fn merge_reviewed_entries(
     previous: &[PluginApiBaselineEntry],
     candidates: Vec<PluginApiBaselineEntry>,
-    blocked: &BTreeSet<String>,
+    blocked_signed: &BTreeSet<String>,
+    blocked_local: &BTreeSet<String>,
 ) -> Vec<PluginApiBaselineEntry> {
     let mut merged = previous
         .iter()
@@ -280,6 +348,11 @@ fn merge_reviewed_entries(
         })
         .collect::<BTreeMap<_, _>>();
     for candidate in candidates {
+        let blocked = if candidate.local_mapping_integrity_sha256.is_some() {
+            blocked_local
+        } else {
+            blocked_signed
+        };
         if !blocked
             .iter()
             .any(|plugin_id| plugin_id.eq_ignore_ascii_case(&candidate.plugin_id))
@@ -294,73 +367,85 @@ fn read_document(path: &Path) -> Result<Option<PluginApiBaselineDocument>, Strin
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("无法读取签名插件契约基线: {error}")),
+        Err(error) => return Err(format!("无法读取插件能力基线: {error}")),
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err("签名插件契约基线必须是普通文件".into());
+        return Err("插件能力基线必须是普通文件".into());
     }
     if metadata.len() > MAX_DOCUMENT_BYTES {
-        return Err("签名插件契约基线超过 4 MiB 限制".into());
+        return Err("插件能力基线超过 4 MiB 限制".into());
     }
-    let bytes = fs::read(path).map_err(|error| format!("无法读取签名插件契约基线: {error}"))?;
+    let bytes = fs::read(path).map_err(|error| format!("无法读取插件能力基线: {error}"))?;
     if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
-        return Err("签名插件契约基线读取期间发生变化或超过 4 MiB 限制".into());
+        return Err("插件能力基线读取期间发生变化或超过 4 MiB 限制".into());
     }
-    let document: PluginApiBaselineDocument = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("签名插件契约基线格式无效: {error}"))?;
+    let document: PluginApiBaselineDocument =
+        serde_json::from_slice(&bytes).map_err(|error| format!("插件能力基线格式无效: {error}"))?;
     validate_document(&document)?;
     Ok(Some(document))
 }
 
 fn validate_document(document: &PluginApiBaselineDocument) -> Result<(), String> {
-    if !matches!(document.schema_version, 1 | SCHEMA_VERSION) {
+    if !matches!(document.schema_version, 1 | 2 | SCHEMA_VERSION) {
         return Err(format!(
-            "不支持签名插件契约基线版本 {}",
+            "不支持插件能力基线版本 {}",
             document.schema_version
         ));
     }
     if document.plugins.len() > MAX_PLUGINS {
-        return Err(format!("签名插件契约基线不能超过 {MAX_PLUGINS} 个插件"));
+        return Err(format!("插件能力基线不能超过 {MAX_PLUGINS} 个能力"));
     }
     let mut identities = BTreeSet::new();
     for entry in &document.plugins {
         validate_plugin_services(&entry.plugin_id, &entry.services)
-            .map_err(|error| format!("签名插件契约基线声明无效: {error}"))?;
+            .map_err(|error| format!("插件能力基线声明无效: {error}"))?;
         if !identities.insert(normalized_id(&entry.plugin_id)) {
-            return Err("签名插件契约基线包含重复或大小写冲突的插件 ID".into());
+            return Err("插件能力基线包含重复或大小写冲突的插件 ID".into());
+        }
+        if document.schema_version < SCHEMA_VERSION
+            && entry.local_mapping_integrity_sha256.is_some()
+        {
+            return Err("旧版插件契约基线不能声明本地映射完整性摘要".into());
+        }
+        if entry
+            .local_mapping_integrity_sha256
+            .as_deref()
+            .is_some_and(|digest| !is_lowercase_sha256(digest))
+        {
+            return Err("插件能力基线包含无效的本地映射完整性摘要".into());
         }
     }
     Ok(())
 }
 
 fn persist_document(path: &Path, document: &PluginApiBaselineDocument) -> Result<(), String> {
-    let parent = path.parent().ok_or("签名插件契约基线缺少父目录")?;
+    let parent = path.parent().ok_or("插件能力基线缺少父目录")?;
     fs::create_dir_all(parent).map_err(|error| format!("无法创建契约基线目录: {error}"))?;
     let parent_metadata =
         fs::symlink_metadata(parent).map_err(|error| format!("无法检查契约基线目录: {error}"))?;
     if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
-        return Err("签名插件契约基线目录必须是普通目录".into());
+        return Err("插件能力基线目录必须是普通目录".into());
     }
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err("签名插件契约基线目标必须是普通文件".into());
+            return Err("插件能力基线目标必须是普通文件".into());
         }
     }
     let mut bytes = serde_json::to_vec_pretty(document)
-        .map_err(|error| format!("无法序列化签名插件契约基线: {error}"))?;
+        .map_err(|error| format!("无法序列化插件能力基线: {error}"))?;
     bytes.push(b'\n');
     if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
-        return Err("签名插件契约基线超过 4 MiB 限制".into());
+        return Err("插件能力基线超过 4 MiB 限制".into());
     }
     let mut temporary = NamedTempFile::new_in(parent)
-        .map_err(|error| format!("无法创建签名插件契约基线暂存文件: {error}"))?;
+        .map_err(|error| format!("无法创建插件能力基线暂存文件: {error}"))?;
     temporary
         .write_all(&bytes)
         .and_then(|_| temporary.as_file_mut().sync_all())
-        .map_err(|error| format!("无法持久化签名插件契约基线: {error}"))?;
+        .map_err(|error| format!("无法持久化插件能力基线: {error}"))?;
     temporary
         .persist(path)
-        .map_err(|error| format!("无法原子替换签名插件契约基线: {}", error.error))?;
+        .map_err(|error| format!("无法原子替换插件能力基线: {}", error.error))?;
     sync_directory(parent)?;
     Ok(())
 }
@@ -369,7 +454,7 @@ fn pending_path(path: &Path) -> Result<PathBuf, String> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or("签名插件契约基线文件名无效")?;
+        .ok_or("插件能力基线文件名无效")?;
     Ok(path.with_file_name(format!("{file_name}.pending")))
 }
 
@@ -393,7 +478,7 @@ fn remove_regular_file(path: &Path) -> Result<(), String> {
 fn sync_directory(path: &Path) -> Result<(), String> {
     fs::File::open(path)
         .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("无法持久化签名插件契约基线目录: {error}"))
+        .map_err(|error| format!("无法持久化插件能力基线目录: {error}"))
 }
 
 #[cfg(not(unix))]
@@ -411,17 +496,57 @@ fn default_installed() -> bool {
 
 fn ensure_plugin_limit(entries: &[PluginApiBaselineEntry]) -> Result<(), String> {
     if entries.len() > MAX_PLUGINS {
-        return Err(format!("签名插件契约基线不能超过 {MAX_PLUGINS} 个插件"));
+        return Err(format!("插件能力基线不能超过 {MAX_PLUGINS} 个能力"));
     }
     Ok(())
+}
+
+fn adopt_legacy_local_mappings(
+    entries: &mut Vec<PluginApiBaselineEntry>,
+    candidates: &[PluginApiBaselineEntry],
+) {
+    let mut identities = entries
+        .iter()
+        .map(|entry| normalized_id(&entry.plugin_id))
+        .collect::<BTreeSet<_>>();
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.local_mapping_integrity_sha256.is_some())
+    {
+        if identities.insert(normalized_id(&candidate.plugin_id)) {
+            entries.push(candidate.clone());
+        }
+    }
+    entries.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+}
+
+fn same_capability(left: &PluginApiBaselineEntry, right: &PluginApiBaselineEntry) -> bool {
+    left.plugin_id == right.plugin_id
+        && left.version == right.version
+        && left.services == right.services
+        && left.local_mapping_integrity_sha256 == right.local_mapping_integrity_sha256
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn document_matches_candidates(
     document: &[PluginApiBaselineEntry],
     candidates: &[PluginApiBaselineEntry],
+    schema_version: u8,
 ) -> bool {
     let candidates = candidates
         .iter()
+        .filter(|entry| {
+            schema_version >= SCHEMA_VERSION || entry.local_mapping_integrity_sha256.is_none()
+        })
+        .collect::<Vec<_>>();
+    let candidates = candidates
+        .into_iter()
         .map(|entry| (normalized_id(&entry.plugin_id), entry))
         .collect::<BTreeMap<_, _>>();
     if candidates.len() != document.iter().filter(|entry| entry.installed).count() {
@@ -462,6 +587,24 @@ mod tests {
         }
     }
 
+    fn local_manifest(
+        plugin_id: &str,
+        root: PathBuf,
+        integrity: &str,
+        service: serde_json::Value,
+    ) -> PluginManifest {
+        let mut manifest = manifest(plugin_id, root, service);
+        let metadata = manifest.metadata.as_mut().unwrap();
+        metadata.version = Version::parse("0.0.0-local").unwrap();
+        metadata.desktop_version_requirement = None;
+        manifest.local_mapping_integrity_sha256 = Some(integrity.repeat(64));
+        manifest
+    }
+
+    fn seed_legacy_empty_baseline(path: &Path) {
+        fs::write(path, br#"{"schemaVersion":2,"plugins":[]}"#).unwrap();
+    }
+
     #[test]
     fn baseline_blocks_offline_route_removal_but_adopts_safe_additions() {
         let root = tempfile::tempdir().unwrap();
@@ -477,9 +620,10 @@ mod tests {
                 "methods": [{"name": "read", "alias": "scan"}]
             }),
         );
-        let (_, blocked, recovered) =
+        let (_, blocked, local_blocked, recovered) =
             PluginApiBaselineStore::open(path.clone(), &[original], &local_root).unwrap();
         assert!(blocked.is_empty());
+        assert!(local_blocked.is_empty());
         assert!(!recovered);
 
         let breaking = manifest(
@@ -491,9 +635,10 @@ mod tests {
                 "methods": [{"name": "read"}]
             }),
         );
-        let (store, blocked, recovered) =
+        let (store, blocked, local_blocked, recovered) =
             PluginApiBaselineStore::open(path.clone(), &[breaking], &local_root).unwrap();
         assert_eq!(blocked, BTreeSet::from(["reader".to_owned()]));
+        assert!(local_blocked.is_empty());
         assert!(!recovered);
         assert!(store
             .baseline_services("reader")
@@ -511,9 +656,10 @@ mod tests {
                 ]
             }),
         );
-        let (_, blocked, recovered) =
+        let (_, blocked, local_blocked, recovered) =
             PluginApiBaselineStore::open(path, &[compatible], &local_root).unwrap();
         assert!(blocked.is_empty());
+        assert!(local_blocked.is_empty());
         assert!(!recovered);
     }
 
@@ -590,6 +736,245 @@ mod tests {
     }
 
     #[test]
+    fn schema_two_adopts_verified_local_mappings_once() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_root = root.path().join("plugins");
+        let local_root = root.path().join("local-mappings");
+        let path = root.path().join("plugin-api-baseline.json");
+        let reader = manifest(
+            "reader",
+            plugin_root.join("reader"),
+            serde_json::json!({
+                "serviceId": "card.reader",
+                "mainClass": "reader.dll",
+                "methods": [{"name": "read"}]
+            }),
+        );
+        let mapping = local_manifest(
+            "printer",
+            local_root.join("printer"),
+            "1",
+            serde_json::json!({
+                "serviceId": "label.printer",
+                "mainClass": "printer.dll",
+                "methods": [{"name": "print"}]
+            }),
+        );
+        let legacy = serde_json::json!({
+            "schemaVersion": 2,
+            "plugins": [{
+                "pluginId": "reader",
+                "version": "1.0.0",
+                "services": reader.services.clone(),
+                "installed": true
+            }]
+        });
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let (store, signed_blocked, local_blocked, recovered) =
+            PluginApiBaselineStore::open(path.clone(), &[reader, mapping], &local_root).unwrap();
+        assert!(signed_blocked.is_empty());
+        assert!(local_blocked.is_empty());
+        assert!(!recovered);
+        assert_eq!(store.entry_count(), 2);
+        let migrated: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(migrated["schemaVersion"], SCHEMA_VERSION);
+        assert_eq!(
+            migrated["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["pluginId"] == "printer")
+                .unwrap()["localMappingIntegritySha256"],
+            "1".repeat(64)
+        );
+    }
+
+    #[test]
+    fn schema_three_blocks_new_and_changed_offline_local_mappings() {
+        let root = tempfile::tempdir().unwrap();
+        let local_root = root.path().join("local-mappings");
+        let path = root.path().join("plugin-api-baseline.json");
+        seed_legacy_empty_baseline(&path);
+        let original = local_manifest(
+            "printer",
+            local_root.join("printer"),
+            "1",
+            serde_json::json!({
+                "serviceId": "label.printer",
+                "mainClass": "printer.dll",
+                "methods": [{"name": "print"}]
+            }),
+        );
+        PluginApiBaselineStore::open(path.clone(), std::slice::from_ref(&original), &local_root)
+            .unwrap();
+
+        let changed = local_manifest(
+            "printer",
+            local_root.join("printer"),
+            "2",
+            serde_json::json!({
+                "serviceId": "label.printer",
+                "mainClass": "printer-v2.dll",
+                "methods": [{"name": "print"}, {"name": "status"}]
+            }),
+        );
+        let added = local_manifest(
+            "scanner",
+            local_root.join("scanner"),
+            "3",
+            serde_json::json!({
+                "serviceId": "code.scanner",
+                "mainClass": "scanner.dll",
+                "methods": [{"name": "scan"}]
+            }),
+        );
+        let (store, signed_blocked, local_blocked, recovered) =
+            PluginApiBaselineStore::open(path, &[changed, added], &local_root).unwrap();
+        assert!(signed_blocked.is_empty());
+        assert_eq!(
+            local_blocked,
+            BTreeSet::from(["printer".to_owned(), "scanner".to_owned()])
+        );
+        assert!(!recovered);
+        assert_eq!(store.entry_count(), 1);
+        let original_integrity = "1".repeat(64);
+        assert_eq!(
+            store
+                .entries
+                .iter()
+                .find(|entry| entry.plugin_id == "printer")
+                .unwrap()
+                .local_mapping_integrity_sha256
+                .as_deref(),
+            Some(original_integrity.as_str())
+        );
+    }
+
+    #[test]
+    fn managed_transition_accepts_local_replacement_and_retirement() {
+        let root = tempfile::tempdir().unwrap();
+        let local_root = root.path().join("local-mappings");
+        let path = root.path().join("plugin-api-baseline.json");
+        seed_legacy_empty_baseline(&path);
+        let original = local_manifest(
+            "printer",
+            local_root.join("printer"),
+            "1",
+            serde_json::json!({
+                "serviceId": "label.printer",
+                "mainClass": "printer.dll",
+                "methods": [{"name": "print"}]
+            }),
+        );
+        let updated = local_manifest(
+            "printer",
+            local_root.join("printer"),
+            "2",
+            serde_json::json!({
+                "serviceId": "label.printer",
+                "mainClass": "printer-v2.dll",
+                "methods": [{"name": "print"}, {"name": "status"}]
+            }),
+        );
+        let (mut store, _, _, _) = PluginApiBaselineStore::open(
+            path.clone(),
+            std::slice::from_ref(&original),
+            &local_root,
+        )
+        .unwrap();
+        store
+            .prepare_transition(std::slice::from_ref(&updated), &local_root)
+            .unwrap();
+        assert!(store
+            .changed_local_mapping_ids_for_manifests(std::slice::from_ref(&updated), &local_root)
+            .unwrap()
+            .is_empty());
+        drop(store);
+
+        let (mut recovered, _, local_blocked, did_recover) =
+            PluginApiBaselineStore::open(path.clone(), &[updated], &local_root).unwrap();
+        assert!(local_blocked.is_empty());
+        assert!(did_recover);
+        recovered
+            .prepare_transition_retiring(&[], &local_root, &["printer"])
+            .unwrap();
+        recovered.commit_transition().unwrap();
+
+        let (_, _, reappeared, _) =
+            PluginApiBaselineStore::open(path, &[original], &local_root).unwrap();
+        assert_eq!(reappeared, BTreeSet::from(["printer".to_owned()]));
+    }
+
+    #[test]
+    fn offline_signed_package_cannot_replace_a_local_mapping_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let local_root = root.path().join("local-mappings");
+        let path = root.path().join("plugin-api-baseline.json");
+        seed_legacy_empty_baseline(&path);
+        let local = local_manifest(
+            "reader",
+            local_root.join("reader"),
+            "1",
+            serde_json::json!({
+                "serviceId": "card.reader",
+                "mainClass": "reader.dll",
+                "methods": [{"name": "read"}]
+            }),
+        );
+        PluginApiBaselineStore::open(path.clone(), &[local], &local_root).unwrap();
+        let signed = manifest(
+            "reader",
+            root.path().join("plugins/reader"),
+            serde_json::json!({
+                "serviceId": "card.reader",
+                "mainClass": "reader.dll",
+                "methods": [{"name": "read"}]
+            }),
+        );
+
+        let (_, signed_blocked, local_blocked, _) =
+            PluginApiBaselineStore::open(path, &[signed], &local_root).unwrap();
+        assert_eq!(signed_blocked, BTreeSet::from(["reader".to_owned()]));
+        assert!(local_blocked.is_empty());
+    }
+
+    #[test]
+    fn missing_baseline_adopts_signed_plugins_but_quarantines_local_mappings() {
+        let root = tempfile::tempdir().unwrap();
+        let local_root = root.path().join("local-mappings");
+        let path = root.path().join("plugin-api-baseline.json");
+        let signed = manifest(
+            "reader",
+            root.path().join("plugins/reader"),
+            serde_json::json!({
+                "serviceId": "card.reader",
+                "mainClass": "reader.dll",
+                "methods": [{"name": "read"}]
+            }),
+        );
+        let local = local_manifest(
+            "printer",
+            local_root.join("printer"),
+            "1",
+            serde_json::json!({
+                "serviceId": "label.printer",
+                "mainClass": "printer.dll",
+                "methods": [{"name": "print"}]
+            }),
+        );
+
+        let (store, signed_blocked, local_blocked, recovered) =
+            PluginApiBaselineStore::open(path, &[signed, local], &local_root).unwrap();
+        assert!(signed_blocked.is_empty());
+        assert_eq!(local_blocked, BTreeSet::from(["printer".to_owned()]));
+        assert!(!recovered);
+        assert_eq!(store.entry_count(), 1);
+        assert!(store.baseline_services("reader").is_some());
+        assert!(store.baseline_services("printer").is_none());
+    }
+
+    #[test]
     fn controlled_replacement_can_retire_an_old_contract_identity() {
         let root = tempfile::tempdir().unwrap();
         let plugin_root = root.path().join("plugins");
@@ -604,12 +989,12 @@ mod tests {
                 "methods": [{"name": "read", "alias": "scan"}]
             }),
         );
-        let (mut store, _, _) =
+        let (mut store, _, _, _) =
             PluginApiBaselineStore::open(path.clone(), &[original], &local_root).unwrap();
 
         // An unexplained disappearance is retained as a tombstone so an
         // incompatible same-ID package cannot be reintroduced as a new plugin.
-        let (reopened, _, _) =
+        let (reopened, _, _, _) =
             PluginApiBaselineStore::open(path.clone(), &[], &local_root).unwrap();
         assert_eq!(reopened.entry_count(), 1);
 
@@ -628,7 +1013,7 @@ mod tests {
                 "methods": [{"name": "different"}]
             }),
         );
-        let (_, blocked, _) =
+        let (_, blocked, _, _) =
             PluginApiBaselineStore::open(path, &[incompatible], &local_root).unwrap();
         assert!(blocked.is_empty());
     }
@@ -649,7 +1034,7 @@ mod tests {
             }),
         );
         PluginApiBaselineStore::open(path.clone(), &[reader], &local_root).unwrap();
-        let (mut store, _, _) =
+        let (mut store, _, _, _) =
             PluginApiBaselineStore::open(path.clone(), &[], &local_root).unwrap();
         let writer = manifest(
             "writer",
@@ -666,7 +1051,7 @@ mod tests {
             .unwrap();
         store.commit_transition().unwrap();
         drop(store);
-        let (reopened, blocked, _) =
+        let (reopened, blocked, _, _) =
             PluginApiBaselineStore::open(path, &[writer], &local_root).unwrap();
         assert!(blocked.is_empty());
         assert_eq!(reopened.entry_count(), 2);
@@ -697,7 +1082,7 @@ mod tests {
                 "methods": [{"name": "read"}, {"name": "status"}]
             }),
         );
-        let (mut store, _, _) = PluginApiBaselineStore::open(
+        let (mut store, _, _, _) = PluginApiBaselineStore::open(
             path.clone(),
             std::slice::from_ref(&original),
             &local_root,
@@ -708,7 +1093,7 @@ mod tests {
             .prepare_transition(std::slice::from_ref(&updated), &local_root)
             .unwrap();
         drop(store);
-        let (mut rolled_back, blocked, recovered) =
+        let (mut rolled_back, blocked, _, recovered) =
             PluginApiBaselineStore::open(path.clone(), &[original], &local_root).unwrap();
         assert!(blocked.is_empty());
         assert!(recovered);
@@ -718,7 +1103,7 @@ mod tests {
             .prepare_transition(std::slice::from_ref(&updated), &local_root)
             .unwrap();
         drop(rolled_back);
-        let (committed, blocked, recovered) =
+        let (committed, blocked, _, recovered) =
             PluginApiBaselineStore::open(path, &[updated], &local_root).unwrap();
         assert!(blocked.is_empty());
         assert!(recovered);
@@ -760,7 +1145,7 @@ mod tests {
                 "methods": [{"name": "different"}]
             }),
         );
-        let (mut store, _, _) =
+        let (mut store, _, _, _) =
             PluginApiBaselineStore::open(path.clone(), &[original], &local_root).unwrap();
         store.prepare_transition(&[updated], &local_root).unwrap();
         drop(store);
