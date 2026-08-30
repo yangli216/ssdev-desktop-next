@@ -88,6 +88,7 @@ struct BundlePolicyIdentity {
     metadata: ReleaseMetadata,
     release_metadata_sha256: String,
     artifact_manifest_sha256: String,
+    nsis_installer_relative_path: String,
 }
 
 fn run_prepare_policy(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
@@ -994,10 +995,11 @@ fn run_check_current_go(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> 
         return Ok(false);
     }
     println!(
-        "CURRENT-GO: signed decision, current trust, and candidate Windows bundle {} are approved for {} at source {}",
+        "CURRENT-GO: signed decision, current trust, and candidate Windows bundle {} are approved for {} at source {}\ninstaller: {}",
         candidate_bundle_after.artifact_manifest_sha256,
         verified.decision.app_version,
-        verified.decision.target_source_revision
+        verified.decision.target_source_revision,
+        candidate_bundle_after.nsis_installer_relative_path
     );
     Ok(true)
 }
@@ -1110,7 +1112,23 @@ fn capture_bundle_policy_identity(
     )?;
     let release_metadata_sha256 = sha256_file(&release_metadata)?;
     let artifact_manifest_sha256 = sha256_file(&artifact_manifest)?;
-    verify_manifest(root, "metadata/artifacts.json")?;
+    let manifest = verify_manifest(root, "metadata/artifacts.json")?;
+    let installers = manifest
+        .files
+        .iter()
+        .filter(|file| {
+            file.relative_path.starts_with("nsis/")
+                && file.relative_path.ends_with("-setup.exe")
+                && !file.relative_path["nsis/".len()..].contains('/')
+                && !file.relative_path.chars().any(char::is_control)
+        })
+        .map(|file| file.relative_path.clone())
+        .collect::<Vec<_>>();
+    let [nsis_installer_relative_path] = installers.as_slice() else {
+        return Err(invalid_input(
+            "release bundle must contain exactly one top-level NSIS setup executable",
+        ));
+    };
     let metadata = verify_release_metadata(&release_metadata, workspace)?;
     if release_metadata_sha256 != sha256_file(&release_metadata)?
         || artifact_manifest_sha256 != sha256_file(&artifact_manifest)?
@@ -1123,6 +1141,7 @@ fn capture_bundle_policy_identity(
         metadata,
         release_metadata_sha256,
         artifact_manifest_sha256,
+        nsis_installer_relative_path: nsis_installer_relative_path.clone(),
     })
 }
 
@@ -1740,6 +1759,31 @@ mod tests {
         assert!(
             release_bundle_root_from_metadata(Path::new("verified/bundle/release.json")).is_err()
         );
+    }
+
+    #[test]
+    fn bundle_identity_selects_exactly_one_manifest_bound_nsis_installer() {
+        let root = tempdir().unwrap();
+        let bundle = root.path().join("bundle");
+        let identity = write_test_candidate_bundle(&bundle, &"d".repeat(40), b"installer");
+        assert_eq!(
+            identity.nsis_installer_relative_path,
+            "nsis/ssdev-setup.exe"
+        );
+
+        fs::remove_file(bundle.join("metadata/artifacts.json")).unwrap();
+        fs::remove_file(bundle.join("metadata/artifacts.json.sig")).unwrap();
+        fs::write(bundle.join("nsis/other-setup.exe"), b"other-installer").unwrap();
+        create_manifest(&bundle, "metadata/artifacts.json").unwrap();
+        fs::write(
+            bundle.join("metadata/artifacts.json.sig"),
+            b"test-update-signature",
+        )
+        .unwrap();
+        assert!(capture_bundle_policy_identity(&bundle, None)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one top-level NSIS setup executable"));
     }
 
     #[test]

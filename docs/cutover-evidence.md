@@ -173,7 +173,7 @@ cargo run --locked -p ssdev-cutover-evidence -- verify-go `
 
 这两份现行信任库不是归档副本，也不绑定进历史决策；它们是部署系统必须独立保护和提供的当前信任锚。命令先执行完整历史复验，再用现行审批库复验策略与 GO、用现行 QA 库复验三个证据封套，并对十二个归档输入及两份现行信任库执行前后摘要复核。现行库中的 `active` 或 `retired` 签名键可以验证已有签名，`revoked`、缺失或同 keyId 替换公钥会输出稳定 `cutover-current-trust-rejected` 并返回 `3`，从而让审批后发生的紧急吊销立即停止部署。不能从 GO 归档目录复制旧信任库冒充现行组织状态。
 
-候选 bundle 必须是构建产出的完整根目录，不能只传 NSIS 安装器。命令在现行授权检查前后分别按 `metadata/artifacts.json` 对全部受清单覆盖文件重新计算大小和 SHA-256，并要求 `release.json`、产物清单、应用版本和源码提交与签名 Windows 证据及 GO 精确一致。完整但属于另一构建的 bundle、单独替换的安装器、缺失/额外文件或损坏清单都会输出稳定 `cutover-candidate-bundle-mismatch` 并返回 `3`；验证期间发生变化返回 `1`。`CURRENT-GO` 会输出获准产物清单摘要，实施人员必须立即从同一个受保护根目录启动其中的 NSIS，不能在检查后复制、重新打包或换用同名文件。命令仍不自动安装，因此其授权不会覆盖检查结束后的人工替换。
+候选 bundle 必须是构建产出的完整根目录，不能只传 NSIS 安装器。命令在现行授权检查前后分别按 `metadata/artifacts.json` 对全部受清单覆盖文件重新计算大小和 SHA-256，并要求 `release.json`、产物清单、应用版本和源码提交与签名 Windows 证据及 GO 精确一致；清单还必须恰好覆盖一个顶层 `nsis/*-setup.exe`。完整但属于另一构建的 bundle、单独替换的安装器、缺失/额外文件、零个/多个 NSIS 或损坏清单都会输出稳定 `cutover-candidate-bundle-mismatch` 并返回 `3`；验证期间发生变化返回 `1`。`CURRENT-GO` 会输出获准产物清单摘要和 `installer: nsis/...-setup.exe` 相对路径，实施人员必须立即从同一个受保护根目录启动这一文件，不能在检查后复制、重新打包或换用同名文件。命令仍不自动安装，因此其授权不会覆盖检查结束后的人工替换。
 
 现行信任和候选 bundle 通过后，命令再以现场系统当前时间检查决策的 `evaluatedAtUnixSeconds` 是否位于签名策略的 `maximumCutoverDecisionAgeSeconds` 内。完整通过输出 `CURRENT-GO` 并返回 `0`；GO 超过窗口或比当前时间提前超过五分钟时，输出稳定 `cutover-decision-stale` 或 `cutover-decision-future-timestamp` 及固定处理动作并返回 `3`。归档签名、文件、schema、I/O 或验证期间输入漂移返回 `1`。它不写文件、不延长窗口且不启动安装；发生吊销、材料变更或需要延期时，必须解决信任事件并用当前证据重新执行 `decide`，取得新的最终审批签名。
 
