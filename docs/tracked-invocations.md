@@ -44,6 +44,10 @@ if (outcome.state === 'completed') {
 
 业务项目不需要重复手写这张状态表。`classifyTrackedInvocationStatus(status)` 会返回稳定的 `execution` 与 `next`：`pending` 只查询同一 operation ID，`completed` 处理原响应，`indeterminate` 和 `completedWithoutResult` 都要求先对账，`unknown` 进入项目自己的恢复策略。所有结果都固定返回 `automaticReplay: 'forbidden'`。该纯函数不保存 ID、不发起查询、不轮询，也不会依据 `ResCode` 替业务创建另一笔逻辑操作。
 
+## 命令拒绝
+
+tracked 调用或状态查询的 Promise 拒绝不代表设备未执行。Desktop 以 schema 1 的 `trackedInvocationError` 对象返回固定 `phase` 和脱敏 `code`，phase 只允许 `authorization`、`runtime`、`availability`、`invoke`、`status`；对象没有消息、路径、来源、路由、operation ID 或底层错误字段。SDK 的 `classifyTrackedInvocationFailure(error)` 会严格检查版本、固定字段集、phase 和有界 code。合法对象得到 `query-same-operation-or-reconcile`，旧客户端字符串、普通 `Error`、额外字段或损坏对象统一得到 `treat-as-possibly-executed`；两者的 `automaticReplay` 都是 `forbidden`。业务可以显示稳定 code 对应的项目提示，但不得解析本地化文案、复制未知错误或据此生成新 ID。
+
 页面刷新后可以使用相同来源、路由和操作 ID 查询：
 
 ```ts

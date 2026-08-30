@@ -170,6 +170,7 @@
 130. 类型化插件客户端不能只覆盖兼容调用，迫使打印、写卡业务在启用持久调用时重新手抄 service/method 和响应类型。共享清单生成器必须保留现有唯一 `<Plugin>Client` 及最小 `PluginInvoker`/fixture 兼容路径，并在同一文件另行导出不以 `Client` 命名的 `create<Plugin>TrackedApi()`；后者只接受 SDK 已确认可用的 `TrackedInvocationBridge`，为每条公开路由生成同类型参数的持久调用和状态查询。调用与查询名称必须作为同一集合避让，不能因 alias 碰撞覆盖真实入口；Web kit 消费门禁必须同时编译并实际核对两类路由。生成代码不得推断厂商幂等性、创建或保存 operation ID、自动轮询/重试，也不得让 fixture 冒充持久账本、崩溃恢复或硬件结果。
 131. 持久调用已经提供 operation ID 和类型化路由后，业务项目仍不能各自解释五种状态并把不确定结果误写成自动重放。Web Bridge SDK 必须提供不执行 I/O 的稳定状态分类：`pending` 只能引导查询同一 operation ID，`completed` 只引导处理原响应，`indeterminate` 与 `completedWithoutResult` 都要求先做业务或设备对账，`unknown` 明确交回项目恢复策略；所有分类统一声明自动重放被禁止。分类器不得保存或创建 ID、发起轮询、依据插件 `ResCode` 创建新逻辑操作，也不得把未知或账本淘汰解释为设备未执行。
 132. 页面刷新后从业务存储恢复的 operation ID 是未知输入，不能因为 TypeScript 最终可赋给 `string` 就绕过持久账本身份规则。SDK 必须提供品牌化 `PluginOperationId`、安全随机创建、类型守卫和固定错误解析入口，只接受规范小写、连字符形式、版本 4 且为 RFC 4122 variant 的 UUID；错误不得复制输入值。Rust 账本必须执行相同 variant、版本与规范格式门禁，生成的 tracked API 调用和状态查询只接受品牌类型；底层可选桥继续保留字符串参数以兼容已经接入的业务。SDK 不提供通用 IndexedDB/后端存储抽象，也不替项目决定一个 ID 与哪笔订单、写卡或打印事务绑定。
+133. tracked 方法的 Promise 拒绝不是执行状态，不能继续用本地化字符串迫使业务项目自行解析并推断设备是否动作。Desktop 命令边界必须返回版本化、精确四字段的 `trackedInvocationError`：`schemaVersion`、固定 kind、授权/运行边界/可用性/调用/查询 phase 和有界脱敏 code；不得包含 message、路径、origin、路由、operation ID 或底层错误。共享桥契约固定 schema、字段和 phase。SDK 必须严格拒绝错误版本、未知 phase、非法 code 及额外字段，并把结构化拒绝与未知旧错误分别映射为查询同一操作或对账、按可能已执行处理；两者都禁止自动重放。该契约不新增重试器，不把所有拒绝宣称为“保证未执行”，也不改变普通 `invokePlugin` 的兼容响应。
 
 ## 不采用的方案
 

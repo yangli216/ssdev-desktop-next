@@ -33,8 +33,20 @@ fixture 按 service、method 和完整 JSON 参数精确匹配，对象键顺序
 
 同一生成文件还会导出独立的 `create<Plugin>TrackedApi()`。打印、写卡等非幂等方法应把 `requireTrackedPluginInvocations(connection.bridge, connection.system)` 的结果传入该工厂，从而继续使用生成的参数/响应类型和固定路由，而不是在业务代码里重新手抄 `serviceId`、`method`。tracked API 为每个公开方法生成调用和状态查询两个方法，并要求 `PluginOperationId`：新动作使用 `createPluginOperationId()`，页面刷新后从业务存储恢复的未知字符串先经过 `parsePluginOperationId()`，损坏、非 v4、非 RFC 4122 variant、非小写规范格式都会在调用前固定失败。底层桥继续接受 `string` 以兼容旧代码。操作 ID 仍必须由业务流程在调用前持久保存。SDK 的 `classifyTrackedInvocationStatus()` 会把五种结果收敛成稳定后续动作，且每种结果都明确 `automaticReplay: 'forbidden'`；它不会提供存储、自动轮询、重试或替业务完成设备对账。
 
+tracked 方法的 Promise 拒绝不是第六种执行状态，也不能据此判断设备没有动作。Desktop 只返回 `{ schemaVersion, kind, phase, code }` 四个字段，不再把本地化文案、授权细节、路径或底层错误交给业务页；phase 区分授权、运行边界、协调器可用性、调用和状态查询。将捕获值交给 `classifyTrackedInvocationFailure()`：结构有效时保留稳定 phase/code，未知或旧客户端错误则不复制原值；两类结果都固定禁止自动重放，并要求使用原 operation ID 查询或按项目规则对账。
+
+```ts
+try {
+  await trackedReader.readCard(operationId, { timeout: 30 })
+} catch (error: unknown) {
+  const failure = classifyTrackedInvocationFailure(error)
+  // failure.automaticReplay 始终为 'forbidden'
+}
+```
+
 ```ts
 import {
+  classifyTrackedInvocationFailure,
   classifyTrackedInvocationStatus,
   connectDesktop,
   createPluginOperationId,

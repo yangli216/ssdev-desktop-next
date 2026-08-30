@@ -173,6 +173,7 @@ async function smokeTestPackagedConsumer(archivePath) {
     const runtimeSmokePath = join(consumer, 'runtime-smoke.mjs')
     await writeFile(runtimeSmokePath, `import {
   CURRENT_BRIDGE_PROTOCOL_VERSION,
+  classifyTrackedInvocationFailure,
   classifyTrackedInvocationStatus,
   createPluginFixtureInvoker,
   isPluginOperationId,
@@ -183,6 +184,16 @@ if (CURRENT_BRIDGE_PROTOCOL_VERSION !== 1) throw new Error('unexpected bridge pr
 const restoredOperationId = parsePluginOperationId('123e4567-e89b-42d3-a456-426614174000')
 if (!isPluginOperationId(restoredOperationId)) {
   throw new Error('packaged operation ID validator rejected a canonical UUID v4')
+}
+const trackedFailure = classifyTrackedInvocationFailure({
+  schemaVersion: 1,
+  kind: 'trackedInvocationError',
+  phase: 'status',
+  code: 'operation-ledger-io',
+})
+if (trackedFailure.next !== 'query-same-operation-or-reconcile'
+    || trackedFailure.automaticReplay !== 'forbidden') {
+  throw new Error('packaged tracked failure classifier is unsafe')
 }
 const trackedDisposition = classifyTrackedInvocationStatus({ state: 'indeterminate' })
 if (trackedDisposition.next !== 'reconcile-before-new-operation'
@@ -206,6 +217,7 @@ if (response.ResCode !== 0 || response.ResData?.ready !== true) {
 
     const typeSmokePath = join(consumer, 'type-smoke.ts')
     await writeFile(typeSmokePath, `import {
+  classifyTrackedInvocationFailure,
   classifyTrackedInvocationStatus,
   createPluginFixtureInvoker,
   type InvokeResponse,
@@ -213,6 +225,7 @@ if (response.ResCode !== 0 || response.ResData?.ready !== true) {
   type PluginInvoker,
   type PluginOperationId,
   type TrackedInvocationDisposition,
+  type TrackedInvocationFailureDisposition,
   type TrackedInvocationStatus,
   parsePluginOperationId,
 } from '@bsoft/ssdev-web-bridge'
@@ -230,11 +243,18 @@ const restoredOperationId: PluginOperationId = parsePluginOperationId(
 const bridgeOperationId: string = restoredOperationId
 const trackedStatus: TrackedInvocationStatus<Health> = { state: 'pending' }
 const trackedDisposition: TrackedInvocationDisposition = classifyTrackedInvocationStatus(trackedStatus)
+const trackedFailure: TrackedInvocationFailureDisposition = classifyTrackedInvocationFailure({
+  schemaVersion: 1,
+  kind: 'trackedInvocationError',
+  phase: 'invoke',
+  code: 'tracked-invocation-capacity',
+})
 const consume = async (): Promise<InvokeResponse<Health>> =>
   invoker.invokePlugin<Health>('consumer-smoke', 'health')
 if (trackedDisposition.kind === 'pending') {
   trackedDisposition.next satisfies 'query-same-operation'
 }
+trackedFailure.automaticReplay satisfies 'forbidden'
 void bridgeOperationId
 void consume()
 `, { encoding: 'utf8', flag: 'wx' })

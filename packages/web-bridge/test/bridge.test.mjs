@@ -11,6 +11,7 @@ import {
   CURRENT_DESKTOP_CAPABILITIES_SCHEMA_VERSION,
   CURRENT_BRIDGE_PROTOCOL_VERSION,
   CURRENT_PROTOCOL_VERSION,
+  CURRENT_TRACKED_INVOCATION_ERROR_SCHEMA_VERSION,
   DesktopBridgeUnavailableError,
   InvalidPluginOperationIdError,
   InvalidPluginFixtureError,
@@ -18,16 +19,19 @@ import {
   PLUGIN_INVOCATION_CONTROL_CODES,
   UnsupportedDesktopProtocolError,
   TRACKED_INVOCATION_METHODS,
+  TRACKED_INVOCATION_ERROR_PHASES,
   TrackedInvocationsUnavailableError,
   UnexpectedPluginInvocationError,
   canRetryPluginInvocationWithBackoff,
   classifyPluginInvocationResponse,
+  classifyTrackedInvocationFailure,
   classifyTrackedInvocationStatus,
   connectDesktop,
   createPluginFixtureInvoker,
   createPluginOperationId,
   getTrackedInvocationCapabilities,
   isPluginOperationId,
+  isTrackedInvocationCommandError,
   isDesktopBridgeAvailable,
   parsePluginOperationId,
   requireDesktopBridge,
@@ -53,7 +57,7 @@ function clearBridge() {
 test.afterEach(clearBridge)
 
 test('matches the shared desktop bridge contract', () => {
-  assert.equal(contract.schemaVersion, 4)
+  assert.equal(contract.schemaVersion, 5)
   assert.equal(CURRENT_BRIDGE_PROTOCOL_VERSION, contract.protocolVersion)
   assert.equal(CURRENT_PROTOCOL_VERSION, contract.protocolVersion)
   assert.equal(CURRENT_DESKTOP_CAPABILITIES_SCHEMA_VERSION, contract.capabilities.schemaVersion)
@@ -61,6 +65,17 @@ test('matches the shared desktop bridge contract', () => {
   assert.deepEqual(TRACKED_INVOCATION_METHODS, contract.optionalMethods)
   assert.deepEqual(BRIDGE_EVENTS, contract.events)
   assert.deepEqual(PLUGIN_INVOCATION_CONTROL_CODES, contract.pluginInvocationControlCodes)
+  assert.equal(
+    CURRENT_TRACKED_INVOCATION_ERROR_SCHEMA_VERSION,
+    contract.trackedInvocationError.schemaVersion,
+  )
+  assert.deepEqual(TRACKED_INVOCATION_ERROR_PHASES, contract.trackedInvocationError.phases)
+  assert.deepEqual(contract.trackedInvocationError.fields, [
+    'schemaVersion',
+    'kind',
+    'phase',
+    'code',
+  ])
 })
 
 test('classifies only controller rejections that prove native execution never started', () => {
@@ -240,6 +255,56 @@ test('classifies every tracked outcome without permitting automatic replay', () 
       (error) => error instanceof TypeError
         && error.message === 'SSDEV tracked invocation status is invalid',
     )
+  }
+})
+
+test('classifies only the versioned tracked command error without replaying failures', () => {
+  for (const phase of TRACKED_INVOCATION_ERROR_PHASES) {
+    const commandError = {
+      schemaVersion: 1,
+      kind: 'trackedInvocationError',
+      phase,
+      code: 'operation-ledger-io',
+    }
+    assert.equal(isTrackedInvocationCommandError(commandError), true)
+    const disposition = classifyTrackedInvocationFailure(commandError)
+    assert.deepEqual(disposition, {
+      kind: 'desktop-rejection',
+      phase,
+      code: 'operation-ledger-io',
+      execution: 'not-confirmed',
+      next: 'query-same-operation-or-reconcile',
+      automaticReplay: 'forbidden',
+    })
+    assert.equal(Object.isFrozen(disposition), true)
+  }
+
+  const malformed = [
+    null,
+    '持久调用协调失败 (operation-ledger-io)',
+    new Error('operation-ledger-io'),
+    {},
+    { schemaVersion: 2, kind: 'trackedInvocationError', phase: 'invoke', code: 'operation-ledger-io' },
+    { schemaVersion: 1, kind: 'trackedInvocationError', phase: 'unknown', code: 'operation-ledger-io' },
+    { schemaVersion: 1, kind: 'trackedInvocationError', phase: 'invoke', code: 'INVALID secret' },
+    {
+      schemaVersion: 1,
+      kind: 'trackedInvocationError',
+      phase: 'invoke',
+      code: 'operation-ledger-io',
+      detail: 'secret-path',
+    },
+  ]
+  for (const error of malformed) {
+    assert.equal(isTrackedInvocationCommandError(error), false)
+    assert.deepEqual(classifyTrackedInvocationFailure(error), {
+      kind: 'unknown-error',
+      phase: null,
+      code: null,
+      execution: 'unknown',
+      next: 'treat-as-possibly-executed',
+      automaticReplay: 'forbidden',
+    })
   }
 })
 

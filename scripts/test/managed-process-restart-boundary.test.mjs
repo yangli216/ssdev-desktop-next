@@ -35,7 +35,7 @@ test('managed process selection drift is a restart-bound runtime boundary', asyn
   assert.match(desktop, /managed-process-restart-required/)
   assert.match(openBusiness, /require_current_managed_processes\(\)\?/)
   assert.match(invokePlugin, /require_current_managed_processes\(\)\?/)
-  assert.match(invokeTracked, /require_current_managed_processes\(\)\?/)
+  assert.match(invokeTracked, /require_current_managed_processes\(\)[\s\S]+TrackedInvocationErrorPhase::Runtime/)
   assert.doesNotMatch(operationStatus, /require_current_managed_processes/)
 
   assert.match(lib, /struct BridgeStatus[\s\S]+managed_process_restart_required: bool/)

@@ -115,7 +115,7 @@ controller 对所有入口统一限制最多 8 个在途插件调用，不建立
 
 调用一旦通过准入，就由 Rust controller 的独立监督任务持有。页面导航、WebView 销毁或 JavaScript 丢弃 Promise 只会脱离结果等待，不会取消已经开始的 DLL/COM/设备操作；监督任务仍执行到响应或受控超时，确保后续管道响应不会错配。业务端必须把这类结果未知的调用视为“可能已经执行”，不能自动重试。真正的设备取消只能在具体插件协议明确支持、且另行定义幂等与确认语义后增加。
 
-对于打印、写卡等非幂等操作，新 SDK 还提供向后兼容的可选 `invokePluginTracked(operationId, serviceId, method, parameters)` 与 `getPluginInvocation(operationId, serviceId, method)`。操作 ID 在进入 controller 前先持久落盘，页面从落盘开始就不再拥有取消权；同来源、同完整请求的重复提交共享一次执行，同 ID 改参数或路由会失败。新建 ID 使用 `createPluginOperationId()`，页面刷新后从业务存储恢复的未知值先由 `parsePluginOperationId()` 校验为 `PluginOperationId`，生成客户端不会接受未经校验的普通字符串；直接桥接签名仍保持兼容。应用崩溃后可能返回 `indeterminate` 或 `completedWithoutResult`，两者都不能自动重放；详见 `tracked-invocations.md`。
+对于打印、写卡等非幂等操作，新 SDK 还提供向后兼容的可选 `invokePluginTracked(operationId, serviceId, method, parameters)` 与 `getPluginInvocation(operationId, serviceId, method)`。操作 ID 在进入 controller 前先持久落盘，页面从落盘开始就不再拥有取消权；同来源、同完整请求的重复提交共享一次执行，同 ID 改参数或路由会失败。新建 ID 使用 `createPluginOperationId()`，页面刷新后从业务存储恢复的未知值先由 `parsePluginOperationId()` 校验为 `PluginOperationId`，生成客户端不会接受未经校验的普通字符串；直接桥接签名仍保持兼容。tracked Promise 拒绝以版本化 `trackedInvocationError` 对象返回 phase/code，业务使用 `classifyTrackedInvocationFailure()` 处理，不能解析本地化文本或把拒绝当作设备未执行。应用崩溃后可能返回 `indeterminate` 或 `completedWithoutResult`，两者都不能自动重放；详见 `tracked-invocations.md`。
 
 不要只按 JavaScript 方法是否存在决定是否启用非幂等流程。新版 `getSystemInfo()` 会在可选 `capabilities.trackedInvocations` 中声明 `supported`、`available`、`accepting`、脱敏错误码和实现边界；SDK 使用 `supportsTrackedPluginInvocations(connection.bridge, connection.system)` 时会同时核对方法与运行时声明。旧客户端没有能力声明，因此可以继续使用基础桥接，但不应进入要求持久防重的流程。
 

@@ -2,6 +2,15 @@ export const CURRENT_BRIDGE_PROTOCOL_VERSION = 1 as const
 // Backward-compatible export for existing business applications.
 export const CURRENT_PROTOCOL_VERSION = CURRENT_BRIDGE_PROTOCOL_VERSION
 export const CURRENT_DESKTOP_CAPABILITIES_SCHEMA_VERSION = 1 as const
+export const CURRENT_TRACKED_INVOCATION_ERROR_SCHEMA_VERSION = 1 as const
+
+export const TRACKED_INVOCATION_ERROR_PHASES = [
+  'authorization',
+  'runtime',
+  'availability',
+  'invoke',
+  'status',
+] as const
 
 export type JsonPrimitive = string | number | boolean | null
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue }
@@ -233,6 +242,34 @@ export type TrackedInvocationStatus<T = JsonValue> =
   | { state: 'indeterminate' }
   | { state: 'completedWithoutResult' }
 
+export type TrackedInvocationErrorPhase = (typeof TRACKED_INVOCATION_ERROR_PHASES)[number]
+
+export interface TrackedInvocationCommandError {
+  schemaVersion: typeof CURRENT_TRACKED_INVOCATION_ERROR_SCHEMA_VERSION
+  kind: 'trackedInvocationError'
+  phase: TrackedInvocationErrorPhase
+  code: string
+}
+
+export type TrackedInvocationFailureDisposition = Readonly<
+  | {
+      kind: 'desktop-rejection'
+      phase: TrackedInvocationErrorPhase
+      code: string
+      execution: 'not-confirmed'
+      next: 'query-same-operation-or-reconcile'
+      automaticReplay: 'forbidden'
+    }
+  | {
+      kind: 'unknown-error'
+      phase: null
+      code: null
+      execution: 'unknown'
+      next: 'treat-as-possibly-executed'
+      automaticReplay: 'forbidden'
+    }
+>
+
 export type TrackedInvocationDisposition = Readonly<
   | {
       kind: 'unknown'
@@ -303,6 +340,53 @@ export function classifyTrackedInvocationStatus(
   return TRACKED_INVOCATION_DISPOSITIONS[
     state as TrackedInvocationStatus['state']
   ]
+}
+
+const TRACKED_INVOCATION_ERROR_FIELDS = [
+  'schemaVersion',
+  'kind',
+  'phase',
+  'code',
+] as const satisfies readonly (keyof TrackedInvocationCommandError)[]
+const TRACKED_INVOCATION_ERROR_CODE_PATTERN = /^[a-z0-9][a-z0-9-]{0,127}$/
+const UNKNOWN_TRACKED_INVOCATION_FAILURE = Object.freeze({
+  kind: 'unknown-error',
+  phase: null,
+  code: null,
+  execution: 'unknown',
+  next: 'treat-as-possibly-executed',
+  automaticReplay: 'forbidden',
+} as const satisfies TrackedInvocationFailureDisposition)
+
+export function isTrackedInvocationCommandError(
+  value: unknown,
+): value is TrackedInvocationCommandError {
+  if (!isRecord(value)) return false
+  const keys = Object.keys(value)
+  return keys.length === TRACKED_INVOCATION_ERROR_FIELDS.length
+    && TRACKED_INVOCATION_ERROR_FIELDS.every((field) => Object.hasOwn(value, field))
+    && value.schemaVersion === CURRENT_TRACKED_INVOCATION_ERROR_SCHEMA_VERSION
+    && value.kind === 'trackedInvocationError'
+    && typeof value.phase === 'string'
+    && TRACKED_INVOCATION_ERROR_PHASES.includes(value.phase as TrackedInvocationErrorPhase)
+    && typeof value.code === 'string'
+    && TRACKED_INVOCATION_ERROR_CODE_PATTERN.test(value.code)
+}
+
+export function classifyTrackedInvocationFailure(
+  error: unknown,
+): TrackedInvocationFailureDisposition {
+  if (!isTrackedInvocationCommandError(error)) {
+    return UNKNOWN_TRACKED_INVOCATION_FAILURE
+  }
+  return Object.freeze({
+    kind: 'desktop-rejection',
+    phase: error.phase,
+    code: error.code,
+    execution: 'not-confirmed',
+    next: 'query-same-operation-or-reconcile',
+    automaticReplay: 'forbidden',
+  })
 }
 
 export interface TrackedInvocationLimits {

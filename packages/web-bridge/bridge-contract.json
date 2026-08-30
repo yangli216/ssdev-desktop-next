@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "protocolVersion": 1,
   "methods": [
     "invokePlugin",
@@ -38,6 +38,23 @@
     "controllerStopping": -32002,
     "executionLaneTimeout": -32003,
     "pluginReloading": -32010
+  },
+  "trackedInvocationError": {
+    "schemaVersion": 1,
+    "kind": "trackedInvocationError",
+    "fields": [
+      "schemaVersion",
+      "kind",
+      "phase",
+      "code"
+    ],
+    "phases": [
+      "authorization",
+      "runtime",
+      "availability",
+      "invoke",
+      "status"
+    ]
   },
   "events": [
     "ssdev-capture",

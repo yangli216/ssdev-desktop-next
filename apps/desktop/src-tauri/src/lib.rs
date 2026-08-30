@@ -5737,6 +5737,46 @@ async fn plugin_invoke(
     Ok(state.controller.invoke(request).await)
 }
 
+const TRACKED_INVOCATION_ERROR_SCHEMA_VERSION: u8 = 1;
+#[cfg(test)]
+const TRACKED_INVOCATION_ERROR_PHASES: [&str; 5] = [
+    "authorization",
+    "runtime",
+    "availability",
+    "invoke",
+    "status",
+];
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum TrackedInvocationErrorPhase {
+    Authorization,
+    Runtime,
+    Availability,
+    Invoke,
+    Status,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrackedInvocationCommandError {
+    schema_version: u8,
+    kind: &'static str,
+    phase: TrackedInvocationErrorPhase,
+    code: &'static str,
+}
+
+impl TrackedInvocationCommandError {
+    fn new(phase: TrackedInvocationErrorPhase, code: &'static str) -> Self {
+        Self {
+            schema_version: TRACKED_INVOCATION_ERROR_SCHEMA_VERSION,
+            kind: "trackedInvocationError",
+            phase,
+            code,
+        }
+    }
+}
+
 #[tauri::command]
 async fn plugin_invoke_tracked(
     caller: WebviewWindow,
@@ -5744,20 +5784,33 @@ async fn plugin_invoke_tracked(
     state: State<'_, BridgeState>,
     operation_id: String,
     request: InvokeRequest,
-) -> Result<TrackedInvocationStatus, String> {
+) -> Result<TrackedInvocationStatus, TrackedInvocationCommandError> {
     let origin = desktop::require_plugin_invocation(
         &caller,
         &desktop_state,
         &request.service_id,
         &request.method,
-    )?;
-    desktop_state.require_current_managed_processes()?;
+    )
+    .map_err(|_| {
+        TrackedInvocationCommandError::new(
+            TrackedInvocationErrorPhase::Authorization,
+            "tracked-invocation-not-authorized",
+        )
+    })?;
+    desktop_state
+        .require_current_managed_processes()
+        .map_err(|_| {
+            TrackedInvocationCommandError::new(
+                TrackedInvocationErrorPhase::Runtime,
+                "tracked-invocation-runtime-boundary",
+            )
+        })?;
     let coordinator = state.invocation_coordinator.as_ref().ok_or_else(|| {
-        format!(
-            "持久调用协调不可用 ({})",
+        TrackedInvocationCommandError::new(
+            TrackedInvocationErrorPhase::Availability,
             state
                 .invocation_coordinator_error
-                .unwrap_or("tracked-invocation-unavailable")
+                .unwrap_or("tracked-invocation-unavailable"),
         )
     })?;
     coordinator
@@ -5768,7 +5821,12 @@ async fn plugin_invoke_tracked(
             Arc::clone(&state.controller),
         )
         .await
-        .map_err(|error| format!("持久调用协调失败 ({})", error.diagnostic_code()))
+        .map_err(|error| {
+            TrackedInvocationCommandError::new(
+                TrackedInvocationErrorPhase::Invoke,
+                error.diagnostic_code(),
+            )
+        })
 }
 
 #[tauri::command]
@@ -5779,20 +5837,31 @@ async fn plugin_invocation_status(
     operation_id: String,
     service_id: String,
     method: String,
-) -> Result<TrackedInvocationStatus, String> {
-    let origin = desktop::require_plugin_invocation(&caller, &desktop_state, &service_id, &method)?;
+) -> Result<TrackedInvocationStatus, TrackedInvocationCommandError> {
+    let origin = desktop::require_plugin_invocation(&caller, &desktop_state, &service_id, &method)
+        .map_err(|_| {
+            TrackedInvocationCommandError::new(
+                TrackedInvocationErrorPhase::Authorization,
+                "tracked-invocation-not-authorized",
+            )
+        })?;
     let coordinator = state.invocation_coordinator.as_ref().ok_or_else(|| {
-        format!(
-            "持久调用协调不可用 ({})",
+        TrackedInvocationCommandError::new(
+            TrackedInvocationErrorPhase::Availability,
             state
                 .invocation_coordinator_error
-                .unwrap_or("tracked-invocation-unavailable")
+                .unwrap_or("tracked-invocation-unavailable"),
         )
     })?;
     coordinator
         .status(&origin, &operation_id, &service_id, &method)
         .await
-        .map_err(|error| format!("持久调用状态查询失败 ({})", error.diagnostic_code()))
+        .map_err(|error| {
+            TrackedInvocationCommandError::new(
+                TrackedInvocationErrorPhase::Status,
+                error.diagnostic_code(),
+            )
+        })
 }
 
 #[derive(Serialize)]
@@ -7108,7 +7177,8 @@ mod tests {
         LocalMappingImportServicePreview, LocalMappingRemovalPreview, OfflineRuntimeProbe,
         PluginInstallBlocker, PluginInstallSource, PluginPackagePreview,
         PluginPackageServicePreview, PluginReloadPreview, ProjectBundlePreview,
-        SignedPluginUninstallPreview, StartupFailureDocument, StartupStage, APP_DATA_DIRECTORY,
+        SignedPluginUninstallPreview, StartupFailureDocument, StartupStage,
+        TrackedInvocationCommandError, TrackedInvocationErrorPhase, APP_DATA_DIRECTORY,
         FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
@@ -9182,6 +9252,27 @@ mod tests {
             ),
             PathBuf::from("user/plugins")
         );
+    }
+
+    #[test]
+    fn tracked_command_errors_expose_only_versioned_phase_and_code() {
+        let value = serde_json::to_value(TrackedInvocationCommandError::new(
+            TrackedInvocationErrorPhase::Invoke,
+            "operation-ledger-io",
+        ))
+        .unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "schemaVersion": 1,
+                "kind": "trackedInvocationError",
+                "phase": "invoke",
+                "code": "operation-ledger-io",
+            })
+        );
+        assert!(!value.to_string().contains("持久调用"));
+        assert!(!value.to_string().contains("path"));
     }
 
     #[test]
