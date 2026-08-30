@@ -958,6 +958,52 @@ pub struct ProductionCutoverInputs<'a> {
     pub windows_attestation_sha256: String,
 }
 
+#[derive(Debug)]
+pub struct ProductionCutoverReadinessInputs<'a> {
+    pub policy: &'a ProductionCutoverPolicy,
+    pub evidence_trust_store_sha256: String,
+    pub approval_trust_store_sha256: String,
+    pub plugin: &'a PluginMatrixEvidence,
+    pub migration: &'a MigrationAuditEvidence,
+    pub windows: &'a WindowsPackageEvidence,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ProductionCutoverReadiness {
+    pub eligible_for_evidence_signing: bool,
+    pub blocker_codes: Vec<String>,
+}
+
+pub fn evaluate_production_cutover_readiness(
+    inputs: ProductionCutoverReadinessInputs<'_>,
+    evaluated_at_unix_seconds: u64,
+) -> Result<ProductionCutoverReadiness, EvidenceError> {
+    let placeholder_sha256 = "0".repeat(64);
+    let decision = evaluate_production_cutover(
+        ProductionCutoverInputs {
+            policy: inputs.policy,
+            policy_sha256: placeholder_sha256.clone(),
+            policy_attestation_sha256: placeholder_sha256.clone(),
+            evidence_trust_store_sha256: inputs.evidence_trust_store_sha256,
+            approval_trust_store_sha256: inputs.approval_trust_store_sha256,
+            plugin: inputs.plugin,
+            plugin_sha256: placeholder_sha256.clone(),
+            plugin_attestation_sha256: placeholder_sha256.clone(),
+            migration: inputs.migration,
+            migration_sha256: placeholder_sha256.clone(),
+            migration_attestation_sha256: placeholder_sha256.clone(),
+            windows: inputs.windows,
+            windows_sha256: placeholder_sha256.clone(),
+            windows_attestation_sha256: placeholder_sha256,
+        },
+        evaluated_at_unix_seconds,
+    )?;
+    Ok(ProductionCutoverReadiness {
+        eligible_for_evidence_signing: decision.eligible,
+        blocker_codes: decision.blocker_codes,
+    })
+}
+
 pub fn evaluate_production_cutover(
     inputs: ProductionCutoverInputs<'_>,
     evaluated_at_unix_seconds: u64,
@@ -2093,6 +2139,20 @@ mod tests {
                 "windows-x86-host-mismatch",
             ]
         );
+        let readiness = evaluate_production_cutover_readiness(
+            ProductionCutoverReadinessInputs {
+                policy: &policy,
+                evidence_trust_store_sha256: "8".repeat(64),
+                approval_trust_store_sha256: "2".repeat(64),
+                plugin: &plugin,
+                migration: &migration,
+                windows: &windows,
+            },
+            1000,
+        )
+        .unwrap();
+        assert_eq!(readiness.eligible_for_evidence_signing, decision.eligible);
+        assert_eq!(readiness.blocker_codes, decision.blocker_codes);
     }
 
     #[test]

@@ -9,13 +9,14 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use ssdev_cutover_evidence::{
-    evaluate_production_cutover, load_delivery_ready_deployment_check,
-    load_migration_audit_evidence, load_plugin_matrix_evidence, load_windows_package_evidence,
-    prepare_new_output, sha256_file, verify_evidence_attestation,
-    verify_production_cutover_policy_attestation, write_cutover_decision,
-    write_production_cutover_policy, write_windows_package_evidence, EvidenceAttestationKind,
-    EvidenceType, MigrationCoverageMinimums, ProductionCutoverInputs, ProductionCutoverPolicy,
-    WindowsPackageEvidence, CUTOVER_POLICY_SCHEMA_VERSION, WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION,
+    evaluate_production_cutover, evaluate_production_cutover_readiness,
+    load_delivery_ready_deployment_check, load_migration_audit_evidence,
+    load_plugin_matrix_evidence, load_windows_package_evidence, prepare_new_output, sha256_file,
+    verify_evidence_attestation, verify_production_cutover_policy_attestation,
+    write_cutover_decision, write_production_cutover_policy, write_windows_package_evidence,
+    EvidenceAttestationKind, EvidenceType, MigrationCoverageMinimums, ProductionCutoverInputs,
+    ProductionCutoverPolicy, ProductionCutoverReadinessInputs, WindowsPackageEvidence,
+    CUTOVER_POLICY_SCHEMA_VERSION, WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION,
 };
 use ssdev_origin_policy::{signing_payload as origin_policy_signing_payload, OriginPolicy};
 use ssdev_pilot_readiness::{
@@ -40,6 +41,17 @@ struct PolicyApprovalInputs {
     migration_audit_signer_key_id: String,
     windows_package_signer_key_id: String,
     cutover_decision_signer_key_id: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct UnsignedCutoverHashes {
+    policy: String,
+    policy_attestation: String,
+    approval_trust_store: String,
+    evidence_trust_store: String,
+    plugin: String,
+    migration: String,
+    windows: String,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -237,9 +249,112 @@ fn run() -> Result<bool, Box<dyn Error>> {
             run_windows_package(&arguments)?;
             Ok(true)
         }
+        "precheck" => run_precheck(&arguments),
         "decide" => run_decision(&arguments),
         _ => Err(usage().into()),
     }
+}
+
+fn run_precheck(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> {
+    if arguments.len() != 8 {
+        return Err(usage().into());
+    }
+    let policy_path = path_argument(arguments.get(1), "production cutover policy")?;
+    let policy_attestation_path =
+        path_argument(arguments.get(2), "production cutover policy attestation")?;
+    let approval_trust_store_path = path_argument(arguments.get(3), "approval trust store")?;
+    let evidence_trust_store_path = path_argument(arguments.get(4), "evidence trust store")?;
+    let plugin_path = path_argument(arguments.get(5), "plugin matrix evidence")?;
+    let migration_path = path_argument(arguments.get(6), "migration audit evidence")?;
+    let windows_path = path_argument(arguments.get(7), "Windows package evidence")?;
+
+    let hashes_before = capture_unsigned_cutover_hashes(
+        &policy_path,
+        &policy_attestation_path,
+        &approval_trust_store_path,
+        &evidence_trust_store_path,
+        &plugin_path,
+        &migration_path,
+        &windows_path,
+    )?;
+    let policy = verify_production_cutover_policy_attestation(
+        &policy_path,
+        &policy_attestation_path,
+        &approval_trust_store_path,
+    )?;
+    let evidence_trust = TrustStore::load(&evidence_trust_store_path)?;
+    for key_id in [
+        &policy.plugin_matrix_signer_key_id,
+        &policy.migration_audit_signer_key_id,
+        &policy.windows_package_signer_key_id,
+    ] {
+        evidence_trust.ensure_key_can_issue(TrustPurpose::CutoverEvidence, key_id)?;
+    }
+    let plugin = load_plugin_matrix_evidence(&plugin_path)?;
+    let migration = load_migration_audit_evidence(&migration_path)?;
+    let windows = load_windows_package_evidence(&windows_path)?;
+    let evaluated_at_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| invalid_input("system clock is before the Unix epoch"))?
+        .as_secs();
+    let hashes_after = capture_unsigned_cutover_hashes(
+        &policy_path,
+        &policy_attestation_path,
+        &approval_trust_store_path,
+        &evidence_trust_store_path,
+        &plugin_path,
+        &migration_path,
+        &windows_path,
+    )?;
+    if hashes_before != hashes_after {
+        return Err(invalid_input(
+            "cutover policy, trust store, or unsigned evidence changed during precheck",
+        ));
+    }
+
+    let readiness = evaluate_production_cutover_readiness(
+        ProductionCutoverReadinessInputs {
+            policy: &policy,
+            evidence_trust_store_sha256: hashes_after.evidence_trust_store,
+            approval_trust_store_sha256: hashes_after.approval_trust_store,
+            plugin: &plugin,
+            migration: &migration,
+            windows: &windows,
+        },
+        evaluated_at_unix_seconds,
+    )?;
+    if readiness.eligible_for_evidence_signing {
+        println!(
+            "READY-FOR-EVIDENCE-SIGNING: unsigned evidence satisfies the current production policy"
+        );
+    } else {
+        eprintln!(
+            "BLOCKED: {} blocker(s): {}",
+            readiness.blocker_codes.len(),
+            readiness.blocker_codes.join(", ")
+        );
+    }
+    Ok(readiness.eligible_for_evidence_signing)
+}
+
+fn capture_unsigned_cutover_hashes(
+    policy: &Path,
+    policy_attestation: &Path,
+    approval_trust_store: &Path,
+    evidence_trust_store: &Path,
+    plugin: &Path,
+    migration: &Path,
+    windows: &Path,
+) -> Result<UnsignedCutoverHashes, Box<dyn Error>> {
+    Ok(UnsignedCutoverHashes {
+        policy: sha256_file(policy)?,
+        policy_attestation: sha256_file(policy_attestation)?,
+        approval_trust_store: sha256_file(approval_trust_store)?,
+        evidence_trust_store: sha256_file(evidence_trust_store)?,
+        plugin: sha256_file(plugin)?,
+        migration: sha256_file(migration)?,
+        windows: sha256_file(windows)?,
+    })
 }
 
 fn run_windows_package(arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
@@ -822,7 +937,7 @@ fn invalid_input(message: &str) -> Box<dyn Error> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ssdev-cutover-evidence prepare-policy <workspace> <pilot-materials-root> <pilot-manifest.json> <pilot-report.json> <candidate-bundle-root> <evidence-trust.json> <policy-approval-inputs.json> <policy-output.json>\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> <deployment-check.json|none> <application-state-preservation-verified> [previous-release.json]\n  ssdev-cutover-evidence decide <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
+    "usage:\n  ssdev-cutover-evidence prepare-policy <workspace> <pilot-materials-root> <pilot-manifest.json> <pilot-report.json> <candidate-bundle-root> <evidence-trust.json> <policy-approval-inputs.json> <policy-output.json>\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> <deployment-check.json|none> <application-state-preservation-verified> [previous-release.json]\n  ssdev-cutover-evidence precheck <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <migration-evidence.json> <windows-evidence.json>\n  ssdev-cutover-evidence decide <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
 }
 
 #[cfg(test)]
@@ -945,5 +1060,41 @@ mod tests {
         retired["keys"][0]["status"] = serde_json::json!("retired");
         fs::write(&evidence, serde_json::to_vec(&retired).unwrap()).unwrap();
         assert!(validate_cutover_signing_keys(&evidence, &approval_trust, &approval).is_err());
+    }
+
+    #[test]
+    fn usage_places_unsigned_precheck_before_the_final_signed_decision() {
+        let help = usage();
+        let precheck = help.find("ssdev-cutover-evidence precheck").unwrap();
+        let decide = help.find("ssdev-cutover-evidence decide").unwrap();
+
+        assert!(precheck < decide);
+        assert!(help.contains("<plugin-evidence.json> <migration-evidence.json>"));
+        assert!(!help[precheck..decide].contains("plugin-evidence.sig.json"));
+    }
+
+    #[test]
+    fn unsigned_precheck_hashes_bind_every_input_without_writing_output() {
+        let root = tempdir().unwrap();
+        let paths = (0..7)
+            .map(|index| {
+                let path = root.path().join(format!("input-{index}.json"));
+                fs::write(&path, format!("input-{index}")).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let before = capture_unsigned_cutover_hashes(
+            &paths[0], &paths[1], &paths[2], &paths[3], &paths[4], &paths[5], &paths[6],
+        )
+        .unwrap();
+
+        fs::write(&paths[6], "changed").unwrap();
+        let after = capture_unsigned_cutover_hashes(
+            &paths[0], &paths[1], &paths[2], &paths[3], &paths[4], &paths[5], &paths[6],
+        )
+        .unwrap();
+
+        assert_ne!(before, after);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 7);
     }
 }

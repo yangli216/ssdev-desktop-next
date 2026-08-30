@@ -75,7 +75,24 @@ scripts/test-windows-package.ps1 `
 
 工具只接受 schema 1、`unsigned-local-record`、Windows、候选版本一致、13 个固定检查项齐全且 `business-frontend` 为 `pass` 的深度记录；记录必须在包证据生成前一小时内产生。它会在读取前后复算摘要并把摘要及生成时间写入待签名的 schema 7 包证据，原始记录仍应随 QA 归档保存。未传参数时脚本显式写入空绑定，适用于普通 CI，但最终判定不会把它当作现场验收。
 
-每份证据生成后，由对应受控 QA 环境使用统一外部签名流程处理，三个 artifact kind 分别为 `plugin-matrix-evidence`、`migration-audit-evidence` 和 `windows-package-evidence`。例如：
+三份证据生成后、提交 QA KMS/HSM 签名前，先执行只读预检：
+
+```powershell
+cargo run --locked -p ssdev-cutover-evidence -- precheck `
+  D:\cutover-inputs\production-policy.json `
+  D:\cutover-output\production-policy.sig.json `
+  D:\cutover-inputs\release-trust.json `
+  D:\cutover-inputs\evidence-trust.json `
+  D:\cutover-inputs\plugin-matrix-evidence.json `
+  D:\cutover-inputs\migration-evidence.json `
+  D:\cutover-inputs\windows-package-evidence.json
+```
+
+`precheck` 先验签生产策略并确认最终审批信任根，再检查策略指定的三个 QA keyId 在绑定的证据信任库中仍可签发，随后加载三份未签证据并直接复用最终 `evaluate_production_cutover` 的全部时效、来源、材料、发布集合、来源策略、宿主、升级回退和业务页门禁。检查前后会复算策略、策略封套、两份信任库和三份证据；任一输入漂移返回 `1`。无阻断输出 `READY-FOR-EVIDENCE-SIGNING` 并返回 `0`，存在业务阻断只输出排序稳定的相同阻断码并返回 `3`。命令不写决策、签名请求或其他文件，也不会把未签证据变成可审批事实。
+
+预检只是当前时点的返工保护，不预留证据有效期，也不授权跳过签名。预检后任一证据变化都需要重新执行；最终 `decide` 仍会逐份验证策略和三个证据封套、签名 keyId、用途、信任库原始摘要和全部输入前后身份，并再次运行同一判定。只有最终带真实封套摘要的决策可以进入审批。
+
+预检通过后，由对应受控 QA 环境使用统一外部签名流程处理，三个 artifact kind 分别为 `plugin-matrix-evidence`、`migration-audit-evidence` 和 `windows-package-evidence`。例如：
 
 ```powershell
 cargo run --locked -p ssdev-release-signing -- prepare `
