@@ -652,12 +652,18 @@ pub struct PluginLoadFailure {
     pub error: ConfigError,
 }
 
+struct DiscoveredPluginDirectory {
+    plugin_id: String,
+    path: PathBuf,
+    loaded: Result<PluginManifest, ConfigError>,
+}
+
 pub fn discover_plugins(root: &Path) -> Result<DiscoveryReport, ConfigError> {
     let entries = fs::read_dir(root).map_err(|source| ConfigError::ReadDirectory {
         path: root.to_path_buf(),
         source,
     })?;
-    let mut report = DiscoveryReport::default();
+    let mut discovered = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|source| ConfigError::ReadDirectory {
             path: root.to_path_buf(),
@@ -677,22 +683,69 @@ pub fn discover_plugins(root: &Path) -> Result<DiscoveryReport, ConfigError> {
             continue;
         }
         let path = entry.path();
-        match PluginManifest::load(plugin_id.clone(), &path) {
+        let loaded = PluginManifest::load(plugin_id.clone(), &path);
+        discovered.push(DiscoveredPluginDirectory {
+            plugin_id,
+            path,
+            loaded,
+        });
+    }
+    Ok(finalize_plugin_discovery(discovered))
+}
+
+fn finalize_plugin_discovery(mut discovered: Vec<DiscoveredPluginDirectory>) -> DiscoveryReport {
+    discovered.sort_by(|left, right| {
+        normalized_plugin_id(&left.plugin_id)
+            .cmp(&normalized_plugin_id(&right.plugin_id))
+            .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut identity_counts = HashMap::new();
+    for item in &discovered {
+        *identity_counts
+            .entry(normalized_plugin_id(&item.plugin_id))
+            .or_insert(0_usize) += 1;
+    }
+
+    let mut report = DiscoveryReport::default();
+    for item in discovered {
+        if identity_counts
+            .get(&normalized_plugin_id(&item.plugin_id))
+            .is_some_and(|count| *count > 1)
+        {
+            report.failures.push(PluginLoadFailure {
+                plugin_id: item.plugin_id.clone(),
+                path: item.path,
+                error: ConfigError::Validation(format!(
+                    "plugin identity [{}] has multiple directories under Windows case-insensitive semantics",
+                    item.plugin_id
+                )),
+            });
+            continue;
+        }
+        match item.loaded {
             Ok(manifest) => report.manifests.push(manifest),
             Err(error) => report.failures.push(PluginLoadFailure {
-                plugin_id,
-                path,
+                plugin_id: item.plugin_id,
+                path: item.path,
                 error,
             }),
         }
     }
+    report.manifests.sort_by(|left, right| {
+        normalized_plugin_id(&left.plugin_id).cmp(&normalized_plugin_id(&right.plugin_id))
+    });
+    report.failures.sort_by(|left, right| {
+        normalized_plugin_id(&left.plugin_id)
+            .cmp(&normalized_plugin_id(&right.plugin_id))
+            .then_with(|| left.plugin_id.cmp(&right.plugin_id))
+            .then_with(|| left.path.cmp(&right.path))
+    });
     report
-        .manifests
-        .sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
-    report
-        .failures
-        .sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
-    Ok(report)
+}
+
+fn normalized_plugin_id(plugin_id: &str) -> String {
+    plugin_id.to_ascii_lowercase()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1961,6 +2014,55 @@ mod tests {
         assert_eq!(report.manifests.len(), 1);
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].plugin_id, "invalid");
+    }
+
+    #[test]
+    fn discovery_quarantines_every_windows_case_colliding_identity() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join(API_FILENAME),
+            r#"[{"serviceId":"svc","mainClass":"tool.exe","methods":[]}]"#,
+        )
+        .unwrap();
+        let discovered = ["Reader", "reader"]
+            .into_iter()
+            .map(|plugin_id| DiscoveredPluginDirectory {
+                plugin_id: plugin_id.to_owned(),
+                path: root.path().join(plugin_id),
+                loaded: PluginManifest::load(plugin_id, root.path()),
+            })
+            .collect();
+
+        let report = finalize_plugin_discovery(discovered);
+
+        assert!(report.manifests.is_empty());
+        assert_eq!(report.failures.len(), 2);
+        assert_eq!(report.failures[0].plugin_id, "Reader");
+        assert_eq!(report.failures[1].plugin_id, "reader");
+        assert!(report.failures.iter().all(|failure| failure
+            .error
+            .to_string()
+            .contains("Windows case-insensitive semantics")));
+
+        let discovered = vec![
+            DiscoveredPluginDirectory {
+                plugin_id: "Reader".into(),
+                path: root.path().join("Reader"),
+                loaded: PluginManifest::load("Reader", root.path()),
+            },
+            DiscoveredPluginDirectory {
+                plugin_id: "reader".into(),
+                path: root.path().join("reader"),
+                loaded: Err(ConfigError::Validation("broken fixture".into())),
+            },
+        ];
+        let report = finalize_plugin_discovery(discovered);
+        assert!(report.manifests.is_empty());
+        assert_eq!(report.failures.len(), 2);
+        assert!(report
+            .failures
+            .iter()
+            .all(|failure| !failure.error.to_string().contains("broken fixture")));
     }
 
     #[test]

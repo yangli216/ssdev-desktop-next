@@ -15,7 +15,7 @@ use tokio::sync::{
 use tokio::time::{timeout, timeout_at, Instant};
 use tracing::{info, warn};
 use webplus_ipc::{read_frame_async, write_frame_async, FrameError};
-use webplus_plugin_config::PluginManifest;
+use webplus_plugin_config::{validate_portable_plugin_id, PluginManifest};
 use webplus_protocol::{
     is_reserved_controller_invoke_code, HostCommand, HostPayload, HostRequest, HostResponse,
     HostResult, InvokeRequest, InvokeResponse, PluginArchitecture, HOST_PROTOCOL_VERSION,
@@ -226,9 +226,20 @@ impl PluginController {
         if service_id.trim().is_empty() {
             return Err(ControllerError::EmptyServiceId);
         }
+        validate_controller_plugin_id(&descriptor.plugin_id)?;
         self.plugin_lifecycle(&descriptor.plugin_id).await;
 
         let mut routes = self.routes.write().await;
+        if let Some(existing) = routes.values().find(|route| {
+            normalized_plugin_id(&route.descriptor.plugin_id)
+                == normalized_plugin_id(&descriptor.plugin_id)
+                && route.descriptor.plugin_id != descriptor.plugin_id
+        }) {
+            return Err(ControllerError::DuplicatePluginIdentity {
+                existing: existing.descriptor.plugin_id.clone(),
+                candidate: descriptor.plugin_id,
+            });
+        }
         if let Some(existing) = routes.get(&service_id) {
             if existing.descriptor != descriptor {
                 return Err(ControllerError::DuplicateService(service_id));
@@ -292,14 +303,15 @@ impl PluginController {
             let manifest = route.manifest.as_ref().ok_or_else(|| {
                 ControllerError::MissingActiveManifest(route.descriptor.plugin_id.clone())
             })?;
-            if let Some(existing) = manifests.get(&manifest.plugin_id) {
+            let identity = normalized_plugin_id(&manifest.plugin_id);
+            if let Some(existing) = manifests.get(&identity) {
                 if existing.as_ref() != manifest.as_ref() {
                     return Err(ControllerError::InconsistentActiveManifest(
                         manifest.plugin_id.clone(),
                     ));
                 }
             } else {
-                manifests.insert(manifest.plugin_id.clone(), Arc::clone(manifest));
+                manifests.insert(identity, Arc::clone(manifest));
             }
         }
         Ok(manifests
@@ -668,7 +680,7 @@ impl PluginController {
         let mut lifecycles = self.plugin_lifecycles.lock().await;
         Arc::clone(
             lifecycles
-                .entry(plugin_id.to_owned())
+                .entry(normalized_plugin_id(plugin_id))
                 .or_insert_with(|| Arc::new(PluginLifecycle::new())),
         )
     }
@@ -980,7 +992,16 @@ fn routes_from_manifests(
     manifests: &[PluginManifest],
 ) -> Result<HashMap<String, ServiceRoute>, ControllerError> {
     let mut routes = HashMap::new();
+    let mut plugin_identities = HashMap::new();
     for manifest in manifests {
+        validate_controller_plugin_id(&manifest.plugin_id)?;
+        let normalized = normalized_plugin_id(&manifest.plugin_id);
+        if let Some(existing) = plugin_identities.insert(normalized, manifest.plugin_id.clone()) {
+            return Err(ControllerError::DuplicatePluginIdentity {
+                existing,
+                candidate: manifest.plugin_id.clone(),
+            });
+        }
         let snapshot = Arc::new(manifest.clone());
         for service in &manifest.services {
             let service_id = service.service_id.clone();
@@ -1016,6 +1037,17 @@ fn routes_from_manifests(
         }
     }
     Ok(routes)
+}
+
+fn validate_controller_plugin_id(plugin_id: &str) -> Result<(), ControllerError> {
+    if plugin_id.trim().is_empty() {
+        return Err(ControllerError::EmptyPluginId);
+    }
+    validate_portable_plugin_id(plugin_id).map_err(|_| ControllerError::InvalidPluginId)
+}
+
+fn normalized_plugin_id(plugin_id: &str) -> String {
+    plugin_id.to_ascii_lowercase()
 }
 
 struct PluginSupervisor {
@@ -1679,6 +1711,10 @@ pub enum ControllerError {
     EmptyServiceId,
     #[error("plugin ID must not be empty")]
     EmptyPluginId,
+    #[error("plugin ID is not portable to the Windows runtime")]
+    InvalidPluginId,
+    #[error("plugin IDs [{existing}] and [{candidate}] resolve to the same Windows identity")]
+    DuplicatePluginIdentity { existing: String, candidate: String },
     #[error("service [{0}] is already routed to a different plugin")]
     DuplicateService(String),
     #[error("active routes for plugin [{0}] do not share one manifest snapshot")]
@@ -1750,6 +1786,8 @@ impl ControllerError {
             Self::InvalidInvocationLimit { .. } => "invalid-invocation-limit",
             Self::EmptyServiceId => "empty-service-id",
             Self::EmptyPluginId => "empty-plugin-id",
+            Self::InvalidPluginId => "invalid-plugin-id",
+            Self::DuplicatePluginIdentity { .. } => "duplicate-plugin-identity",
             Self::DuplicateService(_) => "duplicate-service",
             Self::InconsistentActiveManifest(_) => "active-manifest-inconsistent",
             Self::MissingActiveManifest(_) => "active-manifest-missing",
@@ -3083,6 +3121,75 @@ mod tests {
             PluginController::validate_manifests(&manifests),
             Err(ControllerError::DuplicateService(service)) if service == "shared"
         ));
+    }
+
+    #[test]
+    fn replacement_manifest_set_rejects_windows_plugin_identity_aliases() {
+        let root = tempdir().unwrap();
+        let mut manifests = Vec::new();
+        for (index, plugin_id) in ["Reader", "reader"].into_iter().enumerate() {
+            let directory = root.path().join(format!("source-{index}"));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("api.json"),
+                format!(r#"{{"serviceId":"service-{index}","mainClass":"reader.dll"}}"#),
+            )
+            .unwrap();
+            manifests.push(PluginManifest::load(plugin_id, directory).unwrap());
+        }
+
+        let failure = PluginController::validate_manifests(&manifests).unwrap_err();
+        assert!(matches!(
+            &failure,
+            ControllerError::DuplicatePluginIdentity {
+                existing,
+                candidate,
+            } if existing == "Reader" && candidate == "reader"
+        ));
+        assert_eq!(failure.diagnostic_code(), "duplicate-plugin-identity");
+
+        manifests.truncate(1);
+        manifests[0].plugin_id = "CON".into();
+        let failure = PluginController::validate_manifests(&manifests).unwrap_err();
+        assert!(matches!(&failure, ControllerError::InvalidPluginId));
+        assert_eq!(failure.diagnostic_code(), "invalid-plugin-id");
+    }
+
+    #[tokio::test]
+    async fn incremental_registration_and_maintenance_share_windows_plugin_identity() {
+        let root = tempdir().unwrap();
+        let mut manifests = Vec::new();
+        for (index, plugin_id) in ["Reader", "reader"].into_iter().enumerate() {
+            let directory = root.path().join(format!("incremental-{index}"));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("api.json"),
+                format!(r#"{{"serviceId":"route-{index}","mainClass":"reader.dll"}}"#),
+            )
+            .unwrap();
+            manifests.push(PluginManifest::load(plugin_id, directory).unwrap());
+        }
+        let controller = Arc::new(PluginController::new(config()).unwrap());
+        controller.register_manifest(&manifests[0]).await.unwrap();
+        let failure = controller
+            .register_manifest(&manifests[1])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            failure,
+            ControllerError::DuplicatePluginIdentity { .. }
+        ));
+
+        let maintenance = controller.begin_plugin_maintenance("READER").await.unwrap();
+        let response = controller
+            .invoke(InvokeRequest {
+                service_id: "route-0".into(),
+                method: "probe".into(),
+                parameters: Map::new(),
+            })
+            .await;
+        assert_eq!(response.res_code, CONTROLLER_MAINTENANCE);
+        drop(maintenance);
     }
 
     #[tokio::test]
