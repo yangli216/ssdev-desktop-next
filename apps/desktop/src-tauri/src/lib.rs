@@ -994,9 +994,54 @@ fn rollback_project_components(
     }
 }
 
+struct ProjectFinalRollbackContext<'a, 'm> {
+    app: &'a AppHandle,
+    desktop_state: &'a desktop::DesktopState,
+    maintenance: &'a webplus_controller::PluginMaintenance<'m>,
+    previous_active_plugins: &'a [PluginManifest],
+}
+
+async fn rollback_project_after_final_verification(
+    context: &ProjectFinalRollbackContext<'_, '_>,
+    previous_config: ssdev_config::DesktopConfig,
+    transaction: project_activation::ProjectActivation,
+    activated: Vec<ActivatedProjectComponent>,
+    reason: &'static str,
+) -> String {
+    let config_restored =
+        desktop::replace_desktop_config(context.app, context.desktop_state, previous_config)
+            .is_ok();
+    let routes_restored = context
+        .maintenance
+        .replace_manifests(context.previous_active_plugins)
+        .await
+        .is_ok();
+    let components_restored = rollback_project_components(transaction, activated).is_ok();
+    format!(
+        "{reason}，未提交项目；旧配置恢复{}，旧路由恢复{}，组件恢复{}{}",
+        restoration_result(config_restored),
+        restoration_result(routes_restored),
+        restoration_result(components_restored),
+        if config_restored && routes_restored && components_restored {
+            "，请重新预检"
+        } else {
+            "，请重新启动客户端完成恢复"
+        }
+    )
+}
+
+fn restoration_result(success: bool) -> &'static str {
+    if success {
+        "成功"
+    } else {
+        "失败"
+    }
+}
+
 struct PreparedProjectBundle {
     config: ssdev_config::DesktopConfig,
     components: Vec<PreparedProjectComponent>,
+    current_state_sha256: String,
     preview: ProjectBundlePreview,
 }
 
@@ -1283,6 +1328,12 @@ async fn import_project_bundle(
     let signed_plugins = prepared.preview.signed_plugins;
     let local_mappings = prepared.preview.local_mappings;
     let preflighted_hosts = prepared.preview.preflighted_hosts;
+    let target_config = prepared.config.clone();
+    let target_manifests = prepared
+        .components
+        .iter()
+        .map(|component| component.manifest().clone())
+        .collect::<Vec<_>>();
     let previous_config = desktop_state.config.snapshot();
     let previous_plugins = inspect_all_plugins(
         &state.plugin_root,
@@ -1293,11 +1344,31 @@ async fn import_project_bundle(
     if !previous_plugins.failures.is_empty() {
         return Err("当前插件清单在项目预检后发生变化，请处理隔离项后重试".into());
     }
+    let verified_current_state_sha256 = calculate_project_import_state_digest(
+        previous_config.clone(),
+        previous_plugins.manifests.clone(),
+        state.local_mapping_root.clone(),
+    )
+    .await?;
+    ensure_project_import_baseline_matches(
+        &prepared.current_state_sha256,
+        &verified_current_state_sha256,
+    )?;
     let previous_active_plugins = state
         .controller
         .active_manifests()
         .await
         .map_err(|error| format!("无法读取当前插件运行状态 ({})", error.diagnostic_code()))?;
+    let previous_routes_match = state
+        .controller
+        .manifests_match_active_routes(&previous_plugins.manifests)
+        .await
+        .map_err(|error| format!("无法复核当前插件运行状态 ({})", error.diagnostic_code()))?;
+    if !previous_routes_match {
+        return Err(
+            "当前磁盘能力与活动路由不一致；请先安全重新扫描或重启客户端后再导入项目".into(),
+        );
+    }
     let members = prepared
         .components
         .iter()
@@ -1306,7 +1377,7 @@ async fn import_project_bundle(
     let transaction = project_activation::ProjectActivation::begin(
         &state.project_transaction_root,
         &previous_config,
-        &prepared.config,
+        &target_config,
         members,
     )?;
     let maintenance = state.controller.begin_maintenance().await;
@@ -1357,6 +1428,31 @@ async fn import_project_bundle(
             });
         }
     };
+    if let Err(error) =
+        ensure_project_component_manifests_match(&target_manifests, &installed.manifests)
+    {
+        let rollback = rollback_project_components(transaction, activated);
+        return Err(match rollback {
+            Ok(()) => format!("{error}，已恢复导入前状态"),
+            Err(rollback) => format!("{error}; {rollback}"),
+        });
+    }
+    let target_state_sha256 = match calculate_project_import_state_digest(
+        target_config.clone(),
+        installed.manifests.clone(),
+        state.local_mapping_root.clone(),
+    )
+    .await
+    {
+        Ok(digest) => digest,
+        Err(_) => {
+            let rollback = rollback_project_components(transaction, activated);
+            return Err(match rollback {
+                Ok(()) => "项目组件激活后无法绑定待提交状态，已恢复导入前状态".into(),
+                Err(rollback) => format!("项目组件激活后无法绑定待提交状态; {rollback}"),
+            });
+        }
+    };
     let baseline_transition =
         match SignedPluginApiBaselineTransition::prepare(&state, &installed.manifests) {
             Ok(transition) => transition,
@@ -1375,7 +1471,8 @@ async fn import_project_bundle(
             Err(rollback) => format!("新项目路由无效: {error}; {rollback}"),
         });
     }
-    if let Err(error) = desktop::replace_desktop_config(&app, &desktop_state, prepared.config) {
+    if let Err(error) = desktop::replace_desktop_config(&app, &desktop_state, target_config.clone())
+    {
         let route_restore = maintenance
             .replace_manifests(&previous_active_plugins)
             .await;
@@ -1394,6 +1491,77 @@ async fn import_project_bundle(
                     .map_or_else(|| "成功".to_owned(), |failure| failure)
             ),
         });
+    }
+    let final_rollback = ProjectFinalRollbackContext {
+        app: &app,
+        desktop_state: &desktop_state,
+        maintenance: &maintenance,
+        previous_active_plugins: &previous_active_plugins,
+    };
+    let committing_plugins = match inspect_all_plugins(
+        &state.plugin_root,
+        &state.local_mapping_root,
+        state.trust_store.as_deref(),
+        &state.desktop_version,
+    ) {
+        Ok(inspected) if inspected.failures.is_empty() => inspected,
+        _ => {
+            let error = rollback_project_after_final_verification(
+                &final_rollback,
+                previous_config,
+                transaction,
+                activated,
+                "项目提交前能力清单复核失败",
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    if ensure_project_component_manifests_match(&target_manifests, &committing_plugins.manifests)
+        .is_err()
+    {
+        let error = rollback_project_after_final_verification(
+            &final_rollback,
+            previous_config,
+            transaction,
+            activated,
+            "项目提交前精确能力集合发生变化",
+        )
+        .await;
+        return Err(error);
+    }
+    let committing_state_sha256 = calculate_project_import_state_digest(
+        desktop_state.config.snapshot(),
+        committing_plugins.manifests.clone(),
+        state.local_mapping_root.clone(),
+    )
+    .await;
+    if committing_state_sha256.as_ref() != Ok(&target_state_sha256) {
+        let error = rollback_project_after_final_verification(
+            &final_rollback,
+            previous_config,
+            transaction,
+            activated,
+            "项目提交前配置或能力内容发生变化",
+        )
+        .await;
+        return Err(error);
+    }
+    let committing_routes_match = state
+        .controller
+        .manifests_match_active_routes(&committing_plugins.manifests)
+        .await
+        .unwrap_or(false);
+    if !committing_routes_match {
+        let error = rollback_project_after_final_verification(
+            &final_rollback,
+            previous_config,
+            transaction,
+            activated,
+            "项目提交前活动路由复核失败",
+        )
+        .await;
+        return Err(error);
     }
     if let Err(error) = transaction.mark_committed() {
         let config_restore = desktop::replace_desktop_config(&app, &desktop_state, previous_config);
@@ -1510,15 +1678,12 @@ async fn prepare_project_bundle(
     let config_preview = desktop::build_config_change_preview(&current_config, &opened.config)?;
     let current_state_manifests = current.manifests.clone();
     let current_state_local_root = state.local_mapping_root.clone();
-    let current_state_digest = tokio::task::spawn_blocking(move || {
-        project_import_state_digest(
-            &current_config,
-            &current_state_manifests,
-            &current_state_local_root,
-        )
-    })
-    .await
-    .map_err(|_| "项目导入基线摘要任务异常终止".to_owned())??;
+    let current_state_digest = calculate_project_import_state_digest(
+        current_config,
+        current_state_manifests,
+        current_state_local_root,
+    )
+    .await?;
     let plan_id = project_import_plan_id(
         &bundle_sha256,
         &current_state_digest,
@@ -1709,6 +1874,7 @@ async fn prepare_project_bundle(
     Ok(PreparedProjectBundle {
         config: opened.config,
         components,
+        current_state_sha256: current_state_digest,
         preview: ProjectBundlePreview {
             plan_id,
             schema_version,
@@ -2298,6 +2464,37 @@ fn project_import_state_digest(
 
     hash_complete_plugin_state(&mut hasher, manifests, local_mapping_root)?;
     Ok(lowercase_hex(&hasher.finalize()))
+}
+
+async fn calculate_project_import_state_digest(
+    config: ssdev_config::DesktopConfig,
+    manifests: Vec<PluginManifest>,
+    local_mapping_root: PathBuf,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        project_import_state_digest(&config, &manifests, &local_mapping_root)
+    })
+    .await
+    .map_err(|_| "项目导入状态摘要任务异常终止".to_owned())?
+}
+
+fn ensure_project_import_baseline_matches(expected: &str, actual: &str) -> Result<(), String> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err("当前配置或本机能力在项目确认期间发生变化，请重新预检后再导入".into())
+    }
+}
+
+fn ensure_project_component_manifests_match(
+    expected: &[PluginManifest],
+    actual: &[PluginManifest],
+) -> Result<(), String> {
+    if same_manifest_contracts(expected, actual) {
+        Ok(())
+    } else {
+        Err("项目组件激活后的能力集合与项目包不一致".into())
+    }
 }
 
 fn hash_complete_plugin_state(
@@ -6569,8 +6766,9 @@ mod tests {
         ensure_local_mapping_import_plan_matches, ensure_local_mapping_removal_plan_matches,
         ensure_local_plugin_install_plan_matches, ensure_plugin_reload_candidate_state_matches,
         ensure_plugin_reload_plan_matches, ensure_plugin_update_plan_matches,
-        ensure_plugin_version_change_allowed, ensure_project_delivery_identity,
-        ensure_project_export_active_manifests_match, ensure_project_export_runtime_matches,
+        ensure_plugin_version_change_allowed, ensure_project_component_manifests_match,
+        ensure_project_delivery_identity, ensure_project_export_active_manifests_match,
+        ensure_project_export_runtime_matches, ensure_project_import_baseline_matches,
         ensure_signed_plugin_compatible, ensure_signed_plugin_route_coverage,
         ensure_signed_plugin_uninstall_plan_matches, ensure_upgrade_allowed, inspect_all_plugins,
         is_lowercase_sha256, is_plugin_update_available, legacy_config_candidates,
@@ -7141,6 +7339,65 @@ mod tests {
         assert!(error.contains("不会自动删除"));
         assert!(error.contains("逐项卸载或删除"));
         assert!(error.contains("重新预检"));
+    }
+
+    #[test]
+    fn project_import_rechecks_the_bound_machine_state_before_starting_a_transaction() {
+        assert!(ensure_project_import_baseline_matches("expected", "expected").is_ok());
+        let error = ensure_project_import_baseline_matches("expected", "changed").unwrap_err();
+        assert!(error.contains("项目确认期间发生变化"));
+        assert!(error.contains("重新预检"));
+        assert!(!error.contains("expected"));
+        assert!(!error.contains("changed"));
+    }
+
+    #[test]
+    fn project_import_rejects_missing_extra_or_changed_manifests_after_activation() {
+        let root = tempfile::tempdir().unwrap();
+        let expected = plugin_manifest_with_service(
+            "reader",
+            root.path().join("reader"),
+            serde_json::json!({
+                "serviceId": "card.reader",
+                "mainClass": "reader.dll",
+                "methods": [{"name": "read"}]
+            }),
+        );
+        let extra = plugin_manifest_with_service(
+            "printer",
+            root.path().join("printer"),
+            serde_json::json!({
+                "serviceId": "receipt.printer",
+                "mainClass": "printer.dll",
+                "methods": [{"name": "print"}]
+            }),
+        );
+        let changed = plugin_manifest_with_service(
+            "reader",
+            root.path().join("reader-changed"),
+            serde_json::json!({
+                "serviceId": "card.reader",
+                "mainClass": "reader.dll",
+                "methods": [{"name": "different"}]
+            }),
+        );
+
+        assert!(ensure_project_component_manifests_match(
+            std::slice::from_ref(&expected),
+            std::slice::from_ref(&expected),
+        )
+        .is_ok());
+        assert!(
+            ensure_project_component_manifests_match(std::slice::from_ref(&expected), &[],)
+                .is_err()
+        );
+        assert!(ensure_project_component_manifests_match(
+            std::slice::from_ref(&expected),
+            &[expected.clone(), extra],
+        )
+        .is_err());
+        let error = ensure_project_component_manifests_match(&[expected], &[changed]).unwrap_err();
+        assert_eq!(error, "项目组件激活后的能力集合与项目包不一致");
     }
 
     #[test]

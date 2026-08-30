@@ -89,12 +89,30 @@ test('project import requires an exact component set without deleting target cap
     'ensure_exact_project_component_set(prepared.preview.retained_count)?;',
     prepare,
   )
+  const baselineRecheck = desktop.indexOf(
+    'ensure_project_import_baseline_matches(',
+    exactSetGate,
+  )
   const transaction = desktop.indexOf('ProjectActivation::begin(', exactSetGate)
+  const activatedSetRecheck = desktop.indexOf(
+    'ensure_project_component_manifests_match(',
+    transaction,
+  )
+  const finalInventoryRecheck = desktop.indexOf(
+    'let committing_plugins = match inspect_all_plugins(',
+    activatedSetRecheck,
+  )
+  const durableCommit = desktop.indexOf('transaction.mark_committed()', finalInventoryRecheck)
   assert.ok(importStart >= 0 && prepare > importStart)
-  assert.ok(exactSetGate > prepare && transaction > exactSetGate)
+  assert.ok(exactSetGate > prepare && baselineRecheck > exactSetGate)
+  assert.ok(transaction > baselineRecheck)
+  assert.ok(activatedSetRecheck > transaction)
+  assert.ok(finalInventoryRecheck > activatedSetRecheck && durableCommit > finalInventoryRecheck)
   assert.match(
     desktop,
     /validate_project_delivery_routes\(desktop_state, &opened\.config, &project_manifests\)\?;/,
   )
+  assert.match(desktop, /项目提交前配置或能力内容发生变化/)
+  assert.match(desktop, /rollback_project_after_final_verification/)
   assert.match(desktop, /项目包不会自动删除现有能力/)
 })
