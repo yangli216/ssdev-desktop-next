@@ -5746,6 +5746,14 @@ const TRACKED_INVOCATION_ERROR_PHASES: [&str; 5] = [
     "invoke",
     "status",
 ];
+#[cfg(test)]
+const TRACKED_INVOCATION_STATUS_STATES: [&str; 5] = [
+    "unknown",
+    "pending",
+    "completed",
+    "indeterminate",
+    "completedWithoutResult",
+];
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]

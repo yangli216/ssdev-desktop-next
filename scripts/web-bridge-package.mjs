@@ -178,6 +178,7 @@ async function smokeTestPackagedConsumer(archivePath) {
   createPluginFixtureInvoker,
   isPluginOperationId,
   parsePluginOperationId,
+  parseTrackedInvocationStatus,
 } from '@bsoft/ssdev-web-bridge'
 
 if (CURRENT_BRIDGE_PROTOCOL_VERSION !== 1) throw new Error('unexpected bridge protocol version')
@@ -199,6 +200,18 @@ const trackedDisposition = classifyTrackedInvocationStatus({ state: 'indetermina
 if (trackedDisposition.next !== 'reconcile-before-new-operation'
     || trackedDisposition.automaticReplay !== 'forbidden') {
   throw new Error('packaged tracked status classifier is unsafe')
+}
+const nondurableStatus = parseTrackedInvocationStatus({
+  state: 'completed',
+  response: { ResCode: 0, ResData: { ReturnValue: 0 } },
+  durable: false,
+})
+const nondurableDisposition = classifyTrackedInvocationStatus(nondurableStatus)
+if (nondurableDisposition.kind !== 'completed'
+    || nondurableDisposition.durability !== 'not-confirmed'
+    || nondurableDisposition.next !== 'handle-response-and-record-recovery-risk'
+    || nondurableDisposition.automaticReplay !== 'forbidden') {
+  throw new Error('packaged tracked status classifier lost the nondurable completion risk')
 }
 const invoker = createPluginFixtureInvoker([{
   serviceId: 'consumer-smoke',
@@ -228,6 +241,7 @@ if (response.ResCode !== 0 || response.ResData?.ready !== true) {
   type TrackedInvocationFailureDisposition,
   type TrackedInvocationStatus,
   parsePluginOperationId,
+  parseTrackedInvocationStatus,
 } from '@bsoft/ssdev-web-bridge'
 
 type Health = { ready: boolean }
@@ -241,7 +255,11 @@ const restoredOperationId: PluginOperationId = parsePluginOperationId(
   '123e4567-e89b-42d3-a456-426614174000',
 )
 const bridgeOperationId: string = restoredOperationId
-const trackedStatus: TrackedInvocationStatus<Health> = { state: 'pending' }
+const trackedStatus: TrackedInvocationStatus<Health> = parseTrackedInvocationStatus<Health>({
+  state: 'completed',
+  response: { ResCode: 0, ResData: { ready: true } },
+  durable: false,
+})
 const trackedDisposition: TrackedInvocationDisposition = classifyTrackedInvocationStatus(trackedStatus)
 const trackedFailure: TrackedInvocationFailureDisposition = classifyTrackedInvocationFailure({
   schemaVersion: 1,
@@ -251,8 +269,8 @@ const trackedFailure: TrackedInvocationFailureDisposition = classifyTrackedInvoc
 })
 const consume = async (): Promise<InvokeResponse<Health>> =>
   invoker.invokePlugin<Health>('consumer-smoke', 'health')
-if (trackedDisposition.kind === 'pending') {
-  trackedDisposition.next satisfies 'query-same-operation'
+if (trackedDisposition.kind === 'completed') {
+  trackedDisposition.durability satisfies 'confirmed' | 'not-confirmed'
 }
 trackedFailure.automaticReplay satisfies 'forbidden'
 void bridgeOperationId

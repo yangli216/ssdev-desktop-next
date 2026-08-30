@@ -4,13 +4,13 @@ export const CURRENT_PROTOCOL_VERSION = CURRENT_BRIDGE_PROTOCOL_VERSION
 export const CURRENT_DESKTOP_CAPABILITIES_SCHEMA_VERSION = 1 as const
 export const CURRENT_TRACKED_INVOCATION_ERROR_SCHEMA_VERSION = 1 as const
 
-export const TRACKED_INVOCATION_ERROR_PHASES = [
+export const TRACKED_INVOCATION_ERROR_PHASES = Object.freeze([
   'authorization',
   'runtime',
   'availability',
   'invoke',
   'status',
-] as const
+] as const)
 
 export type JsonPrimitive = string | number | boolean | null
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue }
@@ -161,6 +161,8 @@ export class UnexpectedPluginInvocationError extends Error {
 const MAX_PLUGIN_FIXTURES = 1024
 const MAX_FIXTURE_ROUTE_LENGTH = 256
 const MAX_FIXTURE_JSON_DEPTH = 64
+const MIN_PROTOCOL_RESPONSE_CODE = -2_147_483_648
+const MAX_PROTOCOL_RESPONSE_CODE = 2_147_483_647
 
 /**
  * Creates a deterministic PluginInvoker for business-frontend unit tests.
@@ -242,6 +244,22 @@ export type TrackedInvocationStatus<T = JsonValue> =
   | { state: 'indeterminate' }
   | { state: 'completedWithoutResult' }
 
+export const TRACKED_INVOCATION_STATES = Object.freeze([
+  'unknown',
+  'pending',
+  'completed',
+  'indeterminate',
+  'completedWithoutResult',
+] as const satisfies readonly TrackedInvocationStatus['state'][])
+
+export class InvalidTrackedInvocationStatusError extends TypeError {
+  override readonly name = 'InvalidTrackedInvocationStatusError'
+
+  constructor() {
+    super('SSDEV tracked invocation status is invalid')
+  }
+}
+
 export type TrackedInvocationErrorPhase = (typeof TRACKED_INVOCATION_ERROR_PHASES)[number]
 
 export interface TrackedInvocationCommandError {
@@ -286,7 +304,15 @@ export type TrackedInvocationDisposition = Readonly<
   | {
       kind: 'completed'
       execution: 'completed'
+      durability: 'confirmed'
       next: 'handle-response'
+      automaticReplay: 'forbidden'
+    }
+  | {
+      kind: 'completed'
+      execution: 'completed'
+      durability: 'not-confirmed'
+      next: 'handle-response-and-record-recovery-risk'
       automaticReplay: 'forbidden'
     }
   | {
@@ -310,12 +336,6 @@ const TRACKED_INVOCATION_DISPOSITIONS = Object.freeze({
     next: 'query-same-operation',
     automaticReplay: 'forbidden',
   }),
-  completed: Object.freeze({
-    kind: 'completed',
-    execution: 'completed',
-    next: 'handle-response',
-    automaticReplay: 'forbidden',
-  }),
   indeterminate: Object.freeze({
     kind: 'indeterminate',
     execution: 'possibly-executed',
@@ -328,18 +348,71 @@ const TRACKED_INVOCATION_DISPOSITIONS = Object.freeze({
     next: 'reconcile-before-new-operation',
     automaticReplay: 'forbidden',
   }),
-} as const satisfies Record<TrackedInvocationStatus['state'], TrackedInvocationDisposition>)
+} as const satisfies Record<Exclude<TrackedInvocationStatus['state'], 'completed'>, TrackedInvocationDisposition>)
+
+const COMPLETED_TRACKED_INVOCATION_DISPOSITIONS = Object.freeze({
+  durable: Object.freeze({
+    kind: 'completed',
+    execution: 'completed',
+    durability: 'confirmed',
+    next: 'handle-response',
+    automaticReplay: 'forbidden',
+  }),
+  nondurable: Object.freeze({
+    kind: 'completed',
+    execution: 'completed',
+    durability: 'not-confirmed',
+    next: 'handle-response-and-record-recovery-risk',
+    automaticReplay: 'forbidden',
+  }),
+} as const satisfies Record<'durable' | 'nondurable', TrackedInvocationDisposition>)
+
+export function isTrackedInvocationStatus(
+  value: unknown,
+): value is TrackedInvocationStatus {
+  if (!isRecord(value) || typeof value.state !== 'string') return false
+  switch (value.state) {
+    case 'unknown':
+    case 'pending':
+    case 'indeterminate':
+    case 'completedWithoutResult':
+      return hasExactFields(value, ['state'])
+    case 'completed':
+      if (!hasExactFields(value, ['state', 'response', 'durable'])
+        || typeof value.durable !== 'boolean'
+        || !isFixtureResponse(value.response)) {
+        return false
+      }
+      try {
+        canonicalFixtureJson(value.response)
+        return true
+      } catch {
+        return false
+      }
+    default:
+      return false
+  }
+}
+
+export function parseTrackedInvocationStatus<T = JsonValue>(
+  value: unknown,
+): TrackedInvocationStatus<T> {
+  if (!isTrackedInvocationStatus(value)) {
+    throw new InvalidTrackedInvocationStatusError()
+  }
+  return value as TrackedInvocationStatus<T>
+}
 
 export function classifyTrackedInvocationStatus(
-  status: Pick<TrackedInvocationStatus, 'state'>,
+  value: unknown,
 ): TrackedInvocationDisposition {
-  const state: unknown = (status as { state?: unknown } | null)?.state
-  if (typeof state !== 'string' || !Object.hasOwn(TRACKED_INVOCATION_DISPOSITIONS, state)) {
-    throw new TypeError('SSDEV tracked invocation status is invalid')
+  const status = parseTrackedInvocationStatus(value)
+  if (status.state === 'completed') {
+    return status.durable
+      ? COMPLETED_TRACKED_INVOCATION_DISPOSITIONS.durable
+      : COMPLETED_TRACKED_INVOCATION_DISPOSITIONS.nondurable
   }
-  return TRACKED_INVOCATION_DISPOSITIONS[
-    state as TrackedInvocationStatus['state']
-  ]
+  return TRACKED_INVOCATION_DISPOSITIONS[status.state]
 }
 
 const TRACKED_INVOCATION_ERROR_FIELDS = [
@@ -682,6 +755,12 @@ function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+function hasExactFields(value: UnknownRecord, fields: readonly string[]): boolean {
+  const keys = Object.keys(value)
+  return keys.length === fields.length
+    && fields.every((field) => Object.hasOwn(value, field))
+}
+
 function hasOnlyFixtureFields(value: UnknownRecord): boolean {
   return Object.keys(value).every((key) => (
     key === 'serviceId'
@@ -711,7 +790,9 @@ function isFixtureResponse(value: unknown): value is InvokeResponse {
   return keys.length === 2
     && keys[0] === 'ResCode'
     && keys[1] === 'ResData'
-    && Number.isSafeInteger(value.ResCode)
+    && Number.isInteger(value.ResCode)
+    && (value.ResCode as number) >= MIN_PROTOCOL_RESPONSE_CODE
+    && (value.ResCode as number) <= MAX_PROTOCOL_RESPONSE_CODE
 }
 
 function fixtureInvocationKey(serviceId: string, method: string, parameterJson: string): string {

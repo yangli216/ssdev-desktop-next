@@ -13,6 +13,7 @@ import {
   CURRENT_PROTOCOL_VERSION,
   CURRENT_TRACKED_INVOCATION_ERROR_SCHEMA_VERSION,
   DesktopBridgeUnavailableError,
+  InvalidTrackedInvocationStatusError,
   InvalidPluginOperationIdError,
   InvalidPluginFixtureError,
   InvalidDesktopDeclarationError,
@@ -20,6 +21,7 @@ import {
   UnsupportedDesktopProtocolError,
   TRACKED_INVOCATION_METHODS,
   TRACKED_INVOCATION_ERROR_PHASES,
+  TRACKED_INVOCATION_STATES,
   TrackedInvocationsUnavailableError,
   UnexpectedPluginInvocationError,
   canRetryPluginInvocationWithBackoff,
@@ -32,8 +34,10 @@ import {
   getTrackedInvocationCapabilities,
   isPluginOperationId,
   isTrackedInvocationCommandError,
+  isTrackedInvocationStatus,
   isDesktopBridgeAvailable,
   parsePluginOperationId,
+  parseTrackedInvocationStatus,
   requireDesktopBridge,
   requireTrackedPluginInvocations,
   supportsTrackedPluginInvocations,
@@ -57,7 +61,7 @@ function clearBridge() {
 test.afterEach(clearBridge)
 
 test('matches the shared desktop bridge contract', () => {
-  assert.equal(contract.schemaVersion, 5)
+  assert.equal(contract.schemaVersion, 6)
   assert.equal(CURRENT_BRIDGE_PROTOCOL_VERSION, contract.protocolVersion)
   assert.equal(CURRENT_PROTOCOL_VERSION, contract.protocolVersion)
   assert.equal(CURRENT_DESKTOP_CAPABILITIES_SCHEMA_VERSION, contract.capabilities.schemaVersion)
@@ -70,12 +74,23 @@ test('matches the shared desktop bridge contract', () => {
     contract.trackedInvocationError.schemaVersion,
   )
   assert.deepEqual(TRACKED_INVOCATION_ERROR_PHASES, contract.trackedInvocationError.phases)
+  assert.equal(Object.isFrozen(TRACKED_INVOCATION_ERROR_PHASES), true)
   assert.deepEqual(contract.trackedInvocationError.fields, [
     'schemaVersion',
     'kind',
     'phase',
     'code',
   ])
+  assert.deepEqual(TRACKED_INVOCATION_STATES, contract.trackedInvocationStatus.states)
+  assert.equal(Object.isFrozen(TRACKED_INVOCATION_STATES), true)
+  assert.deepEqual(contract.trackedInvocationStatus.stateFields, {
+    unknown: ['state'],
+    pending: ['state'],
+    completed: ['state', 'response', 'durable'],
+    indeterminate: ['state'],
+    completedWithoutResult: ['state'],
+  })
+  assert.deepEqual(contract.trackedInvocationStatus.responseFields, ['ResCode', 'ResData'])
 })
 
 test('classifies only controller rejections that prove native execution never started', () => {
@@ -229,30 +244,69 @@ test('accepts only canonical UUID v4 operation IDs recovered from storage', () =
   }
 })
 
-test('classifies every tracked outcome without permitting automatic replay', () => {
+test('validates every tracked outcome and preserves completion durability', () => {
   const cases = [
-    ['unknown', 'unknown', 'apply-business-recovery-policy'],
-    ['pending', 'in-progress', 'query-same-operation'],
-    ['completed', 'completed', 'handle-response'],
-    ['indeterminate', 'possibly-executed', 'reconcile-before-new-operation'],
-    ['completedWithoutResult', 'possibly-executed', 'reconcile-before-new-operation'],
+    [
+      { state: 'unknown' },
+      { kind: 'unknown', execution: 'unknown', next: 'apply-business-recovery-policy', automaticReplay: 'forbidden' },
+    ],
+    [
+      { state: 'pending' },
+      { kind: 'pending', execution: 'in-progress', next: 'query-same-operation', automaticReplay: 'forbidden' },
+    ],
+    [
+      { state: 'completed', response: { ResCode: 0, ResData: { ReturnValue: 0 } }, durable: true },
+      { kind: 'completed', execution: 'completed', durability: 'confirmed', next: 'handle-response', automaticReplay: 'forbidden' },
+    ],
+    [
+      { state: 'completed', response: { ResCode: 0, ResData: { ReturnValue: 0 } }, durable: false },
+      { kind: 'completed', execution: 'completed', durability: 'not-confirmed', next: 'handle-response-and-record-recovery-risk', automaticReplay: 'forbidden' },
+    ],
+    [
+      { state: 'indeterminate' },
+      { kind: 'indeterminate', execution: 'possibly-executed', next: 'reconcile-before-new-operation', automaticReplay: 'forbidden' },
+    ],
+    [
+      { state: 'completedWithoutResult' },
+      { kind: 'completedWithoutResult', execution: 'possibly-executed', next: 'reconcile-before-new-operation', automaticReplay: 'forbidden' },
+    ],
   ]
 
-  for (const [state, execution, next] of cases) {
-    const disposition = classifyTrackedInvocationStatus({ state })
-    assert.deepEqual(disposition, {
-      kind: state,
-      execution,
-      next,
-      automaticReplay: 'forbidden',
-    })
+  for (const [status, expected] of cases) {
+    assert.equal(isTrackedInvocationStatus(status), true)
+    assert.equal(parseTrackedInvocationStatus(status), status)
+    const disposition = classifyTrackedInvocationStatus(status)
+    assert.deepEqual(disposition, expected)
     assert.equal(Object.isFrozen(disposition), true)
   }
 
-  for (const invalid of [null, {}, { state: 'completed-without-result' }, { state: 1 }]) {
+  const cyclic = { ReturnValue: 0 }
+  cyclic.self = cyclic
+  const invalid = [
+    null,
+    {},
+    { state: 'completed-without-result' },
+    { state: 1 },
+    { state: 'pending', detail: 'secret' },
+    { state: 'completed', durable: true },
+    { state: 'completed', response: { ResCode: 0, ResData: null }, durable: 'true' },
+    { state: 'completed', response: { ResCode: 0.5, ResData: null }, durable: true },
+    { state: 'completed', response: { ResCode: 2_147_483_648, ResData: null }, durable: true },
+    { state: 'completed', response: { ResCode: 0, ResData: undefined }, durable: true },
+    { state: 'completed', response: { ResCode: 0, ResData: cyclic }, durable: true },
+    { state: 'completed', response: { ResCode: 0, ResData: null, detail: 'secret' }, durable: true },
+  ]
+  for (const status of invalid) {
+    assert.equal(isTrackedInvocationStatus(status), false)
     assert.throws(
-      () => classifyTrackedInvocationStatus(invalid),
-      (error) => error instanceof TypeError
+      () => parseTrackedInvocationStatus(status),
+      (error) => error instanceof InvalidTrackedInvocationStatusError
+        && error instanceof TypeError
+        && error.message === 'SSDEV tracked invocation status is invalid',
+    )
+    assert.throws(
+      () => classifyTrackedInvocationStatus(status),
+      (error) => error instanceof InvalidTrackedInvocationStatusError
         && error.message === 'SSDEV tracked invocation status is invalid',
     )
   }

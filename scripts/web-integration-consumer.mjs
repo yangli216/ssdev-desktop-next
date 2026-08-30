@@ -335,6 +335,7 @@ async function verifyConsumers(options) {
   }`).join(',\n')
     const runtimePath = join(consumer, 'runtime-smoke.mjs')
     await writeFile(runtimePath, `import {
+  InvalidTrackedInvocationStatusError,
   UnexpectedPluginInvocationError,
   createPluginFixtureInvoker,
   parsePluginOperationId,
@@ -419,6 +420,7 @@ for (const integration of integrations) {
   }
   const operationId = parsePluginOperationId('123e4567-e89b-42d3-a456-426614174000')
   const trackedCalls = []
+  let returnMalformedTrackedStatus = false
   const trackedBridge = {
     async invokePluginTracked(actualOperationId, serviceId, method, parameters = {}) {
       if (actualOperationId !== operationId) throw new Error('generated tracked API changed the operation ID')
@@ -429,6 +431,7 @@ for (const integration of integrations) {
       ))
       if (fixture === undefined) throw new UnexpectedPluginInvocationError(serviceId, method)
       trackedCalls.push({ kind: 'invoke', route: routeKey(fixture) })
+      if (returnMalformedTrackedStatus) return { state: 'completed', durable: true }
       return { state: 'completed', response: fixture.response, durable: true }
     },
     async getPluginInvocation(actualOperationId, serviceId, method) {
@@ -438,6 +441,7 @@ for (const integration of integrations) {
       ))
       if (fixture === undefined) throw new UnexpectedPluginInvocationError(serviceId, method)
       trackedCalls.push({ kind: 'status', route: routeKey(fixture) })
+      if (returnMalformedTrackedStatus) return { state: 'completed', durable: true }
       return { state: 'completed', response: fixture.response, durable: true }
     },
   }
@@ -462,6 +466,15 @@ for (const integration of integrations) {
             || expected === undefined
             || JSON.stringify(outcome.response) !== JSON.stringify(expected.response)) {
           throw new Error('generated tracked API returned an unexpected fixture response')
+        }
+        returnMalformedTrackedStatus = true
+        try {
+          await invokeTracked(operationId, fixture.parameters ?? {})
+          throw new Error('generated tracked API accepted a malformed Desktop status')
+        } catch (error) {
+          if (!(error instanceof InvalidTrackedInvocationStatusError)) throw error
+        } finally {
+          returnMalformedTrackedStatus = false
         }
         matched = true
         break

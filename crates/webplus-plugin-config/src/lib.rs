@@ -45,6 +45,7 @@ pub fn generate_typescript_client(
 ) -> Result<String, serde_json::Error> {
     let mut output = String::from(
         "// Generated from an SSDEV plugin manifest. Regenerate after API changes.\n\
+import { parseTrackedInvocationStatus } from '@bsoft/ssdev-web-bridge'\n\
 import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker, PluginOperationId, TrackedInvocationBridge, TrackedInvocationStatus } from '@bsoft/ssdev-web-bridge'\n\n",
     );
     let methods = typescript_method_plans(services);
@@ -128,7 +129,7 @@ import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker, PluginOperat
             " = {}"
         };
         output.push_str(&format!(
-            "    {}(operationId: PluginOperationId, parameters: {}{}): Promise<TrackedInvocationStatus<{}>> {{\n      return bridge.invokePluginTracked<{}>(operationId, {}, {}, parameters)\n    }},\n    {}(operationId: PluginOperationId): Promise<TrackedInvocationStatus<{}>> {{\n      return bridge.getPluginInvocation<{}>(operationId, {}, {})\n    }},\n\n",
+            "    {}(operationId: PluginOperationId, parameters: {}{}): Promise<TrackedInvocationStatus<{}>> {{\n      return bridge.invokePluginTracked<{}>(operationId, {}, {}, parameters)\n        .then((status) => parseTrackedInvocationStatus<{}>(status))\n    }},\n    {}(operationId: PluginOperationId): Promise<TrackedInvocationStatus<{}>> {{\n      return bridge.getPluginInvocation<{}>(operationId, {}, {})\n        .then((status) => parseTrackedInvocationStatus<{}>(status))\n    }},\n\n",
             plan.client_method,
             plan.parameters_type,
             default_parameters,
@@ -136,11 +137,13 @@ import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker, PluginOperat
             plan.data_type,
             serde_json::to_string(&plan.service.service_id)?,
             serde_json::to_string(plan.request_name)?,
+            plan.data_type,
             plan.tracked_status_method,
             plan.data_type,
             plan.data_type,
             serde_json::to_string(&plan.service.service_id)?,
             serde_json::to_string(plan.request_name)?,
+            plan.data_type,
         ));
     }
     output.push_str("  }\n}\n");
@@ -1851,6 +1854,7 @@ mod tests {
 
         let source = generate_typescript_client("Card Reader", &services).unwrap();
         assert!(source.contains("export class CardReaderClient"));
+        assert!(source.contains("import { parseTrackedInvocationStatus }"));
         assert!(source.contains("PluginOperationId, TrackedInvocationBridge"));
         assert!(source.contains("export function createCardReaderTrackedApi"));
         assert!(source.contains("readerCardRead(parameters: ReaderCardReadParameters)"));
@@ -1871,6 +1875,7 @@ mod tests {
         assert!(source.contains(
             "getPluginInvocation<ReaderCardReadData>(operationId, \"reader.card\", \"read\")"
         ));
+        assert!(source.contains("parseTrackedInvocationStatus<ReaderCardReadData>(status)"));
         assert!(!source.contains("$cardNo"));
     }
 

@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "protocolVersion": 1,
   "methods": [
     "invokePlugin",
@@ -54,6 +54,38 @@
       "availability",
       "invoke",
       "status"
+    ]
+  },
+  "trackedInvocationStatus": {
+    "states": [
+      "unknown",
+      "pending",
+      "completed",
+      "indeterminate",
+      "completedWithoutResult"
+    ],
+    "stateFields": {
+      "unknown": [
+        "state"
+      ],
+      "pending": [
+        "state"
+      ],
+      "completed": [
+        "state",
+        "response",
+        "durable"
+      ],
+      "indeterminate": [
+        "state"
+      ],
+      "completedWithoutResult": [
+        "state"
+      ]
+    },
+    "responseFields": [
+      "ResCode",
+      "ResData"
     ]
   },
   "events": [

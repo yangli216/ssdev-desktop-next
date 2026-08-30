@@ -661,12 +661,35 @@ mod tests {
     #[test]
     fn public_status_names_match_the_sdk_contract() {
         assert_eq!(
-            serde_json::to_value(TrackedInvocationStatus::Indeterminate).unwrap()["state"],
-            "indeterminate"
+            serde_json::to_value(TrackedInvocationStatus::Unknown).unwrap(),
+            json!({ "state": "unknown" })
         );
         assert_eq!(
-            serde_json::to_value(TrackedInvocationStatus::CompletedWithoutResult).unwrap()["state"],
-            "completedWithoutResult"
+            serde_json::to_value(TrackedInvocationStatus::Pending).unwrap(),
+            json!({ "state": "pending" })
+        );
+        assert_eq!(
+            serde_json::to_value(TrackedInvocationStatus::Completed {
+                response: InvokeResponse::success(json!({ "ReturnValue": 0 })),
+                durable: false,
+            })
+            .unwrap(),
+            json!({
+                "state": "completed",
+                "response": {
+                    "ResCode": 0,
+                    "ResData": { "ReturnValue": 0 },
+                },
+                "durable": false,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(TrackedInvocationStatus::Indeterminate).unwrap(),
+            json!({ "state": "indeterminate" })
+        );
+        assert_eq!(
+            serde_json::to_value(TrackedInvocationStatus::CompletedWithoutResult).unwrap(),
+            json!({ "state": "completedWithoutResult" })
         );
     }
 

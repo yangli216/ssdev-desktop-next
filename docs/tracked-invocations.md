@@ -6,6 +6,7 @@
 import {
   connectDesktop,
   createPluginOperationId,
+  parseTrackedInvocationStatus,
   parsePluginOperationId,
   requireTrackedPluginInvocations,
 } from '@bsoft/ssdev-web-bridge'
@@ -16,12 +17,12 @@ const bridge = requireTrackedPluginInvocations(
   connection.system,
 )
 const operationId = createPluginOperationId()
-const outcome = await bridge.invokePluginTracked(
+const outcome = parseTrackedInvocationStatus(await bridge.invokePluginTracked(
   operationId,
   'printer',
   'print',
   { documentId: '业务侧引用' },
-)
+))
 
 if (outcome.state === 'completed') {
   console.log(outcome.response)
@@ -37,12 +38,12 @@ if (outcome.state === 'completed') {
 | 状态 | 含义 | 业务动作 |
 | --- | --- | --- |
 | `pending` | 当前进程中同一操作仍在执行 | 继续查询，不能生成新 ID 重试 |
-| `completed` | 已得到插件响应；`durable=true` 表示完成标记也已落盘 | 按 `response.ResCode` 处理；安全重试错误也必须使用新操作 ID |
+| `completed` | 已得到插件响应；`durable=true` 表示完成标记也已落盘，`false` 表示本次响应有效但重启后的恢复证据未确认 | 按 `response.ResCode` 处理；`durable=false` 时同时记录恢复风险，任何新业务动作仍使用新操作 ID |
 | `indeterminate` | 上一进程已持久接纳，但在崩溃前没有可靠完成标记 | 视为“可能已经执行”，通过设备或业务后端对账，不能自动重放 |
 | `completedWithoutResult` | 已知操作完成或同 ID 已使用，但响应因重启、过期、过大或缓存淘汰不可恢复 | 通过业务/设备状态对账，不能重放 |
 | `unknown` | 当前保留窗口内没有该操作的证据 | 不代表设备未执行；只能由业务规则决定是否创建新的逻辑操作 |
 
-业务项目不需要重复手写这张状态表。`classifyTrackedInvocationStatus(status)` 会返回稳定的 `execution` 与 `next`：`pending` 只查询同一 operation ID，`completed` 处理原响应，`indeterminate` 和 `completedWithoutResult` 都要求先对账，`unknown` 进入项目自己的恢复策略。所有结果都固定返回 `automaticReplay: 'forbidden'`。该纯函数不保存 ID、不发起查询、不轮询，也不会依据 `ResCode` 替业务创建另一笔逻辑操作。
+业务项目不需要重复手写这张状态表。`parseTrackedInvocationStatus(value)` 会先严格校验状态对应的精确字段；`completed` 必须带有合法 JSON `response` 和布尔 `durable`，其他状态只能包含 `state`。损坏、额外字段或未知未来格式以不复制原值的固定错误失败。清单生成的 tracked API 已自动执行该校验，直接使用底层桥时需要显式解析。`classifyTrackedInvocationStatus(status)` 随后返回稳定的 `execution` 与 `next`：`pending` 只查询同一 operation ID；可靠落盘的 `completed` 处理原响应，`durable=false` 则处理响应并记录恢复风险；`indeterminate` 和 `completedWithoutResult` 都要求先对账；`unknown` 进入项目自己的恢复策略。所有结果都固定返回 `automaticReplay: 'forbidden'`。这些纯函数不保存 ID、不发起查询、不轮询，也不会依据 `ResCode` 替业务创建另一笔逻辑操作。
 
 ## 命令拒绝
 
