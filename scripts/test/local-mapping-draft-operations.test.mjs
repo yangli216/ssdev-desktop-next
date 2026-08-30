@@ -12,6 +12,7 @@ const studioVue = new URL('../../apps/desktop/src/LocalMappingStudio.vue', impor
 const desktopRust = new URL('../../apps/desktop/src-tauri/src/lib.rs', import.meta.url)
 const localMappingsRust = new URL('../../apps/desktop/src-tauri/src/local_mappings.rs', import.meta.url)
 const capabilityBaselineRust = new URL('../../apps/desktop/src-tauri/src/plugin_api_baseline.rs', import.meta.url)
+const controllerRust = new URL('../../crates/webplus-controller/src/lib.rs', import.meta.url)
 
 test('native mapping operations cannot silently use an older activated mapping', async () => {
   const source = await readFile(studioVue, 'utf8')
@@ -98,4 +99,23 @@ test('saved regression parameters remain inside the approved mapping snapshot', 
   assert.match(desktop, /local_mapping_definition_is_accepted\(&state, &plugin_id, &definition_sha256\)/)
   assert.match(studio, /可能触发打印、写卡或设备动作/)
   assert.match(studio, /退出客户端后直接改写用例会隔离映射/)
+})
+
+test('local regression stops before another non-idempotent device action', async () => {
+  const [studio, desktop, controller] = await Promise.all([
+    readFile(studioVue, 'utf8'),
+    readFile(desktopRust, 'utf8'),
+    readFile(controllerRust, 'utf8'),
+  ])
+
+  assert.match(controller, /pub enum InvocationExecutionState[\s\S]+NotExecuted[\s\S]+Completed[\s\S]+Indeterminate/)
+  assert.match(controller, /pub async fn invoke_with_execution_state/)
+  assert.match(controller, /worker_for\(descriptor\)[\s\S]+InvocationExecutionState::NotExecuted/)
+  assert.match(controller, /worker_guard\.invoke\(request\)[\s\S]+InvocationExecutionState::Indeterminate/)
+  assert.match(desktop, /invoke_with_execution_state\(InvokeRequest/)
+  assert.match(desktop, /debug_case_batch_stop_reason\(outcome\.execution_state, passed\)/)
+  assert.match(desktop, /if current_stop_reason\.is_some\(\)[\s\S]+break;/)
+  assert.match(desktop, /skipped_case_count: usize/)
+  assert.match(studio, /执行状态不确定[\s\S]+不要直接重试/)
+  assert.match(studio, /结果未通过[\s\S]+剩余.*个未运行/)
 })

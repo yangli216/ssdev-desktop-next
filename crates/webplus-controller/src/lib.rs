@@ -112,6 +112,42 @@ pub struct InvocationAdmissionStats {
     pub accepting: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvocationExecutionState {
+    NotExecuted,
+    Completed,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InvocationOutcome {
+    pub response: InvokeResponse,
+    pub execution_state: InvocationExecutionState,
+}
+
+impl InvocationOutcome {
+    fn not_executed(response: InvokeResponse) -> Self {
+        Self {
+            response,
+            execution_state: InvocationExecutionState::NotExecuted,
+        }
+    }
+
+    fn completed(response: InvokeResponse) -> Self {
+        Self {
+            response,
+            execution_state: InvocationExecutionState::Completed,
+        }
+    }
+
+    fn indeterminate(response: InvokeResponse) -> Self {
+        Self {
+            response,
+            execution_state: InvocationExecutionState::Indeterminate,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PluginPreflightReport {
     pub hosts_started: usize,
@@ -563,33 +599,50 @@ impl PluginController {
     /// waiting for its response. Dropping this future detaches the waiter but
     /// does not cancel a possibly non-idempotent hardware operation.
     pub async fn invoke(self: &Arc<Self>, request: InvokeRequest) -> InvokeResponse {
+        self.invoke_with_execution_state(request).await.response
+    }
+
+    /// Preserves whether a local administrative caller can prove that native
+    /// execution did not start, received a terminal host response, or became
+    /// indeterminate after the request entered the host boundary. The public
+    /// Web Bridge intentionally continues to expose only `InvokeResponse`.
+    pub async fn invoke_with_execution_state(
+        self: &Arc<Self>,
+        request: InvokeRequest,
+    ) -> InvocationOutcome {
         let controller = Arc::clone(self);
         let task = tokio::spawn(async move { controller.invoke_inner(request).await });
         let mut waiter = CallerWaitGuard::new(&self.caller_detachments);
         let result = task.await;
         waiter.complete();
         match result {
-            Ok(response) => response,
+            Ok(outcome) => outcome,
             Err(_) => {
                 warn!(
                     event_code = "plugin-invocation-task-failed",
                     "supervised plugin invocation task failed"
                 );
-                InvokeResponse::error(HOST_FAILURE, "native plugin invocation task failed")
+                InvocationOutcome::indeterminate(InvokeResponse::error(
+                    HOST_FAILURE,
+                    "native plugin invocation task failed",
+                ))
             }
         }
     }
 
-    async fn invoke_inner(&self, request: InvokeRequest) -> InvokeResponse {
+    async fn invoke_inner(&self, request: InvokeRequest) -> InvocationOutcome {
         if let Err(error) = request.validate() {
-            return InvokeResponse::error(INVALID_REQUEST, error.to_string());
+            return InvocationOutcome::not_executed(InvokeResponse::error(
+                INVALID_REQUEST,
+                error.to_string(),
+            ));
         }
         let lifecycle_epoch = self.lifecycle_epoch.load(Ordering::Acquire);
         if !self.accepting_invocations.load(Ordering::Acquire) {
-            return self.reject_stopping_invocation();
+            return InvocationOutcome::not_executed(self.reject_stopping_invocation());
         }
         if self.global_maintenance_active.load(Ordering::Acquire) {
-            return self.reject_maintenance_invocation();
+            return InvocationOutcome::not_executed(self.reject_maintenance_invocation());
         }
         let route = {
             let routes = self.routes.read().await;
@@ -606,14 +659,14 @@ impl PluginController {
             .as_ref()
             .is_some_and(|lifecycle| lifecycle.maintenance_active.load(Ordering::Acquire))
         {
-            return self.reject_maintenance_invocation();
+            return InvocationOutcome::not_executed(self.reject_maintenance_invocation());
         }
         let Ok(_admission) = self.admission.try_acquire() else {
             self.rejected_invocations.fetch_add(1, Ordering::Relaxed);
-            return InvokeResponse::error(
+            return InvocationOutcome::not_executed(InvokeResponse::error(
                 SERVER_BUSY,
                 "native plugin invocation capacity is busy; retry later",
-            );
+            ));
         };
         let _lifecycle = self.lifecycle.read().await;
         let _plugin_lifecycle = match &plugin_lifecycle {
@@ -621,7 +674,7 @@ impl PluginController {
             None => None,
         };
         if !self.accepting_invocations.load(Ordering::Acquire) {
-            return self.reject_stopping_invocation();
+            return InvocationOutcome::not_executed(self.reject_stopping_invocation());
         }
         if self.global_maintenance_active.load(Ordering::Acquire)
             || self.lifecycle_epoch.load(Ordering::Acquire) != lifecycle_epoch
@@ -630,13 +683,13 @@ impl PluginController {
                     || Some(lifecycle.epoch.load(Ordering::Acquire)) != plugin_epoch
             })
         {
-            return self.reject_maintenance_invocation();
+            return InvocationOutcome::not_executed(self.reject_maintenance_invocation());
         }
         let Some(route) = route else {
-            return InvokeResponse::error(
+            return InvocationOutcome::not_executed(InvokeResponse::error(
                 SERVICE_NOT_FOUND,
                 format!("service [{}] could not find!", request.service_id),
-            );
+            ));
         };
 
         let request_timeout = route
@@ -650,15 +703,18 @@ impl PluginController {
             .invoke(&route.descriptor, request, request_timeout)
             .await
         {
-            Ok(response) => sanitize_host_invoke_response(response),
-            Err(error) => {
+            Ok(response) => InvocationOutcome::completed(sanitize_host_invoke_response(response)),
+            Err(failure) => {
                 warn!(
                     event_code = "plugin-host-request-failed",
                     plugin_id = route.descriptor.plugin_id,
-                    error_code = error.diagnostic_code(),
+                    error_code = failure.source.diagnostic_code(),
                     "plugin host request failed"
                 );
-                self.host_failure_response(&error)
+                InvocationOutcome {
+                    response: self.host_failure_response(&failure.source),
+                    execution_state: failure.execution_state,
+                }
             }
         }
     }
@@ -1073,6 +1129,11 @@ struct PluginSupervisor {
     failed_starts: AtomicU64,
 }
 
+struct SupervisorInvokeFailure {
+    source: ControllerError,
+    execution_state: InvocationExecutionState,
+}
+
 struct WorkerSlot {
     state: Mutex<WorkerSlotState>,
     failure_count: AtomicU64,
@@ -1199,32 +1260,48 @@ impl PluginSupervisor {
         descriptor: &PluginDescriptor,
         request: InvokeRequest,
         request_timeout: Duration,
-    ) -> Result<InvokeResponse, ControllerError> {
+    ) -> Result<InvokeResponse, SupervisorInvokeFailure> {
         let worker_key = WorkerKey::from(descriptor);
-        let worker = self.worker_for(descriptor).await?;
+        let worker =
+            self.worker_for(descriptor)
+                .await
+                .map_err(|source| SupervisorInvokeFailure {
+                    source,
+                    execution_state: InvocationExecutionState::NotExecuted,
+                })?;
         let deadline = Instant::now() + request_timeout;
         let result = {
             let Some(mut worker_guard) = lock_before_deadline(worker.as_ref(), deadline).await
             else {
-                return Err(ControllerError::ExecutionLaneTimeout {
-                    plugin_id: descriptor.plugin_id.clone(),
-                    timeout: request_timeout,
+                return Err(SupervisorInvokeFailure {
+                    source: ControllerError::ExecutionLaneTimeout {
+                        plugin_id: descriptor.plugin_id.clone(),
+                        timeout: request_timeout,
+                    },
+                    execution_state: InvocationExecutionState::NotExecuted,
                 });
             };
             match timeout_at(deadline, worker_guard.invoke(request)).await {
-                Ok(result) => result,
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(source)) => Err(SupervisorInvokeFailure {
+                    source,
+                    execution_state: InvocationExecutionState::Indeterminate,
+                }),
                 Err(_) => {
                     worker_guard.kill().await;
-                    Err(ControllerError::Timeout {
-                        plugin_id: descriptor.plugin_id.clone(),
-                        timeout: request_timeout,
+                    Err(SupervisorInvokeFailure {
+                        source: ControllerError::Timeout {
+                            plugin_id: descriptor.plugin_id.clone(),
+                            timeout: request_timeout,
+                        },
+                        execution_state: InvocationExecutionState::Indeterminate,
                     })
                 }
             }
         };
 
-        if let Err(error) = &result {
-            self.evict(&worker_key, &worker, error.diagnostic_code())
+        if let Err(failure) = &result {
+            self.evict(&worker_key, &worker, failure.source.diagnostic_code())
                 .await;
         }
         result
@@ -1978,6 +2055,19 @@ mod tests {
     #[tokio::test]
     async fn missing_service_is_a_legacy_shaped_response() {
         let controller = Arc::new(PluginController::new(config()).unwrap());
+        let outcome = controller
+            .invoke_with_execution_state(InvokeRequest {
+                service_id: "missing".into(),
+                method: "read".into(),
+                parameters: Map::new(),
+            })
+            .await;
+        assert_eq!(
+            outcome.execution_state,
+            InvocationExecutionState::NotExecuted
+        );
+        assert_eq!(outcome.response.res_code, SERVICE_NOT_FOUND);
+
         let response = controller
             .invoke(InvokeRequest {
                 service_id: "missing".into(),
@@ -1988,6 +2078,37 @@ mod tests {
 
         assert_eq!(response.res_code, SERVICE_NOT_FOUND);
         assert!(response.res_data.as_str().unwrap().contains("missing"));
+    }
+
+    #[tokio::test]
+    async fn host_start_failure_is_proven_not_executed() {
+        let controller = Arc::new(PluginController::new(config()).unwrap());
+        controller
+            .register_service(
+                "reader",
+                PluginDescriptor {
+                    plugin_id: "reader-plugin".into(),
+                    plugin_dir: "plugins/reader".into(),
+                    architecture: PluginArchitecture::X64,
+                    local_mapping_integrity_sha256: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome = controller
+            .invoke_with_execution_state(InvokeRequest {
+                service_id: "reader".into(),
+                method: "read".into(),
+                parameters: Map::new(),
+            })
+            .await;
+
+        assert_eq!(outcome.response.res_code, HOST_FAILURE);
+        assert_eq!(
+            outcome.execution_state,
+            InvocationExecutionState::NotExecuted
+        );
     }
 
     #[test]

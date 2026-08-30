@@ -129,7 +129,16 @@ type DebugCaseRunResult = {
   dataPassed: boolean
   dataMismatchPath: string | null
   elapsedMs: number
+  executionState: 'not-executed' | 'completed' | 'indeterminate'
   passed: boolean
+}
+
+type DebugCaseRunBatchResult = {
+  totalCaseCount: number
+  executedCaseCount: number
+  skippedCaseCount: number
+  stopReason: 'execution-indeterminate' | 'not-executed' | 'assertion-failed' | null
+  results: DebugCaseRunResult[]
 }
 
 type MappingInventoryRefreshPlan = {
@@ -930,15 +939,26 @@ async function runDebugCases() {
   if (draft.value.debugCases.length === 0) return
   if (!window.confirm(`将按顺序执行 ${draft.value.debugCases.length} 个已批准用例，可能触发打印、写卡或设备动作。请确认正在使用测试设备和可回滚数据。`)) return
   await run(async () => {
-    regressionResults.value = await invoke<DebugCaseRunResult[]>('run_local_mapping_debug_cases', {
+    const batch = await invoke<DebugCaseRunBatchResult>('run_local_mapping_debug_cases', {
       pluginId: draft.value.pluginId,
     })
+    regressionResults.value = batch.results
     const passed = regressionResults.value.filter((item) => item.passed).length
-    notice.value = `回归执行完成：${passed}/${regressionResults.value.length} 通过。`
+    if (batch.stopReason === 'execution-indeterminate') {
+      notice.value = `回归已停止：第 ${batch.executedCaseCount} 个调用的执行状态不确定，剩余 ${batch.skippedCaseCount} 个未运行。请先核对设备和业务结果，不要直接重试。`
+    } else if (batch.stopReason === 'not-executed') {
+      notice.value = `回归已停止：第 ${batch.executedCaseCount} 个调用确认未执行，剩余 ${batch.skippedCaseCount} 个未运行。请恢复插件宿主或运行状态后重新开始。`
+    } else if (batch.stopReason === 'assertion-failed') {
+      notice.value = `回归已停止：第 ${batch.executedCaseCount} 个结果未通过，剩余 ${batch.skippedCaseCount} 个未运行。请先核对映射、设备状态和期望结果。`
+    } else {
+      notice.value = `回归执行完成：${passed}/${batch.totalCaseCount} 通过。`
+    }
   })
 }
 
 function regressionDataSummary(item: DebugCaseRunResult): string {
+  if (item.executionState === 'indeterminate') return '执行状态不确定；先核对设备和业务结果'
+  if (item.executionState === 'not-executed') return '确认未执行'
   if (!item.dataAsserted) return 'ResData 未断言'
   if (item.dataPassed) return 'ResData 匹配'
   return `ResData 不匹配：${item.dataMismatchPath || '$'}`

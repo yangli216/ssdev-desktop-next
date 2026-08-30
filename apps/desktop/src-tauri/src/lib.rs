@@ -53,8 +53,8 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_global_shortcut::Builder as ShortcutBuilder;
 use tauri_plugin_opener::OpenerExt;
 use webplus_controller::{
-    PluginController, PluginPreflightFailure, PluginTrust, SupervisorConfig,
-    DEFAULT_MAX_IN_FLIGHT_INVOCATIONS,
+    InvocationExecutionState, PluginController, PluginPreflightFailure, PluginTrust,
+    SupervisorConfig, DEFAULT_MAX_IN_FLIGHT_INVOCATIONS,
 };
 use webplus_plugin_config::{
     compare_public_api, discover_plugins, PluginManifest, ServiceDefinition,
@@ -2814,7 +2814,18 @@ struct DebugCaseRunResult {
     data_passed: bool,
     data_mismatch_path: Option<String>,
     elapsed_ms: u128,
+    execution_state: &'static str,
     passed: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DebugCaseRunBatchResult {
+    total_case_count: usize,
+    executed_case_count: usize,
+    skipped_case_count: usize,
+    stop_reason: Option<&'static str>,
+    results: Vec<DebugCaseRunResult>,
 }
 
 #[derive(Serialize)]
@@ -5472,6 +5483,26 @@ fn commit_debug_case_baseline_update(
     Ok(())
 }
 
+fn debug_case_execution_state_name(state: InvocationExecutionState) -> &'static str {
+    match state {
+        InvocationExecutionState::NotExecuted => "not-executed",
+        InvocationExecutionState::Completed => "completed",
+        InvocationExecutionState::Indeterminate => "indeterminate",
+    }
+}
+
+fn debug_case_batch_stop_reason(
+    execution_state: InvocationExecutionState,
+    passed: bool,
+) -> Option<&'static str> {
+    match execution_state {
+        InvocationExecutionState::Indeterminate => Some("execution-indeterminate"),
+        InvocationExecutionState::NotExecuted => Some("not-executed"),
+        InvocationExecutionState::Completed if !passed => Some("assertion-failed"),
+        InvocationExecutionState::Completed => None,
+    }
+}
+
 #[tauri::command]
 async fn save_local_mapping_debug_case(
     caller: WebviewWindow,
@@ -5533,7 +5564,7 @@ async fn run_local_mapping_debug_cases(
     caller: WebviewWindow,
     state: State<'_, BridgeState>,
     plugin_id: String,
-) -> Result<Vec<DebugCaseRunResult>, String> {
+) -> Result<DebugCaseRunBatchResult, String> {
     desktop::require_control(&caller)?;
     let cases = {
         let _install = state.install_lock.lock().await;
@@ -5554,18 +5585,22 @@ async fn run_local_mapping_debug_cases(
         }
         cases
     };
-    let mut results = Vec::with_capacity(cases.len());
+    let total_case_count = cases.len();
+    let mut results = Vec::with_capacity(total_case_count);
+    let mut stop_reason = None;
     for debug_case in cases {
         let started = std::time::Instant::now();
-        let response = state
+        let outcome = state
             .controller
-            .invoke(InvokeRequest {
+            .invoke_with_execution_state(InvokeRequest {
                 service_id: debug_case.service_id.clone(),
                 method: debug_case.method.clone(),
                 parameters: debug_case.parameters,
             })
             .await;
-        let data_mismatch_path = if debug_case.assert_res_data {
+        let response = outcome.response;
+        let execution_completed = outcome.execution_state == InvocationExecutionState::Completed;
+        let data_mismatch_path = if execution_completed && debug_case.assert_res_data {
             local_mappings::res_data_mismatch_path(
                 &debug_case.expected_res_data,
                 &response.res_data,
@@ -5573,7 +5608,11 @@ async fn run_local_mapping_debug_cases(
         } else {
             None
         };
-        let data_passed = data_mismatch_path.is_none();
+        let data_passed = execution_completed && data_mismatch_path.is_none();
+        let passed = execution_completed
+            && response.res_code == debug_case.expected_res_code
+            && (!debug_case.assert_res_data || data_passed);
+        let current_stop_reason = debug_case_batch_stop_reason(outcome.execution_state, passed);
         results.push(DebugCaseRunResult {
             name: debug_case.name,
             service_id: debug_case.service_id,
@@ -5584,18 +5623,44 @@ async fn run_local_mapping_debug_cases(
             data_passed,
             data_mismatch_path,
             elapsed_ms: started.elapsed().as_millis(),
-            passed: response.res_code == debug_case.expected_res_code && data_passed,
+            execution_state: debug_case_execution_state_name(outcome.execution_state),
+            passed,
         });
+        if current_stop_reason.is_some() {
+            stop_reason = current_stop_reason;
+            break;
+        }
     }
     let passed = results.iter().filter(|result| result.passed).count();
-    tracing::info!(
-        event_code = "local-mapping-regression-completed",
-        plugin_id,
-        case_count = results.len(),
-        passed_count = passed,
-        "local mapping synthetic regression completed"
-    );
-    Ok(results)
+    let executed_case_count = results.len();
+    let skipped_case_count = total_case_count.saturating_sub(executed_case_count);
+    if let Some(reason) = stop_reason {
+        tracing::warn!(
+            event_code = "local-mapping-regression-stopped",
+            plugin_id,
+            total_case_count,
+            executed_case_count,
+            skipped_case_count,
+            passed_count = passed,
+            stop_reason = reason,
+            "local mapping synthetic regression stopped before another device action"
+        );
+    } else {
+        tracing::info!(
+            event_code = "local-mapping-regression-completed",
+            plugin_id,
+            case_count = results.len(),
+            passed_count = passed,
+            "local mapping synthetic regression completed"
+        );
+    }
+    Ok(DebugCaseRunBatchResult {
+        total_case_count,
+        executed_case_count,
+        skipped_case_count,
+        stop_reason,
+        results,
+    })
 }
 
 fn service_inventory_item(service: ServiceDefinition) -> ServiceInventoryItem {
@@ -6983,37 +7048,37 @@ fn select_runtime_path(
 mod tests {
     use super::{
         classify_local_plugin_install_action, classify_project_component_action,
-        collect_plugin_updates, desktop, early_startup_log_dir,
-        ensure_catalog_plugin_id_matches_installed, ensure_config_signed_plugin_route_coverage,
-        ensure_exact_project_component_set, ensure_local_mapping_import_plan_matches,
-        ensure_local_mapping_removal_plan_matches, ensure_local_plugin_install_plan_matches,
-        ensure_plugin_reload_candidate_state_matches, ensure_plugin_reload_plan_matches,
-        ensure_plugin_update_plan_matches, ensure_plugin_version_change_allowed,
-        ensure_project_component_manifests_match, ensure_project_delivery_identity,
-        ensure_project_export_active_manifests_match, ensure_project_export_runtime_matches,
-        ensure_project_import_baseline_matches, ensure_signed_plugin_compatible,
-        ensure_signed_plugin_route_coverage, ensure_signed_plugin_uninstall_plan_matches,
-        ensure_upgrade_allowed, inspect_all_plugins, is_lowercase_sha256,
-        is_plugin_update_available, legacy_config_candidates, local_mapping_directory_state_digest,
-        local_mapping_import_plan_id, local_mapping_import_state_digest,
-        local_mapping_removal_plan_id, local_mappings, local_plugin_install_plan_id,
-        open_project_bundle_for_mode, persist_startup_failure_document,
-        plugin_reload_active_state_digest, plugin_reload_candidate_state_digest,
-        plugin_reload_impact, plugin_reload_plan_id, plugin_update_installed_state_digest,
-        plugin_update_plan_id, preflight_failure_message, prepare_plugin_removal, project_bundle,
-        project_import_plan_id, project_import_state_digest,
-        quarantine_plugin_capability_violations, resolve_startup_failure_document,
-        same_manifest_contracts, select_runtime_path, service_inventory_item,
-        signed_plugin_api_change_summary, signed_plugin_directory_state_digest,
-        signed_plugin_route_policy_coverage, signed_plugin_uninstall_plan_id,
-        startup_failure_message, validate_signed_plugin_activation_routes,
-        validate_signed_plugin_api_changes, webview2_startup_failure, BridgePluginHostHealth,
-        CatalogWithdrawalReason, FrontendRuntime, InspectedPlugins, LocalMappingImportPreview,
-        LocalMappingImportServicePreview, LocalMappingRemovalPreview, OfflineRuntimeProbe,
-        PluginInstallBlocker, PluginInstallSource, PluginPackagePreview,
-        PluginPackageServicePreview, PluginReloadPreview, ProjectBundlePreview,
-        SignedPluginUninstallPreview, StartupFailureDocument, StartupStage, APP_DATA_DIRECTORY,
-        FRONTEND_READY_TIMEOUT,
+        collect_plugin_updates, debug_case_batch_stop_reason, debug_case_execution_state_name,
+        desktop, early_startup_log_dir, ensure_catalog_plugin_id_matches_installed,
+        ensure_config_signed_plugin_route_coverage, ensure_exact_project_component_set,
+        ensure_local_mapping_import_plan_matches, ensure_local_mapping_removal_plan_matches,
+        ensure_local_plugin_install_plan_matches, ensure_plugin_reload_candidate_state_matches,
+        ensure_plugin_reload_plan_matches, ensure_plugin_update_plan_matches,
+        ensure_plugin_version_change_allowed, ensure_project_component_manifests_match,
+        ensure_project_delivery_identity, ensure_project_export_active_manifests_match,
+        ensure_project_export_runtime_matches, ensure_project_import_baseline_matches,
+        ensure_signed_plugin_compatible, ensure_signed_plugin_route_coverage,
+        ensure_signed_plugin_uninstall_plan_matches, ensure_upgrade_allowed, inspect_all_plugins,
+        is_lowercase_sha256, is_plugin_update_available, legacy_config_candidates,
+        local_mapping_directory_state_digest, local_mapping_import_plan_id,
+        local_mapping_import_state_digest, local_mapping_removal_plan_id, local_mappings,
+        local_plugin_install_plan_id, open_project_bundle_for_mode,
+        persist_startup_failure_document, plugin_reload_active_state_digest,
+        plugin_reload_candidate_state_digest, plugin_reload_impact, plugin_reload_plan_id,
+        plugin_update_installed_state_digest, plugin_update_plan_id, preflight_failure_message,
+        prepare_plugin_removal, project_bundle, project_import_plan_id,
+        project_import_state_digest, quarantine_plugin_capability_violations,
+        resolve_startup_failure_document, same_manifest_contracts, select_runtime_path,
+        service_inventory_item, signed_plugin_api_change_summary,
+        signed_plugin_directory_state_digest, signed_plugin_route_policy_coverage,
+        signed_plugin_uninstall_plan_id, startup_failure_message,
+        validate_signed_plugin_activation_routes, validate_signed_plugin_api_changes,
+        webview2_startup_failure, BridgePluginHostHealth, CatalogWithdrawalReason, FrontendRuntime,
+        InspectedPlugins, LocalMappingImportPreview, LocalMappingImportServicePreview,
+        LocalMappingRemovalPreview, OfflineRuntimeProbe, PluginInstallBlocker, PluginInstallSource,
+        PluginPackagePreview, PluginPackageServicePreview, PluginReloadPreview,
+        ProjectBundlePreview, SignedPluginUninstallPreview, StartupFailureDocument, StartupStage,
+        APP_DATA_DIRECTORY, FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -7027,7 +7092,7 @@ mod tests {
         path::PathBuf,
         time::{Duration, UNIX_EPOCH},
     };
-    use webplus_controller::PluginPreflightFailure;
+    use webplus_controller::{InvocationExecutionState, PluginPreflightFailure};
     use webplus_plugin_config::{PluginManifest, ServiceDefinition, API_FILENAME};
     use webplus_plugin_repository::PluginCatalog;
     use webplus_plugin_trust::{
@@ -7049,6 +7114,30 @@ mod tests {
             discovered_plugin_ids,
             local_mapping_ids,
         }
+    }
+
+    #[test]
+    fn local_regression_stops_before_the_next_device_action() {
+        assert_eq!(
+            debug_case_batch_stop_reason(InvocationExecutionState::Completed, true),
+            None
+        );
+        assert_eq!(
+            debug_case_batch_stop_reason(InvocationExecutionState::Completed, false),
+            Some("assertion-failed")
+        );
+        assert_eq!(
+            debug_case_batch_stop_reason(InvocationExecutionState::NotExecuted, false),
+            Some("not-executed")
+        );
+        assert_eq!(
+            debug_case_batch_stop_reason(InvocationExecutionState::Indeterminate, false),
+            Some("execution-indeterminate")
+        );
+        assert_eq!(
+            debug_case_execution_state_name(InvocationExecutionState::Indeterminate),
+            "indeterminate"
+        );
     }
 
     fn plugin_manifest_with_service(
