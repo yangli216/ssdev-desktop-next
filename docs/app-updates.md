@@ -13,7 +13,7 @@ SSDEV Desktop 的应用更新与插件更新是两条独立信任链：
 3. 检查更新时先用目标 Desktop SemVer 重新发现全部签名插件和本地映射；任何签名插件缺少明确兼容范围、范围不匹配，或任一能力存在完整性、定义一致性及插件 ID 冲突异常，都会作为阻塞项展示，不提供安装操作。
 4. 可安装结果生成只用于本次确认的域分隔计划标识，绑定当前版本、目标版本、发布日期、目标平台、下载 URL、Minisign 签名、页面展示的发布说明，以及当前全部签名插件的身份、签名 keyId、完整文件载荷和本地映射的确定性内容包。开始新一轮检查时会先清除旧 pending，检查失败不能继续安装上一轮对象。
 5. 用户确认安装时必须提交计划标识；客户端在插件安装锁内重新恢复事务、读取精确 pending 更新并重建完整能力集合摘要。pending 被另一轮检查替换，或签名插件、本地映射被安装、更新、删除及内容发生变化时，旧确认在下载前失败。
-6. 更新包流式写入用户本地数据目录，默认最多 256 MiB；重定向和最终下载均受 HTTPS-only 客户端约束。临时根必须是非符号链接目录；普通失败自动删除临时文件，下载期间进程崩溃留下的固定前缀普通文件会在下一次更新前清理，不删除同目录其他文件或目录。
+6. 更新包流式写入用户本地数据目录，默认和在线轻量构建最多 256 MiB；携带 WebView2 的离线 Windows 构建按同一运行时硬上限明确允许 512 MiB，避免 x64 离线 NSIS 已正确签名却无法被自身策略验证。重定向和最终下载均受 HTTPS-only 客户端约束。临时根必须是非符号链接目录；普通失败自动删除临时文件，下载期间进程崩溃留下的固定前缀普通文件会在下一次更新前清理，不删除同目录其他文件或目录。
 7. 下载过程中使用现代预哈希 Minisign 签名做流式验证，未通过验签不会进入安装阶段。验签并完整读取后再次验证目标 Desktop 兼容性和完整能力集合摘要，阻止下载期间发生的签名插件或本地映射漂移。
 8. 二次复核成功后先通知控制台进入安装阶段，再关闭原生调用准入并排空所有 DLL/COM 插件宿主；业务窗口保留到系统安装程序成功接管并由进程退出或重启统一关闭。若安装交接失败，controller 与持久协调器恢复准入，原业务窗口继续可用；控制台同步作废已经消费的一次性确认标识、显示恢复结果并要求重新检查，不能停留在“正在安装”或直接重试旧计划。
 9. Windows 安装器会退出当前客户端；macOS/Linux 安装完成后由客户端重启。
@@ -57,7 +57,7 @@ $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD="<由 CI secret 注入>"
 
 Windows 发布机还必须安装固定版 `cargo-cyclonedx 0.5.9`。构建会为桌面主程序、x86/x64 插件宿主及 npm 前端生成 CycloneDX 1.5 SBOM，移除工作区绝对路径和随机标识；随后生成覆盖整个 bundle 的规范化路径、长度和 SHA-256 清单，并用同一受控 Tauri 更新密钥签名。发布清单不依赖包内自声明公钥建立信任，验收时必须通过 `-ExpectedAppUpdatePublicKey` 独立提供组织更新公钥；更新密钥轮换期间，上一包通过 `-PreviousExpectedAppUpdatePublicKey` 使用独立旧公钥验证。
 
-Windows 构建只生成 NSIS。默认使用 `-WebViewInstallMode OfflineInstaller` 生成离线版；在线轻量渠道使用 `-WebViewInstallMode DownloadBootstrapper`，已有 WebView2 时复用系统运行时，缺失时安装过程需要访问 Microsoft 下载服务。构建只允许这两种 WebView2 策略，不开放可能在运行时缺失时直接启动失败的 `skip`。安装器类型、架构和 WebView2 模式写入 `metadata/package-profile.json` 并进入签名产物清单；验收脚本通过 `-ExpectedWebViewInstallMode` 与候选精确匹配，通过可选 `-PreviousExpectedWebViewInstallMode` 独立验证上一 bundle，允许离线旧版迁移到在线轻量候选但不允许伪造任一模式。
+Windows 构建只生成 NSIS。默认使用 `-WebViewInstallMode OfflineInstaller` 生成离线版；在线轻量渠道使用 `-WebViewInstallMode DownloadBootstrapper`，已有 WebView2 时复用系统运行时，缺失时安装过程需要访问 Microsoft 下载服务。构建只允许这两种 WebView2 策略，不开放可能在运行时缺失时直接启动失败的 `skip`。离线策略将 updater 流式上限固定为 512 MiB，在线轻量策略保持 256 MiB；两者都受 Rust 运行时的 512 MiB 绝对硬上限约束，不能由发布参数任意扩大。安装器类型、架构和 WebView2 模式写入 `metadata/package-profile.json` 并进入签名产物清单；验收脚本通过 `-ExpectedWebViewInstallMode` 与候选精确匹配，通过可选 `-PreviousExpectedWebViewInstallMode` 独立验证上一 bundle，允许离线旧版迁移到在线轻量候选但不允许伪造任一模式。
 
 缺少更新公钥、HTTPS 端点、更新私钥或 Windows 代码签名配置时，正式打包脚本会直接失败。只有 `CI=true` 且显式传入 `-AllowUnsignedTestBuild` 时才能生成不可分发的未签名测试包。
 

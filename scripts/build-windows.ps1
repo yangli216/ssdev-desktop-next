@@ -323,12 +323,17 @@ try {
     throw "Unsigned CI test builds must use a reserved .invalid update host."
   }
 
+  $appUpdateMaxDownloadBytes = if ($WebViewInstallMode -eq "OfflineInstaller") {
+    536870912
+  } else {
+    268435456
+  }
   $appUpdatePolicy = [ordered]@{
     schemaVersion = 1
     enabled = $true
     endpoints = @($AppUpdateEndpoint)
     pubkey = $updatePublicKeyText
-    maxDownloadBytes = 268435456
+    maxDownloadBytes = $appUpdateMaxDownloadBytes
   }
   $windowsBundleConfig = [ordered]@{}
   $windowsBundleConfig["webviewInstallMode"] = [ordered]@{

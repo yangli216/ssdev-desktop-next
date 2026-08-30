@@ -50,6 +50,13 @@ test("Windows build exposes only the supported installer and WebView2 profiles",
   assert.match(script, /webviewInstallMode/);
   assert.match(script, /package-profile\.json/);
   assert.match(script, /larger than 128 MiB/);
+  assert.match(
+    script,
+    /\$appUpdateMaxDownloadBytes = if \(\$WebViewInstallMode -eq "OfflineInstaller"\)/,
+  );
+  assert.match(script, /OfflineInstaller"\) \{\s*536870912/);
+  assert.match(script, /else \{\s*268435456/);
+  assert.match(script, /maxDownloadBytes = \$appUpdateMaxDownloadBytes/);
   assert.doesNotMatch(script, /ValidateSet\([^\r\n]*"Skip"/);
 });
 
