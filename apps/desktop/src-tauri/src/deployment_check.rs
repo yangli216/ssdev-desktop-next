@@ -657,6 +657,9 @@ fn preflight_failure_action(code: &str) -> &'static str {
             "检查组件类型、x86/x64 架构和静态 ABI 声明。"
         }
         "host-spawn-failed" => "确认客户端安装完整，并检查终端防护是否阻止插件宿主启动。",
+        "plugin-trust-store-changed" => {
+            "停止原生能力调用，使用组织发布的完整安装包修复客户端并重新启动。"
+        }
         "host-protocol-version-mismatch" | "protocol-version-mismatch" => {
             "修复或重新安装当前 Desktop，确保主程序与插件宿主版本一致。"
         }
@@ -902,6 +905,15 @@ mod tests {
                 && item.summary.contains("native-dll-preflight-failed")
                 && item.action.is_some_and(|action| action.contains("DLL"))
         }));
+    }
+
+    #[test]
+    fn changed_plugin_trust_has_a_specific_repair_action() {
+        let action = preflight_failure_action("plugin-trust-store-changed");
+        assert!(action.contains("停止原生能力调用"));
+        assert!(action.contains("完整安装包"));
+        assert!(action.contains("重新启动"));
+        assert!(!action.contains('/') && !action.contains('\\'));
     }
 
     #[test]

@@ -16,6 +16,7 @@ use tokio::time::{timeout, timeout_at, Instant};
 use tracing::{info, warn};
 use webplus_ipc::{read_frame_async, write_frame_async, FrameError};
 use webplus_plugin_config::{validate_portable_plugin_id, PluginManifest};
+use webplus_plugin_trust::TrustStore;
 use webplus_protocol::{
     is_reserved_controller_invoke_code, HostCommand, HostPayload, HostRequest, HostResponse,
     HostResult, InvokeRequest, InvokeResponse, PluginArchitecture, HOST_PROTOCOL_VERSION,
@@ -1477,6 +1478,7 @@ impl PluginWorker {
                 trust_store,
                 trust_store_sha256,
             } => {
+                ensure_pinned_trust_store(trust_store, trust_store_sha256)?;
                 command
                     .arg("--trust-store")
                     .arg(trust_store)
@@ -1504,6 +1506,7 @@ impl PluginWorker {
                         .arg("--local-mapping-integrity-sha256")
                         .arg(integrity);
                 } else {
+                    ensure_pinned_trust_store(trust_store, trust_store_sha256)?;
                     command
                         .arg("--trust-store")
                         .arg(trust_store)
@@ -1701,6 +1704,15 @@ fn is_lowercase_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+fn ensure_pinned_trust_store(path: &Path, expected_sha256: &str) -> Result<(), ControllerError> {
+    let trust_store =
+        TrustStore::load(path).map_err(|_| ControllerError::PluginTrustStoreChanged)?;
+    if trust_store.document_sha256() != expected_sha256 {
+        return Err(ControllerError::PluginTrustStoreChanged);
+    }
+    Ok(())
+}
+
 fn validate_response(
     expected_request_id: u64,
     response: HostResponse,
@@ -1742,6 +1754,8 @@ pub enum ControllerError {
     InvalidInvocationLimit { actual: usize, maximum: usize },
     #[error("strict plugin trust requires a lowercase SHA-256 trust-store identity")]
     InvalidTrustStoreIdentity,
+    #[error("plugin trust store changed after desktop startup")]
+    PluginTrustStoreChanged,
     #[error("serviceId must not be empty")]
     EmptyServiceId,
     #[error("plugin ID must not be empty")]
@@ -1820,6 +1834,7 @@ impl ControllerError {
         match self {
             Self::InvalidInvocationLimit { .. } => "invalid-invocation-limit",
             Self::InvalidTrustStoreIdentity => "invalid-trust-store-identity",
+            Self::PluginTrustStoreChanged => "plugin-trust-store-changed",
             Self::EmptyServiceId => "empty-service-id",
             Self::EmptyPluginId => "empty-plugin-id",
             Self::InvalidPluginId => "invalid-plugin-id",
@@ -1997,6 +2012,26 @@ mod tests {
         assert!(matches!(
             PluginController::new(config),
             Err(ControllerError::InvalidTrustStoreIdentity)
+        ));
+    }
+
+    #[test]
+    fn signed_host_start_rejects_a_changed_or_missing_trust_store() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("trust.json");
+        fs::write(&path, br#"{"schemaVersion":2,"keys":[]}"#).unwrap();
+        let approved = TrustStore::load(&path).unwrap();
+        let expected = approved.document_sha256().to_owned();
+        assert!(ensure_pinned_trust_store(&path, &expected).is_ok());
+
+        fs::write(&path, b"{\n  \"schemaVersion\": 2,\n  \"keys\": []\n}\n").unwrap();
+        let changed = ensure_pinned_trust_store(&path, &expected).unwrap_err();
+        assert_eq!(changed.diagnostic_code(), "plugin-trust-store-changed");
+
+        fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            ensure_pinned_trust_store(&path, &expected),
+            Err(ControllerError::PluginTrustStoreChanged)
         ));
     }
 
