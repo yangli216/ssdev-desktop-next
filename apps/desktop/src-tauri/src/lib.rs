@@ -892,6 +892,7 @@ struct ProjectBundlePreview {
     upgrade_count: usize,
     replace_count: usize,
     retained_count: usize,
+    exact_component_set: bool,
     components: Vec<ProjectBundleComponentPreview>,
     retained_components: Vec<ProjectBundleComponentPreview>,
 }
@@ -1278,6 +1279,7 @@ async fn import_project_bundle(
     if prepared.preview.plan_id != expected_plan_id {
         return Err("项目包或当前机器状态已在预检后变化，请重新预检后确认导入".into());
     }
+    ensure_exact_project_component_set(prepared.preview.retained_count)?;
     let signed_plugins = prepared.preview.signed_plugins;
     let local_mappings = prepared.preview.local_mappings;
     let preflighted_hosts = prepared.preview.preflighted_hosts;
@@ -1674,24 +1676,12 @@ async fn prepare_project_bundle(
             }
         })
         .collect::<Vec<_>>();
-    let mut candidates = current
-        .manifests
-        .iter()
-        .filter(|manifest| !imported_ids.contains(&manifest.plugin_id))
-        .cloned()
-        .collect::<Vec<_>>();
-    candidates.extend(
-        components
-            .iter()
-            .map(|component| component.manifest().clone()),
-    );
-    validate_signed_plugin_api_baseline(state, &candidates)?;
-    validate_signed_plugin_api_changes(&current.manifests, &candidates, &state.local_mapping_root)?;
-    validate_project_delivery_routes(desktop_state, &opened.config, &candidates)?;
     let project_manifests = components
         .iter()
         .map(|component| component.manifest().clone())
         .collect::<Vec<_>>();
+    validate_signed_plugin_api_baseline(state, &project_manifests)?;
+    validate_project_delivery_routes(desktop_state, &opened.config, &project_manifests)?;
     let preflighted_hosts = preflight_manifests(state, &project_manifests, "项目组件").await?;
     let signed_plugins = previews
         .iter()
@@ -1715,6 +1705,7 @@ async fn prepare_project_bundle(
         .filter(|component| matches!(component.action, "reinstall" | "replace"))
         .count();
     let retained_count = retained_components.len();
+    let exact_component_set = retained_count == 0;
     Ok(PreparedProjectBundle {
         config: opened.config,
         components,
@@ -1734,6 +1725,7 @@ async fn prepare_project_bundle(
             upgrade_count,
             replace_count,
             retained_count,
+            exact_component_set,
             components: previews,
             retained_components,
         },
@@ -2214,6 +2206,15 @@ fn ensure_project_delivery_identity(config: &ssdev_config::DesktopConfig) -> Res
                 .into(),
         )
     }
+}
+
+fn ensure_exact_project_component_set(retained_count: usize) -> Result<(), String> {
+    if retained_count == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "目标机器还有 {retained_count} 个项目包未声明的插件或本地映射；项目包不会自动删除现有能力，请先在“插件管理”或“原生映射”中逐项卸载或删除，或重新生成包含这些能力的项目包，然后重新预检"
+    ))
 }
 
 async fn preflight_manifests(
@@ -6564,33 +6565,33 @@ mod tests {
     use super::{
         classify_local_plugin_install_action, classify_project_component_action,
         collect_plugin_updates, desktop, early_startup_log_dir,
-        ensure_config_signed_plugin_route_coverage, ensure_local_mapping_import_plan_matches,
-        ensure_local_mapping_removal_plan_matches, ensure_local_plugin_install_plan_matches,
-        ensure_plugin_reload_candidate_state_matches, ensure_plugin_reload_plan_matches,
-        ensure_plugin_update_plan_matches, ensure_plugin_version_change_allowed,
-        ensure_project_delivery_identity, ensure_project_export_active_manifests_match,
-        ensure_project_export_runtime_matches, ensure_signed_plugin_compatible,
-        ensure_signed_plugin_route_coverage, ensure_signed_plugin_uninstall_plan_matches,
-        ensure_upgrade_allowed, inspect_all_plugins, is_lowercase_sha256,
-        is_plugin_update_available, legacy_config_candidates, local_mapping_directory_state_digest,
-        local_mapping_import_plan_id, local_mapping_import_state_digest,
-        local_mapping_removal_plan_id, local_mappings, local_plugin_install_plan_id,
-        open_project_bundle_for_mode, persist_startup_failure_document,
-        plugin_reload_active_state_digest, plugin_reload_candidate_state_digest,
-        plugin_reload_impact, plugin_reload_plan_id, plugin_update_installed_state_digest,
-        plugin_update_plan_id, preflight_failure_message, prepare_plugin_removal, project_bundle,
-        project_import_plan_id, project_import_state_digest, resolve_startup_failure_document,
-        same_manifest_contracts, select_runtime_path, service_inventory_item,
-        signed_plugin_api_change_summary, signed_plugin_directory_state_digest,
-        signed_plugin_route_policy_coverage, signed_plugin_uninstall_plan_id,
-        startup_failure_message, validate_signed_plugin_activation_routes,
-        validate_signed_plugin_api_changes, webview2_startup_failure, BridgePluginHostHealth,
-        CatalogWithdrawalReason, FrontendRuntime, InspectedPlugins, LocalMappingImportPreview,
-        LocalMappingImportServicePreview, LocalMappingRemovalPreview, OfflineRuntimeProbe,
-        PluginInstallBlocker, PluginInstallSource, PluginPackagePreview,
-        PluginPackageServicePreview, PluginReloadPreview, ProjectBundlePreview,
-        SignedPluginUninstallPreview, StartupFailureDocument, StartupStage, APP_DATA_DIRECTORY,
-        FRONTEND_READY_TIMEOUT,
+        ensure_config_signed_plugin_route_coverage, ensure_exact_project_component_set,
+        ensure_local_mapping_import_plan_matches, ensure_local_mapping_removal_plan_matches,
+        ensure_local_plugin_install_plan_matches, ensure_plugin_reload_candidate_state_matches,
+        ensure_plugin_reload_plan_matches, ensure_plugin_update_plan_matches,
+        ensure_plugin_version_change_allowed, ensure_project_delivery_identity,
+        ensure_project_export_active_manifests_match, ensure_project_export_runtime_matches,
+        ensure_signed_plugin_compatible, ensure_signed_plugin_route_coverage,
+        ensure_signed_plugin_uninstall_plan_matches, ensure_upgrade_allowed, inspect_all_plugins,
+        is_lowercase_sha256, is_plugin_update_available, legacy_config_candidates,
+        local_mapping_directory_state_digest, local_mapping_import_plan_id,
+        local_mapping_import_state_digest, local_mapping_removal_plan_id, local_mappings,
+        local_plugin_install_plan_id, open_project_bundle_for_mode,
+        persist_startup_failure_document, plugin_reload_active_state_digest,
+        plugin_reload_candidate_state_digest, plugin_reload_impact, plugin_reload_plan_id,
+        plugin_update_installed_state_digest, plugin_update_plan_id, preflight_failure_message,
+        prepare_plugin_removal, project_bundle, project_import_plan_id,
+        project_import_state_digest, resolve_startup_failure_document, same_manifest_contracts,
+        select_runtime_path, service_inventory_item, signed_plugin_api_change_summary,
+        signed_plugin_directory_state_digest, signed_plugin_route_policy_coverage,
+        signed_plugin_uninstall_plan_id, startup_failure_message,
+        validate_signed_plugin_activation_routes, validate_signed_plugin_api_changes,
+        webview2_startup_failure, BridgePluginHostHealth, CatalogWithdrawalReason, FrontendRuntime,
+        InspectedPlugins, LocalMappingImportPreview, LocalMappingImportServicePreview,
+        LocalMappingRemovalPreview, OfflineRuntimeProbe, PluginInstallBlocker, PluginInstallSource,
+        PluginPackagePreview, PluginPackageServicePreview, PluginReloadPreview,
+        ProjectBundlePreview, SignedPluginUninstallPreview, StartupFailureDocument, StartupStage,
+        APP_DATA_DIRECTORY, FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -7110,6 +7111,7 @@ mod tests {
             upgrade_count: 0,
             replace_count: 0,
             retained_count: 0,
+            exact_component_set: true,
             components: Vec::new(),
             retained_components: Vec::new(),
         };
@@ -7127,7 +7129,18 @@ mod tests {
         );
         assert_eq!(value["configPreview"]["currentManagedProcessCount"], 1);
         assert_eq!(value["configPreview"]["candidateManagedProcessCount"], 0);
+        assert_eq!(value["exactComponentSet"], true);
         assert!(value["configPreview"].get("planId").is_none());
+    }
+
+    #[test]
+    fn project_import_requires_the_package_to_describe_the_exact_component_set() {
+        assert!(ensure_exact_project_component_set(0).is_ok());
+        let error = ensure_exact_project_component_set(2).unwrap_err();
+        assert!(error.contains("2 个项目包未声明"));
+        assert!(error.contains("不会自动删除"));
+        assert!(error.contains("逐项卸载或删除"));
+        assert!(error.contains("重新预检"));
     }
 
     #[test]

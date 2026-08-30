@@ -67,3 +67,34 @@ test('project identity is visible, signed with delivery state, and required for 
   assert.match(deployment, /"project-identity"[\s\S]+DeploymentCheckStatus::Fail/)
   assert.match(evidence, /item\.id == "project-identity" && item\.status == DeploymentCheckRecordStatus::Pass/)
 })
+
+test('project import requires an exact component set without deleting target capabilities', async () => {
+  const [frontend, desktop] = await Promise.all([
+    readFile(controlFrontendUrl, 'utf8'),
+    readFile(desktopCoreUrl, 'utf8'),
+  ])
+
+  assert.match(frontend, /exactComponentSet: boolean/)
+  assert.match(frontend, /目标机存在包外能力，暂不能导入/)
+  assert.match(frontend, /!projectBundlePreview\.exactComponentSet/)
+  assert.match(frontend, /需要先处理的包外能力/)
+  assert.match(frontend, /客户端不会自动删除目标机能力/)
+
+  const importStart = desktop.indexOf('async fn import_project_bundle(')
+  const prepare = desktop.indexOf(
+    'let prepared = prepare_project_bundle(source, &state, &desktop_state).await?;',
+    importStart,
+  )
+  const exactSetGate = desktop.indexOf(
+    'ensure_exact_project_component_set(prepared.preview.retained_count)?;',
+    prepare,
+  )
+  const transaction = desktop.indexOf('ProjectActivation::begin(', exactSetGate)
+  assert.ok(importStart >= 0 && prepare > importStart)
+  assert.ok(exactSetGate > prepare && transaction > exactSetGate)
+  assert.match(
+    desktop,
+    /validate_project_delivery_routes\(desktop_state, &opened\.config, &project_manifests\)\?;/,
+  )
+  assert.match(desktop, /项目包不会自动删除现有能力/)
+})

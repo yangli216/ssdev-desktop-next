@@ -143,6 +143,7 @@ type ProjectBundlePreview = {
   upgradeCount: number
   replaceCount: number
   retainedCount: number
+  exactComponentSet: boolean
   components: Array<{
     pluginId: string
     version?: string
@@ -1224,6 +1225,10 @@ async function importSelectedProjectBundle() {
     error.value = '请先选择并预检项目部署包。'
     return
   }
+  if (!projectBundlePreview.value.exactComponentSet) {
+    error.value = '目标机器存在项目包未声明的能力。请先在“插件管理”或“原生映射”中逐项处理，或重新生成包含这些能力的项目包，然后重新预检。'
+    return
+  }
   if (configDraftDirty.value && !window.confirm('当前项目配置有未保存更改。导入项目会以项目包中的配置替换这些草稿，确定继续吗？')) return
   if (mappingDraftDirty.value && !window.confirm('当前原生映射工作台有未保存更改。导入项目会刷新工作台并丢弃这些更改，确定继续吗？')) return
   const source = selectedProjectBundle.value
@@ -1823,9 +1828,10 @@ async function exportDeploymentCheck() {
           <div class="project-bundle-copy"><p class="eyebrow">PROJECT DELIVERY</p><h2>项目部署包</h2><p>将当前配置、签名插件和本地映射作为一个交付单元迁移到目标 Windows 机器；正式导入要求同目录组织签名旁签。</p></div>
           <div class="project-bundle-actions"><button type="button" :disabled="busy || projectStateUnverified || projectDeliveryDraftDirty" @click="exportProjectBundle">导出项目包草稿</button><button class="primary" type="button" :disabled="busy || projectStateUnverified || projectDeliveryDraftDirty" @click="inspectProjectBundle">选择已签项目包并预检</button></div>
           <div v-if="projectBundlePreview" class="project-bundle-preview">
-            <header><div><strong>变更计划已验证，可以导入</strong><small>由客户端 {{ projectBundlePreview.createdByVersion }} 创建 · schema {{ projectBundlePreview.schemaVersion }} · {{ projectBundlePreview.signatureVerified ? `组织签名 ${projectBundlePreview.signatureKeyId}` : '调试态未签名' }}</small></div><button class="primary" type="button" :disabled="busy || projectStateUnverified" @click="importSelectedProjectBundle">确认计划并切换项目</button></header>
+            <header><div><strong>{{ projectBundlePreview.exactComponentSet ? '变更计划已验证，可以导入' : '目标机存在包外能力，暂不能导入' }}</strong><small>由客户端 {{ projectBundlePreview.createdByVersion }} 创建 · schema {{ projectBundlePreview.schemaVersion }} · {{ projectBundlePreview.signatureVerified ? `组织签名 ${projectBundlePreview.signatureKeyId}` : '调试态未签名' }}</small></div><button class="primary" type="button" :disabled="busy || projectStateUnverified || !projectBundlePreview.exactComponentSet" @click="importSelectedProjectBundle">确认计划并切换项目</button></header>
+            <p v-if="!projectBundlePreview.exactComponentSet" class="project-bundle-blocker">项目包必须代表当前单项目工作区的完整能力集合。客户端不会自动删除目标机能力；请到“插件管理”逐项卸载签名插件、到“原生映射”逐项删除映射，或在源机重新生成包含这些能力的项目包，然后重新预检。</p>
             <div class="bundle-summary"><span><strong>{{ projectBundlePreview.businessOrigins }}</strong>业务来源</span><span><strong>{{ projectBundlePreview.signedPlugins }}</strong>签名插件</span><span><strong>{{ projectBundlePreview.localMappings }}</strong>本地映射</span><span><strong>{{ projectBundlePreview.serviceCount }}</strong>原生服务</span><span><strong>{{ projectBundlePreview.preflightedHosts }}</strong>宿主预检</span></div>
-            <div class="project-change-summary"><span :class="{ changed: projectBundlePreview.configPreview.configChanged }">配置{{ projectBundlePreview.configPreview.configChanged ? '更新' : '不变' }}</span><span>新增 {{ projectBundlePreview.installCount }}</span><span>升级 {{ projectBundlePreview.upgradeCount }}</span><span>修复/替换 {{ projectBundlePreview.replaceCount }}</span><span>保留本机 {{ projectBundlePreview.retainedCount }}</span><span class="changed">业务页面：切换后关闭</span></div>
+            <div class="project-change-summary"><span :class="{ changed: projectBundlePreview.configPreview.configChanged }">配置{{ projectBundlePreview.configPreview.configChanged ? '更新' : '不变' }}</span><span>新增 {{ projectBundlePreview.installCount }}</span><span>升级 {{ projectBundlePreview.upgradeCount }}</span><span>修复/替换 {{ projectBundlePreview.replaceCount }}</span><span :class="{ changed: projectBundlePreview.retainedCount > 0 }">包外现有 {{ projectBundlePreview.retainedCount }}</span><span class="changed">业务页面：切换后关闭</span></div>
             <h3>目标项目配置</h3>
             <div class="config-import-target"><span>目标项目</span><strong>{{ projectBundlePreview.configPreview.candidateProjectName }} · {{ projectBundlePreview.configPreview.candidateProjectId }}</strong></div>
             <div class="config-import-target"><span>默认业务入口</span><strong>{{ projectBundlePreview.configPreview.candidateDefaultWebsite || '未配置' }}</strong></div>
@@ -1849,7 +1855,7 @@ async function exportDeploymentCheck() {
             <details v-if="projectBundlePreview.configPreview.candidateEnvironments.length" class="config-import-environments"><summary>查看目标业务环境（{{ projectBundlePreview.configPreview.candidateEnvironments.length }}）</summary><ul><li v-for="environment in projectBundlePreview.configPreview.candidateEnvironments" :key="`${environment.name}:${environment.url}`"><strong>{{ environment.name }}</strong><code>{{ environment.url }}</code></li></ul></details>
             <h3>项目包变更</h3>
             <ul><li v-for="component in projectBundlePreview.components" :key="component.pluginId"><span><strong>{{ component.pluginId }}</strong><small>{{ component.source === 'signed-package' ? `签名插件 ${component.version ?? ''} · Desktop ${component.desktopVersionRequirement ?? '未声明'}${component.action === 'install' ? '' : ` · API 新增 ${component.apiAdditionCount} / 原生复核 ${component.apiReviewChangeCount}`}` : '本地动态映射' }}</small></span><em><b :class="`plan-action ${component.action}`">{{ projectActionLabels[component.action] }}</b>{{ component.serviceCount }} 个服务</em></li></ul>
-            <details v-if="projectBundlePreview.retainedComponents.length" class="retained-components"><summary>不会删除的本机现有能力（{{ projectBundlePreview.retainedCount }}）</summary><ul><li v-for="component in projectBundlePreview.retainedComponents" :key="component.pluginId"><span><strong>{{ component.pluginId }}</strong><small>{{ component.source === 'signed-package' ? `签名插件 ${component.version ?? ''}` : '本地动态映射' }}</small></span><em><b class="plan-action retain">保留</b>{{ component.serviceCount }} 个服务</em></li></ul></details>
+            <details v-if="projectBundlePreview.retainedComponents.length" class="retained-components" open><summary>需要先处理的包外能力（{{ projectBundlePreview.retainedCount }}）</summary><ul><li v-for="component in projectBundlePreview.retainedComponents" :key="component.pluginId"><span><strong>{{ component.pluginId }}</strong><small>{{ component.source === 'signed-package' ? `签名插件 ${component.version ?? ''}` : '本地动态映射' }}</small></span><em><b class="plan-action retain">阻断</b>{{ component.serviceCount }} 个服务</em></li></ul></details>
           </div>
         </section>
         <section v-show="activeSection === 'delivery'" v-if="deploymentCheck" :class="['deployment-check', { ready: deploymentCheck.ready && !controlLoadFailed && !controlRefreshIncomplete && !runtimeStatusStale && !mappingWorkspaceUnverified && !projectDeliveryDraftDirty }]" aria-label="部署自检结果">
