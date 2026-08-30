@@ -977,7 +977,14 @@ pub(crate) fn open_business_at(
         BusinessWindowOptions::default(),
     );
     match result {
-        Ok(_) => Ok(label),
+        Ok(_) => {
+            tracing::info!(
+                event_code = "business-window-created",
+                app_version = %app.package_info().version,
+                "authorized business window created"
+            );
+            Ok(label)
+        }
         Err(error) => {
             state.release_business_window_label(&label);
             Err(error)

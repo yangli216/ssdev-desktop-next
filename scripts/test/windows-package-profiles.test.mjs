@@ -21,6 +21,10 @@ const desktopMainUrl = new URL(
   "../../apps/desktop/src-tauri/src/main.rs",
   import.meta.url,
 );
+const desktopRuntimeUrl = new URL(
+  "../../apps/desktop/src-tauri/src/desktop.rs",
+  import.meta.url,
+);
 const pluginHostMainUrl = new URL(
   "../../crates/webplus-plugin-host/src/main.rs",
   import.meta.url,
@@ -165,6 +169,36 @@ test("Windows package smoke requires a rendered frontend IPC signal", async () =
   assert.match(packageTest, /resolvedByAppVersion/);
   assert.doesNotMatch(packageTest, /Get-StartupEventCount/);
   assert.match(controlHtml, /SSDEV Desktop 正在启动/);
+});
+
+test("Windows candidate smoke proves the configured business window is created", async () => {
+  const [packageTest, workflow, desktopRuntime] = await Promise.all([
+    readFile(packageTestUrl, "utf8"),
+    readFile(workflowUrl, "utf8"),
+    readFile(desktopRuntimeUrl, "utf8"),
+  ]);
+
+  assert.match(packageTest, /\[string\]\$BusinessStartupUrl/);
+  assert.match(packageTest, /function Write-BusinessStartupConfig/);
+  assert.match(packageTest, /"business-window-created"/);
+  assert.match(packageTest, /\[switch\]\$RequireBusinessWindow/);
+  assert.match(
+    packageTest,
+    /Invoke-ApplicationSmoke \$candidateExecutable \$script:CandidateRelease\.appVersion -RequireBusinessWindow:\(\[bool\]\$BusinessStartupUrl\)/,
+  );
+  assert.match(
+    packageTest,
+    /Invoke-ApplicationSmoke \$rollbackExecutable \$script:PreviousRelease\.appVersion\r?\n/,
+  );
+  assert.equal(
+    (workflow.match(/-BusinessStartupUrl "https:\/\/business\.invalid\/"/g) ?? []).length,
+    2,
+  );
+  const eventStart = desktopRuntime.indexOf('event_code = "business-window-created"');
+  assert.ok(eventStart >= 0);
+  const event = desktopRuntime.slice(eventStart, desktopRuntime.indexOf(");", eventStart));
+  assert.match(event, /app_version/);
+  assert.doesNotMatch(event, /url|origin|label/i);
 });
 
 test("Windows upgrade gate reinstalls and launches the exact previous release", async () => {

@@ -19,6 +19,7 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$EvidenceEnvironment,
   [string]$DeploymentCheckRecord,
+  [string]$BusinessStartupUrl,
   [switch]$RequireAuthenticode,
   [switch]$SkipLaunch
 )
@@ -60,6 +61,21 @@ if ($DeploymentCheckRecord) {
     throw "DeploymentCheckRecord must be an existing deep deployment-check JSON file."
   }
   $DeploymentCheckRecord = (Resolve-Path -LiteralPath $DeploymentCheckRecord).Path
+}
+if ($BusinessStartupUrl) {
+  if ($BusinessStartupUrl.Length -gt 4096) {
+    throw "BusinessStartupUrl exceeds the desktop configuration limit."
+  }
+  $businessStartupUri = $null
+  if (
+    -not ([Uri]::TryCreate($BusinessStartupUrl, [UriKind]::Absolute, [ref]$businessStartupUri)) -or
+    $businessStartupUri.Scheme -notin @("http", "https") -or
+    -not $businessStartupUri.Host -or
+    $businessStartupUri.UserInfo -or
+    $businessStartupUri.Fragment
+  ) {
+    throw "BusinessStartupUrl must be an absolute HTTP(S) URL without credentials or a fragment."
+  }
 }
 
 function Read-ExpectedUpdatePublicKey {
@@ -648,9 +664,13 @@ function Write-UpgradeStateSentinels {
   foreach ($directory in @($Paths.ConfigRoot, $Paths.PluginRoot, $Paths.LocalMappingRoot)) {
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
   }
+  $config = [ordered]@{ upgradeSentinel = $Sentinel }
+  if ($BusinessStartupUrl) {
+    $config["website"] = $BusinessStartupUrl
+  }
   [System.IO.File]::WriteAllText(
     $Paths.ConfigPath,
-    ([ordered]@{ upgradeSentinel = $Sentinel } | ConvertTo-Json),
+    ($config | ConvertTo-Json),
     [System.Text.UTF8Encoding]::new($false)
   )
   foreach ($path in @($Paths.PluginStateSentinel, $Paths.LocalMappingStateSentinel)) {
@@ -671,6 +691,9 @@ function Assert-UpgradeStatePreserved {
   if ((Get-OptionalProperty $preserved "upgradeSentinel") -ne $Sentinel) {
     throw "$Stage did not preserve unknown desktop configuration fields."
   }
+  if ($BusinessStartupUrl -and (Get-OptionalProperty $preserved "website") -ne $BusinessStartupUrl) {
+    throw "$Stage did not preserve the configured default business address."
+  }
   foreach ($state in @(
     [pscustomobject]@{ Path = $Paths.PluginStateSentinel; Label = "plugin data" },
     [pscustomobject]@{ Path = $Paths.LocalMappingStateSentinel; Label = "local mapping data" }
@@ -682,6 +705,19 @@ function Assert-UpgradeStatePreserved {
       throw "$Stage did not preserve existing $($state.Label)."
     }
   }
+}
+
+function Write-BusinessStartupConfig {
+  param([Parameter(Mandatory = $true)]$Paths)
+  if (-not $BusinessStartupUrl) {
+    return
+  }
+  New-Item -ItemType Directory -Force -Path $Paths.ConfigRoot | Out-Null
+  [System.IO.File]::WriteAllText(
+    $Paths.ConfigPath,
+    ([ordered]@{ website = $BusinessStartupUrl } | ConvertTo-Json),
+    [System.Text.UTF8Encoding]::new($false)
+  )
 }
 
 function Write-UnresolvedStartupFailureMarker {
@@ -755,7 +791,8 @@ function Remove-OwnedApplicationData {
 function Invoke-ApplicationSmoke {
   param(
     [Parameter(Mandatory = $true)][string]$Executable,
-    [Parameter(Mandatory = $true)][string]$ExpectedVersion
+    [Parameter(Mandatory = $true)][string]$ExpectedVersion,
+    [switch]$RequireBusinessWindow
   )
   if ($SkipLaunch) {
     return
@@ -769,10 +806,12 @@ function Invoke-ApplicationSmoke {
   try {
     $diagnosticLog = $dataPaths.DiagnosticLog
     $frontendEventsBefore = Get-DiagnosticEventCount $diagnosticLog $ExpectedVersion "frontend-ready"
+    $businessWindowEventsBefore = Get-DiagnosticEventCount $diagnosticLog $ExpectedVersion "business-window-created"
     $startupFailureGeneratedAt = Write-UnresolvedStartupFailureMarker $dataPaths
     $application = Start-Process -FilePath $Executable -PassThru
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     $frontendReadyObserved = $false
+    $businessWindowObserved = -not $RequireBusinessWindow
     do {
       Start-Sleep -Milliseconds 250
       $application.Refresh()
@@ -783,10 +822,19 @@ function Invoke-ApplicationSmoke {
         if ((Get-DiagnosticEventCount $diagnosticLog $ExpectedVersion "frontend-ready") -gt $frontendEventsBefore) {
           $frontendReadyObserved = $true
         }
+        if (
+          $RequireBusinessWindow -and
+          (Get-DiagnosticEventCount $diagnosticLog $ExpectedVersion "business-window-created") -gt $businessWindowEventsBefore
+        ) {
+          $businessWindowObserved = $true
+        }
       }
-    } while (-not $frontendReadyObserved -and [DateTime]::UtcNow -lt $deadline)
+    } while ((-not $frontendReadyObserved -or -not $businessWindowObserved) -and [DateTime]::UtcNow -lt $deadline)
     if (-not $frontendReadyObserved) {
       throw "Installed application stayed alive, but the control frontend did not mount and reach native IPC."
+    }
+    if (-not $businessWindowObserved) {
+      throw "Installed candidate did not create the configured default business window."
     }
     Assert-StartupFailureResolved $dataPaths $ExpectedVersion $startupFailureGeneratedAt
   } finally {
@@ -847,11 +895,12 @@ function Test-Installer {
   )
   $dataPaths = Get-ApplicationDataPaths
   Assert-ApplicationDataClean $dataPaths
+  Write-BusinessStartupConfig $dataPaths
   $executable = $null
   try {
     $executable = Install-ApplicationPackage $Installer
     Assert-InstalledLayout $executable $metadataDirectory
-    Invoke-ApplicationSmoke $executable $script:CandidateRelease.appVersion
+    Invoke-ApplicationSmoke $executable $script:CandidateRelease.appVersion -RequireBusinessWindow:([bool]$BusinessStartupUrl)
     Capture-CandidateRuntimeHashes $executable
     Uninstall-ApplicationPackage $executable
     $executable = $null
@@ -893,7 +942,7 @@ function Test-Upgrade {
     $activeInstaller = $CandidateInstaller
     Assert-InstalledLayout $candidateExecutable $metadataDirectory
     Assert-UpgradeStatePreserved $dataPaths $sentinel "NSIS candidate upgrade"
-    Invoke-ApplicationSmoke $candidateExecutable $script:CandidateRelease.appVersion
+    Invoke-ApplicationSmoke $candidateExecutable $script:CandidateRelease.appVersion -RequireBusinessWindow:([bool]$BusinessStartupUrl)
     Assert-UpgradeStatePreserved $dataPaths $sentinel "Candidate startup"
     Capture-CandidateRuntimeHashes $candidateExecutable
 

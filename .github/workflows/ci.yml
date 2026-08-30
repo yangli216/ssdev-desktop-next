@@ -187,6 +187,7 @@ jobs:
           -ExpectedAppUpdatePublicKey $env:SSDEV_CI_UPDATE_PUBLIC_KEY
           -EvidenceOutput (Join-Path $env:RUNNER_TEMP "ssdev-windows-${{ matrix.arch }}-package-evidence.json")
           -EvidenceEnvironment github-windows-${{ matrix.arch }}-package-smoke
+          -BusinessStartupUrl "https://business.invalid/"
           -ExpectedWebViewInstallMode OfflineInstaller
       - name: Upload unsigned offline Windows test packages
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -219,6 +220,7 @@ jobs:
           -ExpectedAppUpdatePublicKey $env:SSDEV_CI_UPDATE_PUBLIC_KEY
           -EvidenceOutput (Join-Path $env:RUNNER_TEMP "ssdev-windows-${{ matrix.arch }}-online-light-evidence.json")
           -EvidenceEnvironment github-windows-${{ matrix.arch }}-online-light-smoke
+          -BusinessStartupUrl "https://business.invalid/"
           -ExpectedWebViewInstallMode DownloadBootstrapper
           -PreviousExpectedWebViewInstallMode OfflineInstaller
       - name: Upload unsigned online-light Windows test package
