@@ -36,7 +36,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ssdev_config::ConfigStore;
 use ssdev_diagnostics::{
-    is_known_startup_failure_code, DiagnosticContext, DiagnosticsState, DiagnosticsStats,
+    is_known_startup_failure_code, probe_webview2_runtime, DiagnosticContext, DiagnosticsState,
+    DiagnosticsStats, OfflineRuntimeProbe, OfflineWebView2Status,
 };
 use ssdev_invocation_ledger::{
     COMPLETED_OPERATION_RETENTION, INDETERMINATE_OPERATION_RETENTION, MAX_DURABLE_OPERATIONS,
@@ -72,6 +73,8 @@ use invocations::{
 use plugin_api_baseline::PluginApiBaselineStore;
 
 const FRONTEND_READY_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(any(windows, test))]
+const APP_DATA_DIRECTORY: &str = "com.bsoft.ssdev.desktop";
 const STARTUP_FAILURE_FILE_NAME: &str = "startup-failure.json";
 const STARTUP_FAILURE_SCHEMA_VERSION: u8 = 2;
 const MAX_STARTUP_FAILURE_BYTES: u64 = 4 * 1024;
@@ -80,27 +83,29 @@ const MAX_STARTUP_FAILURE_BYTES: u64 = 4 * 1024;
 #[repr(u8)]
 enum StartupStage {
     Bootstrap = 0,
-    RuntimePaths = 1,
-    Diagnostics = 2,
-    LocalStorage = 3,
-    TrustPolicy = 4,
-    PluginRuntime = 5,
-    CoreServices = 6,
-    DesktopShell = 7,
-    SetupComplete = 8,
+    RuntimePrerequisites = 1,
+    RuntimePaths = 2,
+    Diagnostics = 3,
+    LocalStorage = 4,
+    TrustPolicy = 5,
+    PluginRuntime = 6,
+    CoreServices = 7,
+    DesktopShell = 8,
+    SetupComplete = 9,
 }
 
 impl StartupStage {
     fn current() -> Self {
         match STARTUP_STAGE.load(Ordering::Acquire) {
-            1 => Self::RuntimePaths,
-            2 => Self::Diagnostics,
-            3 => Self::LocalStorage,
-            4 => Self::TrustPolicy,
-            5 => Self::PluginRuntime,
-            6 => Self::CoreServices,
-            7 => Self::DesktopShell,
-            8 => Self::SetupComplete,
+            1 => Self::RuntimePrerequisites,
+            2 => Self::RuntimePaths,
+            3 => Self::Diagnostics,
+            4 => Self::LocalStorage,
+            5 => Self::TrustPolicy,
+            6 => Self::PluginRuntime,
+            7 => Self::CoreServices,
+            8 => Self::DesktopShell,
+            9 => Self::SetupComplete,
             _ => Self::Bootstrap,
         }
     }
@@ -111,6 +116,12 @@ impl StartupStage {
 
     fn failure(self) -> StartupFailure {
         match self {
+            Self::RuntimePrerequisites => StartupFailure {
+                event_code: "desktop-startup-failed",
+                code: "startup-webview2-check",
+                summary: "无法确认 Microsoft Edge WebView2 Runtime 是否可用。",
+                action: "请使用组织发布的完整安装包修复 SSDEV Desktop 后重试。",
+            },
             Self::RuntimePaths => StartupFailure {
                 event_code: "desktop-startup-failed",
                 code: "startup-runtime-paths",
@@ -5436,6 +5447,13 @@ fn system_declaration<R: tauri::Runtime>(
 pub fn run() {
     StartupStage::Bootstrap.enter();
     install_safe_panic_hook();
+    initialize_early_startup_log_dir();
+    StartupStage::RuntimePrerequisites.enter();
+    if let Some(failure) = webview2_startup_failure(&probe_webview2_runtime()) {
+        report_fatal_startup_failure(failure);
+        return;
+    }
+    StartupStage::Bootstrap.enter();
     let shortcut_plugin = ShortcutBuilder::<tauri::Wry>::new().build();
 
     let app = tauri::Builder::default()
@@ -6102,6 +6120,42 @@ fn allow_unsigned_plugins() -> bool {
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
+fn webview2_startup_failure(runtime: &OfflineRuntimeProbe) -> Option<StartupFailure> {
+    match runtime.webview2_status() {
+        OfflineWebView2Status::Available | OfflineWebView2Status::NotApplicable => None,
+        OfflineWebView2Status::Unavailable => Some(StartupFailure {
+            event_code: "desktop-startup-failed",
+            code: "startup-webview2-runtime",
+            summary: "当前 Windows 用户无法使用 Microsoft Edge WebView2 Runtime。",
+            action: "请修复或重新安装 Microsoft Edge WebView2 Runtime 后重试。",
+        }),
+        OfflineWebView2Status::ProbeUnavailable => Some(StartupFailure {
+            event_code: "desktop-startup-failed",
+            code: "startup-webview2-loader",
+            summary: "SSDEV Desktop 无法检查 WebView2 Runtime。",
+            action: "请使用组织发布的完整安装包修复 SSDEV Desktop，不要单独替换程序文件。",
+        }),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn early_startup_log_dir(local_app_data: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let local_app_data = PathBuf::from(local_app_data?);
+    local_app_data
+        .is_absolute()
+        .then(|| local_app_data.join(APP_DATA_DIRECTORY).join("logs"))
+}
+
+#[cfg(windows)]
+fn initialize_early_startup_log_dir() {
+    if let Some(log_dir) = early_startup_log_dir(std::env::var_os("LOCALAPPDATA")) {
+        let _ = STARTUP_LOG_DIR.set(log_dir);
+    }
+}
+
+#[cfg(not(windows))]
+fn initialize_early_startup_log_dir() {}
+
 fn install_safe_panic_hook() {
     let _previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -6495,32 +6549,33 @@ fn select_runtime_path(
 mod tests {
     use super::{
         classify_local_plugin_install_action, classify_project_component_action,
-        collect_plugin_updates, desktop, ensure_config_signed_plugin_route_coverage,
-        ensure_local_mapping_import_plan_matches, ensure_local_mapping_removal_plan_matches,
-        ensure_local_plugin_install_plan_matches, ensure_plugin_reload_candidate_state_matches,
-        ensure_plugin_reload_plan_matches, ensure_plugin_update_plan_matches,
-        ensure_plugin_version_change_allowed, ensure_project_export_active_manifests_match,
-        ensure_project_export_runtime_matches, ensure_signed_plugin_compatible,
-        ensure_signed_plugin_route_coverage, ensure_signed_plugin_uninstall_plan_matches,
-        ensure_upgrade_allowed, inspect_all_plugins, is_lowercase_sha256,
-        is_plugin_update_available, legacy_config_candidates, local_mapping_directory_state_digest,
-        local_mapping_import_plan_id, local_mapping_import_state_digest,
-        local_mapping_removal_plan_id, local_mappings, local_plugin_install_plan_id,
-        open_project_bundle_for_mode, persist_startup_failure_document,
-        plugin_reload_active_state_digest, plugin_reload_candidate_state_digest,
-        plugin_reload_impact, plugin_reload_plan_id, plugin_update_installed_state_digest,
-        plugin_update_plan_id, preflight_failure_message, prepare_plugin_removal, project_bundle,
-        project_import_plan_id, project_import_state_digest, resolve_startup_failure_document,
-        same_manifest_contracts, select_runtime_path, service_inventory_item,
-        signed_plugin_api_change_summary, signed_plugin_directory_state_digest,
-        signed_plugin_route_policy_coverage, signed_plugin_uninstall_plan_id,
-        startup_failure_message, validate_signed_plugin_activation_routes,
-        validate_signed_plugin_api_changes, BridgePluginHostHealth, CatalogWithdrawalReason,
-        FrontendRuntime, InspectedPlugins, LocalMappingImportPreview,
-        LocalMappingImportServicePreview, LocalMappingRemovalPreview, PluginInstallBlocker,
-        PluginInstallSource, PluginPackagePreview, PluginPackageServicePreview,
-        PluginReloadPreview, ProjectBundlePreview, SignedPluginUninstallPreview,
-        StartupFailureDocument, StartupStage, FRONTEND_READY_TIMEOUT,
+        collect_plugin_updates, desktop, early_startup_log_dir,
+        ensure_config_signed_plugin_route_coverage, ensure_local_mapping_import_plan_matches,
+        ensure_local_mapping_removal_plan_matches, ensure_local_plugin_install_plan_matches,
+        ensure_plugin_reload_candidate_state_matches, ensure_plugin_reload_plan_matches,
+        ensure_plugin_update_plan_matches, ensure_plugin_version_change_allowed,
+        ensure_project_export_active_manifests_match, ensure_project_export_runtime_matches,
+        ensure_signed_plugin_compatible, ensure_signed_plugin_route_coverage,
+        ensure_signed_plugin_uninstall_plan_matches, ensure_upgrade_allowed, inspect_all_plugins,
+        is_lowercase_sha256, is_plugin_update_available, legacy_config_candidates,
+        local_mapping_directory_state_digest, local_mapping_import_plan_id,
+        local_mapping_import_state_digest, local_mapping_removal_plan_id, local_mappings,
+        local_plugin_install_plan_id, open_project_bundle_for_mode,
+        persist_startup_failure_document, plugin_reload_active_state_digest,
+        plugin_reload_candidate_state_digest, plugin_reload_impact, plugin_reload_plan_id,
+        plugin_update_installed_state_digest, plugin_update_plan_id, preflight_failure_message,
+        prepare_plugin_removal, project_bundle, project_import_plan_id,
+        project_import_state_digest, resolve_startup_failure_document, same_manifest_contracts,
+        select_runtime_path, service_inventory_item, signed_plugin_api_change_summary,
+        signed_plugin_directory_state_digest, signed_plugin_route_policy_coverage,
+        signed_plugin_uninstall_plan_id, startup_failure_message,
+        validate_signed_plugin_activation_routes, validate_signed_plugin_api_changes,
+        webview2_startup_failure, BridgePluginHostHealth, CatalogWithdrawalReason, FrontendRuntime,
+        InspectedPlugins, LocalMappingImportPreview, LocalMappingImportServicePreview,
+        LocalMappingRemovalPreview, OfflineRuntimeProbe, PluginInstallBlocker, PluginInstallSource,
+        PluginPackagePreview, PluginPackageServicePreview, PluginReloadPreview,
+        ProjectBundlePreview, SignedPluginUninstallPreview, StartupFailureDocument, StartupStage,
+        APP_DATA_DIRECTORY, FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -6576,6 +6631,7 @@ mod tests {
     fn startup_stages_have_stable_actionable_failure_codes() {
         for (stage, expected_code) in [
             (StartupStage::Bootstrap, "startup-framework"),
+            (StartupStage::RuntimePrerequisites, "startup-webview2-check"),
             (StartupStage::RuntimePaths, "startup-runtime-paths"),
             (StartupStage::Diagnostics, "startup-diagnostics"),
             (StartupStage::LocalStorage, "startup-local-storage"),
@@ -6595,6 +6651,39 @@ mod tests {
             assert!(message.contains("处理建议"));
             assert!(message.contains("日志目录"));
         }
+    }
+
+    #[test]
+    fn webview2_prerequisite_failures_are_specific_and_path_free() {
+        assert!(webview2_startup_failure(&OfflineRuntimeProbe::not_applicable()).is_none());
+        assert!(
+            webview2_startup_failure(&OfflineRuntimeProbe::webview2_available("139.0.3405.125"))
+                .is_none()
+        );
+        let missing =
+            webview2_startup_failure(&OfflineRuntimeProbe::webview2_unavailable()).unwrap();
+        assert_eq!(missing.code, "startup-webview2-runtime");
+        assert!(missing.action.contains("WebView2 Runtime"));
+        let loader =
+            webview2_startup_failure(&OfflineRuntimeProbe::webview2_probe_unavailable()).unwrap();
+        assert_eq!(loader.code, "startup-webview2-loader");
+        for failure in [missing, loader] {
+            assert!(ssdev_diagnostics::is_known_startup_failure_code(
+                failure.code
+            ));
+            assert!(!failure.summary.contains("C:\\"));
+            assert!(!failure.action.contains("WebView2Loader.dll"));
+        }
+    }
+
+    #[test]
+    fn early_startup_log_location_uses_only_an_absolute_user_data_root() {
+        assert!(early_startup_log_dir(Some("relative".into())).is_none());
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            early_startup_log_dir(Some(root.path().as_os_str().to_owned())),
+            Some(root.path().join(APP_DATA_DIRECTORY).join("logs"))
+        );
     }
 
     #[test]

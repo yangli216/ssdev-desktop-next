@@ -25,6 +25,18 @@ const desktopRuntimeUrl = new URL(
   "../../apps/desktop/src-tauri/src/desktop.rs",
   import.meta.url,
 );
+const desktopLibUrl = new URL(
+  "../../apps/desktop/src-tauri/src/lib.rs",
+  import.meta.url,
+);
+const diagnosticsLibUrl = new URL(
+  "../../crates/ssdev-diagnostics/src/lib.rs",
+  import.meta.url,
+);
+const desktopDoctorUrl = new URL(
+  "../../crates/ssdev-desktop-doctor/src/main.rs",
+  import.meta.url,
+);
 const pluginHostMainUrl = new URL(
   "../../crates/webplus-plugin-host/src/main.rs",
   import.meta.url,
@@ -154,6 +166,36 @@ test("Windows release executables and native hosts do not open consoles", async 
   assert.match(desktopMain, /windows_subsystem = "windows"/);
   assert.match(pluginHostMain, /windows_subsystem = "windows"/);
   assert.match(controller, /\.creation_flags\(CREATE_NO_WINDOW\)/);
+});
+
+test("Windows desktop checks the current-user WebView2 runtime before Tauri", async () => {
+  const [desktop, diagnostics, doctor] = await Promise.all([
+    readFile(desktopLibUrl, "utf8"),
+    readFile(diagnosticsLibUrl, "utf8"),
+    readFile(desktopDoctorUrl, "utf8"),
+  ]);
+  const probe = desktop.indexOf("probe_webview2_runtime()");
+  const builder = desktop.indexOf("tauri::Builder::default()");
+
+  assert.ok(probe >= 0);
+  assert.ok(builder > probe);
+  assert.match(desktop, /StartupStage::RuntimePrerequisites\.enter\(\)/);
+  assert.match(desktop, /startup-webview2-runtime/);
+  assert.match(desktop, /startup-webview2-loader/);
+  assert.match(desktop, /initialize_early_startup_log_dir\(\)/);
+  assert.match(diagnostics, /probe_linked_loader\(\)/);
+  assert.match(diagnostics, /webview2_com_sys/);
+  assert.match(doctor, /probe_webview2_runtime_from_adjacent_loader\(\)/);
+  assert.match(diagnostics, /LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR/);
+  assert.match(diagnostics, /LOAD_LIBRARY_SEARCH_SYSTEM32/);
+  assert.match(diagnostics, /GetAvailableCoreWebView2BrowserVersionString/);
+  assert.doesNotMatch(
+    diagnostics.slice(
+      diagnostics.indexOf("mod windows_runtime_probe"),
+      diagnostics.indexOf("pub struct OfflineDiagnosticsSummary"),
+    ),
+    /Registry|HKEY|reqwest|http/i,
+  );
 });
 
 test("Windows package smoke requires a rendered frontend IPC signal", async () => {

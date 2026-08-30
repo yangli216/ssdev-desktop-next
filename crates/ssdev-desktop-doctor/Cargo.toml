@@ -8,13 +8,3 @@ publish = false
 
 [dependencies]
 ssdev-diagnostics.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-# Provides the locked Microsoft loader redistributed beside this tool. The probe
-# resolves its one documented export dynamically so a missing loader stays diagnosable.
-webview2-com-sys = "0.38.2"
-windows = { version = "0.62", features = [
-  "Win32_Foundation",
-  "Win32_System_Com",
-  "Win32_System_LibraryLoader",
-] }
