@@ -14,7 +14,9 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$EvidenceOutput,
   [Parameter(Mandatory = $true)]
-  [string]$EvidenceEnvironment
+  [string]$EvidenceEnvironment,
+  [string]$Workspace,
+  [string]$MatrixRunner
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,7 +42,14 @@ function Resolve-MatrixInput([string]$Value, [string]$Kind, [string]$Code, [stri
   return $resolved
 }
 
-$workspace = Split-Path -Parent $PSScriptRoot
+$sourceWorkspace = if ($Workspace) {
+  Resolve-MatrixInput $Workspace Container "matrix-release-inputs-invalid" "Restore the clean source workspace for the approved candidate revision."
+} else {
+  Split-Path -Parent $PSScriptRoot
+}
+if (-not (Test-Path -LiteralPath (Join-Path $sourceWorkspace "Cargo.toml") -PathType Leaf)) {
+  Stop-Matrix "matrix-release-inputs-invalid" "Supply -Workspace with the clean source workspace for the approved candidate revision."
+}
 $pluginRootPath = Resolve-MatrixInput $PluginRoot Container "matrix-release-inputs-invalid" "Re-materialize the approved release set into a new plugin root."
 $releaseSetSpecPath = Resolve-MatrixInput $ReleaseSetSpec Leaf "matrix-release-inputs-invalid" "Restore the approved release-set specification and repeat release-set-check."
 $trustStorePath = Resolve-MatrixInput $TrustStore Leaf "matrix-trust-store-invalid" "Restore the approved active plugin trust store, then repeat release-set-check."
@@ -63,19 +72,41 @@ if ($EvidenceEnvironment -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') {
   Stop-Matrix "matrix-arguments-invalid" "Use a portable evidence environment identifier of 1 to 128 characters."
 }
 
-Push-Location $workspace
+Push-Location $sourceWorkspace
 try {
-  $matrixRunnerTargetRoot = Join-Path $workspace "target"
-  cargo build --locked --release -p webplus-controller --example plugin_matrix --target x86_64-pc-windows-msvc --target-dir $matrixRunnerTargetRoot
-  if ($LASTEXITCODE -ne 0) {
-    Stop-Matrix "matrix-runner-build-failed" "Restore the locked Rust toolchain and source workspace, then rebuild the formal matrix runner."
+  $matrixRunnerPath = $null
+  if ($MatrixRunner) {
+    $matrixRunnerPath = Resolve-MatrixInput $MatrixRunner Leaf "matrix-runner-build-failed" "Restore and verify the approved Windows x64 delivery toolkit."
+  } else {
+    $adjacentRunner = Join-Path $PSScriptRoot "ssdev-plugin-matrix.exe"
+    if (Test-Path -LiteralPath $adjacentRunner -PathType Leaf) {
+      $manifestVerifier = Join-Path $PSScriptRoot "ssdev-release-manifest.exe"
+      $artifactManifest = Join-Path $PSScriptRoot "artifacts.json"
+      if (
+        -not (Test-Path -LiteralPath $manifestVerifier -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $artifactManifest -PathType Leaf)
+      ) {
+        Stop-Matrix "matrix-runner-build-failed" "Restore the complete approved Windows x64 delivery toolkit and its artifact manifest."
+      }
+      & $manifestVerifier verify $PSScriptRoot "artifacts.json" | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        Stop-Matrix "matrix-runner-build-failed" "Restore and re-verify the approved Windows x64 delivery toolkit before running the matrix."
+      }
+      $matrixRunnerPath = (Resolve-Path -LiteralPath $adjacentRunner).Path
+    } else {
+      $matrixRunnerTargetRoot = Join-Path $sourceWorkspace "target"
+      cargo build --locked --release -p webplus-controller --example plugin_matrix --target x86_64-pc-windows-msvc --target-dir $matrixRunnerTargetRoot
+      if ($LASTEXITCODE -ne 0) {
+        Stop-Matrix "matrix-runner-build-failed" "Restore the locked Rust toolchain and source workspace, then rebuild the formal matrix runner."
+      }
+      $matrixRunnerPath = Join-Path $matrixRunnerTargetRoot "x86_64-pc-windows-msvc\release\examples\plugin_matrix.exe"
+      if (-not (Test-Path -LiteralPath $matrixRunnerPath -PathType Leaf)) {
+        Stop-Matrix "matrix-runner-build-failed" "Restore the locked Rust toolchain and source workspace, then rebuild the formal matrix runner."
+      }
+    }
   }
-  $matrixRunner = Join-Path $matrixRunnerTargetRoot "x86_64-pc-windows-msvc\release\examples\plugin_matrix.exe"
-  if (-not (Test-Path -LiteralPath $matrixRunner -PathType Leaf)) {
-    Stop-Matrix "matrix-runner-build-failed" "Restore the locked Rust toolchain and source workspace, then rebuild the formal matrix runner."
-  }
-  & $matrixRunner `
-    $x86HostPath $x64HostPath $pluginRootPath $releaseSetSpecPath $trustStorePath $matrixPath $workspace $evidenceOutputPath $EvidenceEnvironment
+  & $matrixRunnerPath `
+    $x86HostPath $x64HostPath $pluginRootPath $releaseSetSpecPath $trustStorePath $matrixPath $sourceWorkspace $evidenceOutputPath $EvidenceEnvironment
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
   }

@@ -105,6 +105,20 @@ jobs:
       - name: Run Windows native gate
         shell: powershell
         run: ./scripts/test-windows.ps1
+      - name: Build unsigned Windows x64 delivery toolkit
+        shell: powershell
+        run: >-
+          ./scripts/build-windows-delivery-tools.ps1
+          -OutputDirectory (Join-Path $env:RUNNER_TEMP "ssdev-windows-delivery-tools-x64")
+          -AllowUnsignedTestBuild
+      - name: Upload unsigned Windows x64 delivery toolkit
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ssdev-windows-delivery-tools-x64-unsigned
+          path: ${{ runner.temp }}/ssdev-windows-delivery-tools-x64/**
+          if-no-files-found: error
+          retention-days: 14
 
   windows-packages:
     name: Windows ${{ matrix.arch }} offline and online-light NSIS
