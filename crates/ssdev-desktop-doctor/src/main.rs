@@ -2,7 +2,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use ssdev_diagnostics::{export_offline_diagnostics, inspect_offline_diagnostics};
+use ssdev_diagnostics::{
+    export_offline_diagnostics_with_runtime, inspect_offline_diagnostics_with_runtime,
+    OfflineRuntimeProbe,
+};
 
 const APP_DATA_DIRECTORY: &str = "com.bsoft.ssdev.desktop";
 
@@ -34,9 +37,11 @@ fn run(arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode, 
         Command::Inspect { data_root } | Command::Collect { data_root, .. } => data_root.as_deref(),
     })?;
     let log_dir = data_root.join("logs");
+    let runtime = probe_runtime();
     match command {
         Command::Inspect { .. } => {
-            let summary = inspect_offline_diagnostics(&log_dir).map_err(map_diagnostics_error)?;
+            let summary = inspect_offline_diagnostics_with_runtime(&log_dir, runtime)
+                .map_err(map_diagnostics_error)?;
             println!(
                 "status: {}",
                 if summary.requires_attention() {
@@ -50,6 +55,13 @@ fn run(arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode, 
             println!("errorEvents: {}", summary.error_events);
             println!("warningEvents: {}", summary.warning_events);
             println!("invalidEventLines: {}", summary.invalid_event_lines);
+            println!(
+                "webView2Status: {}",
+                summary.runtime.webview2_status().as_str()
+            );
+            if let Some(version) = summary.runtime.webview2_version() {
+                println!("webView2Version: {version}");
+            }
             if let Some(failure) = &summary.startup_failure {
                 println!("startupFailureCode: {}", failure.error_code);
                 println!(
@@ -90,12 +102,19 @@ fn run(arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode, 
             }
         }
         Command::Collect { destination, .. } => {
-            let export = export_offline_diagnostics(&log_dir, &destination)
+            let export = export_offline_diagnostics_with_runtime(&log_dir, &destination, runtime)
                 .map_err(map_diagnostics_error)?;
             println!("COLLECTED");
             println!("archiveBytes: {}", export.archive_bytes);
             println!("logFiles: {}", export.summary.log_files);
             println!("errorEvents: {}", export.summary.error_events);
+            println!(
+                "webView2Status: {}",
+                export.summary.runtime.webview2_status().as_str()
+            );
+            if let Some(version) = export.summary.runtime.webview2_version() {
+                println!("webView2Version: {version}");
+            }
             println!(
                 "startupFailureIncluded: {}",
                 export.summary.startup_failure.is_some()
@@ -103,6 +122,128 @@ fn run(arguments: impl Iterator<Item = std::ffi::OsString>) -> Result<ExitCode, 
             println!("action: 通过组织批准的支持渠道传输该诊断包。");
             Ok(ExitCode::SUCCESS)
         }
+    }
+}
+
+#[cfg(not(windows))]
+fn probe_runtime() -> OfflineRuntimeProbe {
+    OfflineRuntimeProbe::not_applicable()
+}
+
+#[cfg(windows)]
+fn probe_runtime() -> OfflineRuntimeProbe {
+    windows_probe::probe_webview2()
+}
+
+#[cfg(windows)]
+mod windows_probe {
+    use std::fs;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::PathBuf;
+
+    use ssdev_diagnostics::OfflineRuntimeProbe;
+    use windows::core::{PCSTR, PCWSTR};
+    use windows::Win32::Foundation::{FreeLibrary, HMODULE};
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::System::LibraryLoader::{
+        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+        LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+
+    const LOADER_FILE_NAME: &str = "WebView2Loader.dll";
+    const VERSION_PROCEDURE: &[u8] = b"GetAvailableCoreWebView2BrowserVersionString\0";
+    const HRESULT_FILE_NOT_FOUND: i32 = 0x8007_0002_u32 as i32;
+    const MAX_VERSION_UTF16_UNITS: usize = 64;
+
+    type GetAvailableVersion = unsafe extern "system" fn(*const u16, *mut *mut u16) -> i32;
+
+    struct LoadedModule(HMODULE);
+
+    impl Drop for LoadedModule {
+        fn drop(&mut self) {
+            // The handle was returned by LoadLibraryExW and is owned by this guard.
+            let _ = unsafe { FreeLibrary(self.0) };
+        }
+    }
+
+    struct CoTaskMemWide(*mut u16);
+
+    impl Drop for CoTaskMemWide {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // The WebView2 Loader contract allocates this result with CoTaskMemAlloc.
+                unsafe { CoTaskMemFree(Some(self.0.cast())) };
+            }
+        }
+    }
+
+    pub fn probe_webview2() -> OfflineRuntimeProbe {
+        let Some(loader_path) = adjacent_loader_path() else {
+            return OfflineRuntimeProbe::webview2_probe_unavailable();
+        };
+        let Ok(metadata) = fs::symlink_metadata(&loader_path) else {
+            return OfflineRuntimeProbe::webview2_probe_unavailable();
+        };
+        if !metadata.file_type().is_file() {
+            return OfflineRuntimeProbe::webview2_probe_unavailable();
+        }
+        let loader_path = loader_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let Ok(module) = (unsafe {
+            LoadLibraryExW(
+                PCWSTR::from_raw(loader_path.as_ptr()),
+                None,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        }) else {
+            return OfflineRuntimeProbe::webview2_probe_unavailable();
+        };
+        let module = LoadedModule(module);
+        let Some(procedure) =
+            (unsafe { GetProcAddress(module.0, PCSTR::from_raw(VERSION_PROCEDURE.as_ptr())) })
+        else {
+            return OfflineRuntimeProbe::webview2_probe_unavailable();
+        };
+        // GetProcAddress returned the named WebView2 Loader export with this documented ABI.
+        let get_available_version: GetAvailableVersion = unsafe { std::mem::transmute(procedure) };
+        let mut raw_version = std::ptr::null_mut();
+        let result = unsafe { get_available_version(std::ptr::null(), &mut raw_version) };
+        let raw_version = CoTaskMemWide(raw_version);
+        if result < 0 {
+            return if result == HRESULT_FILE_NOT_FOUND {
+                OfflineRuntimeProbe::webview2_unavailable()
+            } else {
+                OfflineRuntimeProbe::webview2_probe_unavailable()
+            };
+        }
+        let Some(version) = bounded_version_string(raw_version.0) else {
+            return OfflineRuntimeProbe::webview2_probe_unavailable();
+        };
+        OfflineRuntimeProbe::webview2_available(&version)
+    }
+
+    fn adjacent_loader_path() -> Option<PathBuf> {
+        let executable = std::env::current_exe().ok()?;
+        let parent = executable.parent()?;
+        Some(parent.join(LOADER_FILE_NAME))
+    }
+
+    fn bounded_version_string(pointer: *const u16) -> Option<String> {
+        if pointer.is_null() {
+            return None;
+        }
+        for length in 0..=MAX_VERSION_UTF16_UNITS {
+            // The Loader returned a NUL-terminated CoTaskMem string. Reads remain bounded.
+            if unsafe { *pointer.add(length) } == 0 {
+                // The slice is bounded above and remains valid until CoTaskMemWide is dropped.
+                return String::from_utf16(unsafe { std::slice::from_raw_parts(pointer, length) })
+                    .ok();
+            }
+        }
+        None
     }
 }
 
@@ -244,6 +385,15 @@ mod tests {
                 .unwrap_err()
                 .code,
             "desktop-diagnostics-data-root-invalid"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn runtime_probe_is_explicitly_not_applicable_off_windows() {
+        assert_eq!(
+            probe_runtime().webview2_status(),
+            ssdev_diagnostics::OfflineWebView2Status::NotApplicable
         );
     }
 }

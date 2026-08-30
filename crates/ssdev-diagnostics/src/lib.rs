@@ -62,9 +62,90 @@ pub struct OfflineDiagnosticFinding {
     pub count: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OfflineWebView2Status {
+    Available,
+    Unavailable,
+    ProbeUnavailable,
+    NotApplicable,
+}
+
+impl OfflineWebView2Status {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+            Self::ProbeUnavailable => "probe-unavailable",
+            Self::NotApplicable => "not-applicable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfflineRuntimeProbe {
+    web_view2_status: OfflineWebView2Status,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    web_view2_version: Option<String>,
+}
+
+impl OfflineRuntimeProbe {
+    pub const fn not_applicable() -> Self {
+        Self {
+            web_view2_status: OfflineWebView2Status::NotApplicable,
+            web_view2_version: None,
+        }
+    }
+
+    pub fn webview2_available(version: &str) -> Self {
+        let Some(version) = sanitize_webview2_version(version) else {
+            return Self::webview2_probe_unavailable();
+        };
+        Self {
+            web_view2_status: OfflineWebView2Status::Available,
+            web_view2_version: Some(version),
+        }
+    }
+
+    pub const fn webview2_unavailable() -> Self {
+        Self {
+            web_view2_status: OfflineWebView2Status::Unavailable,
+            web_view2_version: None,
+        }
+    }
+
+    pub const fn webview2_probe_unavailable() -> Self {
+        Self {
+            web_view2_status: OfflineWebView2Status::ProbeUnavailable,
+            web_view2_version: None,
+        }
+    }
+
+    pub const fn webview2_status(&self) -> OfflineWebView2Status {
+        self.web_view2_status
+    }
+
+    pub fn webview2_version(&self) -> Option<&str> {
+        self.web_view2_version.as_deref()
+    }
+
+    const fn requires_attention(&self) -> bool {
+        matches!(
+            self.web_view2_status,
+            OfflineWebView2Status::Unavailable | OfflineWebView2Status::ProbeUnavailable
+        )
+    }
+
+    const fn is_diagnostic_data(&self) -> bool {
+        !matches!(self.web_view2_status, OfflineWebView2Status::NotApplicable)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfflineDiagnosticsSummary {
+    pub runtime: OfflineRuntimeProbe,
     pub log_files: usize,
     pub log_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -79,7 +160,8 @@ pub struct OfflineDiagnosticsSummary {
 
 impl OfflineDiagnosticsSummary {
     pub fn requires_attention(&self) -> bool {
-        self.log_bytes == 0
+        self.runtime.requires_attention()
+            || self.log_bytes == 0
             || self.startup_failure_marker_invalid
             || self.error_events > 0
             || self
@@ -89,7 +171,11 @@ impl OfflineDiagnosticsSummary {
     }
 
     pub fn action(&self) -> &'static str {
-        if self.startup_failure_marker_invalid {
+        if self.runtime.web_view2_status == OfflineWebView2Status::Unavailable {
+            "修复或重新安装当前 Windows 用户可用的 Microsoft Edge WebView2 Runtime 后重试客户端。"
+        } else if self.runtime.web_view2_status == OfflineWebView2Status::ProbeUnavailable {
+            "重新获取并复验完整 Windows 项目交付工具包后，在发生故障的用户会话中重试。"
+        } else if self.startup_failure_marker_invalid {
             "保留现场并导出诊断包；启动故障标记无效，不要手工修复或删除。"
         } else if self
             .startup_failure
@@ -345,8 +431,15 @@ impl DiagnosticsState {
 pub fn inspect_offline_diagnostics(
     log_dir: &Path,
 ) -> Result<OfflineDiagnosticsSummary, DiagnosticsError> {
+    inspect_offline_diagnostics_with_runtime(log_dir, OfflineRuntimeProbe::not_applicable())
+}
+
+pub fn inspect_offline_diagnostics_with_runtime(
+    log_dir: &Path,
+    runtime: OfflineRuntimeProbe,
+) -> Result<OfflineDiagnosticsSummary, DiagnosticsError> {
     if !ensure_log_directory_or_missing(log_dir)? {
-        return Ok(build_offline_summary(None, false, &[]));
+        return Ok(build_offline_summary(None, false, &[], runtime));
     }
     let (startup_failure, startup_failure_marker_invalid) = read_startup_failure(log_dir)?;
     let logs = read_offline_logs(log_dir)?;
@@ -354,12 +447,25 @@ pub fn inspect_offline_diagnostics(
         startup_failure,
         startup_failure_marker_invalid,
         &logs,
+        runtime,
     ))
 }
 
 pub fn export_offline_diagnostics(
     log_dir: &Path,
     destination: &Path,
+) -> Result<OfflineDiagnosticsExport, DiagnosticsError> {
+    export_offline_diagnostics_with_runtime(
+        log_dir,
+        destination,
+        OfflineRuntimeProbe::not_applicable(),
+    )
+}
+
+pub fn export_offline_diagnostics_with_runtime(
+    log_dir: &Path,
+    destination: &Path,
+    runtime: OfflineRuntimeProbe,
 ) -> Result<OfflineDiagnosticsExport, DiagnosticsError> {
     validate_export_destination(destination)?;
     let log_directory_present = ensure_log_directory_or_missing(log_dir)?;
@@ -373,10 +479,16 @@ pub fn export_offline_diagnostics(
     } else {
         Vec::new()
     };
-    let summary = build_offline_summary(startup_failure, startup_failure_marker_invalid, &logs);
+    let summary = build_offline_summary(
+        startup_failure,
+        startup_failure_marker_invalid,
+        &logs,
+        runtime,
+    );
     if summary.log_bytes == 0
         && summary.startup_failure.is_none()
         && !summary.startup_failure_marker_invalid
+        && !summary.runtime.is_diagnostic_data()
     {
         return Err(DiagnosticsError::OfflineDataUnavailable);
     }
@@ -479,6 +591,7 @@ fn build_offline_summary(
     startup_failure: Option<OfflineStartupFailure>,
     startup_failure_marker_invalid: bool,
     logs: &[OfflineLog],
+    runtime: OfflineRuntimeProbe,
 ) -> OfflineDiagnosticsSummary {
     let log_bytes = logs
         .iter()
@@ -593,6 +706,7 @@ fn build_offline_summary(
         )
         .collect();
     OfflineDiagnosticsSummary {
+        runtime,
         log_files: logs.len(),
         log_bytes,
         startup_failure,
@@ -613,6 +727,36 @@ fn is_safe_diagnostic_code(code: &str) -> bool {
         && code
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn sanitize_webview2_version(version: &str) -> Option<String> {
+    if version.is_empty() || version.len() > 64 || !version.is_ascii() {
+        return None;
+    }
+    let (numeric, channel) = match version.split_once(' ') {
+        Some((numeric, channel))
+            if !channel.contains(' ')
+                && matches!(
+                    channel.to_ascii_lowercase().as_str(),
+                    "beta" | "dev" | "canary"
+                ) =>
+        {
+            (numeric, Some(channel.to_ascii_lowercase()))
+        }
+        Some(_) => return None,
+        None => (version, None),
+    };
+    if numeric.split('.').count() != 4
+        || !numeric.split('.').all(|component| {
+            !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return None;
+    }
+    Some(match channel {
+        Some(channel) => format!("{numeric} {channel}"),
+        None => numeric.to_owned(),
+    })
 }
 
 fn validate_export_destination(destination: &Path) -> Result<(), DiagnosticsError> {
@@ -1227,6 +1371,77 @@ mod tests {
         assert_eq!(empty.log_files, 1);
         assert_eq!(empty.log_bytes, 0);
         assert!(empty.requires_attention());
+    }
+
+    #[test]
+    fn offline_runtime_probe_accepts_only_bounded_webview2_versions() {
+        let available = OfflineRuntimeProbe::webview2_available("139.0.3405.125");
+        assert_eq!(
+            available.webview2_status(),
+            OfflineWebView2Status::Available
+        );
+        assert_eq!(available.webview2_version(), Some("139.0.3405.125"));
+        assert_eq!(
+            OfflineRuntimeProbe::webview2_available("139.0.3405.125 Dev").webview2_version(),
+            Some("139.0.3405.125 dev")
+        );
+        assert_eq!(
+            OfflineRuntimeProbe::webview2_available("139.0.private/path.125").webview2_status(),
+            OfflineWebView2Status::ProbeUnavailable
+        );
+        assert_eq!(
+            OfflineRuntimeProbe::webview2_available("139.0.3405.125 private").webview2_status(),
+            OfflineWebView2Status::ProbeUnavailable
+        );
+        assert_eq!(
+            OfflineRuntimeProbe::webview2_available(&format!("1.2.3.{}", "4".repeat(65)))
+                .webview2_version(),
+            None
+        );
+    }
+
+    #[test]
+    fn unavailable_webview2_is_actionable_even_after_frontend_recovery() {
+        let root = tempdir().unwrap();
+        let log_dir = root.path().join("logs");
+        fs::create_dir(&log_dir).unwrap();
+        fs::write(
+            log_dir.join(LOG_FILE_NAME),
+            b"{\"level\":\"INFO\",\"event_code\":\"frontend-ready\"}\n",
+        )
+        .unwrap();
+
+        let summary = inspect_offline_diagnostics_with_runtime(
+            &log_dir,
+            OfflineRuntimeProbe::webview2_unavailable(),
+        )
+        .unwrap();
+        assert!(summary.requires_attention());
+        assert!(summary.action().contains("WebView2 Runtime"));
+    }
+
+    #[test]
+    fn runtime_only_offline_export_preserves_a_sanitized_loader_result() {
+        let root = tempdir().unwrap();
+        let destination = root.path().join("runtime-only.zip");
+        let export = export_offline_diagnostics_with_runtime(
+            &root.path().join("missing"),
+            &destination,
+            OfflineRuntimeProbe::webview2_available("139.0.3405.125"),
+        )
+        .unwrap();
+        assert_eq!(export.summary.log_bytes, 0);
+
+        let mut archive = ZipArchive::new(File::open(destination).unwrap()).unwrap();
+        assert_eq!(archive.len(), 1);
+        let mut manifest = String::new();
+        archive
+            .by_name("manifest.json")
+            .unwrap()
+            .read_to_string(&mut manifest)
+            .unwrap();
+        assert!(manifest.contains("\"webView2Status\": \"available\""));
+        assert!(manifest.contains("\"webView2Version\": \"139.0.3405.125\""));
     }
 
     #[test]

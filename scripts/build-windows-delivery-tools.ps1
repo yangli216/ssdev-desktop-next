@@ -108,7 +108,7 @@ try {
     throw "Delivery tool SBOM source outputs must not exist before the build."
   }
 
-  $cargoMetadataText = (& cargo metadata --locked --no-deps --format-version 1 | Out-String)
+  $cargoMetadataText = (& cargo metadata --locked --format-version 1 | Out-String)
   if ($LASTEXITCODE -ne 0) {
     throw "Unable to read locked Cargo workspace metadata."
   }
@@ -118,6 +118,24 @@ try {
     throw "Unable to resolve the delivery toolkit semantic version."
   }
   $toolkitVersion = [string]$versionEntry[0].version
+  $webView2LoaderPackage = @($cargoMetadata.packages | Where-Object { $_.name -eq "webview2-com-sys" })
+  if ($webView2LoaderPackage.Count -ne 1 -or -not ([string]$webView2LoaderPackage[0].source)) {
+    throw "Unable to resolve the locked WebView2 Loader package."
+  }
+  $webView2LoaderSource = Join-Path `
+    (Split-Path -Parent ([string]$webView2LoaderPackage[0].manifest_path)) `
+    "x64/WebView2Loader.dll"
+  if (-not (Test-Path -LiteralPath $webView2LoaderSource -PathType Leaf)) {
+    throw "The locked WebView2 Loader binary is missing."
+  }
+  $webView2LoaderSignature = Get-AuthenticodeSignature -FilePath $webView2LoaderSource
+  if (
+    $webView2LoaderSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+    $webView2LoaderSignature.SignerCertificate.Subject -notmatch "Microsoft Corporation"
+  ) {
+    throw "The locked WebView2 Loader does not have a valid Microsoft Authenticode signature."
+  }
+  $webView2LoaderSourceHash = (Get-FileHash -LiteralPath $webView2LoaderSource -Algorithm SHA256).Hash
 
   Assert-CycloneDxTool
   & rustup target add $Target
@@ -160,6 +178,25 @@ try {
     $matrixRunnerDestination = Join-Path $staging "ssdev-plugin-matrix.exe"
     Copy-Item -LiteralPath $matrixRunnerSource -Destination $matrixRunnerDestination
     $executables += $matrixRunnerDestination
+
+    $webView2LoaderDestination = Join-Path $staging "WebView2Loader.dll"
+    Copy-Item -LiteralPath $webView2LoaderSource -Destination $webView2LoaderDestination
+    $copiedLoaderSignature = Get-AuthenticodeSignature -FilePath $webView2LoaderDestination
+    $copiedLoaderHash = (Get-FileHash -LiteralPath $webView2LoaderDestination -Algorithm SHA256).Hash
+    if (
+      $copiedLoaderHash -ne $webView2LoaderSourceHash -or
+      $copiedLoaderSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+      $copiedLoaderSignature.SignerCertificate.Thumbprint -ne $webView2LoaderSignature.SignerCertificate.Thumbprint
+    ) {
+      throw "The staged WebView2 Loader signature does not match the locked Microsoft source."
+    }
+
+    $doctorProbePath = Join-Path $staging "ssdev-desktop-doctor.exe"
+    $doctorProbeOutput = (& $doctorProbePath inspect --data-root $staging 2>&1 | Out-String)
+    $doctorProbeExitCode = $LASTEXITCODE
+    if ($doctorProbeExitCode -ne 3 -or $doctorProbeOutput -notmatch '(?m)^webView2Status: available\r?$') {
+      throw "The delivery doctor could not discover the current-user WebView2 Runtime through the staged Loader."
+    }
 
     Copy-Item -LiteralPath (Join-Path $workspace "scripts/test-plugin-matrix.ps1") -Destination (Join-Path $staging "run-plugin-matrix.ps1")
     Copy-Item -LiteralPath (Join-Path $workspace "docs/windows-delivery-tools.md") -Destination (Join-Path $staging "README.md")
@@ -237,8 +274,11 @@ try {
       sourceDirty = $false
       target = $Target
       executableCount = $executables.Count
+      runtimeLoaderCount = 1
+      webView2LoaderPackageVersion = [string]($webView2LoaderPackage[0].version)
       sbomCount = $sboms.Count
       authenticodeVerified = $hasSigning
+      webView2LoaderAuthenticodeVerified = $true
     }
     [System.IO.File]::WriteAllText(
       (Join-Path $staging "release.json"),

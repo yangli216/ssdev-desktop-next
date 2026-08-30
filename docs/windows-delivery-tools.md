@@ -4,7 +4,7 @@
 
 工具包包含：
 
-- `ssdev-desktop-doctor.exe`：客户端无法进入控制台时，只读检查当前 Windows 用户的启动标记并离线收集固定脱敏日志；
+- `ssdev-desktop-doctor.exe`：客户端无法进入控制台时，通过同目录受清单保护的 Microsoft Loader 只读检查当前用户实际可发现的 WebView2 Runtime，再检查启动标记并离线收集固定脱敏日志；
 - `ssdev-pilot-readiness.exe`：建立、检查和复验真实试点材料；
 - `ssdev-migration-audit.exe`：从已复验材料执行旧 WebPlus/Electron 迁移审计；
 - `ssdev-plugin-tool.exe`：插件源检查、客户端/fixture、签名准备、封包和发布集合；
@@ -24,7 +24,7 @@
 Get-Content .\release.json
 ```
 
-`artifacts.json` 覆盖 README、包装器、发布元数据、全部可执行文件和 SBOM；任何缺失、增加或字节变化都会失败。`release.json` 记录工具版本、完整源码提交、目标架构、SBOM 数量和 Authenticode 状态。生产工具包的所有 EXE 必须由组织 Windows 发布流程签名并显示 `authenticodeVerified: true`，最终目录归档还必须具有组织发布签名；未签名 JSON 清单本身不是发布信任根。GitHub Actions 中名称带 `unsigned` 的短期制品只用于验证构建链，不能进入生产交付。
+`artifacts.json` 覆盖 README、包装器、发布元数据、全部可执行文件、Microsoft WebView2 Loader 和 SBOM；任何缺失、增加或字节变化都会失败。`release.json` 记录工具版本、完整源码提交、目标架构、SBOM 数量、组织 EXE 签名和 Microsoft Loader 签名状态。生产工具包的所有 EXE 必须由组织 Windows 发布流程签名并显示 `authenticodeVerified: true`，最终目录归档还必须具有组织发布签名；未签名 JSON 清单本身不是发布信任根。GitHub Actions 中名称带 `unsigned` 的短期制品只用于验证构建链，不能进入生产交付。
 
 工具包不含私钥、令牌、业务材料、插件包、黄金矩阵、信任库或 Windows 客户端安装包。组织公开信任库仍应从受保护发布渠道提供，KMS/HSM 私钥不得复制到工具目录。
 
@@ -36,7 +36,9 @@ Get-Content .\release.json
 .\ssdev-desktop-doctor.exe inspect
 ```
 
-`CLEAR` 只表示没有未解决启动标记、最近一次真实控制前端就绪后没有 ERROR 且存在非空可读日志，不代表业务页面、插件或硬件验收通过。`ATTENTION` 返回退出码 `3`。工具按轮转时间顺序扫描有界 JSON 日志；新的非重复 `frontend-ready` 会清除更早启动会话的错误，只聚合其后最多 16 种最新 WARN/ERROR 的稳定 `event_code`、可移植 `error_code` 和次数，并单独报告无效行及被省略摘要项数量。日志 `message`、其他字段、日志目录、URL、配置和插件路径都不进入控制台摘要。
+`CLEAR` 只表示当前用户可被官方 Loader 发现 WebView2 Runtime、没有未解决启动标记、最近一次真实控制前端就绪后没有 ERROR 且存在非空可读日志，不代表业务页面、插件或硬件验收通过。`ATTENTION` 返回退出码 `3`。`webView2Status` 会区分 `available`、Loader 正常调用但未找到运行时的 `unavailable`，以及工具包缺失/损坏或 Loader 调用异常的 `probe-unavailable`；只有发现成功且版本满足有界四段数字格式及可选的固定 `beta`、`dev`、`canary` 通道后缀时才输出 `webView2Version`。这比读取“已安装”注册项更接近 Desktop 实际启动条件，但不会创建 WebView、访问网络或读取浏览器资料。
+
+工具按轮转时间顺序扫描有界 JSON 日志；新的非重复 `frontend-ready` 会清除更早启动会话的错误，只聚合其后最多 16 种最新 WARN/ERROR 的稳定 `event_code`、可移植 `error_code` 和次数，并单独报告无效行及被省略摘要项数量。日志 `message`、其他字段、日志目录、URL、配置和插件路径都不进入控制台摘要。
 
 需要交给实施人员时，指定一个尚不存在的绝对 ZIP 路径：
 
@@ -44,7 +46,7 @@ Get-Content .\release.json
 .\ssdev-desktop-doctor.exe collect D:\support\ssdev-startup-20260830.zip
 ```
 
-工具只读取当前用户应用数据目录下固定的 `logs/ssdev.log*` 和最多 4 KiB 的启动标记；启动标记会解析为已知错误码和是否恢复，原始摘要不会直接复制进归档。离线 manifest 的聚合结果和 ZIP 内日志来自同一次有界读取，避免收集期间轮转后摘要对应另一批字节。日志目录、日志文件或启动标记是链接/异常类型时失败关闭，输出不覆盖已有文件，也不读取配置、插件、账本或业务缓存。只有在受控复制其他用户的完整应用数据后，才可用 `--data-root <绝对目录>` 指向该副本。诊断包仍按内部运维数据通过组织批准渠道传输。
+工具只读取当前用户应用数据目录下固定的 `logs/ssdev.log*` 和最多 4 KiB 的启动标记；启动标记会解析为已知错误码和是否恢复，原始摘要不会直接复制进归档。离线 manifest 同时保存上述脱敏 Runtime 结果，聚合结果和 ZIP 内日志来自同一次有界读取，避免收集期间轮转后摘要对应另一批字节。即使 Desktop 尚未来得及写日志，Windows 下也可以导出只含 Runtime 结果的 manifest。日志目录、日志文件或启动标记是链接/异常类型时失败关闭，输出不覆盖已有文件，也不读取配置、插件、账本、业务缓存或浏览器资料。只有在受控复制其他用户的完整应用数据后，才可用 `--data-root <绝对目录>` 指向该副本；Runtime 结果仍反映运行 Doctor 的当前机器和用户。诊断包仍按内部运维数据通过组织批准渠道传输。
 
 ## 推荐执行顺序
 
@@ -78,7 +80,7 @@ Get-Content .\release.json
 
 ## 构建与签名
 
-构建机必须使用锁定依赖，并预装精确版本 `cargo-cyclonedx 0.5.9`。脚本会拒绝构建前残留的目标 SBOM，生成后清理临时源文件，并在封装前再次确认提交未变化且工作区仍为 clean。CI 使用下面的测试模式生成独立无签名制品：
+构建机必须使用锁定依赖，并预装精确版本 `cargo-cyclonedx 0.5.9`。脚本从锁定的 `webview2-com-sys` 依赖复制 x64 `WebView2Loader.dll`，复验其 Microsoft Authenticode、复制前后 SHA-256 和证书身份，并实际要求 Doctor 在构建用户会话发现 WebView2 Runtime；这项工具包复制动作不改变普通 Desktop 安装包的内容或体积。脚本会拒绝构建前残留的目标 SBOM，生成后清理临时源文件，并在封装前再次确认提交未变化且工作区仍为 clean。CI 使用下面的测试模式生成独立无签名制品：
 
 ```powershell
 .\scripts\build-windows-delivery-tools.ps1 `
@@ -95,4 +97,4 @@ Get-Content .\release.json
   -ExpectedSignerSubject 'CN=Example Organization'
 ```
 
-所有模式都要求 clean commit，输出目录必须位于源码工作区之外且尚不存在，脚本不会覆盖已有工具包。生产发布系统必须对最终目录归档建立组织级发布签名；逐文件清单和 Authenticode 不能替代归档签名或发布渠道访问控制。
+所有模式都要求 clean commit，输出目录必须位于源码工作区之外且尚不存在，脚本不会覆盖已有工具包。`artifacts.json` 覆盖 8 个可执行文件、Microsoft Loader、README、包装器、发布元数据和 8 份 SBOM。生产发布系统必须对最终目录归档建立组织级发布签名；逐文件清单和 Authenticode 不能替代归档签名或发布渠道访问控制。
