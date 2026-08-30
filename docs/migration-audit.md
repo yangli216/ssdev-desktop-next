@@ -23,7 +23,7 @@ cargo run --locked -p ssdev-migration-audit -- `
 
 相同 finding code 必须保持同一严重级别和处理动作；code 使用有界 ASCII 标识，处理动作有长度和控制字符限制。若工具内部新增了不一致或无法安全展示的 finding，正式输出会在写文件前失败，而不会退化为只有数量、需要实施人员打开 JSON 猜测。
 
-schema 4 完整报告绑定 `materialSetSha256` 和 `migrationAuditBindingsSha256`。schema 3 迁移证据继续绑定完整报告和来源策略 SHA-256，并新增同一个试点材料集合摘要。后续 schema 7 Go/No-Go 策略必须精确指定该材料集合，Windows 包 schema 7 继续绑定同一来源策略、上一生产 bundle、独立回退、应用状态保留结果和近期深度部署记录，因此不能用一套材料完成移交、再用另一套较小样本、其他低版本或未打开真实业务页的结果通过审计与升级。
+schema 4 完整报告绑定 `materialSetSha256` 和 `migrationAuditBindingsSha256`。schema 3 迁移证据继续绑定完整报告和来源策略 SHA-256，并新增同一个试点材料集合摘要。后续 schema 8 Go/No-Go 策略必须精确指定该材料集合和 GO 执行窗口，Windows 包 schema 7 继续绑定同一来源策略、上一生产 bundle、独立回退、应用状态保留结果和近期深度部署记录，因此不能用一套材料完成移交、再用另一套较小样本、其他低版本或未打开真实业务页的结果通过审计与升级。
 
 ## 探索性盘点
 

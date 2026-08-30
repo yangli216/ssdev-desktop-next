@@ -1,6 +1,7 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "maximumEvidenceAgeSeconds": 604800,
+  "maximumCutoverDecisionAgeSeconds": 86400,
   "migrationCoverageMinimums": {
     "configFiles": 1,
     "pluginDirectories": 1,

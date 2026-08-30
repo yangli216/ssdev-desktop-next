@@ -15,8 +15,10 @@ use webplus_plugin_trust::{
 pub const EVIDENCE_SCHEMA_VERSION: u8 = 3;
 pub const PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION: u8 = 2;
 pub const WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION: u8 = 7;
-pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 7;
+pub const CUTOVER_POLICY_SCHEMA_VERSION: u8 = 8;
 pub const CUTOVER_DECISION_SCHEMA_VERSION: u8 = 3;
+const MAX_CUTOVER_DECISION_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
+const CUTOVER_CLOCK_SKEW_SECONDS: u64 = 5 * 60;
 const MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
 const MAX_DEPLOYMENT_CHECK_BYTES: u64 = 128 * 1024;
 const MAX_DEPLOYMENT_CHECK_AGE_SECONDS: u64 = 60 * 60;
@@ -214,6 +216,7 @@ pub struct ProductionCutoverPolicy {
     pub expected_app_version: String,
     pub expected_previous_app_version: String,
     pub maximum_evidence_age_seconds: u64,
+    pub maximum_cutover_decision_age_seconds: u64,
     pub expected_windows_artifact_manifest_sha256: String,
     pub expected_previous_windows_artifact_manifest_sha256: String,
     pub expected_previous_release_metadata_sha256: String,
@@ -256,6 +259,13 @@ impl ProductionCutoverPolicy {
         if !(60..=31 * 24 * 60 * 60).contains(&self.maximum_evidence_age_seconds) {
             return Err(EvidenceError::Invalid(
                 "maximumEvidenceAgeSeconds must be between 60 seconds and 31 days".into(),
+            ));
+        }
+        if !(60..=MAX_CUTOVER_DECISION_AGE_SECONDS)
+            .contains(&self.maximum_cutover_decision_age_seconds)
+        {
+            return Err(EvidenceError::Invalid(
+                "maximumCutoverDecisionAgeSeconds must be between 60 seconds and 7 days".into(),
             ));
         }
         if [
@@ -331,6 +341,53 @@ pub struct CutoverDecision {
     pub windows_package_attestation_sha256: String,
     pub eligible: bool,
     pub blocker_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CurrentCutoverBlocker {
+    pub code: &'static str,
+    pub remediation: &'static str,
+}
+
+pub fn current_cutover_authorization_blocker(
+    policy: &ProductionCutoverPolicy,
+    decision: &CutoverDecision,
+    now_unix_seconds: u64,
+) -> Result<Option<CurrentCutoverBlocker>, EvidenceError> {
+    policy.validate()?;
+    decision.validate()?;
+    if !decision.eligible
+        || decision.target_source_revision != policy.target_source_revision
+        || decision.app_version != policy.expected_app_version
+        || decision.approval_signer_key_id != policy.cutover_decision_signer_key_id
+    {
+        return Err(EvidenceError::Invalid(
+            "current cutover check requires the eligible decision reproduced from its signed policy"
+                .into(),
+        ));
+    }
+    if now_unix_seconds == 0 {
+        return Err(EvidenceError::Invalid(
+            "current cutover check time must be positive".into(),
+        ));
+    }
+    if decision.evaluated_at_unix_seconds
+        > now_unix_seconds.saturating_add(CUTOVER_CLOCK_SKEW_SECONDS)
+    {
+        return Ok(Some(CurrentCutoverBlocker {
+            code: "cutover-decision-future-timestamp",
+            remediation: "correct the deployment verifier system clock and obtain a newly evaluated signed GO before rollout",
+        }));
+    }
+    if now_unix_seconds.saturating_sub(decision.evaluated_at_unix_seconds)
+        > policy.maximum_cutover_decision_age_seconds
+    {
+        return Ok(Some(CurrentCutoverBlocker {
+            code: "cutover-decision-stale",
+            remediation: "rerun the current evidence decision and approval flow to obtain a signed GO inside the approved rollout window",
+        }));
+    }
+    Ok(None)
 }
 
 impl CutoverDecision {
@@ -1900,6 +1957,7 @@ mod tests {
             expected_app_version: "1.2.3".into(),
             expected_previous_app_version: "1.2.2".into(),
             maximum_evidence_age_seconds: 3600,
+            maximum_cutover_decision_age_seconds: 86_400,
             expected_windows_artifact_manifest_sha256: "8".repeat(64),
             expected_previous_windows_artifact_manifest_sha256: "d".repeat(64),
             expected_previous_release_metadata_sha256: "9".repeat(64),
@@ -2081,6 +2139,40 @@ mod tests {
         assert!(decision.blocker_codes.is_empty());
         assert_eq!(decision.policy_attestation_sha256, "0".repeat(64));
         assert_eq!(decision.approval_trust_store_sha256, "2".repeat(64));
+        assert_eq!(
+            current_cutover_authorization_blocker(
+                &policy,
+                &decision,
+                decision.evaluated_at_unix_seconds + policy.maximum_cutover_decision_age_seconds,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            current_cutover_authorization_blocker(
+                &policy,
+                &decision,
+                decision.evaluated_at_unix_seconds
+                    + policy.maximum_cutover_decision_age_seconds
+                    + 1,
+            )
+            .unwrap()
+            .unwrap()
+            .code,
+            "cutover-decision-stale"
+        );
+        let mut future_decision = decision.clone();
+        future_decision.evaluated_at_unix_seconds = 1_301;
+        assert_eq!(
+            current_cutover_authorization_blocker(&policy, &future_decision, 1_000)
+                .unwrap()
+                .unwrap()
+                .code,
+            "cutover-decision-future-timestamp"
+        );
+        let mut invalid_window = policy.clone();
+        invalid_window.maximum_cutover_decision_age_seconds = MAX_CUTOVER_DECISION_AGE_SECONDS + 1;
+        assert!(invalid_window.validate().is_err());
         reproduce_production_cutover_decision(
             ProductionCutoverInputs {
                 policy: &policy,
