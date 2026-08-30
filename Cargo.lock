@@ -4401,6 +4401,8 @@ dependencies = [
 name = "ssdev-cutover-evidence"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
  "semver",
  "serde",
  "serde_json",

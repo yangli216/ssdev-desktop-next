@@ -1141,6 +1141,35 @@ pub fn verify_production_cutover_policy_attestation(
     Ok(policy)
 }
 
+pub fn verify_production_cutover_decision_attestation(
+    decision_path: &Path,
+    envelope_path: &Path,
+    trust_store_path: &Path,
+) -> Result<CutoverDecision, EvidenceError> {
+    let document = read_bounded_bytes(decision_path, MAX_EVIDENCE_BYTES)?;
+    let decision = CutoverDecision::from_bytes_for_signing(&document)?;
+    let envelope: DetachedSignatureDocument =
+        serde_json::from_slice(&read_bounded_bytes(envelope_path, MAX_EVIDENCE_BYTES)?)?;
+    envelope.validate()?;
+    if envelope.key_id != decision.approval_signer_key_id {
+        return Err(EvidenceError::Invalid(
+            "cutover decision signer does not match the approved release duty".into(),
+        ));
+    }
+    if sha256_file(trust_store_path)? != decision.approval_trust_store_sha256 {
+        return Err(EvidenceError::Invalid(
+            "cutover decision approval trust store does not match the signed decision".into(),
+        ));
+    }
+    TrustStore::load(trust_store_path)?.verify_detached_for_issuance(
+        TrustPurpose::CutoverDecision,
+        &envelope.key_id,
+        &cutover_decision_signing_payload(&document),
+        &envelope.signature,
+    )?;
+    Ok(decision)
+}
+
 pub fn load_production_cutover_policy(
     path: &Path,
 ) -> Result<ProductionCutoverPolicy, EvidenceError> {
@@ -1477,6 +1506,19 @@ pub fn evaluate_production_cutover(
     Ok(decision)
 }
 
+pub fn reproduce_production_cutover_decision(
+    inputs: ProductionCutoverInputs<'_>,
+    expected: &CutoverDecision,
+) -> Result<(), EvidenceError> {
+    let reproduced = evaluate_production_cutover(inputs, expected.evaluated_at_unix_seconds)?;
+    if &reproduced != expected {
+        return Err(EvidenceError::Invalid(
+            "signed cutover decision does not reproduce from the supplied archive inputs".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn write_cutover_decision(
     path: &Path,
     decision: &CutoverDecision,
@@ -1709,6 +1751,8 @@ fn hex_digest(value: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use ed25519_dalek::{Signer, SigningKey};
 
     fn valid() -> PluginMatrixEvidence {
         PluginMatrixEvidence {
@@ -2037,6 +2081,48 @@ mod tests {
         assert!(decision.blocker_codes.is_empty());
         assert_eq!(decision.policy_attestation_sha256, "0".repeat(64));
         assert_eq!(decision.approval_trust_store_sha256, "2".repeat(64));
+        reproduce_production_cutover_decision(
+            ProductionCutoverInputs {
+                policy: &policy,
+                policy_sha256: "1".repeat(64),
+                policy_attestation_sha256: "0".repeat(64),
+                evidence_trust_store_sha256: "8".repeat(64),
+                approval_trust_store_sha256: "2".repeat(64),
+                plugin: &plugin,
+                plugin_sha256: "2".repeat(64),
+                plugin_attestation_sha256: "5".repeat(64),
+                migration: &migration,
+                migration_sha256: "3".repeat(64),
+                migration_attestation_sha256: "6".repeat(64),
+                windows: &windows,
+                windows_sha256: "4".repeat(64),
+                windows_attestation_sha256: "7".repeat(64),
+            },
+            &decision,
+        )
+        .unwrap();
+        let mut changed_decision = decision.clone();
+        changed_decision.windows_package_evidence_sha256 = "e".repeat(64);
+        assert!(reproduce_production_cutover_decision(
+            ProductionCutoverInputs {
+                policy: &policy,
+                policy_sha256: "1".repeat(64),
+                policy_attestation_sha256: "0".repeat(64),
+                evidence_trust_store_sha256: "8".repeat(64),
+                approval_trust_store_sha256: "2".repeat(64),
+                plugin: &plugin,
+                plugin_sha256: "2".repeat(64),
+                plugin_attestation_sha256: "5".repeat(64),
+                migration: &migration,
+                migration_sha256: "3".repeat(64),
+                migration_attestation_sha256: "6".repeat(64),
+                windows: &windows,
+                windows_sha256: "4".repeat(64),
+                windows_attestation_sha256: "7".repeat(64),
+            },
+            &changed_decision,
+        )
+        .is_err());
         let mut legacy_decision = decision.clone();
         legacy_decision.schema_version = 2;
         assert!(legacy_decision.validate().is_err());
@@ -2278,6 +2364,78 @@ mod tests {
             CutoverDecision::from_bytes_for_signing(&serde_json::to_vec(&decision).unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn signed_go_verification_binds_the_approval_key_trust_store_and_document() {
+        let root = tempfile::tempdir().unwrap();
+        let trust_path = root.path().join("approval-trust.json");
+        let decision_path = root.path().join("cutover-decision.json");
+        let envelope_path = root.path().join("cutover-decision.sig.json");
+        let signing_key = SigningKey::from_bytes(&[71_u8; 32]);
+        fs::write(
+            &trust_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 2,
+                "keys": [{
+                    "keyId": "cutover-approval",
+                    "algorithm": "ed25519",
+                    "publicKey": BASE64.encode(signing_key.verifying_key().to_bytes()),
+                    "purposes": ["cutover-decision"],
+                    "status": "active"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let decision = CutoverDecision {
+            schema_version: CUTOVER_DECISION_SCHEMA_VERSION,
+            target_source_revision: "d".repeat(40),
+            app_version: "1.2.3".into(),
+            approval_signer_key_id: "cutover-approval".into(),
+            evaluated_at_unix_seconds: 1_000,
+            policy_sha256: "0".repeat(64),
+            policy_attestation_sha256: "1".repeat(64),
+            evidence_trust_store_sha256: "2".repeat(64),
+            approval_trust_store_sha256: sha256_file(&trust_path).unwrap(),
+            plugin_matrix_evidence_sha256: "4".repeat(64),
+            migration_audit_evidence_sha256: "5".repeat(64),
+            windows_package_evidence_sha256: "6".repeat(64),
+            plugin_matrix_attestation_sha256: "7".repeat(64),
+            migration_audit_attestation_sha256: "8".repeat(64),
+            windows_package_attestation_sha256: "9".repeat(64),
+            eligible: true,
+            blocker_codes: Vec::new(),
+        };
+        write_cutover_decision(&decision_path, &decision).unwrap();
+        let document = fs::read(&decision_path).unwrap();
+        let signature = BASE64.encode(
+            signing_key
+                .sign(&cutover_decision_signing_payload(&document))
+                .to_bytes(),
+        );
+        let envelope = DetachedSignatureDocument::new("cutover-approval", &signature).unwrap();
+        fs::write(&envelope_path, envelope.to_pretty_json().unwrap()).unwrap();
+
+        assert_eq!(
+            verify_production_cutover_decision_attestation(
+                &decision_path,
+                &envelope_path,
+                &trust_path,
+            )
+            .unwrap(),
+            decision
+        );
+
+        let mut changed: serde_json::Value = serde_json::from_slice(&document).unwrap();
+        changed["appVersion"] = serde_json::json!("1.2.4");
+        fs::write(&decision_path, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+        assert!(verify_production_cutover_decision_attestation(
+            &decision_path,
+            &envelope_path,
+            &trust_path,
+        )
+        .is_err());
     }
 
     #[test]

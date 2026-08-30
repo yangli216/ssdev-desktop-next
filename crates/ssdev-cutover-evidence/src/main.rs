@@ -12,7 +12,8 @@ use ssdev_cutover_evidence::{
     evaluate_production_cutover, evaluate_production_cutover_readiness,
     load_delivery_ready_deployment_check, load_migration_audit_evidence,
     load_plugin_matrix_evidence, load_windows_package_evidence, prepare_new_output,
-    production_cutover_blocker_remediation, sha256_file, verify_evidence_attestation,
+    production_cutover_blocker_remediation, reproduce_production_cutover_decision, sha256_file,
+    verify_evidence_attestation, verify_production_cutover_decision_attestation,
     verify_production_cutover_policy_attestation, write_cutover_decision,
     write_production_cutover_policy, write_windows_package_evidence, EvidenceAttestationKind,
     EvidenceType, MigrationCoverageMinimums, ProductionCutoverInputs, ProductionCutoverPolicy,
@@ -53,6 +54,22 @@ struct UnsignedCutoverHashes {
     plugin: String,
     migration: String,
     windows: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SignedCutoverArchiveHashes {
+    decision: String,
+    decision_attestation: String,
+    policy: String,
+    policy_attestation: String,
+    approval_trust_store: String,
+    evidence_trust_store: String,
+    plugin: String,
+    plugin_attestation: String,
+    migration: String,
+    migration_attestation: String,
+    windows: String,
+    windows_attestation: String,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -252,6 +269,7 @@ fn run() -> Result<bool, Box<dyn Error>> {
         }
         "precheck" => run_precheck(&arguments),
         "decide" => run_decision(&arguments),
+        "verify-go" => run_verify_go(&arguments),
         _ => Err(usage().into()),
     }
 }
@@ -686,6 +704,150 @@ fn run_decision(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> {
     Ok(decision.eligible)
 }
 
+fn run_verify_go(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> {
+    if arguments.len() != 13 {
+        return Err(usage().into());
+    }
+    let decision_path = path_argument(arguments.get(1), "production cutover decision")?;
+    let decision_attestation_path =
+        path_argument(arguments.get(2), "production cutover decision attestation")?;
+    let policy_path = path_argument(arguments.get(3), "production cutover policy")?;
+    let policy_attestation_path =
+        path_argument(arguments.get(4), "production cutover policy attestation")?;
+    let approval_trust_store_path = path_argument(arguments.get(5), "approval trust store")?;
+    let evidence_trust_store_path = path_argument(arguments.get(6), "evidence trust store")?;
+    let plugin_path = path_argument(arguments.get(7), "plugin matrix evidence")?;
+    let plugin_attestation_path = path_argument(arguments.get(8), "plugin matrix attestation")?;
+    let migration_path = path_argument(arguments.get(9), "migration audit evidence")?;
+    let migration_attestation_path =
+        path_argument(arguments.get(10), "migration audit attestation")?;
+    let windows_path = path_argument(arguments.get(11), "Windows package evidence")?;
+    let windows_attestation_path = path_argument(arguments.get(12), "Windows package attestation")?;
+
+    let hashes_before = capture_signed_cutover_archive_hashes(
+        &decision_path,
+        &decision_attestation_path,
+        &policy_path,
+        &policy_attestation_path,
+        &approval_trust_store_path,
+        &evidence_trust_store_path,
+        &plugin_path,
+        &plugin_attestation_path,
+        &migration_path,
+        &migration_attestation_path,
+        &windows_path,
+        &windows_attestation_path,
+    )?;
+    let decision = verify_production_cutover_decision_attestation(
+        &decision_path,
+        &decision_attestation_path,
+        &approval_trust_store_path,
+    )?;
+    let policy = verify_production_cutover_policy_attestation(
+        &policy_path,
+        &policy_attestation_path,
+        &approval_trust_store_path,
+    )?;
+    verify_evidence_attestation(
+        EvidenceAttestationKind::PluginMatrix,
+        &plugin_path,
+        &plugin_attestation_path,
+        &evidence_trust_store_path,
+        &policy.plugin_matrix_signer_key_id,
+    )?;
+    verify_evidence_attestation(
+        EvidenceAttestationKind::MigrationAudit,
+        &migration_path,
+        &migration_attestation_path,
+        &evidence_trust_store_path,
+        &policy.migration_audit_signer_key_id,
+    )?;
+    verify_evidence_attestation(
+        EvidenceAttestationKind::WindowsPackage,
+        &windows_path,
+        &windows_attestation_path,
+        &evidence_trust_store_path,
+        &policy.windows_package_signer_key_id,
+    )?;
+    let plugin = load_plugin_matrix_evidence(&plugin_path)?;
+    let migration = load_migration_audit_evidence(&migration_path)?;
+    let windows = load_windows_package_evidence(&windows_path)?;
+    let hashes_after = capture_signed_cutover_archive_hashes(
+        &decision_path,
+        &decision_attestation_path,
+        &policy_path,
+        &policy_attestation_path,
+        &approval_trust_store_path,
+        &evidence_trust_store_path,
+        &plugin_path,
+        &plugin_attestation_path,
+        &migration_path,
+        &migration_attestation_path,
+        &windows_path,
+        &windows_attestation_path,
+    )?;
+    if hashes_before != hashes_after {
+        return Err(invalid_input(
+            "signed cutover archive changed during verification",
+        ));
+    }
+    reproduce_production_cutover_decision(
+        ProductionCutoverInputs {
+            policy: &policy,
+            policy_sha256: hashes_after.policy,
+            policy_attestation_sha256: hashes_after.policy_attestation,
+            evidence_trust_store_sha256: hashes_after.evidence_trust_store,
+            approval_trust_store_sha256: hashes_after.approval_trust_store,
+            plugin: &plugin,
+            plugin_sha256: hashes_after.plugin,
+            plugin_attestation_sha256: hashes_after.plugin_attestation,
+            migration: &migration,
+            migration_sha256: hashes_after.migration,
+            migration_attestation_sha256: hashes_after.migration_attestation,
+            windows: &windows,
+            windows_sha256: hashes_after.windows,
+            windows_attestation_sha256: hashes_after.windows_attestation,
+        },
+        &decision,
+    )?;
+    println!(
+        "VERIFIED-GO: signed decision and complete cutover archive reproduce the approved production decision for {} at source {}",
+        decision.app_version, decision.target_source_revision
+    );
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_signed_cutover_archive_hashes(
+    decision: &Path,
+    decision_attestation: &Path,
+    policy: &Path,
+    policy_attestation: &Path,
+    approval_trust_store: &Path,
+    evidence_trust_store: &Path,
+    plugin: &Path,
+    plugin_attestation: &Path,
+    migration: &Path,
+    migration_attestation: &Path,
+    windows: &Path,
+    windows_attestation: &Path,
+) -> Result<SignedCutoverArchiveHashes, Box<dyn Error>> {
+    Ok(SignedCutoverArchiveHashes {
+        decision: sha256_file(decision)?,
+        decision_attestation: sha256_file(decision_attestation)?,
+        policy: sha256_file(policy)?,
+        policy_attestation: sha256_file(policy_attestation)?,
+        approval_trust_store: sha256_file(approval_trust_store)?,
+        evidence_trust_store: sha256_file(evidence_trust_store)?,
+        plugin: sha256_file(plugin)?,
+        plugin_attestation: sha256_file(plugin_attestation)?,
+        migration: sha256_file(migration)?,
+        migration_attestation: sha256_file(migration_attestation)?,
+        windows: sha256_file(windows)?,
+        windows_attestation: sha256_file(windows_attestation)?,
+    })
+}
+
 fn render_cutover_blockers(
     heading: &str,
     blocker_codes: &[String],
@@ -966,7 +1128,7 @@ fn invalid_input(message: &str) -> Box<dyn Error> {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ssdev-cutover-evidence prepare-policy <workspace> <pilot-materials-root> <pilot-manifest.json> <pilot-report.json> <candidate-bundle-root> <evidence-trust.json> <policy-approval-inputs.json> <policy-output.json>\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> <deployment-check.json|none> <application-state-preservation-verified> [previous-release.json]\n  ssdev-cutover-evidence precheck <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <migration-evidence.json> <windows-evidence.json>\n  ssdev-cutover-evidence decide <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>"
+    "usage:\n  ssdev-cutover-evidence prepare-policy <workspace> <pilot-materials-root> <pilot-manifest.json> <pilot-report.json> <candidate-bundle-root> <evidence-trust.json> <policy-approval-inputs.json> <policy-output.json>\n  ssdev-cutover-evidence windows-package <workspace> <release.json> <artifacts.json> <output> <environment> <Nsis> <launch-verified> <authenticode-verified> <installed-plugin-trust-store-sha256> <installed-origin-policy-sha256> <x86-host-sha256> <x64-host-sha256> <deployment-check.json|none> <application-state-preservation-verified> [previous-release.json]\n  ssdev-cutover-evidence precheck <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <migration-evidence.json> <windows-evidence.json>\n  ssdev-cutover-evidence decide <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json> <decision-output.json>\n  ssdev-cutover-evidence verify-go <cutover-decision.json> <cutover-decision.sig.json> <production-policy.json> <production-policy.sig.json> <approval-trust.json> <evidence-trust.json> <plugin-evidence.json> <plugin-evidence.sig.json> <migration-evidence.json> <migration-evidence.sig.json> <windows-evidence.json> <windows-evidence.sig.json>"
 }
 
 #[cfg(test)]
@@ -1096,10 +1258,13 @@ mod tests {
         let help = usage();
         let precheck = help.find("ssdev-cutover-evidence precheck").unwrap();
         let decide = help.find("ssdev-cutover-evidence decide").unwrap();
+        let verify = help.find("ssdev-cutover-evidence verify-go").unwrap();
 
         assert!(precheck < decide);
+        assert!(decide < verify);
         assert!(help.contains("<plugin-evidence.json> <migration-evidence.json>"));
         assert!(!help[precheck..decide].contains("plugin-evidence.sig.json"));
+        assert!(help[verify..].contains("<cutover-decision.sig.json>"));
     }
 
     #[test]
@@ -1148,5 +1313,32 @@ mod tests {
         )
         .is_err());
         assert!(render_cutover_blockers("cutover: BLOCKED", &[], "rerun").is_err());
+    }
+
+    #[test]
+    fn signed_archive_hashes_bind_all_twelve_inputs_without_writing_output() {
+        let root = tempdir().unwrap();
+        let paths = (0..12)
+            .map(|index| {
+                let path = root.path().join(format!("archive-{index}.json"));
+                fs::write(&path, format!("archive-{index}")).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let before = capture_signed_cutover_archive_hashes(
+            &paths[0], &paths[1], &paths[2], &paths[3], &paths[4], &paths[5], &paths[6], &paths[7],
+            &paths[8], &paths[9], &paths[10], &paths[11],
+        )
+        .unwrap();
+
+        fs::write(&paths[1], "changed-envelope").unwrap();
+        let after = capture_signed_cutover_archive_hashes(
+            &paths[0], &paths[1], &paths[2], &paths[3], &paths[4], &paths[5], &paths[6], &paths[7],
+            &paths[8], &paths[9], &paths[10], &paths[11],
+        )
+        .unwrap();
+
+        assert_ne!(before, after);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 12);
     }
 }

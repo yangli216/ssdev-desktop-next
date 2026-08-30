@@ -17,3 +17,7 @@ ssdev-release-manifest.workspace = true
 tempfile = "3"
 thiserror.workspace = true
 webplus-plugin-trust.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true

@@ -141,6 +141,26 @@ cargo run --locked -p ssdev-release-signing -- prepare `
   --request D:\cutover-output\cutover-decision.request.json
 ```
 
-审批密钥必须为 `active`，显式声明独立的 `cutover-decision` 用途，并精确匹配策略写入决策的 `approvalSignerKeyId`；`prepare`、`finalize` 和 `verify` 还会把传入发布信任库的原始字节 SHA-256 与 schema 3 决策中的 `approvalTrustStoreSha256` 比较。即使替代库包含同名 active keyId，也不能签发或复验这份 GO。插件、目录、来源策略、进程策略或 QA 证据密钥不能越权签发。KMS/HSM 返回签名后，使用 [统一发布文档签名](release-signing.md) 的 `finalize` 生成 detached 封套，再用 `verify --kind cutover-decision` 独立复验。签名域为 `SSDEV-CUTOVER-DECISION\0` 加决策原始字节 SHA-256，任何空白或字段变化都会使签名失效。
+审批密钥必须为 `active`，显式声明独立的 `cutover-decision` 用途，并精确匹配策略写入决策的 `approvalSignerKeyId`；`prepare`、`finalize` 和 `verify` 还会把传入发布信任库的原始字节 SHA-256 与 schema 3 决策中的 `approvalTrustStoreSha256` 比较。即使替代库包含同名 active keyId，也不能签发或复验这份 GO。插件、目录、来源策略、进程策略或 QA 证据密钥不能越权签发。KMS/HSM 返回签名后，使用 [统一发布文档签名](release-signing.md) 的 `finalize` 生成 detached 封套；签名站可以先用 `verify --kind cutover-decision` 单独复验。签名域为 `SSDEV-CUTOVER-DECISION\0` 加决策原始字节 SHA-256，任何空白或字段变化都会使签名失效。
 
-归档时必须一起保存策略及其签名封套、发布和证据信任库、三份证据及其封套、迁移完整报告、决策、签名请求、审批系统审计 ID 和最终签名封套。验证方应按决策中的策略、策略封套、两份信任库、三份证据和三个证据封套 SHA-256 找回全部原始输入，不能只保留签名后的摘要页。
+归档接收方应对完整输入执行一次只读复验，而不是手工逐个比较摘要：
+
+```powershell
+cargo run --locked -p ssdev-cutover-evidence -- verify-go `
+  D:\cutover-output\cutover-decision.json `
+  D:\cutover-output\cutover-decision.sig.json `
+  D:\cutover-inputs\production-policy.json `
+  D:\cutover-output\production-policy.sig.json `
+  D:\cutover-inputs\release-trust.json `
+  D:\cutover-inputs\evidence-trust.json `
+  D:\cutover-inputs\plugin-matrix-evidence.json `
+  D:\cutover-inputs\plugin-matrix-evidence.sig.json `
+  D:\cutover-inputs\migration-evidence.json `
+  D:\cutover-inputs\migration-evidence.sig.json `
+  D:\cutover-inputs\windows-package-evidence.json `
+  D:\cutover-inputs\windows-package-evidence.sig.json
+```
+
+`verify-go` 只接受可签发的 `eligible: true` schema 3 决策。它先验证最终审批封套、策略封套和三个 QA 封套的用途、keyId、公钥及信任库原始身份，再加载三份证据；十二个输入全部在验证前后复算 SHA-256。最后使用决策记录的 `evaluatedAtUnixSeconds` 重跑同一个生产判定器，要求策略、封套、两份信任库、证据、证据封套、版本、阻断集合和所有摘要逐字段重现原决策。这里使用获批决策时点是为了验证“当时签发的 GO 是否真实可重现”，不会把日后正常归档复验误判为证据过期；它不重新授权一次新的生产切换。任一替换、缺失、漂移或重放差异返回 `1`，完整通过输出 `VERIFIED-GO` 并返回 `0`，不写新文件。
+
+归档时必须一起保存策略及其签名封套、发布和证据信任库、三份证据及其封套、迁移完整报告、决策、签名请求、审批系统审计 ID 和最终签名封套。验证方必须保留并传入决策绑定的全部原始字节，不能只保留签名后的摘要页。
