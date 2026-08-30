@@ -168,7 +168,11 @@ async function smokeTestPackagedConsumer(archivePath) {
       '--no-fund',
       '--package-lock=false',
       archivePath,
-    ], { cwd: consumer, role: 'offline SDK consumer install' })
+    ], {
+      cwd: consumer,
+      env: { ...process.env, npm_config_cache: join(consumer, '.npm-cache') },
+      role: 'offline SDK consumer install',
+    })
 
     const runtimeSmokePath = join(consumer, 'runtime-smoke.mjs')
     await writeFile(runtimeSmokePath, `import {
@@ -179,6 +183,7 @@ async function smokeTestPackagedConsumer(archivePath) {
   isPluginOperationId,
   parsePluginOperationId,
   parseTrackedInvocationStatus,
+  settleTrackedInvocation,
 } from '@bsoft/ssdev-web-bridge'
 
 if (CURRENT_BRIDGE_PROTOCOL_VERSION !== 1) throw new Error('unexpected bridge protocol version')
@@ -213,6 +218,23 @@ if (nondurableDisposition.kind !== 'completed'
     || nondurableDisposition.automaticReplay !== 'forbidden') {
   throw new Error('packaged tracked status classifier lost the nondurable completion risk')
 }
+const nondurableSettlement = await settleTrackedInvocation(Promise.resolve(nondurableStatus))
+if (nondurableSettlement.kind !== 'status'
+    || nondurableSettlement.disposition.kind !== 'completed'
+    || nondurableSettlement.disposition.durability !== 'not-confirmed') {
+  throw new Error('packaged tracked settlement lost the nondurable completion risk')
+}
+const rejectedSettlement = await settleTrackedInvocation(Promise.reject({
+  schemaVersion: 1,
+  kind: 'trackedInvocationError',
+  phase: 'invoke',
+  code: 'operation-ledger-io',
+}))
+if (rejectedSettlement.kind !== 'failure'
+    || rejectedSettlement.disposition.kind !== 'desktop-rejection'
+    || rejectedSettlement.disposition.automaticReplay !== 'forbidden') {
+  throw new Error('packaged tracked settlement classified a rejection unsafely')
+}
 const invoker = createPluginFixtureInvoker([{
   serviceId: 'consumer-smoke',
   method: 'health',
@@ -240,8 +262,10 @@ if (response.ResCode !== 0 || response.ResData?.ready !== true) {
   type TrackedInvocationDisposition,
   type TrackedInvocationFailureDisposition,
   type TrackedInvocationStatus,
+  type TrackedInvocationSettlement,
   parsePluginOperationId,
   parseTrackedInvocationStatus,
+  settleTrackedInvocation,
 } from '@bsoft/ssdev-web-bridge'
 
 type Health = { ready: boolean }
@@ -267,6 +291,9 @@ const trackedFailure: TrackedInvocationFailureDisposition = classifyTrackedInvoc
   phase: 'invoke',
   code: 'tracked-invocation-capacity',
 })
+const trackedSettlement: Promise<TrackedInvocationSettlement<Health>> = settleTrackedInvocation<Health>(
+  Promise.resolve(trackedStatus),
+)
 const consume = async (): Promise<InvokeResponse<Health>> =>
   invoker.invokePlugin<Health>('consumer-smoke', 'health')
 if (trackedDisposition.kind === 'completed') {
@@ -274,6 +301,7 @@ if (trackedDisposition.kind === 'completed') {
 }
 trackedFailure.automaticReplay satisfies 'forbidden'
 void bridgeOperationId
+void trackedSettlement
 void consume()
 `, { encoding: 'utf8', flag: 'wx' })
     await writeFile(join(consumer, 'tsconfig.json'), `${JSON.stringify({

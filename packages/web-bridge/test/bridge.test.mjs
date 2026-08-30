@@ -40,6 +40,7 @@ import {
   parseTrackedInvocationStatus,
   requireDesktopBridge,
   requireTrackedPluginInvocations,
+  settleTrackedInvocation,
   supportsTrackedPluginInvocations,
   wasPluginInvocationGuaranteedNotExecuted,
 } from '../dist/index.js'
@@ -359,6 +360,74 @@ test('classifies only the versioned tracked command error without replaying fail
       next: 'treat-as-possibly-executed',
       automaticReplay: 'forbidden',
     })
+  }
+})
+
+test('settles a direct tracked promise without exposing errors or replay authority', async () => {
+  const nondurable = {
+    state: 'completed',
+    response: { ResCode: 0, ResData: { ReturnValue: 0 } },
+    durable: false,
+  }
+  const completed = await settleTrackedInvocation(Promise.resolve(nondurable))
+  assert.deepEqual(completed, {
+    kind: 'status',
+    status: nondurable,
+    disposition: {
+      kind: 'completed',
+      execution: 'completed',
+      durability: 'not-confirmed',
+      next: 'handle-response-and-record-recovery-risk',
+      automaticReplay: 'forbidden',
+    },
+  })
+  assert.equal(Object.isFrozen(completed), true)
+  assert.equal(Object.isFrozen(completed.disposition), true)
+
+  const commandError = {
+    schemaVersion: 1,
+    kind: 'trackedInvocationError',
+    phase: 'invoke',
+    code: 'operation-ledger-io',
+  }
+  const rejected = await settleTrackedInvocation(Promise.reject(commandError))
+  assert.deepEqual(rejected, {
+    kind: 'failure',
+    disposition: {
+      kind: 'desktop-rejection',
+      phase: 'invoke',
+      code: 'operation-ledger-io',
+      execution: 'not-confirmed',
+      next: 'query-same-operation-or-reconcile',
+      automaticReplay: 'forbidden',
+    },
+  })
+  assert.equal(Object.isFrozen(rejected), true)
+
+  const malformed = {
+    state: 'completed',
+    durable: true,
+    detail: 'secret-path',
+  }
+  const unknownCases = [
+    settleTrackedInvocation(Promise.resolve(malformed)),
+    settleTrackedInvocation(Promise.reject(new Error('secret-error'))),
+    settleTrackedInvocation(Promise.reject('legacy localized secret')),
+  ]
+  for (const settlement of await Promise.all(unknownCases)) {
+    assert.deepEqual(settlement, {
+      kind: 'failure',
+      disposition: {
+        kind: 'unknown-error',
+        phase: null,
+        code: null,
+        execution: 'unknown',
+        next: 'treat-as-possibly-executed',
+        automaticReplay: 'forbidden',
+      },
+    })
+    assert.equal(JSON.stringify(settlement).includes('secret'), false)
+    assert.equal(Object.hasOwn(settlement, 'error'), false)
   }
 })
 

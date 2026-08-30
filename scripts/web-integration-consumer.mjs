@@ -292,7 +292,11 @@ async function verifyConsumers(options) {
       '--no-fund',
       '--package-lock=false',
       sdkArchiveSnapshot,
-    ], { cwd: consumer, role: 'offline Web integration SDK install' })
+    ], {
+      cwd: consumer,
+      env: { ...process.env, npm_config_cache: join(consumer, '.npm-cache') },
+      role: 'offline Web integration SDK install',
+    })
     const kitFiles = kits.map((kit, index) => {
       const prefix = `kit-${String(index).padStart(2, '0')}`
       return Object.freeze({
@@ -335,10 +339,10 @@ async function verifyConsumers(options) {
   }`).join(',\n')
     const runtimePath = join(consumer, 'runtime-smoke.mjs')
     await writeFile(runtimePath, `import {
-  InvalidTrackedInvocationStatusError,
   UnexpectedPluginInvocationError,
   createPluginFixtureInvoker,
   parsePluginOperationId,
+  settleTrackedInvocation,
 } from '@bsoft/ssdev-web-bridge'
 
 ${runtimeImports}
@@ -467,12 +471,25 @@ for (const integration of integrations) {
             || JSON.stringify(outcome.response) !== JSON.stringify(expected.response)) {
           throw new Error('generated tracked API returned an unexpected fixture response')
         }
+        const settled = await settleTrackedInvocation(
+          invokeTracked(operationId, fixture.parameters ?? {}),
+        )
+        if (settled.kind !== 'status'
+            || settled.status.state !== 'completed'
+            || settled.disposition.kind !== 'completed'
+            || settled.disposition.durability !== 'confirmed') {
+          throw new Error('generated tracked API could not be safely settled')
+        }
         returnMalformedTrackedStatus = true
         try {
-          await invokeTracked(operationId, fixture.parameters ?? {})
-          throw new Error('generated tracked API accepted a malformed Desktop status')
-        } catch (error) {
-          if (!(error instanceof InvalidTrackedInvocationStatusError)) throw error
+          const malformedSettlement = await settleTrackedInvocation(
+            invokeTracked(operationId, fixture.parameters ?? {}),
+          )
+          if (malformedSettlement.kind !== 'failure'
+              || malformedSettlement.disposition.kind !== 'unknown-error'
+              || malformedSettlement.disposition.automaticReplay !== 'forbidden') {
+            throw new Error('generated tracked API settled a malformed Desktop status unsafely')
+          }
         } finally {
           returnMalformedTrackedStatus = false
         }

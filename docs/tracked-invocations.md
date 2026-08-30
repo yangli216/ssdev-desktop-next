@@ -6,9 +6,9 @@
 import {
   connectDesktop,
   createPluginOperationId,
-  parseTrackedInvocationStatus,
   parsePluginOperationId,
   requireTrackedPluginInvocations,
+  settleTrackedInvocation,
 } from '@bsoft/ssdev-web-bridge'
 
 const connection = await connectDesktop()
@@ -17,15 +17,17 @@ const bridge = requireTrackedPluginInvocations(
   connection.system,
 )
 const operationId = createPluginOperationId()
-const outcome = parseTrackedInvocationStatus(await bridge.invokePluginTracked(
-  operationId,
-  'printer',
-  'print',
-  { documentId: '业务侧引用' },
-))
+const settlement = await settleTrackedInvocation(
+  bridge.invokePluginTracked(
+    operationId,
+    'printer',
+    'print',
+    { documentId: '业务侧引用' },
+  ),
+)
 
-if (outcome.state === 'completed') {
-  console.log(outcome.response)
+if (settlement.kind === 'status' && settlement.status.state === 'completed') {
+  console.log(settlement.status.response)
 }
 ```
 
@@ -43,19 +45,17 @@ if (outcome.state === 'completed') {
 | `completedWithoutResult` | 已知操作完成或同 ID 已使用，但响应因重启、过期、过大或缓存淘汰不可恢复 | 通过业务/设备状态对账，不能重放 |
 | `unknown` | 当前保留窗口内没有该操作的证据 | 不代表设备未执行；只能由业务规则决定是否创建新的逻辑操作 |
 
-业务项目不需要重复手写这张状态表。`parseTrackedInvocationStatus(value)` 会先严格校验状态对应的精确字段；`completed` 必须带有合法 JSON `response` 和布尔 `durable`，其他状态只能包含 `state`。损坏、额外字段或未知未来格式以不复制原值的固定错误失败。清单生成的 tracked API 已自动执行该校验，直接使用底层桥时需要显式解析。`classifyTrackedInvocationStatus(status)` 随后返回稳定的 `execution` 与 `next`：`pending` 只查询同一 operation ID；可靠落盘的 `completed` 处理原响应，`durable=false` 则处理响应并记录恢复风险；`indeterminate` 和 `completedWithoutResult` 都要求先对账；`unknown` 进入项目自己的恢复策略。所有结果都固定返回 `automaticReplay: 'forbidden'`。这些纯函数不保存 ID、不发起查询、不轮询，也不会依据 `ResCode` 替业务创建另一笔逻辑操作。
+业务项目不需要重复手写这张状态表。`settleTrackedInvocation(directPromise)` 是默认入口：成功时返回类型化 `status` 和稳定 `disposition`，拒绝或损坏状态时只返回脱敏失败 disposition，不复制原异常。内部的 `parseTrackedInvocationStatus(value)` 会严格校验状态对应的精确字段；`completed` 必须带有合法 JSON `response` 和布尔 `durable`，其他状态只能包含 `state`。`classifyTrackedInvocationStatus(status)` 把 `pending` 导向查询同一 operation ID；可靠落盘的 `completed` 导向处理原响应，`durable=false` 则处理响应并记录恢复风险；`indeterminate` 和 `completedWithoutResult` 都要求先对账；`unknown` 进入项目自己的恢复策略。解析器和两个分类器仍可单独使用，但统一结算可避免项目漏写其中一支。所有结果都固定返回 `automaticReplay: 'forbidden'`。这些纯函数不保存 ID、不发起查询、不轮询，也不会依据 `ResCode` 替业务创建另一笔逻辑操作。传入结算器的应是生成 API 或底层桥的直接 Promise，不要先在 `.then()` 中执行订单写入等业务处理，以免把业务自身异常误归为调用失败。
 
 ## 命令拒绝
 
-tracked 调用或状态查询的 Promise 拒绝不代表设备未执行。Desktop 以 schema 1 的 `trackedInvocationError` 对象返回固定 `phase` 和脱敏 `code`，phase 只允许 `authorization`、`runtime`、`availability`、`invoke`、`status`；对象没有消息、路径、来源、路由、operation ID 或底层错误字段。SDK 的 `classifyTrackedInvocationFailure(error)` 会严格检查版本、固定字段集、phase 和有界 code。合法对象得到 `query-same-operation-or-reconcile`，旧客户端字符串、普通 `Error`、额外字段或损坏对象统一得到 `treat-as-possibly-executed`；两者的 `automaticReplay` 都是 `forbidden`。业务可以显示稳定 code 对应的项目提示，但不得解析本地化文案、复制未知错误或据此生成新 ID。
+tracked 调用或状态查询的 Promise 拒绝不代表设备未执行。Desktop 以 schema 1 的 `trackedInvocationError` 对象返回固定 `phase` 和脱敏 `code`，phase 只允许 `authorization`、`runtime`、`availability`、`invoke`、`status`；对象没有消息、路径、来源、路由、operation ID 或底层错误字段。统一结算器会调用 `classifyTrackedInvocationFailure(error)` 严格检查版本、固定字段集、phase 和有界 code：合法对象得到 `query-same-operation-or-reconcile`，旧客户端字符串、普通 `Error`、额外字段或损坏状态统一得到 `treat-as-possibly-executed`；两者的 `automaticReplay` 都是 `forbidden`，结算结果不带原异常。业务可以显示稳定 code 对应的项目提示，但不得解析本地化文案或据此生成新 ID。
 
 页面刷新后可以使用相同来源、路由和操作 ID 查询：
 
 ```ts
-const status = await bridge.getPluginInvocation(
-  operationId,
-  'printer',
-  'print',
+const statusSettlement = await settleTrackedInvocation(
+  bridge.getPluginInvocation(operationId, 'printer', 'print'),
 )
 ```
 

@@ -31,27 +31,17 @@ const reader = new ReaderPluginClient(invoker)
 
 fixture 按 service、method 和完整 JSON 参数精确匹配，对象键顺序不影响结果；省略参数与 `{}` 等价。重复定义、非 JSON 数据、超出 JavaScript 安全范围的整数和未声明调用都会显式失败，错误不复制参数内容；精确 64 位整数应按插件契约使用字符串。每次调用返回独立副本，测试代码修改结果不会污染下一用例。该工具不会写入 `window.ssdevDesktop`，也不模拟持久操作 ID、超时、重试、DLL/COM 行为或硬件副作用，只用于业务前端单元测试，不能替代 Windows 插件黄金矩阵。
 
-同一生成文件还会导出独立的 `create<Plugin>TrackedApi()`。打印、写卡等非幂等方法应把 `requireTrackedPluginInvocations(connection.bridge, connection.system)` 的结果传入该工厂，从而继续使用生成的参数/响应类型和固定路由，而不是在业务代码里重新手抄 `serviceId`、`method`。tracked API 为每个公开方法生成调用和状态查询两个方法，并要求 `PluginOperationId`：新动作使用 `createPluginOperationId()`，页面刷新后从业务存储恢复的未知字符串先经过 `parsePluginOperationId()`，损坏、非 v4、非 RFC 4122 variant、非小写规范格式都会在调用前固定失败。生成入口还会自动用 `parseTrackedInvocationStatus()` 校验 Desktop 返回的精确状态、响应和 `durable` 字段；直接使用底层桥时应显式调用该解析器。底层桥继续接受 `string` 以兼容旧代码。操作 ID 仍必须由业务流程在调用前持久保存。SDK 的 `classifyTrackedInvocationStatus()` 会把五种结果收敛成稳定后续动作；`completed` 且 `durable=false` 会明确要求在处理响应时记录恢复风险，避免重启后把同一记录变成无法解释的 `indeterminate`。每种结果都固定 `automaticReplay: 'forbidden'`；SDK 不提供存储、自动轮询、重试或替业务完成设备对账。
+同一生成文件还会导出独立的 `create<Plugin>TrackedApi()`。打印、写卡等非幂等方法应把 `requireTrackedPluginInvocations(connection.bridge, connection.system)` 的结果传入该工厂，从而继续使用生成的参数/响应类型和固定路由，而不是在业务代码里重新手抄 `serviceId`、`method`。tracked API 为每个公开方法生成调用和状态查询两个方法，并要求 `PluginOperationId`：新动作使用 `createPluginOperationId()`，页面刷新后从业务存储恢复的未知字符串先经过 `parsePluginOperationId()`，损坏、非 v4、非 RFC 4122 variant、非小写规范格式都会在调用前固定失败。生成入口还会自动用 `parseTrackedInvocationStatus()` 校验 Desktop 返回的精确状态、响应和 `durable` 字段；底层桥继续接受 `string` 以兼容旧代码。操作 ID 仍必须由业务流程在调用前持久保存。
 
-tracked 方法的 Promise 拒绝不是第六种执行状态，也不能据此判断设备没有动作。Desktop 只返回 `{ schemaVersion, kind, phase, code }` 四个字段，不再把本地化文案、授权细节、路径或底层错误交给业务页；phase 区分授权、运行边界、协调器可用性、调用和状态查询。将捕获值交给 `classifyTrackedInvocationFailure()`：结构有效时保留稳定 phase/code，未知或旧客户端错误则不复制原值；两类结果都固定禁止自动重放，并要求使用原 operation ID 查询或按项目规则对账。
-
-```ts
-try {
-  await trackedReader.readCard(operationId, { timeout: 30 })
-} catch (error: unknown) {
-  const failure = classifyTrackedInvocationFailure(error)
-  // failure.automaticReplay 始终为 'forbidden'
-}
-```
+业务默认把生成 API 的直接 Promise 交给 `settleTrackedInvocation()`。它在同一入口完成严格状态解析、成功分类和拒绝分类，返回冻结的 `{ kind: 'status', status, disposition }` 或 `{ kind: 'failure', disposition }`；结构化 Desktop 拒绝保留脱敏 phase/code，旧客户端异常、损坏状态或未知错误统一按“可能已执行”处理，原异常不会进入结果。`completed` 且 `durable=false` 会明确要求在处理响应时记录恢复风险。全部 disposition 都固定 `automaticReplay: 'forbidden'`。底层 `parseTrackedInvocationStatus()`、`classifyTrackedInvocationStatus()` 和 `classifyTrackedInvocationFailure()` 仍可单独组合，但不应让每个项目重复实现 try/catch 安全分支。SDK 不提供存储、自动轮询、重试或替业务完成设备对账。
 
 ```ts
 import {
-  classifyTrackedInvocationFailure,
-  classifyTrackedInvocationStatus,
   connectDesktop,
   createPluginOperationId,
   parsePluginOperationId,
   requireTrackedPluginInvocations,
+  settleTrackedInvocation,
 } from '@bsoft/ssdev-web-bridge'
 import { createReaderPluginTrackedApi } from './generated/reader-plugin-client'
 
@@ -60,15 +50,20 @@ const trackedReader = createReaderPluginTrackedApi(
   requireTrackedPluginInvocations(connection.bridge, connection.system),
 )
 const operationId = createPluginOperationId()
-const outcome = await trackedReader.readCard(operationId, { timeout: 30 })
-const disposition = classifyTrackedInvocationStatus(outcome)
-// pending 时继续使用 operationId 调用 getReadCardStatus(operationId)；
-// 不确定结果必须对账，任何状态都不能自动生成新 ID 重放。
+const settlement = await settleTrackedInvocation(
+  trackedReader.readCard(operationId, { timeout: 30 }),
+)
+if (settlement.kind === 'status') {
+  // settlement.status 保留类型化响应，settlement.disposition 给出安全后续动作。
+  // pending 继续查询同一 operationId；不确定结果先对账。
+} else {
+  // failure 不包含原异常；继续查询同一 operationId 或按项目规则对账。
+}
 
 // 页面刷新后，从业务流程自己的持久记录恢复并重新校验：
 async function restoreReadCardOperation(restoredValue: unknown) {
   const restoredOperationId = parsePluginOperationId(restoredValue)
-  return trackedReader.getReadCardStatus(restoredOperationId)
+  return settleTrackedInvocation(trackedReader.getReadCardStatus(restoredOperationId))
 }
 ```
 

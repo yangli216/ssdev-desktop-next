@@ -320,6 +320,18 @@ export type TrackedInvocationDisposition = Readonly<
       execution: 'possibly-executed'
       next: 'reconcile-before-new-operation'
       automaticReplay: 'forbidden'
+  }
+>
+
+export type TrackedInvocationSettlement<T = JsonValue> = Readonly<
+  | {
+      kind: 'status'
+      status: TrackedInvocationStatus<T>
+      disposition: TrackedInvocationDisposition
+    }
+  | {
+      kind: 'failure'
+      disposition: TrackedInvocationFailureDisposition
     }
 >
 
@@ -407,6 +419,12 @@ export function classifyTrackedInvocationStatus(
   value: unknown,
 ): TrackedInvocationDisposition {
   const status = parseTrackedInvocationStatus(value)
+  return classifyValidTrackedInvocationStatus(status)
+}
+
+function classifyValidTrackedInvocationStatus<T>(
+  status: TrackedInvocationStatus<T>,
+): TrackedInvocationDisposition {
   if (status.state === 'completed') {
     return status.durable
       ? COMPLETED_TRACKED_INVOCATION_DISPOSITIONS.durable
@@ -460,6 +478,30 @@ export function classifyTrackedInvocationFailure(
     next: 'query-same-operation-or-reconcile',
     automaticReplay: 'forbidden',
   })
+}
+
+/**
+ * Converts one direct tracked bridge/generated-API promise into a safe result.
+ * Do not pass a promise chain that already performs business side effects: an
+ * exception from that chain would be conservatively classified as an unknown
+ * invocation failure.
+ */
+export async function settleTrackedInvocation<T = JsonValue>(
+  invocation: PromiseLike<unknown>,
+): Promise<TrackedInvocationSettlement<T>> {
+  try {
+    const status = parseTrackedInvocationStatus<T>(await invocation)
+    return Object.freeze({
+      kind: 'status',
+      status,
+      disposition: classifyValidTrackedInvocationStatus(status),
+    })
+  } catch (error: unknown) {
+    return Object.freeze({
+      kind: 'failure',
+      disposition: classifyTrackedInvocationFailure(error),
+    })
+  }
 }
 
 export interface TrackedInvocationLimits {
