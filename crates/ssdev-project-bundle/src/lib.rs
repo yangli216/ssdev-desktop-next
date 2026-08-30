@@ -174,7 +174,7 @@ pub fn prepare_inputs(
     let mut prepared = Vec::with_capacity(inputs.len());
     let mut total_bytes = 0_u64;
     for input in inputs {
-        validate_plugin_id(&input.plugin_id)?;
+        validate_component_declaration(&input.plugin_id, input.version.as_deref(), input.kind)?;
         if !ids.insert(normalized_plugin_id(&input.plugin_id)) {
             return Err(format!(
                 "项目包包含重复或仅大小写不同的插件 ID [{}]",
@@ -207,7 +207,7 @@ pub fn create_from_prepared(
     destination: &Path,
     config: &DesktopConfig,
     created_by_version: &str,
-    inputs: Vec<PreparedProjectBundleInput>,
+    mut inputs: Vec<PreparedProjectBundleInput>,
 ) -> Result<ProjectBundleSummary, String> {
     require_extension(destination)?;
     config.validate().map_err(|error| error.to_string())?;
@@ -217,6 +217,7 @@ pub fn create_from_prepared(
     if inputs.len() > MAX_COMPONENTS {
         return Err(format!("项目包最多包含 {MAX_COMPONENTS} 个插件或映射"));
     }
+    normalize_and_validate_prepared_inputs(&mut inputs)?;
     let mut manifests = Vec::with_capacity(inputs.len());
     let mut total_bytes = 0_u64;
     for input in &inputs {
@@ -621,7 +622,11 @@ fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
     }
     let mut ids = BTreeSet::new();
     for component in &manifest.components {
-        validate_plugin_id(&component.plugin_id)?;
+        validate_component_declaration(
+            &component.plugin_id,
+            component.version.as_deref(),
+            component.kind,
+        )?;
         if !ids.insert(normalized_plugin_id(&component.plugin_id)) {
             return Err(format!(
                 "项目包包含重复或仅大小写不同的插件 ID [{}]",
@@ -655,6 +660,48 @@ fn validate_plugin_id(plugin_id: &str) -> Result<(), String> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
         return Err(format!("项目组件 ID [{plugin_id}] 不可移植"));
+    }
+    Ok(())
+}
+
+fn validate_component_declaration(
+    plugin_id: &str,
+    version: Option<&str>,
+    kind: ProjectComponentKind,
+) -> Result<(), String> {
+    validate_plugin_id(plugin_id)?;
+    match kind {
+        ProjectComponentKind::SignedPlugin => {
+            let version =
+                version.ok_or_else(|| format!("项目签名插件 [{plugin_id}] 缺少 SemVer 版本"))?;
+            semver::Version::parse(version)
+                .map_err(|_| format!("项目签名插件 [{plugin_id}] 的版本不是有效 SemVer"))?;
+        }
+        ProjectComponentKind::LocalMapping if version.is_some() => {
+            return Err(format!("项目本地映射 [{plugin_id}] 不应声明发布版本"));
+        }
+        ProjectComponentKind::LocalMapping => {}
+    }
+    Ok(())
+}
+
+fn normalize_and_validate_prepared_inputs(
+    inputs: &mut [PreparedProjectBundleInput],
+) -> Result<(), String> {
+    inputs.sort_by(|left, right| {
+        normalized_plugin_id(left.plugin_id())
+            .cmp(&normalized_plugin_id(right.plugin_id()))
+            .then_with(|| left.plugin_id().cmp(right.plugin_id()))
+    });
+    let mut ids = BTreeSet::new();
+    for input in inputs {
+        validate_component_declaration(input.plugin_id(), input.version(), input.kind())?;
+        if !ids.insert(normalized_plugin_id(input.plugin_id())) {
+            return Err(format!(
+                "项目包包含重复或仅大小写不同的插件 ID [{}]",
+                input.plugin_id()
+            ));
+        }
     }
     Ok(())
 }
@@ -881,6 +928,89 @@ mod tests {
 
         let error = validate_manifest(&manifest).unwrap_err();
         assert!(error.contains("重复或仅大小写不同"));
+    }
+
+    #[test]
+    fn final_writer_revalidates_and_canonicalizes_prepared_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let reader = root.path().join("reader.ssdev-plugin");
+        let printer = root.path().join("printer.ssdev-mapping");
+        fs::write(&reader, b"reader fixture").unwrap();
+        fs::write(&printer, b"printer fixture").unwrap();
+        let prepared = prepare_inputs(vec![
+            ProjectBundleInput {
+                plugin_id: "reader".into(),
+                version: Some("1.0.0".into()),
+                kind: ProjectComponentKind::SignedPlugin,
+                path: reader,
+            },
+            ProjectBundleInput {
+                plugin_id: "printer.local".into(),
+                version: None,
+                kind: ProjectComponentKind::LocalMapping,
+                path: printer,
+            },
+        ])
+        .unwrap();
+
+        let duplicated = vec![prepared[0].clone(), prepared[0].clone()];
+        let duplicate_destination = root.path().join("duplicate.ssdev-project");
+        let error = create_from_prepared(&duplicate_destination, &config(), "1.0.0", duplicated)
+            .unwrap_err();
+        assert!(error.contains("重复或仅大小写不同"));
+        assert!(!duplicate_destination.exists());
+
+        let canonical_destination = root.path().join("canonical.ssdev-project");
+        create_from_prepared(&canonical_destination, &config(), "1.0.0", prepared.clone()).unwrap();
+        let mut reversed = prepared;
+        reversed.reverse();
+        let reordered_destination = root.path().join("reordered.ssdev-project");
+        create_from_prepared(&reordered_destination, &config(), "1.0.0", reversed).unwrap();
+        assert_eq!(
+            fs::read(canonical_destination).unwrap(),
+            fs::read(reordered_destination).unwrap()
+        );
+    }
+
+    #[test]
+    fn component_kind_has_one_version_contract_on_create_and_read() {
+        let root = tempfile::tempdir().unwrap();
+        let component = root.path().join("component.bin");
+        fs::write(&component, b"fixture").unwrap();
+
+        let missing_signed_version = prepare_inputs(vec![ProjectBundleInput {
+            plugin_id: "reader".into(),
+            version: None,
+            kind: ProjectComponentKind::SignedPlugin,
+            path: component.clone(),
+        }])
+        .unwrap_err();
+        assert!(missing_signed_version.contains("缺少 SemVer 版本"));
+        let local_version = prepare_inputs(vec![ProjectBundleInput {
+            plugin_id: "reader.local".into(),
+            version: Some("1.0.0".into()),
+            kind: ProjectComponentKind::LocalMapping,
+            path: component,
+        }])
+        .unwrap_err();
+        assert!(local_version.contains("不应声明发布版本"));
+
+        let invalid_manifest = ProjectManifest {
+            schema_version: SCHEMA_VERSION,
+            created_by_version: "1.0.0".into(),
+            config_sha256: "0".repeat(64),
+            components: vec![ProjectComponentManifest {
+                plugin_id: "reader".into(),
+                version: Some("not-semver".into()),
+                kind: ProjectComponentKind::SignedPlugin,
+                archive: component_archive("reader", ProjectComponentKind::SignedPlugin),
+                sha256: "1".repeat(64),
+                bytes: 1,
+            }],
+        };
+        assert!(validate_manifest(&invalid_manifest)
+            .unwrap_err()
+            .contains("不是有效 SemVer"));
     }
 
     #[test]
