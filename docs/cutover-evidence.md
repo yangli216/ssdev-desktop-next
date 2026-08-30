@@ -88,7 +88,7 @@ cargo run --locked -p ssdev-cutover-evidence -- precheck `
   D:\cutover-inputs\windows-package-evidence.json
 ```
 
-`precheck` 先验签生产策略并确认最终审批信任根，再检查策略指定的三个 QA keyId 在绑定的证据信任库中仍可签发，随后加载三份未签证据并直接复用最终 `evaluate_production_cutover` 的全部时效、来源、材料、发布集合、来源策略、宿主、升级回退和业务页门禁。检查前后会复算策略、策略封套、两份信任库和三份证据；任一输入漂移返回 `1`。无阻断输出 `READY-FOR-EVIDENCE-SIGNING` 并返回 `0`，存在业务阻断只输出排序稳定的相同阻断码并返回 `3`。命令不写决策、签名请求或其他文件，也不会把未签证据变成可审批事实。
+`precheck` 先验签生产策略并确认最终审批信任根，再检查策略指定的三个 QA keyId 在绑定的证据信任库中仍可签发，随后加载三份未签证据并直接复用最终 `evaluate_production_cutover` 的全部时效、来源、材料、发布集合、来源策略、宿主、升级回退和业务页门禁。检查前后会复算策略、策略封套、两份信任库和三份证据；任一输入漂移返回 `1`。无阻断输出 `READY-FOR-EVIDENCE-SIGNING` 并返回 `0`；存在业务阻断时，按排序稳定的每个阻断码输出一条固定、脱敏的 `action`，随后返回 `3`。命令不写决策、签名请求或其他文件，也不会把未签证据变成可审批事实。
 
 预检只是当前时点的返工保护，不预留证据有效期，也不授权跳过签名。预检后任一证据变化都需要重新执行；最终 `decide` 仍会逐份验证策略和三个证据封套、签名 keyId、用途、信任库原始摘要和全部输入前后身份，并再次运行同一判定。只有最终带真实封套摘要的决策可以进入审批。
 
@@ -122,7 +122,7 @@ cargo run --locked -p ssdev-cutover-evidence -- decide `
   D:\cutover-output\cutover-decision.json
 ```
 
-输入必须是有大小上限的普通文件，决策输出的父目录必须预先存在且目标不能已存在。工具先使用获准发布信任库验证策略的 `cutover-policy` 封套、keyId、用途和独立签名域，再按策略指定 `keyId` 和 `cutover-evidence` 用途验证三个 active-key 证据封套；所有策略、封套、信任库和证据都在读取前后重新计算摘要，执行中变化直接拒绝。插件矩阵只接受 schema 2，迁移审计只接受 schema 3，Windows 包只接受 schema 7；对应旧证据必须用已复验试点输入、指定上一生产 bundle 和实际候选包重新执行。schema 3 决策记录策略、策略封套、实际 QA 证据信任库和实际最终审批信任库摘要；旧 schema 2 GO 缺少策略授权身份，不能继续签发。`GO` 返回 0；`NO-GO` 仍以不覆盖方式写出排序后的稳定阻塞码，随后返回 3，便于 CI 阻断发布；输入损坏、签名/用途/keyId 不匹配、schema 不匹配或 I/O 失败返回 1。
+输入必须是有大小上限的普通文件，决策输出的父目录必须预先存在且目标不能已存在。工具先使用获准发布信任库验证策略的 `cutover-policy` 封套、keyId、用途和独立签名域，再按策略指定 `keyId` 和 `cutover-evidence` 用途验证三个 active-key 证据封套；所有策略、封套、信任库和证据都在读取前后重新计算摘要，执行中变化直接拒绝。插件矩阵只接受 schema 2，迁移审计只接受 schema 3，Windows 包只接受 schema 7；对应旧证据必须用已复验试点输入、指定上一生产 bundle 和实际候选包重新执行。schema 3 决策记录策略、策略封套、实际 QA 证据信任库和实际最终审批信任库摘要；旧 schema 2 GO 缺少策略授权身份，不能继续签发。`GO` 返回 0；`NO-GO` 仍以不覆盖方式写出排序后的稳定阻塞码，并为每项输出与 `precheck` 相同的固定处理动作，随后返回 3，便于现场修正和 CI 阻断发布。当前 schema 的决策只接受已有处理动作的阻断码，新增门禁若遗漏操作指引会失败关闭；输入损坏、签名/用途/keyId 不匹配、schema 不匹配或 I/O 失败返回 1。
 
 常见阻塞码包括 dirty/source mismatch、证据过期或未来时间、试点材料集合不匹配、候选或上一生产 Windows 版本/产物清单/发布元数据不匹配、插件发布集合/信任库/矩阵不匹配、实机矩阵与安装包信任库或宿主不一致、迁移/安装/策略三方来源策略摘要不一致、HTTP 来源授权不完整、迁移资产计数低于策略、静态资源/HAR 未覆盖、旧本机 HTTP 仍被观察到、迁移 warning/critical 未清零，以及 Windows 签名、NSIS 安装、启动、升级、上一版本回装启动或应用状态保留未验证。`windows-rollback-not-verified` 不能由已有升级结果替代；`windows-application-state-preservation-not-verified` 也不能由回装启动替代，必须重新执行完整回退和三类哨兵复核并生成 schema 7 包证据。
 

@@ -371,10 +371,14 @@ impl CutoverDecision {
         if self.blocker_codes.len() > 64
             || self.blocker_codes.windows(2).any(|pair| pair[0] >= pair[1])
             || self.blocker_codes.iter().any(|code| !is_finding_code(code))
+            || self
+                .blocker_codes
+                .iter()
+                .any(|code| production_cutover_blocker_remediation(code).is_none())
             || self.eligible != self.blocker_codes.is_empty()
         {
             return Err(EvidenceError::Invalid(
-                "cutover blockers must be unique, sorted, bounded, and agree with eligibility"
+                "cutover blockers must be recognized, unique, sorted, bounded, and agree with eligibility"
                     .into(),
             ));
         }
@@ -396,6 +400,219 @@ impl CutoverDecision {
         }
         Ok(decision)
     }
+}
+
+const PRODUCTION_CUTOVER_BLOCKER_GUIDANCE: &[(&str, &str)] = &[
+    (
+        "approval-trust-store-mismatch",
+        "restore the exact approved release trust store bound by the signed production policy",
+    ),
+    (
+        "browser-assets-not-covered",
+        "audit the real business frontend build and include at least one scanned asset root and file",
+    ),
+    (
+        "browser-har-not-covered",
+        "capture representative authenticated business flows and rerun the audit with complete HAR requests",
+    ),
+    (
+        "evidence-trust-store-mismatch",
+        "use the exact QA evidence trust store bound by the signed production policy",
+    ),
+    (
+        "legacy-desktop-http-observed",
+        "remove or separately migrate every observed legacy desktop HTTP callback before regenerating migration evidence",
+    ),
+    (
+        "legacy-webplus-http-observed",
+        "remove the observed WebPlus localhost HTTP dependency from the target deployment before regenerating migration evidence",
+    ),
+    (
+        "migration-audit-dirty-source",
+        "run the formal migration audit from a clean target source revision and generate new evidence",
+    ),
+    (
+        "migration-audit-future-timestamp",
+        "correct the migration QA system clock and regenerate the migration evidence",
+    ),
+    (
+        "migration-audit-source-mismatch",
+        "rerun the formal migration audit from the exact source revision named by the production policy",
+    ),
+    (
+        "migration-audit-stale",
+        "rerun the formal migration audit so its evidence is within the approved validity period",
+    ),
+    (
+        "migration-browser-asset-files-below-policy",
+        "audit enough real business frontend files to satisfy the approved migration coverage minimum",
+    ),
+    (
+        "migration-browser-asset-roots-below-policy",
+        "include every approved business frontend asset root and rerun the formal migration audit",
+    ),
+    (
+        "migration-browser-har-files-below-policy",
+        "include the approved representative HAR files and rerun the formal migration audit",
+    ),
+    (
+        "migration-browser-har-requests-below-policy",
+        "capture enough valid representative HAR requests to satisfy the approved migration coverage minimum",
+    ),
+    (
+        "migration-config-files-below-policy",
+        "include the approved production configuration samples and rerun the formal migration audit",
+    ),
+    (
+        "migration-critical-findings",
+        "resolve every critical migration finding and generate new migration evidence",
+    ),
+    (
+        "migration-http-origin-authorization-incomplete",
+        "authorize each retained insecure business origin in the signed policy or migrate it before rerunning the audit",
+    ),
+    (
+        "migration-key-bindings-below-policy",
+        "include the approved legacy shortcut inventory and satisfy the migration coverage minimum",
+    ),
+    (
+        "migration-origin-policy-mismatch",
+        "rerun the migration audit with the exact signed origin policy bound by the production policy",
+    ),
+    (
+        "migration-pilot-material-set-mismatch",
+        "rerun the migration audit from the exact independently verified pilot material set",
+    ),
+    (
+        "migration-plugin-directories-below-policy",
+        "include the approved production plugin directories and rerun the formal migration audit",
+    ),
+    (
+        "migration-services-below-policy",
+        "audit enough real plugin services to satisfy the approved migration coverage minimum",
+    ),
+    (
+        "migration-warning-findings",
+        "resolve every migration warning and generate new migration evidence",
+    ),
+    (
+        "plugin-matrix-dirty-source",
+        "run the production plugin matrix from a clean target source revision and generate new evidence",
+    ),
+    (
+        "plugin-matrix-future-timestamp",
+        "correct the plugin QA system clock and regenerate the plugin matrix evidence",
+    ),
+    (
+        "plugin-matrix-mismatch",
+        "run the production matrix with the exact approved finalized golden matrix",
+    ),
+    (
+        "plugin-matrix-source-mismatch",
+        "rerun the production plugin matrix from the exact source revision named by the production policy",
+    ),
+    (
+        "plugin-matrix-stale",
+        "rerun the production plugin matrix so its evidence is within the approved validity period",
+    ),
+    (
+        "plugin-package-set-mismatch",
+        "materialize and test the exact approved signed plugin package set",
+    ),
+    (
+        "plugin-release-set-spec-mismatch",
+        "run the production matrix from the exact approved plugin release set specification",
+    ),
+    (
+        "plugin-trust-store-mismatch",
+        "use the exact approved plugin trust store for release materialization and matrix execution",
+    ),
+    (
+        "windows-app-version-mismatch",
+        "rebuild and validate the exact candidate Desktop version named by the production policy",
+    ),
+    (
+        "windows-application-state-preservation-not-verified",
+        "repeat upgrade and rollback while verifying configuration, plugin, and local mapping data preservation",
+    ),
+    (
+        "windows-artifact-manifest-mismatch",
+        "validate the exact candidate Windows bundle and artifact manifest bound by the production policy",
+    ),
+    (
+        "windows-authenticode-not-verified",
+        "sign the Windows executables with the approved publisher certificate and repeat package validation",
+    ),
+    (
+        "windows-business-frontend-not-verified",
+        "run a recent deep deployment check that proves the real business page reached Rust IPC",
+    ),
+    (
+        "windows-launch-not-verified",
+        "repeat Windows package validation and prove the installed candidate reaches the frontend-ready signal",
+    ),
+    (
+        "windows-nsis-not-verified",
+        "install and validate the approved NSIS candidate on the target Windows environment",
+    ),
+    (
+        "windows-origin-policy-mismatch",
+        "validate the candidate package with the exact signed origin policy bound by the production policy",
+    ),
+    (
+        "windows-package-dirty-source",
+        "build and validate the Windows candidate from a clean target source revision",
+    ),
+    (
+        "windows-package-future-timestamp",
+        "correct the Windows QA system clock and regenerate the package evidence",
+    ),
+    (
+        "windows-package-source-mismatch",
+        "rebuild and validate the Windows package from the exact source revision named by the production policy",
+    ),
+    (
+        "windows-package-stale",
+        "repeat Windows package validation so its evidence is within the approved validity period",
+    ),
+    (
+        "windows-plugin-trust-store-mismatch",
+        "install a candidate containing the exact plugin trust store used by the approved plugin matrix",
+    ),
+    (
+        "windows-previous-app-version-mismatch",
+        "repeat the upgrade and rollback gate from the exact previous production version named by the policy",
+    ),
+    (
+        "windows-previous-artifact-manifest-mismatch",
+        "use the exact previous production bundle artifact manifest bound by the policy",
+    ),
+    (
+        "windows-previous-release-metadata-mismatch",
+        "use the exact previous production release metadata and complete bundle bound by the policy",
+    ),
+    (
+        "windows-rollback-not-verified",
+        "uninstall the candidate, reinstall the exact previous production bundle, and prove it launches",
+    ),
+    (
+        "windows-upgrade-not-verified",
+        "repeat the in-place upgrade from the approved previous production bundle to the candidate",
+    ),
+    (
+        "windows-x64-host-mismatch",
+        "run the plugin matrix with the exact signed x64 host shipped in the candidate package",
+    ),
+    (
+        "windows-x86-host-mismatch",
+        "run the plugin matrix with the exact signed x86 host shipped in the candidate package",
+    ),
+];
+
+pub fn production_cutover_blocker_remediation(code: &str) -> Option<&'static str> {
+    PRODUCTION_CUTOVER_BLOCKER_GUIDANCE
+        .iter()
+        .find_map(|(candidate, remediation)| (*candidate == code).then_some(*remediation))
 }
 
 impl WindowsPackageEvidence {
@@ -2171,6 +2388,50 @@ mod tests {
             digest_named_payloads("plugin-set", &first).unwrap(),
             digest_named_payloads("plugin-set", &changed).unwrap()
         );
+    }
+
+    #[test]
+    fn every_cutover_blocker_has_bounded_path_free_remediation() {
+        assert!(PRODUCTION_CUTOVER_BLOCKER_GUIDANCE
+            .windows(2)
+            .all(|pair| pair[0].0 < pair[1].0));
+        for (code, remediation) in PRODUCTION_CUTOVER_BLOCKER_GUIDANCE {
+            assert!(is_finding_code(code));
+            assert_eq!(
+                production_cutover_blocker_remediation(code),
+                Some(*remediation)
+            );
+            assert!(!remediation.is_empty());
+            assert!(remediation.len() <= 240);
+            assert!(remediation.is_ascii());
+            assert!(!remediation.contains("C:\\"));
+            assert!(!remediation.contains("/Users/"));
+            assert!(!remediation.chars().any(char::is_control));
+        }
+        assert!(production_cutover_blocker_remediation("unknown-future-blocker").is_none());
+
+        let mut unknown = CutoverDecision {
+            schema_version: CUTOVER_DECISION_SCHEMA_VERSION,
+            target_source_revision: "d".repeat(40),
+            app_version: "1.2.3".into(),
+            approval_signer_key_id: "cutover-approval".into(),
+            evaluated_at_unix_seconds: 1,
+            policy_sha256: "0".repeat(64),
+            policy_attestation_sha256: "1".repeat(64),
+            evidence_trust_store_sha256: "2".repeat(64),
+            approval_trust_store_sha256: "3".repeat(64),
+            plugin_matrix_evidence_sha256: "4".repeat(64),
+            migration_audit_evidence_sha256: "5".repeat(64),
+            windows_package_evidence_sha256: "6".repeat(64),
+            plugin_matrix_attestation_sha256: "7".repeat(64),
+            migration_audit_attestation_sha256: "8".repeat(64),
+            windows_package_attestation_sha256: "9".repeat(64),
+            eligible: false,
+            blocker_codes: vec!["unknown-future-blocker".into()],
+        };
+        assert!(unknown.validate().is_err());
+        unknown.blocker_codes = vec!["windows-rollback-not-verified".into()];
+        assert!(unknown.validate().is_ok());
     }
 
     #[test]

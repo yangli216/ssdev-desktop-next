@@ -228,6 +228,6 @@ powershell -ExecutionPolicy Bypass -File scripts/test-plugin-matrix.ps1 `
 
 ## 生产切换判定
 
-正式迁移审计、真实插件矩阵和 Windows 包验收各自生成不可覆盖的精简证据。送入三套 QA KMS/HSM 前，`ssdev-cutover-evidence precheck` 使用已签生产策略和同一两份信任库对三份未签证据执行只读、无输出的同源判定，提前返回最终会出现的稳定阻断码，避免摘要、版本、时效或覆盖不一致在签名后才返工；它不替代证据签名。随后由对应 QA 环境使用 `cutover-evidence` 用途密钥签名，并使用 [生产切换证据与 Go/No-Go](docs/cutover-evidence.md) 中的严格判定器按策略指定 keyId 验证三份封套，确认三者来自同一 clean commit、仍在有效期内，最终 Windows 产物清单和插件发布集合、信任库、黄金矩阵精确匹配审批输入，实机测试信任库/宿主与安装包实际内容逐字节一致，旧配置/插件/快捷键/前端/HAR 覆盖达到项目下限，且 HTTP 清理、迁移 finding、NSIS 安装、签名、启动、跨版本升级和上一版本回装启动全部满足。`NO-GO` 会留存阻塞码并返回非零状态；只有 `GO` 文档能由另一把具备独立 `cutover-decision` 用途的组织 KMS/HSM 密钥签发最终审批封套。
+正式迁移审计、真实插件矩阵和 Windows 包验收各自生成不可覆盖的精简证据。送入三套 QA KMS/HSM 前，`ssdev-cutover-evidence precheck` 使用已签生产策略和同一两份信任库对三份未签证据执行只读、无输出的同源判定，提前返回最终会出现的稳定阻断码和逐项处理动作，避免摘要、版本、时效或覆盖不一致在签名后才返工；它不替代证据签名。随后由对应 QA 环境使用 `cutover-evidence` 用途密钥签名，并使用 [生产切换证据与 Go/No-Go](docs/cutover-evidence.md) 中的严格判定器按策略指定 keyId 验证三份封套，确认三者来自同一 clean commit、仍在有效期内，最终 Windows 产物清单和插件发布集合、信任库、黄金矩阵精确匹配审批输入，实机测试信任库/宿主与安装包实际内容逐字节一致，旧配置/插件/快捷键/前端/HAR 覆盖达到项目下限，且 HTTP 清理、迁移 finding、NSIS 安装、签名、启动、跨版本升级和上一版本回装启动全部满足。`NO-GO` 会留存阻塞码、输出同源处理动作并返回非零状态；只有 `GO` 文档能由另一把具备独立 `cutover-decision` 用途的组织 KMS/HSM 密钥签发最终审批封套。
 
 生产策略使用 `ssdev-cutover-evidence prepare-policy` 自动生成：版本、提交和全部材料/插件/bundle/信任库摘要来自已复验试点输入与候选包，人工只批准证据时效、迁移覆盖下限和四个职责签名人。schema 7 策略固定 QA 与最终审批信任库，并必须先由现有最终审批职责以独立 `cutover-policy` 域签名；`decide` 不接受未签名或被替换的策略。schema 3 GO 决策继续固定策略封套和实际两份信任库；同名 keyId 的替代公钥库不能通过判定或签发。工具在写入前二次复验输入且禁止覆盖，避免把复制错误或不匹配版本固化为看似有效的策略。

@@ -11,12 +11,13 @@ use sha2::{Digest, Sha256};
 use ssdev_cutover_evidence::{
     evaluate_production_cutover, evaluate_production_cutover_readiness,
     load_delivery_ready_deployment_check, load_migration_audit_evidence,
-    load_plugin_matrix_evidence, load_windows_package_evidence, prepare_new_output, sha256_file,
-    verify_evidence_attestation, verify_production_cutover_policy_attestation,
-    write_cutover_decision, write_production_cutover_policy, write_windows_package_evidence,
-    EvidenceAttestationKind, EvidenceType, MigrationCoverageMinimums, ProductionCutoverInputs,
-    ProductionCutoverPolicy, ProductionCutoverReadinessInputs, WindowsPackageEvidence,
-    CUTOVER_POLICY_SCHEMA_VERSION, WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION,
+    load_plugin_matrix_evidence, load_windows_package_evidence, prepare_new_output,
+    production_cutover_blocker_remediation, sha256_file, verify_evidence_attestation,
+    verify_production_cutover_policy_attestation, write_cutover_decision,
+    write_production_cutover_policy, write_windows_package_evidence, EvidenceAttestationKind,
+    EvidenceType, MigrationCoverageMinimums, ProductionCutoverInputs, ProductionCutoverPolicy,
+    ProductionCutoverReadinessInputs, WindowsPackageEvidence, CUTOVER_POLICY_SCHEMA_VERSION,
+    WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION,
 };
 use ssdev_origin_policy::{signing_payload as origin_policy_signing_payload, OriginPolicy};
 use ssdev_pilot_readiness::{
@@ -329,9 +330,12 @@ fn run_precheck(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> {
         );
     } else {
         eprintln!(
-            "BLOCKED: {} blocker(s): {}",
-            readiness.blocker_codes.len(),
-            readiness.blocker_codes.join(", ")
+            "{}",
+            render_cutover_blockers(
+                "production cutover precheck: BLOCKED",
+                &readiness.blocker_codes,
+                "resolve every blocker, regenerate affected unsigned evidence, and rerun precheck before QA signing",
+            )?
         );
     }
     Ok(readiness.eligible_for_evidence_signing)
@@ -671,12 +675,37 @@ fn run_decision(arguments: &[OsString]) -> Result<bool, Box<dyn Error>> {
         );
     } else {
         eprintln!(
-            "NO-GO: {} blocker(s): {}",
-            decision.blocker_codes.len(),
-            decision.blocker_codes.join(", ")
+            "{}",
+            render_cutover_blockers(
+                "production cutover decision: NO-GO",
+                &decision.blocker_codes,
+                "archive this NO-GO decision, resolve every blocker, regenerate and sign affected evidence, then decide to a new output path",
+            )?
         );
     }
     Ok(decision.eligible)
+}
+
+fn render_cutover_blockers(
+    heading: &str,
+    blocker_codes: &[String],
+    next: &str,
+) -> Result<String, Box<dyn Error>> {
+    if blocker_codes.is_empty() {
+        return Err(invalid_input(
+            "blocked cutover summary requires at least one blocker",
+        ));
+    }
+    let mut lines = vec![format!("{heading} ({} blockers)", blocker_codes.len())];
+    for code in blocker_codes {
+        let remediation = production_cutover_blocker_remediation(code).ok_or_else(|| {
+            invalid_input("cutover blocker does not have stable remediation guidance")
+        })?;
+        lines.push(format!("blocker: {code}"));
+        lines.push(format!("action: {remediation}"));
+    }
+    lines.push(format!("next: {next}"));
+    Ok(lines.join("\n"))
 }
 
 fn validate_previous_version(
@@ -1096,5 +1125,28 @@ mod tests {
 
         assert_ne!(before, after);
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 7);
+    }
+
+    #[test]
+    fn cutover_blocker_summary_is_actionable_and_rejects_unknown_codes() {
+        let codes = vec![
+            "migration-warning-findings".to_string(),
+            "windows-rollback-not-verified".to_string(),
+        ];
+        let summary = render_cutover_blockers("cutover: BLOCKED", &codes, "rerun").unwrap();
+
+        assert!(summary.starts_with("cutover: BLOCKED (2 blockers)"));
+        assert_eq!(summary.matches("blocker:").count(), 2);
+        assert_eq!(summary.matches("action:").count(), 2);
+        assert!(summary.contains("next: rerun"));
+        assert!(!summary.contains("C:\\"));
+        assert!(!summary.contains("/Users/"));
+        assert!(render_cutover_blockers(
+            "cutover: BLOCKED",
+            &["unknown-future-blocker".into()],
+            "rerun",
+        )
+        .is_err());
+        assert!(render_cutover_blockers("cutover: BLOCKED", &[], "rerun").is_err());
     }
 }
