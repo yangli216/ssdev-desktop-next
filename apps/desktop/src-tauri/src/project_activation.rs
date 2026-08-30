@@ -233,8 +233,11 @@ fn validate_members(members: &[ProjectActivationMember]) -> Result<(), String> {
         {
             return Err("项目事务包含无效组件 ID".into());
         }
-        if !ids.insert(member.plugin_id.clone()) {
-            return Err(format!("项目事务包含重复组件 [{}]", member.plugin_id));
+        if !ids.insert(member.plugin_id.to_ascii_lowercase()) {
+            return Err(format!(
+                "项目事务包含重复或仅大小写不同的组件 [{}]",
+                member.plugin_id
+            ));
         }
     }
     Ok(())
@@ -483,5 +486,24 @@ mod tests {
             ],
         )
         .is_err());
+        let error = match ProjectActivation::begin(
+            &root.path().join("case-conflict"),
+            &config,
+            &config,
+            vec![
+                ProjectActivationMember {
+                    plugin_id: "reader".into(),
+                    kind: ProjectActivationKind::SignedPlugin,
+                },
+                ProjectActivationMember {
+                    plugin_id: "Reader".into(),
+                    kind: ProjectActivationKind::LocalMapping,
+                },
+            ],
+        ) {
+            Ok(_) => panic!("case-insensitive duplicate component ID was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("重复或仅大小写不同"));
     }
 }

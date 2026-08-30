@@ -115,4 +115,13 @@ test('project import requires an exact component set without deleting target cap
   assert.match(desktop, /项目提交前配置或能力内容发生变化/)
   assert.match(desktop, /rollback_project_after_final_verification/)
   assert.match(desktop, /项目包不会自动删除现有能力/)
+  assert.match(
+    desktop,
+    /normalized_plugin_id\(&manifest\.plugin_id\) == normalized_plugin_id\(&declared_id\)/,
+  )
+  assert.match(
+    desktop,
+    /map\(\|component\| normalized_plugin_id\(&component\.manifest\(\)\.plugin_id\)\)/,
+  )
+  assert.match(desktop, /仅大小写不同；请统一 ID 大小写后重新生成或预检项目包/)
 })

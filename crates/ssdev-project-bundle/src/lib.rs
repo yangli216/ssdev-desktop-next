@@ -169,14 +169,17 @@ pub fn prepare_inputs(
     if inputs.len() > MAX_COMPONENTS {
         return Err(format!("项目包最多包含 {MAX_COMPONENTS} 个插件或映射"));
     }
-    inputs.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    inputs.sort_by_key(|input| normalized_plugin_id(&input.plugin_id));
     let mut ids = BTreeSet::new();
     let mut prepared = Vec::with_capacity(inputs.len());
     let mut total_bytes = 0_u64;
     for input in inputs {
         validate_plugin_id(&input.plugin_id)?;
-        if !ids.insert(input.plugin_id.clone()) {
-            return Err(format!("项目包包含重复插件 ID [{}]", input.plugin_id));
+        if !ids.insert(normalized_plugin_id(&input.plugin_id)) {
+            return Err(format!(
+                "项目包包含重复或仅大小写不同的插件 ID [{}]",
+                input.plugin_id
+            ));
         }
         let metadata = fs::symlink_metadata(&input.path)
             .map_err(|error| format!("无法读取项目组件 [{}]: {error}", input.plugin_id))?;
@@ -619,8 +622,11 @@ fn validate_manifest(manifest: &ProjectManifest) -> Result<(), String> {
     let mut ids = BTreeSet::new();
     for component in &manifest.components {
         validate_plugin_id(&component.plugin_id)?;
-        if !ids.insert(component.plugin_id.clone()) {
-            return Err(format!("项目包包含重复插件 ID [{}]", component.plugin_id));
+        if !ids.insert(normalized_plugin_id(&component.plugin_id)) {
+            return Err(format!(
+                "项目包包含重复或仅大小写不同的插件 ID [{}]",
+                component.plugin_id
+            ));
         }
         if component.archive != component_archive(&component.plugin_id, component.kind) {
             return Err(format!("项目组件 [{}] 路径不规范", component.plugin_id));
@@ -651,6 +657,10 @@ fn validate_plugin_id(plugin_id: &str) -> Result<(), String> {
         return Err(format!("项目组件 ID [{plugin_id}] 不可移植"));
     }
     Ok(())
+}
+
+fn normalized_plugin_id(plugin_id: &str) -> String {
+    plugin_id.to_ascii_lowercase()
 }
 
 fn require_extension(path: &Path) -> Result<(), String> {
@@ -812,6 +822,22 @@ mod tests {
             ]
         };
         assert!(create(&destination, &config(), "1.0.0", inputs()).is_err());
+        let case_conflict = vec![
+            ProjectBundleInput {
+                plugin_id: "reader".into(),
+                version: Some("1.0.0".into()),
+                kind: ProjectComponentKind::SignedPlugin,
+                path: component.clone(),
+            },
+            ProjectBundleInput {
+                plugin_id: "Reader".into(),
+                version: None,
+                kind: ProjectComponentKind::LocalMapping,
+                path: component.clone(),
+            },
+        ];
+        let error = create(&destination, &config(), "1.0.0", case_conflict).unwrap_err();
+        assert!(error.contains("重复或仅大小写不同"));
         fs::write(&destination, b"existing").unwrap();
         assert!(create(
             &destination,
@@ -825,6 +851,36 @@ mod tests {
             }],
         )
         .is_err());
+    }
+
+    #[test]
+    fn import_refuses_component_ids_that_only_differ_by_ascii_case() {
+        let manifest = ProjectManifest {
+            schema_version: SCHEMA_VERSION,
+            created_by_version: "1.0.0".into(),
+            config_sha256: "0".repeat(64),
+            components: vec![
+                ProjectComponentManifest {
+                    plugin_id: "reader".into(),
+                    version: Some("1.0.0".into()),
+                    kind: ProjectComponentKind::SignedPlugin,
+                    archive: component_archive("reader", ProjectComponentKind::SignedPlugin),
+                    sha256: "1".repeat(64),
+                    bytes: 1,
+                },
+                ProjectComponentManifest {
+                    plugin_id: "Reader".into(),
+                    version: None,
+                    kind: ProjectComponentKind::LocalMapping,
+                    archive: component_archive("Reader", ProjectComponentKind::LocalMapping),
+                    sha256: "2".repeat(64),
+                    bytes: 1,
+                },
+            ],
+        };
+
+        let error = validate_manifest(&manifest).unwrap_err();
+        assert!(error.contains("重复或仅大小写不同"));
     }
 
     #[test]

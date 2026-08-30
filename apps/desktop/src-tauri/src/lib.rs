@@ -1694,12 +1694,22 @@ async fn prepare_project_bundle(
     for (declared_id, declared_version, kind, path) in specifications {
         match kind {
             project_bundle::ProjectComponentKind::SignedPlugin => {
-                if current.manifests.iter().any(|manifest| {
-                    manifest.plugin_id == declared_id
-                        && is_local_manifest(manifest, &state.local_mapping_root)
-                }) {
+                let current_same_id = current.manifests.iter().find(|manifest| {
+                    normalized_plugin_id(&manifest.plugin_id) == normalized_plugin_id(&declared_id)
+                });
+                if current_same_id
+                    .is_some_and(|manifest| is_local_manifest(manifest, &state.local_mapping_root))
+                {
                     return Err(format!(
                         "项目签名插件 [{declared_id}] 与目标机器的同名本地映射冲突，请先删除本地映射"
+                    ));
+                }
+                if let Some(manifest) =
+                    current_same_id.filter(|manifest| manifest.plugin_id != declared_id)
+                {
+                    return Err(format!(
+                        "项目签名插件 ID [{declared_id}] 与目标机器现有插件 [{}] 仅大小写不同；请统一 ID 大小写后重新生成或预检项目包",
+                        manifest.plugin_id
                     ));
                 }
                 let trust_store = state
@@ -1722,10 +1732,8 @@ async fn prepare_project_bundle(
                 {
                     return Err(format!("项目组件 [{declared_id}] 身份或版本与清单不一致"));
                 }
-                let current_manifest = current.manifests.iter().find(|manifest| {
-                    manifest.plugin_id == declared_id
-                        && !is_local_manifest(manifest, &state.local_mapping_root)
-                });
+                let current_manifest = current_same_id
+                    .filter(|manifest| !is_local_manifest(manifest, &state.local_mapping_root));
                 let baseline_version = signed_plugin_baseline_version(state, &declared_id)?;
                 let current_version = baseline_version.as_ref().or_else(|| {
                     current_manifest
@@ -1760,18 +1768,25 @@ async fn prepare_project_bundle(
                 components.push(PreparedProjectComponent::Signed(prepared));
             }
             project_bundle::ProjectComponentKind::LocalMapping => {
-                let current_mapping_exists = current.manifests.iter().any(|manifest| {
-                    manifest.plugin_id == declared_id
-                        && is_local_manifest(manifest, &state.local_mapping_root)
+                let current_same_id = current.manifests.iter().find(|manifest| {
+                    normalized_plugin_id(&manifest.plugin_id) == normalized_plugin_id(&declared_id)
                 });
-                if current.manifests.iter().any(|manifest| {
-                    manifest.plugin_id == declared_id
-                        && !is_local_manifest(manifest, &state.local_mapping_root)
-                }) {
+                if current_same_id
+                    .is_some_and(|manifest| !is_local_manifest(manifest, &state.local_mapping_root))
+                {
                     return Err(format!(
                         "项目本地映射 [{declared_id}] 与目标机器的同名签名插件冲突，请先调整映射 ID"
                     ));
                 }
+                if let Some(manifest) =
+                    current_same_id.filter(|manifest| manifest.plugin_id != declared_id)
+                {
+                    return Err(format!(
+                        "项目本地映射 ID [{declared_id}] 与目标机器现有映射 [{}] 仅大小写不同；请统一 ID 大小写后重新生成或预检项目包",
+                        manifest.plugin_id
+                    ));
+                }
+                let current_mapping_exists = current_same_id.is_some();
                 if declared_version.is_some() {
                     return Err(format!("本地映射 [{declared_id}] 不应声明发布版本"));
                 }
@@ -1806,12 +1821,12 @@ async fn prepare_project_bundle(
 
     let imported_ids = components
         .iter()
-        .map(|component| component.manifest().plugin_id.clone())
+        .map(|component| normalized_plugin_id(&component.manifest().plugin_id))
         .collect::<std::collections::HashSet<_>>();
     let retained_components = current
         .manifests
         .iter()
-        .filter(|manifest| !imported_ids.contains(&manifest.plugin_id))
+        .filter(|manifest| !imported_ids.contains(&normalized_plugin_id(&manifest.plugin_id)))
         .map(|manifest| {
             let local = is_local_manifest(manifest, &state.local_mapping_root);
             ProjectBundleComponentPreview {
