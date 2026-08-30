@@ -13,6 +13,13 @@ const MAX_SSO_REQUEST_FIELD_BYTES: usize = 1024;
 const MAX_SSO_RESPONSE_FIELD_BYTES: usize = 16 * 1024;
 const SSO_STATUS_EVENT: &str = "desktop://sso-status";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SsoLaunchOutcome {
+    NotRequested,
+    Started,
+    Rejected,
+}
+
 #[derive(Default)]
 pub(crate) struct SsoRuntimeState {
     inner: Mutex<SsoRuntime>,
@@ -136,14 +143,17 @@ impl<R: Runtime> Drop for SsoTaskGuard<R> {
     }
 }
 
-pub(crate) fn start_from_process_arguments(app: &AppHandle) {
-    start_from_arguments(app, std::env::args());
+pub(crate) fn start_from_process_arguments(app: &AppHandle) -> SsoLaunchOutcome {
+    start_from_arguments(app, std::env::args())
 }
 
-pub(crate) fn start_from_arguments(app: &AppHandle, arguments: impl IntoIterator<Item = String>) {
+pub(crate) fn start_from_arguments(
+    app: &AppHandle,
+    arguments: impl IntoIterator<Item = String>,
+) -> SsoLaunchOutcome {
     let arguments = match parse_arguments(arguments) {
         Ok(Some(arguments)) => arguments,
-        Ok(None) => return,
+        Ok(None) => return SsoLaunchOutcome::NotRequested,
         Err(()) => {
             record_error(app, "sso-arguments-invalid");
             emit_status(app, "sso-arguments-invalid");
@@ -151,7 +161,7 @@ pub(crate) fn start_from_arguments(app: &AppHandle, arguments: impl IntoIterator
                 event_code = "sso-arguments-invalid",
                 "SSO process arguments are invalid"
             );
-            return;
+            return SsoLaunchOutcome::Rejected;
         }
     };
     if !try_begin(app) {
@@ -160,7 +170,7 @@ pub(crate) fn start_from_arguments(app: &AppHandle, arguments: impl IntoIterator
             event_code = "sso-already-running",
             "concurrent SSO launch was rejected"
         );
-        return;
+        return SsoLaunchOutcome::Rejected;
     }
     emit_status(app, "sso-login-started");
     let app = app.clone();
@@ -170,10 +180,12 @@ pub(crate) fn start_from_arguments(app: &AppHandle, arguments: impl IntoIterator
             Ok(()) => task.complete(None, "sso-login-succeeded"),
             Err(_) => {
                 task.complete(Some("sso-login-failed"), "sso-login-failed");
+                desktop::show_control(&app);
                 tracing::warn!(event_code = "sso-login-failed", "SSO login failed");
             }
         }
     });
+    SsoLaunchOutcome::Started
 }
 
 fn try_begin<R: Runtime>(app: &AppHandle<R>) -> bool {

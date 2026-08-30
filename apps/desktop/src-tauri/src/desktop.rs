@@ -1352,7 +1352,7 @@ pub(crate) fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                     ..
                 }
             ) {
-                show_control(tray.app_handle());
+                focus_primary_surface(tray.app_handle());
             }
         });
     if let Some(icon) = app.default_window_icon() {
@@ -1491,15 +1491,29 @@ fn request_graceful_exit(app: &AppHandle, exit_code: i32) {
 }
 
 pub(crate) fn setup_control_window(app: &tauri::App) -> tauri::Result<()> {
-    WebviewWindowBuilder::new(app, "control", WebviewUrl::App("index.html".into()))
+    let window = WebviewWindowBuilder::new(app, "control", WebviewUrl::App("index.html".into()))
         .title("SSDEV Desktop")
         .inner_size(1120.0, 760.0)
         .min_inner_size(760.0, 600.0)
         .center()
         .resizable(true)
+        .visible(false)
         .on_navigation(is_control_page)
         .on_new_window(|_, _| NewWindowResponse::Deny)
         .build()?;
+    let control = window.clone();
+    window.on_window_event(move |event| {
+        let WindowEvent::CloseRequested { api, .. } = event else {
+            return;
+        };
+        let exiting = control
+            .try_state::<DesktopState>()
+            .is_some_and(|state| state.exit_lifecycle.is_ready());
+        if !exiting && control.app_handle().tray_by_id("ssdev-main").is_some() {
+            api.prevent_close();
+            let _ = control.hide();
+        }
+    });
     Ok(())
 }
 
@@ -1691,6 +1705,7 @@ fn start_business_frontend_watchdog(app: AppHandle, label: String, generation: u
             "business frontend did not reach native IPC before the readiness deadline"
         );
         if let Some(window) = app.get_webview_window(&label) {
+            let recovery_app = app.clone();
             app.dialog()
                 .message(
                     "业务页面未在 30 秒内完成加载。请检查业务地址、网络和证书，并返回控制台选择“仅重试失败窗口”；如仍失败，请导出诊断包。错误码：business-frontend-not-ready",
@@ -1699,7 +1714,7 @@ fn start_business_frontend_watchdog(app: AppHandle, label: String, generation: u
                 .kind(MessageDialogKind::Error)
                 .buttons(MessageDialogButtons::Ok)
                 .parent(&window)
-                .show(|_| {});
+                .show(move |_| show_control(&recovery_app));
         }
     });
 }
@@ -2141,12 +2156,28 @@ fn retry_timed_out_business_windows_internal(
     result
 }
 
-pub(crate) fn show_control(app: &AppHandle) {
+pub(crate) fn show_control<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("control") {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
+}
+
+pub(crate) fn focus_primary_surface<R: Runtime>(app: &AppHandle<R>) {
+    let mut business_windows = app
+        .webview_windows()
+        .into_iter()
+        .filter(|(label, _)| label.starts_with(BUSINESS_LABEL_PREFIX))
+        .collect::<Vec<_>>();
+    business_windows.sort_by(|left, right| left.0.cmp(&right.0));
+    let Some((_, window)) = business_windows.into_iter().next() else {
+        show_control(app);
+        return;
+    };
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
 }
 
 pub(crate) fn reset_business_zoom(app: &AppHandle) {

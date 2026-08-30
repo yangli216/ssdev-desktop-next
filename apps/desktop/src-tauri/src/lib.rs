@@ -5449,8 +5449,11 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_single_instance::init(|app, arguments, _| {
-            desktop::show_control(app);
-            sso::start_from_arguments(app, arguments);
+            match sso::start_from_arguments(app, arguments) {
+                sso::SsoLaunchOutcome::Started => {}
+                sso::SsoLaunchOutcome::NotRequested => desktop::focus_primary_surface(app),
+                sso::SsoLaunchOutcome::Rejected => desktop::show_control(app),
+            }
         }))
         .plugin(shortcut_plugin)
         .setup(|app| {
@@ -5715,14 +5718,39 @@ pub fn run() {
             }
             desktop::setup_control_window(app)?;
             start_frontend_watchdog(app.handle());
-            if let Err(_error) = desktop::setup_tray(app) {
+            let tray_available = if let Err(_error) = desktop::setup_tray(app) {
                 tracing::warn!(
                     event_code = "startup-tray-unavailable",
                     error_code = "tray-initialization-failed",
-                    "system tray is unavailable; the control window will continue"
+                    "system tray is unavailable; the control window will remain visible for recovery"
                 );
+                false
+            } else {
+                true
+            };
+            match sso::start_from_process_arguments(app.handle()) {
+                sso::SsoLaunchOutcome::Started | sso::SsoLaunchOutcome::Rejected => {
+                    desktop::show_control(app.handle());
+                }
+                sso::SsoLaunchOutcome::NotRequested => {
+                    let desktop_state = app.state::<desktop::DesktopState>();
+                    let has_default_business = initial_config.website_url()?.is_some();
+                    if !has_default_business {
+                        desktop::show_control(app.handle());
+                    } else if let Err(_error) =
+                        desktop::open_configured_business(app.handle(), &desktop_state)
+                    {
+                        tracing::warn!(
+                            event_code = "startup-business-window-unavailable",
+                            error_code = "business-window-open-failed",
+                            "default business window could not be opened; the local control window will continue"
+                        );
+                        desktop::show_control(app.handle());
+                    } else if !tray_available {
+                        desktop::show_control(app.handle());
+                    }
+                }
             }
-            sso::start_from_process_arguments(app.handle());
             tracing::info!(
                 event_code = "app-started",
                 app_version = %app.package_info().version,

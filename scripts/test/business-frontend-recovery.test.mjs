@@ -23,6 +23,7 @@ test('timed out business recovery is targeted and available only to the local co
   assert.match(desktop, /claim_timed_out_business_windows\(\)/)
   assert.match(desktop, /restore_business_frontend_timeout\(&label, generation\)/)
   assert.match(desktop, /start_business_frontend_watchdog\(app\.clone\(\), label, generation\)/)
+  assert.match(desktop, /\.show\(move \|_\| show_control\(&recovery_app\)\)/)
   assert.match(commands, /"retry_timed_out_business_windows"/)
   assert.match(commands, /"allow-retry-timed-out-business-windows"/)
   assert.ok(capability.permissions.includes('allow-retry-timed-out-business-windows'))
