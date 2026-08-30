@@ -114,8 +114,27 @@ test('local regression stops before another non-idempotent device action', async
   assert.match(controller, /worker_guard\.invoke\(request\)[\s\S]+InvocationExecutionState::Indeterminate/)
   assert.match(desktop, /invoke_with_execution_state\(InvokeRequest/)
   assert.match(desktop, /debug_case_batch_stop_reason\(outcome\.execution_state, passed\)/)
+  assert.match(desktop, /async fn run_local_mapping_debug_cases[\s\S]+let _install = state\.install_lock\.lock\(\)\.await;[\s\S]+for debug_case in cases/)
   assert.match(desktop, /if current_stop_reason\.is_some\(\)[\s\S]+break;/)
   assert.match(desktop, /skipped_case_count: usize/)
   assert.match(studio, /执行状态不确定[\s\S]+不要直接重试/)
   assert.match(studio, /结果未通过[\s\S]+剩余.*个未运行/)
+})
+
+test('single local debug calls preserve execution facts and approved route scope', async () => {
+  const [studio, desktop] = await Promise.all([
+    readFile(studioVue, 'utf8'),
+    readFile(desktopRust, 'utf8'),
+  ])
+
+  assert.match(desktop, /async fn debug_plugin_invoke[\s\S]+plugin_id: String[\s\S]+approved_local_mapping_debug_context\(&state, &plugin_id\)/)
+  assert.match(desktop, /async fn debug_plugin_invoke[\s\S]+let _install = state\.install_lock\.lock\(\)\.await;[\s\S]+invoke_with_execution_state\(request\)/)
+  assert.match(desktop, /ensure_local_mapping_debug_request_declared\(&approved, &plugin_id, &request\)/)
+  assert.match(desktop, /debug_plugin_invoke[\s\S]+invoke_with_execution_state\(request\)/)
+  assert.match(desktop, /struct PluginDebugResult[\s\S]+execution_state: &'static str/)
+  assert.match(studio, /debug_plugin_invoke[\s\S]+pluginId: draft\.value\.pluginId/)
+  assert.match(studio, /executionState === 'indeterminate'[\s\S]+不要直接重试或把本次响应保存为期望值/)
+  assert.match(studio, /executionState === 'not-executed'[\s\S]+确认未执行/)
+  assert.match(studio, /if \(!editingStoredCase\.value\) expectedResCode\.value = debugResult\.value\.response\.ResCode/)
+  assert.match(studio, /可能触发打印、写卡或设备动作/)
 })

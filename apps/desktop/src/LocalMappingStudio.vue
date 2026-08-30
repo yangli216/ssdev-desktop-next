@@ -112,6 +112,7 @@ type ComDiscoveryResult = {
 
 type DebugResult = {
   elapsedMs: number
+  executionState: 'not-executed' | 'completed' | 'indeterminate'
   response: {
     ResCode: number
     ResData: unknown
@@ -846,17 +847,28 @@ async function invokeDebug() {
     error.value = '请先保存有效的服务 ID 和方法名称。'
     return
   }
+  if (!window.confirm('将执行一次已批准映射调用，可能触发打印、写卡或设备动作。请确认正在使用测试设备和可回滚数据。')) return
   await run(async () => {
     debugResult.value = await invoke<DebugResult>('debug_plugin_invoke', {
+      pluginId: draft.value.pluginId,
       request: { serviceId, method: methodName, parameters: currentDebugParameters() },
     })
+    suggestedExpectedDataText.value = ''
+    if (debugResult.value.executionState === 'indeterminate') {
+      notice.value = `调用执行状态不确定，用时 ${debugResult.value.elapsedMs} ms。请先核对设备和业务结果，不要直接重试或把本次响应保存为期望值。`
+      return
+    }
+    if (debugResult.value.executionState === 'not-executed') {
+      notice.value = `调用确认未执行，用时 ${debugResult.value.elapsedMs} ms。请恢复插件宿主或运行状态后再重试。`
+      return
+    }
     if (!editingStoredCase.value) expectedResCode.value = debugResult.value.response.ResCode
     suggestedExpectedDataText.value = debugResult.value.response.ResCode === 0
       ? returnValueAssertionSuggestion(debugResult.value.response.ResData)
       : ''
     notice.value = suggestedExpectedDataText.value
-      ? `调用完成，用时 ${debugResult.value.elapsedMs} ms；可采用本次 ReturnValue 作为断言。`
-      : `调用完成，用时 ${debugResult.value.elapsedMs} ms。`
+      ? `调用已返回，用时 ${debugResult.value.elapsedMs} ms；可采用本次 ReturnValue 作为断言。`
+      : `调用已返回，用时 ${debugResult.value.elapsedMs} ms。`
   })
 }
 
@@ -1118,8 +1130,8 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
             <p v-if="callableParameters.length === 0">此方法没有输入参数。</p>
           </div>
           <button type="button" :disabled="busy || disabled || draftDirty || !mappingIsInstalled" @click="invokeDebug">运行测试</button>
-          <div v-if="debugResult && !draftDirty" class="debug-result" :class="{ failed: debugResult.response.ResCode !== 0 }">
-            <strong>ResCode: {{ debugResult.response.ResCode }}</strong><small>{{ debugResult.elapsedMs }} ms</small>
+          <div v-if="debugResult && !draftDirty" class="debug-result" :class="{ failed: debugResult.response.ResCode !== 0 || debugResult.executionState !== 'completed', indeterminate: debugResult.executionState === 'indeterminate' }">
+            <strong>ResCode: {{ debugResult.response.ResCode }}</strong><small>{{ debugResult.executionState === 'completed' ? '已返回' : debugResult.executionState === 'not-executed' ? '确认未执行' : '执行状态不确定' }} · {{ debugResult.elapsedMs }} ms</small>
             <pre>{{ JSON.stringify(debugResult.response.ResData, null, 2) }}</pre>
           </div>
           <div class="debug-case-editor">
@@ -1248,6 +1260,7 @@ legend { padding: 0 7px; color: #355746; font-size: 13px; font-weight: 800; }
 .debug-inputs input[type="checkbox"] { width: 18px; }
 .debug-result { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-top: 12px; padding: 12px; border-radius: 9px; background: #e1efe5; }
 .debug-result.failed { background: #f8e1dc; color: #8b2e22; }
+.debug-result.indeterminate { background: #fff0cf; color: #6d4d12; }
 .debug-result pre { grid-column: 1 / -1; max-height: 230px; margin: 0; padding: 10px; overflow: auto; border-radius: 7px; background: rgba(255,255,255,.7); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
 .debug-case-editor { display: grid; grid-template-columns: 1fr 150px auto; gap: 9px; align-items: end; margin-top: 14px; padding-top: 14px; border-top: 1px solid #d1d9d2; }
 .data-assertion-editor { display: grid; grid-template-columns: 210px 1fr; gap: 10px; align-items: start; margin-top: 10px; }

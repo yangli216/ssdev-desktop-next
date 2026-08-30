@@ -2800,6 +2800,7 @@ struct LocalMappingImportContext {
 struct PluginDebugResult {
     elapsed_ms: u128,
     response: InvokeResponse,
+    execution_state: &'static str,
 }
 
 #[derive(Serialize)]
@@ -5329,21 +5330,47 @@ async fn delete_local_mapping(
 async fn debug_plugin_invoke(
     caller: WebviewWindow,
     state: State<'_, BridgeState>,
+    plugin_id: String,
     request: InvokeRequest,
 ) -> Result<PluginDebugResult, String> {
     desktop::require_control(&caller)?;
     request.validate().map_err(|error| error.to_string())?;
+    let _install = state.install_lock.lock().await;
+    let approved = approved_local_mapping_debug_context(&state, &plugin_id).await?;
+    ensure_local_mapping_debug_request_declared(&approved, &plugin_id, &request)?;
     let started = std::time::Instant::now();
-    let response = state.controller.invoke(request).await;
+    let outcome = state.controller.invoke_with_execution_state(request).await;
     Ok(PluginDebugResult {
         elapsed_ms: started.elapsed().as_millis(),
-        response,
+        response: outcome.response,
+        execution_state: debug_case_execution_state_name(outcome.execution_state),
     })
 }
 
 struct ApprovedLocalMappingDebugContext {
     manifests: Vec<PluginManifest>,
+    target_manifest: PluginManifest,
     definition_sha256: String,
+}
+
+fn ensure_local_mapping_debug_request_declared(
+    approved: &ApprovedLocalMappingDebugContext,
+    plugin_id: &str,
+    request: &InvokeRequest,
+) -> Result<(), String> {
+    if approved.target_manifest.plugin_id != plugin_id {
+        return Err("已批准本地映射不包含当前调试目标；请重新读取映射".to_owned());
+    }
+    let service = approved
+        .target_manifest
+        .services
+        .iter()
+        .find(|service| service.service_id == request.service_id)
+        .ok_or_else(|| "当前调试服务不属于已批准本地映射；请重新读取映射".to_owned())?;
+    if service.method(&request.method).is_none() {
+        return Err("当前调试方法不属于已批准本地映射；请重新读取映射".to_owned());
+    }
+    Ok(())
 }
 
 async fn approved_local_mapping_debug_context(
@@ -5378,8 +5405,10 @@ async fn approved_local_mapping_debug_context(
             "本地映射调试用例与上次批准内容不一致；请重新读取映射并检查重新扫描影响".to_owned(),
         );
     }
+    let target_manifest = manifest.clone();
     Ok(ApprovedLocalMappingDebugContext {
         manifests: inspected.manifests,
+        target_manifest,
         definition_sha256,
     })
 }
@@ -5566,8 +5595,8 @@ async fn run_local_mapping_debug_cases(
     plugin_id: String,
 ) -> Result<DebugCaseRunBatchResult, String> {
     desktop::require_control(&caller)?;
+    let _install = state.install_lock.lock().await;
     let cases = {
-        let _install = state.install_lock.lock().await;
         let approved = approved_local_mapping_debug_context(&state, &plugin_id).await?;
         let root = state.local_mapping_root.clone();
         let snapshot_plugin_id = plugin_id.clone();
@@ -7051,34 +7080,36 @@ mod tests {
         collect_plugin_updates, debug_case_batch_stop_reason, debug_case_execution_state_name,
         desktop, early_startup_log_dir, ensure_catalog_plugin_id_matches_installed,
         ensure_config_signed_plugin_route_coverage, ensure_exact_project_component_set,
-        ensure_local_mapping_import_plan_matches, ensure_local_mapping_removal_plan_matches,
-        ensure_local_plugin_install_plan_matches, ensure_plugin_reload_candidate_state_matches,
-        ensure_plugin_reload_plan_matches, ensure_plugin_update_plan_matches,
-        ensure_plugin_version_change_allowed, ensure_project_component_manifests_match,
-        ensure_project_delivery_identity, ensure_project_export_active_manifests_match,
-        ensure_project_export_runtime_matches, ensure_project_import_baseline_matches,
-        ensure_signed_plugin_compatible, ensure_signed_plugin_route_coverage,
-        ensure_signed_plugin_uninstall_plan_matches, ensure_upgrade_allowed, inspect_all_plugins,
-        is_lowercase_sha256, is_plugin_update_available, legacy_config_candidates,
-        local_mapping_directory_state_digest, local_mapping_import_plan_id,
-        local_mapping_import_state_digest, local_mapping_removal_plan_id, local_mappings,
-        local_plugin_install_plan_id, open_project_bundle_for_mode,
-        persist_startup_failure_document, plugin_reload_active_state_digest,
-        plugin_reload_candidate_state_digest, plugin_reload_impact, plugin_reload_plan_id,
-        plugin_update_installed_state_digest, plugin_update_plan_id, preflight_failure_message,
-        prepare_plugin_removal, project_bundle, project_import_plan_id,
-        project_import_state_digest, quarantine_plugin_capability_violations,
-        resolve_startup_failure_document, same_manifest_contracts, select_runtime_path,
-        service_inventory_item, signed_plugin_api_change_summary,
-        signed_plugin_directory_state_digest, signed_plugin_route_policy_coverage,
-        signed_plugin_uninstall_plan_id, startup_failure_message,
-        validate_signed_plugin_activation_routes, validate_signed_plugin_api_changes,
-        webview2_startup_failure, BridgePluginHostHealth, CatalogWithdrawalReason, FrontendRuntime,
-        InspectedPlugins, LocalMappingImportPreview, LocalMappingImportServicePreview,
-        LocalMappingRemovalPreview, OfflineRuntimeProbe, PluginInstallBlocker, PluginInstallSource,
-        PluginPackagePreview, PluginPackageServicePreview, PluginReloadPreview,
-        ProjectBundlePreview, SignedPluginUninstallPreview, StartupFailureDocument, StartupStage,
-        APP_DATA_DIRECTORY, FRONTEND_READY_TIMEOUT,
+        ensure_local_mapping_debug_request_declared, ensure_local_mapping_import_plan_matches,
+        ensure_local_mapping_removal_plan_matches, ensure_local_plugin_install_plan_matches,
+        ensure_plugin_reload_candidate_state_matches, ensure_plugin_reload_plan_matches,
+        ensure_plugin_update_plan_matches, ensure_plugin_version_change_allowed,
+        ensure_project_component_manifests_match, ensure_project_delivery_identity,
+        ensure_project_export_active_manifests_match, ensure_project_export_runtime_matches,
+        ensure_project_import_baseline_matches, ensure_signed_plugin_compatible,
+        ensure_signed_plugin_route_coverage, ensure_signed_plugin_uninstall_plan_matches,
+        ensure_upgrade_allowed, inspect_all_plugins, is_lowercase_sha256,
+        is_plugin_update_available, legacy_config_candidates, local_mapping_directory_state_digest,
+        local_mapping_import_plan_id, local_mapping_import_state_digest,
+        local_mapping_removal_plan_id, local_mappings, local_plugin_install_plan_id,
+        open_project_bundle_for_mode, persist_startup_failure_document,
+        plugin_reload_active_state_digest, plugin_reload_candidate_state_digest,
+        plugin_reload_impact, plugin_reload_plan_id, plugin_update_installed_state_digest,
+        plugin_update_plan_id, preflight_failure_message, prepare_plugin_removal, project_bundle,
+        project_import_plan_id, project_import_state_digest,
+        quarantine_plugin_capability_violations, resolve_startup_failure_document,
+        same_manifest_contracts, select_runtime_path, service_inventory_item,
+        signed_plugin_api_change_summary, signed_plugin_directory_state_digest,
+        signed_plugin_route_policy_coverage, signed_plugin_uninstall_plan_id,
+        startup_failure_message, validate_signed_plugin_activation_routes,
+        validate_signed_plugin_api_changes, webview2_startup_failure,
+        ApprovedLocalMappingDebugContext, BridgePluginHostHealth, CatalogWithdrawalReason,
+        FrontendRuntime, InspectedPlugins, LocalMappingImportPreview,
+        LocalMappingImportServicePreview, LocalMappingRemovalPreview, OfflineRuntimeProbe,
+        PluginInstallBlocker, PluginInstallSource, PluginPackagePreview,
+        PluginPackageServicePreview, PluginReloadPreview, ProjectBundlePreview,
+        SignedPluginUninstallPreview, StartupFailureDocument, StartupStage, APP_DATA_DIRECTORY,
+        FRONTEND_READY_TIMEOUT,
     };
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
@@ -7098,7 +7129,7 @@ mod tests {
     use webplus_plugin_trust::{
         encode_signature_document, prepare_signing_material, TrustStore, SIGNATURE_FILENAME,
     };
-    use webplus_protocol::PluginArchitecture;
+    use webplus_protocol::{InvokeRequest, PluginArchitecture};
 
     fn inspected_plugins(
         manifests: Vec<PluginManifest>,
@@ -7151,6 +7182,52 @@ mod tests {
             metadata: None,
             services: vec![serde_json::from_value(service).unwrap()],
             local_mapping_integrity_sha256: None,
+        }
+    }
+
+    #[test]
+    fn single_debug_request_stays_inside_the_approved_local_mapping() {
+        let approved = ApprovedLocalMappingDebugContext {
+            target_manifest: plugin_manifest_with_service(
+                "reader-local",
+                PathBuf::from("reader-local"),
+                serde_json::json!({
+                    "serviceId": "reader",
+                    "mainClass": "reader.dll",
+                    "methods": [{ "name": "read_native", "alias": "readCard" }]
+                }),
+            ),
+            manifests: Vec::new(),
+            definition_sha256: "approved-definition".to_owned(),
+        };
+
+        for method in ["read_native", "readCard"] {
+            assert!(ensure_local_mapping_debug_request_declared(
+                &approved,
+                "reader-local",
+                &InvokeRequest {
+                    service_id: "reader".to_owned(),
+                    method: method.to_owned(),
+                    parameters: Default::default(),
+                },
+            )
+            .is_ok());
+        }
+        for (plugin_id, service_id, method) in [
+            ("other-plugin", "reader", "readCard"),
+            ("reader-local", "printer", "readCard"),
+            ("reader-local", "reader", "writeCard"),
+        ] {
+            assert!(ensure_local_mapping_debug_request_declared(
+                &approved,
+                plugin_id,
+                &InvokeRequest {
+                    service_id: service_id.to_owned(),
+                    method: method.to_owned(),
+                    parameters: Default::default(),
+                },
+            )
+            .is_err());
         }
     }
 
