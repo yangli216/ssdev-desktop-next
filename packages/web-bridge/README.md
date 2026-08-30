@@ -31,6 +31,25 @@ const reader = new ReaderPluginClient(invoker)
 
 fixture 按 service、method 和完整 JSON 参数精确匹配，对象键顺序不影响结果；省略参数与 `{}` 等价。重复定义、非 JSON 数据、超出 JavaScript 安全范围的整数和未声明调用都会显式失败，错误不复制参数内容；精确 64 位整数应按插件契约使用字符串。每次调用返回独立副本，测试代码修改结果不会污染下一用例。该工具不会写入 `window.ssdevDesktop`，也不模拟持久操作 ID、超时、重试、DLL/COM 行为或硬件副作用，只用于业务前端单元测试，不能替代 Windows 插件黄金矩阵。
 
+同一生成文件还会导出独立的 `create<Plugin>TrackedApi()`。打印、写卡等非幂等方法应把 `requireTrackedPluginInvocations(connection.bridge, connection.system)` 的结果传入该工厂，从而继续使用生成的参数/响应类型和固定路由，而不是在业务代码里重新手抄 `serviceId`、`method`。tracked API 为每个公开方法生成调用和状态查询两个方法；操作 ID 仍必须由业务流程持久保存，`indeterminate` 与 `completedWithoutResult` 仍需对账，生成代码不会自动重试。
+
+```ts
+import {
+  connectDesktop,
+  createPluginOperationId,
+  requireTrackedPluginInvocations,
+} from '@bsoft/ssdev-web-bridge'
+import { createReaderPluginTrackedApi } from './generated/reader-plugin-client'
+
+const connection = await connectDesktop()
+const trackedReader = createReaderPluginTrackedApi(
+  requireTrackedPluginInvocations(connection.bridge, connection.system),
+)
+const operationId = createPluginOperationId()
+const outcome = await trackedReader.readCard(operationId, { timeout: 30 })
+// 页面刷新后继续使用 operationId 调用 getReadCardStatus(operationId)。
+```
+
 已经完成脱敏、精确响应复核并绑定插件版本的正式黄金矩阵，可以通过 `ssdev-plugin-tool web-fixtures` 生成上述数组，避免业务项目再次手抄 route 和数据。生成器拒绝草稿、占位符、未解除复核项和同输入多响应歧义；输出仍包含矩阵原始测试数据，提交前必须单独评审。
 
 单插件正式交接优先使用 `ssdev-plugin-tool web-kit`，一次生成同版本的 `client.ts`、`fixtures.ts` 和 `ssdev-web-kit.json`。清单绑定插件 ID/版本、API、元数据、矩阵和两个 TypeScript 文件摘要，生成失败不会留下部分目录，避免业务项目把新版客户端与旧版 fixture 混用。业务 CI 使用 `ssdev-plugin-tool web-kit-check --kit <目录>` 拒绝缺失、额外、链接或摘要漂移文件；该检查只验证未签名目录相对自身清单的一致性。接入包是待代码评审的源码制品，不包含原生组件，也不替代插件签名或 Windows 实机验收。

@@ -49,6 +49,8 @@ const status = await bridge.getPluginInvocation(
 )
 ```
 
+由本地映射工作台或 `ssdev-plugin-tool client/web-kit` 生成的 TypeScript 文件会额外导出 `create<Plugin>TrackedApi()`。将上面的 `bridge` 传给该工厂后，每个公开方法同时拥有类型化调用和状态查询入口，继续绑定清单中的 service/method 和参数/响应类型；普通 `<Plugin>Client` 与现有 fixture 用法保持不变。生成 API 不替业务保存 operation ID，也不自动轮询或重试。
+
 ## 崩溃一致性边界
 
 协调器在进入 Rust controller 前同步写入并 `fsync` “已接纳”记录，然后由独立监督任务执行插件调用；页面导航、Promise 丢弃或 WebView 销毁不会取消这条链。响应产生后先写入完成标记，再通知等待者。监督层还会观察工作流任务本身：任务在持久接纳前异常终止时释放全部等待者并返回稳定失败，允许业务仍用同一操作 ID 重试；接纳后异常终止则根据账本发布 `indeterminate` 或 `completedWithoutResult`，不会永久停留在 `pending`，正常退出也不会被遗留计数拖住。若账本复核本身失败，结果保守收敛为 `indeterminate`。进程可能在原生组件产生副作用与完成标记之间崩溃，因此系统不会虚假承诺物理设备的 exactly-once；它会恢复为 `indeterminate`，并阻止同 ID 自动重放。

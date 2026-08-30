@@ -45,7 +45,7 @@ pub fn generate_typescript_client(
 ) -> Result<String, serde_json::Error> {
     let mut output = String::from(
         "// Generated from an SSDEV plugin manifest. Regenerate after API changes.\n\
-import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker } from '@bsoft/ssdev-web-bridge'\n\n",
+import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker, TrackedInvocationBridge, TrackedInvocationStatus } from '@bsoft/ssdev-web-bridge'\n\n",
     );
     let methods = typescript_method_plans(services);
     for plan in &methods {
@@ -99,7 +99,7 @@ import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker } from '@bsof
         "export class {}Client {{\n  constructor(private readonly bridge: PluginInvoker) {{}}\n\n",
         typescript_pascal_identifier(display_name)
     ));
-    for plan in methods {
+    for plan in &methods {
         let default_parameters = if plan.has_input_parameters {
             ""
         } else {
@@ -116,7 +116,34 @@ import type { InvokeResponse, JsonObject, JsonValue, PluginInvoker } from '@bsof
             serde_json::to_string(plan.request_name)?,
         ));
     }
-    output.push_str("}\n");
+    output.push_str("}\n\n");
+    output.push_str(&format!(
+        "export function create{}TrackedApi(bridge: TrackedInvocationBridge) {{\n  return {{\n",
+        typescript_pascal_identifier(display_name)
+    ));
+    for plan in methods {
+        let default_parameters = if plan.has_input_parameters {
+            ""
+        } else {
+            " = {}"
+        };
+        output.push_str(&format!(
+            "    {}(operationId: string, parameters: {}{}): Promise<TrackedInvocationStatus<{}>> {{\n      return bridge.invokePluginTracked<{}>(operationId, {}, {}, parameters)\n    }},\n    {}(operationId: string): Promise<TrackedInvocationStatus<{}>> {{\n      return bridge.getPluginInvocation<{}>(operationId, {}, {})\n    }},\n\n",
+            plan.client_method,
+            plan.parameters_type,
+            default_parameters,
+            plan.data_type,
+            plan.data_type,
+            serde_json::to_string(&plan.service.service_id)?,
+            serde_json::to_string(plan.request_name)?,
+            plan.tracked_status_method,
+            plan.data_type,
+            plan.data_type,
+            serde_json::to_string(&plan.service.service_id)?,
+            serde_json::to_string(plan.request_name)?,
+        ));
+    }
+    output.push_str("  }\n}\n");
     Ok(output)
 }
 
@@ -125,6 +152,7 @@ struct TypeScriptMethodPlan<'a> {
     method: &'a MethodDefinition,
     request_name: &'a str,
     client_method: String,
+    tracked_status_method: String,
     parameters_type: String,
     data_type: String,
     has_input_parameters: bool,
@@ -168,12 +196,26 @@ fn typescript_method_plans(services: &[ServiceDefinition]) -> Vec<TypeScriptMeth
                 parameters_type: format!("{stem}Parameters"),
                 data_type: format!("{stem}Data"),
                 client_method,
+                tracked_status_method: String::new(),
                 has_input_parameters: method
                     .parameters
                     .iter()
                     .any(|parameter| !parameter.name().starts_with('$')),
             });
         }
+    }
+    let mut tracked_names = plans
+        .iter()
+        .map(|plan| plan.client_method.clone())
+        .collect::<HashSet<_>>();
+    for plan in &mut plans {
+        plan.tracked_status_method = unique_typescript_identifier(
+            format!(
+                "get{}Status",
+                typescript_pascal_identifier(&plan.client_method)
+            ),
+            &mut tracked_names,
+        );
     }
     plans
 }
@@ -1809,7 +1851,12 @@ mod tests {
 
         let source = generate_typescript_client("Card Reader", &services).unwrap();
         assert!(source.contains("export class CardReaderClient"));
+        assert!(source.contains("TrackedInvocationBridge, TrackedInvocationStatus"));
+        assert!(source.contains("export function createCardReaderTrackedApi"));
         assert!(source.contains("readerCardRead(parameters: ReaderCardReadParameters)"));
+        assert!(source
+            .contains("readerCardRead(operationId: string, parameters: ReaderCardReadParameters)"));
+        assert!(source.contains("getReaderCardReadStatus(operationId: string)"));
         assert!(source.contains("\"port\": string"));
         assert!(source.contains("\"cardNo\": string"));
         assert!(source.contains("ReturnValue: number"));
@@ -1817,7 +1864,34 @@ mod tests {
         assert!(source.contains("\"Count\": JsonValue"));
         assert!(source.contains("ReturnValue: null"));
         assert!(source.contains("invokePlugin<ReaderCardReadData>(\"reader.card\", \"read\""));
+        assert!(source.contains(
+            "invokePluginTracked<ReaderCardReadData>(operationId, \"reader.card\", \"read\", parameters)"
+        ));
+        assert!(source.contains(
+            "getPluginInvocation<ReaderCardReadData>(operationId, \"reader.card\", \"read\")"
+        ));
         assert!(!source.contains("$cardNo"));
+    }
+
+    #[test]
+    fn generated_tracked_status_helpers_do_not_shadow_invocation_methods() {
+        let services: Vec<ServiceDefinition> = serde_json::from_value(serde_json::json!([{
+            "serviceId": "reader",
+            "mainClass": "reader.dll",
+            "methods": [
+                { "name": "Read", "alias": "read", "parameters": [] },
+                { "name": "Status", "alias": "getReadStatus", "parameters": [] }
+            ]
+        }]))
+        .unwrap();
+
+        let source = generate_typescript_client("Reader", &services).unwrap();
+        assert!(source.contains("read(operationId: string, parameters: ReadParameters = {})"));
+        assert!(source.contains(
+            "getReadStatus(operationId: string, parameters: GetReadStatusParameters = {})"
+        ));
+        assert!(source.contains("getReadStatus2(operationId: string)"));
+        assert!(source.contains("getGetReadStatusStatus(operationId: string)"));
     }
 
     #[test]

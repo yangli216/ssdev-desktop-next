@@ -2290,12 +2290,20 @@ mod tests {
         let source = generate_typescript(&definition).unwrap();
         assert!(source.contains("from '@bsoft/ssdev-web-bridge'"));
         assert!(source.contains("PluginInvoker"));
+        assert!(source.contains("TrackedInvocationBridge"));
+        assert!(source.contains("TrackedInvocationStatus"));
         assert!(!source.contains("SsdevDesktopBridge"));
         assert!(source.contains("\"port\": string"));
         assert!(source.contains("\"message\": string"));
         assert!(source.contains("\"Count\": JsonValue"));
         assert!(source.contains("read(parameters: ReadParameters)"));
         assert!(source.contains("invokePlugin<ReadData>(\"ReaderService\", \"read\", parameters)"));
+        assert!(source.contains("createReaderLocalMappingTrackedApi"));
+        assert!(source.contains(
+            "invokePluginTracked<ReadData>(operationId, \"ReaderService\", \"read\", parameters)"
+        ));
+        assert!(source
+            .contains("getPluginInvocation<ReadData>(operationId, \"ReaderService\", \"read\")"));
         assert!(!source.contains("readerService1Read1"));
         assert!(!source.contains("$message"));
     }

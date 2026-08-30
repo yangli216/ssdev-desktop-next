@@ -411,6 +411,75 @@ for (const integration of integrations) {
   if (matchedRoutes.size !== fixtureRoutes.size) {
     throw new Error(\`Web kit [\${integration.pluginId}] client does not cover every fixture route\`)
   }
+  const trackedExports = Object.entries(integration.clientModule)
+    .filter(([name, value]) => name.endsWith('TrackedApi') && typeof value === 'function')
+  if (trackedExports.length !== 1) {
+    throw new Error(\`Web kit [\${integration.pluginId}] must export exactly one generated tracked API\`)
+  }
+  const operationId = '123e4567-e89b-42d3-a456-426614174000'
+  const trackedCalls = []
+  const trackedBridge = {
+    async invokePluginTracked(actualOperationId, serviceId, method, parameters = {}) {
+      if (actualOperationId !== operationId) throw new Error('generated tracked API changed the operation ID')
+      const fixture = integration.fixtures.find((candidate) => (
+        candidate.serviceId === serviceId
+        && candidate.method === method
+        && JSON.stringify(candidate.parameters ?? {}) === JSON.stringify(parameters)
+      ))
+      if (fixture === undefined) throw new UnexpectedPluginInvocationError(serviceId, method)
+      trackedCalls.push({ kind: 'invoke', route: routeKey(fixture) })
+      return { state: 'completed', response: fixture.response, durable: true }
+    },
+    async getPluginInvocation(actualOperationId, serviceId, method) {
+      if (actualOperationId !== operationId) throw new Error('generated tracked API changed the operation ID')
+      const fixture = integration.fixtures.find((candidate) => (
+        candidate.serviceId === serviceId && candidate.method === method
+      ))
+      if (fixture === undefined) throw new UnexpectedPluginInvocationError(serviceId, method)
+      trackedCalls.push({ kind: 'status', route: routeKey(fixture) })
+      return { state: 'completed', response: fixture.response, durable: true }
+    },
+  }
+  const trackedApi = trackedExports[0][1](trackedBridge)
+  const trackedMethods = Object.entries(trackedApi)
+    .filter(([, value]) => typeof value === 'function')
+  if (trackedMethods.length !== integration.methodCount * 2) {
+    throw new Error(\`Web kit [\${integration.pluginId}] tracked API method count does not match its manifest\`)
+  }
+  for (const [method, invokeTracked] of trackedMethods) {
+    let matched = false
+    for (const fixture of integration.fixtures) {
+      try {
+        const before = trackedCalls.length
+        const outcome = await invokeTracked(operationId, fixture.parameters ?? {})
+        if (trackedCalls.length !== before + 1) {
+          throw new Error('generated tracked API did not perform exactly one bridge call')
+        }
+        const call = trackedCalls.at(-1)
+        const expected = integration.fixtures.find((candidate) => routeKey(candidate) === call.route)
+        if (outcome.state !== 'completed'
+            || expected === undefined
+            || JSON.stringify(outcome.response) !== JSON.stringify(expected.response)) {
+          throw new Error('generated tracked API returned an unexpected fixture response')
+        }
+        matched = true
+        break
+      } catch (error) {
+        if (!(error instanceof UnexpectedPluginInvocationError)) throw error
+      }
+    }
+    if (!matched) throw new Error(\`generated tracked API method [\${method}] has no matching fixture\`)
+  }
+  const invokedTrackedRoutes = new Set(trackedCalls
+    .filter((call) => call.kind === 'invoke')
+    .map((call) => call.route))
+  const queriedTrackedRoutes = new Set(trackedCalls
+    .filter((call) => call.kind === 'status')
+    .map((call) => call.route))
+  if (invokedTrackedRoutes.size !== fixtureRoutes.size
+      || queriedTrackedRoutes.size !== fixtureRoutes.size) {
+    throw new Error(\`Web kit [\${integration.pluginId}] tracked API does not cover every fixture route\`)
+  }
 }
 `, { encoding: 'utf8', flag: 'wx' })
     runProcess(process.execPath, [runtimePath], {
