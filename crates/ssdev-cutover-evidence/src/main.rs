@@ -1134,7 +1134,317 @@ fn usage() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use ed25519_dalek::{Signer, SigningKey};
+    use ssdev_cutover_evidence::{
+        cutover_decision_signing_payload, cutover_policy_signing_payload,
+        evidence_attestation_signing_payload, write_migration_audit_evidence,
+        write_plugin_matrix_evidence, HttpEvidenceLevel, MigrationAuditEvidence,
+        PluginMatrixEvidence, CUTOVER_DECISION_SCHEMA_VERSION, EVIDENCE_SCHEMA_VERSION,
+        PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION,
+    };
     use tempfile::tempdir;
+
+    struct SignedGoFixture {
+        arguments: Vec<OsString>,
+        windows_path: PathBuf,
+        windows_signing_key: SigningKey,
+        windows_attestation_path: PathBuf,
+    }
+
+    fn write_test_attestation(path: &Path, key_id: &str, signing_key: &SigningKey, payload: &[u8]) {
+        let signature = BASE64.encode(signing_key.sign(payload).to_bytes());
+        let envelope = DetachedSignatureDocument::new(key_id, &signature).unwrap();
+        fs::write(path, envelope.to_pretty_json().unwrap()).unwrap();
+    }
+
+    fn build_signed_go_fixture(root: &Path) -> SignedGoFixture {
+        let revision = "d".repeat(40);
+        let evaluated_at = 1_000;
+        let approval_key = SigningKey::from_bytes(&[11_u8; 32]);
+        let plugin_key = SigningKey::from_bytes(&[21_u8; 32]);
+        let migration_key = SigningKey::from_bytes(&[22_u8; 32]);
+        let windows_key = SigningKey::from_bytes(&[23_u8; 32]);
+        let approval_trust_path = root.join("approval-trust.json");
+        let evidence_trust_path = root.join("evidence-trust.json");
+        fs::write(
+            &approval_trust_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 2,
+                "keys": [{
+                    "keyId": "cutover-approval",
+                    "algorithm": "ed25519",
+                    "publicKey": BASE64.encode(approval_key.verifying_key().to_bytes()),
+                    "purposes": ["cutover-decision"],
+                    "status": "active"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &evidence_trust_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 2,
+                "keys": [
+                    {
+                        "keyId": "plugin-matrix-qa",
+                        "algorithm": "ed25519",
+                        "publicKey": BASE64.encode(plugin_key.verifying_key().to_bytes()),
+                        "purposes": ["cutover-evidence"],
+                        "status": "active"
+                    },
+                    {
+                        "keyId": "migration-audit-qa",
+                        "algorithm": "ed25519",
+                        "publicKey": BASE64.encode(migration_key.verifying_key().to_bytes()),
+                        "purposes": ["cutover-evidence"],
+                        "status": "active"
+                    },
+                    {
+                        "keyId": "windows-package-qa",
+                        "algorithm": "ed25519",
+                        "publicKey": BASE64.encode(windows_key.verifying_key().to_bytes()),
+                        "purposes": ["cutover-evidence"],
+                        "status": "active"
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let approval_trust_sha256 = sha256_file(&approval_trust_path).unwrap();
+        let evidence_trust_sha256 = sha256_file(&evidence_trust_path).unwrap();
+
+        let policy_path = root.join("production-policy.json");
+        let policy_attestation_path = root.join("production-policy.sig.json");
+        let policy = ProductionCutoverPolicy {
+            schema_version: CUTOVER_POLICY_SCHEMA_VERSION,
+            target_source_revision: revision.clone(),
+            expected_app_version: "1.2.3".into(),
+            expected_previous_app_version: "1.2.2".into(),
+            maximum_evidence_age_seconds: 3_600,
+            expected_windows_artifact_manifest_sha256: "8".repeat(64),
+            expected_previous_windows_artifact_manifest_sha256: "d".repeat(64),
+            expected_previous_release_metadata_sha256: "9".repeat(64),
+            expected_plugin_release_set_spec_sha256: "0".repeat(64),
+            expected_plugin_package_set_sha256: "9".repeat(64),
+            expected_plugin_trust_store_sha256: approval_trust_sha256.clone(),
+            expected_evidence_trust_store_sha256: evidence_trust_sha256.clone(),
+            expected_plugin_matrix_sha256: "3".repeat(64),
+            expected_pilot_material_set_sha256: "b".repeat(64),
+            expected_origin_policy_sha256: "a".repeat(64),
+            migration_coverage_minimums: MigrationCoverageMinimums {
+                config_files: 1,
+                plugin_directories: 2,
+                services: 3,
+                key_bindings: 4,
+                browser_asset_roots: 1,
+                browser_asset_files_scanned: 50,
+                browser_har_files: 1,
+                browser_har_requests_scanned: 100,
+            },
+            plugin_matrix_signer_key_id: "plugin-matrix-qa".into(),
+            migration_audit_signer_key_id: "migration-audit-qa".into(),
+            windows_package_signer_key_id: "windows-package-qa".into(),
+            cutover_decision_signer_key_id: "cutover-approval".into(),
+        };
+        write_production_cutover_policy(&policy_path, &policy).unwrap();
+        let policy_bytes = fs::read(&policy_path).unwrap();
+        write_test_attestation(
+            &policy_attestation_path,
+            "cutover-approval",
+            &approval_key,
+            &cutover_policy_signing_payload(&policy_bytes).unwrap(),
+        );
+
+        let plugin_path = root.join("plugin-evidence.json");
+        let plugin_attestation_path = root.join("plugin-evidence.sig.json");
+        let plugin = PluginMatrixEvidence {
+            schema_version: PLUGIN_MATRIX_EVIDENCE_SCHEMA_VERSION,
+            evidence_type: EvidenceType::PluginMatrix,
+            source_revision: revision.clone(),
+            source_dirty: false,
+            executed_at_unix_seconds: evaluated_at,
+            environment: "plugin-qa".into(),
+            runner_os: "windows".into(),
+            runner_architecture: "x86_64".into(),
+            release_set_spec_sha256: "0".repeat(64),
+            package_set_sha256: "9".repeat(64),
+            plugin_set_sha256: "1".repeat(64),
+            trust_store_sha256: approval_trust_sha256.clone(),
+            matrix_sha256: "3".repeat(64),
+            x86_host_sha256: "4".repeat(64),
+            x64_host_sha256: "5".repeat(64),
+            plugin_count: 1,
+            service_count: 2,
+            method_count: 3,
+            enabled_case_count: 3,
+            passed: true,
+        };
+        write_plugin_matrix_evidence(&plugin_path, &plugin).unwrap();
+        let plugin_bytes = fs::read(&plugin_path).unwrap();
+        write_test_attestation(
+            &plugin_attestation_path,
+            "plugin-matrix-qa",
+            &plugin_key,
+            &evidence_attestation_signing_payload(
+                EvidenceAttestationKind::PluginMatrix,
+                &plugin_bytes,
+            )
+            .unwrap(),
+        );
+
+        let migration_path = root.join("migration-evidence.json");
+        let migration_attestation_path = root.join("migration-evidence.sig.json");
+        let migration = MigrationAuditEvidence {
+            schema_version: EVIDENCE_SCHEMA_VERSION,
+            evidence_type: EvidenceType::MigrationAudit,
+            source_revision: revision.clone(),
+            source_dirty: false,
+            executed_at_unix_seconds: evaluated_at,
+            environment: "migration-qa".into(),
+            runner_os: "windows".into(),
+            runner_architecture: "x86_64".into(),
+            report_sha256: "6".repeat(64),
+            pilot_material_set_sha256: "b".repeat(64),
+            origin_policy_sha256: "a".repeat(64),
+            config_files: 1,
+            plugin_directories: 2,
+            service_count: 3,
+            key_binding_count: 4,
+            browser_asset_roots: 1,
+            browser_asset_files_scanned: 50,
+            browser_har_files: 1,
+            browser_har_requests_scanned: 100,
+            insecure_http_origin_count: 2,
+            authorized_insecure_http_origin_count: 2,
+            webplus_http_evidence: HttpEvidenceLevel::NotObserved,
+            desktop_callback_http_evidence: HttpEvidenceLevel::NotObserved,
+            critical_findings: 0,
+            warning_findings: 0,
+            info_findings: 1,
+            finding_code_counts: BTreeMap::from([("inventory-summary".into(), 1)]),
+        };
+        write_migration_audit_evidence(&migration_path, &migration).unwrap();
+        let migration_bytes = fs::read(&migration_path).unwrap();
+        write_test_attestation(
+            &migration_attestation_path,
+            "migration-audit-qa",
+            &migration_key,
+            &evidence_attestation_signing_payload(
+                EvidenceAttestationKind::MigrationAudit,
+                &migration_bytes,
+            )
+            .unwrap(),
+        );
+
+        let windows_path = root.join("windows-evidence.json");
+        let windows_attestation_path = root.join("windows-evidence.sig.json");
+        let windows = WindowsPackageEvidence {
+            schema_version: WINDOWS_PACKAGE_EVIDENCE_SCHEMA_VERSION,
+            evidence_type: EvidenceType::WindowsPackage,
+            source_revision: revision.clone(),
+            source_dirty: false,
+            executed_at_unix_seconds: evaluated_at,
+            environment: "windows-qa".into(),
+            runner_os: "windows".into(),
+            runner_architecture: "x86_64".into(),
+            release_metadata_sha256: "7".repeat(64),
+            artifact_manifest_sha256: "8".repeat(64),
+            plugin_trust_store_sha256: approval_trust_sha256.clone(),
+            origin_policy_sha256: "a".repeat(64),
+            x86_host_sha256: "4".repeat(64),
+            x64_host_sha256: "5".repeat(64),
+            deployment_check_sha256: Some("6".repeat(64)),
+            deployment_check_generated_at_unix_ms: Some(evaluated_at * 1_000),
+            app_version: "1.2.3".into(),
+            authenticode_required: true,
+            authenticode_verified: true,
+            nsis_install_verified: true,
+            msi_install_verified: false,
+            launch_verified: true,
+            upgrade_verified: true,
+            rollback_verified: true,
+            application_state_preservation_verified: true,
+            previous_app_version: Some("1.2.2".into()),
+            previous_release_metadata_sha256: Some("9".repeat(64)),
+            previous_artifact_manifest_sha256: Some("d".repeat(64)),
+            passed: true,
+        };
+        write_windows_package_evidence(&windows_path, &windows).unwrap();
+        let windows_bytes = fs::read(&windows_path).unwrap();
+        write_test_attestation(
+            &windows_attestation_path,
+            "windows-package-qa",
+            &windows_key,
+            &evidence_attestation_signing_payload(
+                EvidenceAttestationKind::WindowsPackage,
+                &windows_bytes,
+            )
+            .unwrap(),
+        );
+
+        let decision_path = root.join("cutover-decision.json");
+        let decision_attestation_path = root.join("cutover-decision.sig.json");
+        let decision = evaluate_production_cutover(
+            ProductionCutoverInputs {
+                policy: &policy,
+                policy_sha256: sha256_file(&policy_path).unwrap(),
+                policy_attestation_sha256: sha256_file(&policy_attestation_path).unwrap(),
+                evidence_trust_store_sha256: evidence_trust_sha256,
+                approval_trust_store_sha256: approval_trust_sha256,
+                plugin: &plugin,
+                plugin_sha256: sha256_file(&plugin_path).unwrap(),
+                plugin_attestation_sha256: sha256_file(&plugin_attestation_path).unwrap(),
+                migration: &migration,
+                migration_sha256: sha256_file(&migration_path).unwrap(),
+                migration_attestation_sha256: sha256_file(&migration_attestation_path).unwrap(),
+                windows: &windows,
+                windows_sha256: sha256_file(&windows_path).unwrap(),
+                windows_attestation_sha256: sha256_file(&windows_attestation_path).unwrap(),
+            },
+            evaluated_at,
+        )
+        .unwrap();
+        assert!(decision.eligible);
+        assert_eq!(decision.schema_version, CUTOVER_DECISION_SCHEMA_VERSION);
+        write_cutover_decision(&decision_path, &decision).unwrap();
+        let decision_bytes = fs::read(&decision_path).unwrap();
+        write_test_attestation(
+            &decision_attestation_path,
+            "cutover-approval",
+            &approval_key,
+            &cutover_decision_signing_payload(&decision_bytes),
+        );
+
+        let arguments = [
+            PathBuf::from("verify-go"),
+            decision_path,
+            decision_attestation_path,
+            policy_path,
+            policy_attestation_path,
+            approval_trust_path,
+            evidence_trust_path,
+            plugin_path,
+            plugin_attestation_path,
+            migration_path,
+            migration_attestation_path,
+            windows_path.clone(),
+            windows_attestation_path.clone(),
+        ]
+        .into_iter()
+        .map(|path| path.into_os_string())
+        .collect();
+        SignedGoFixture {
+            arguments,
+            windows_path,
+            windows_signing_key: windows_key,
+            windows_attestation_path,
+        }
+    }
 
     #[test]
     fn previous_release_metadata_identifies_only_a_bundle_metadata_directory() {
@@ -1339,6 +1649,41 @@ mod tests {
         .unwrap();
 
         assert_ne!(before, after);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 12);
+    }
+
+    #[test]
+    fn verify_go_replays_a_complete_signed_archive_and_rejects_resigned_substitution() {
+        let root = tempdir().unwrap();
+        let fixture = build_signed_go_fixture(root.path());
+
+        assert!(run_verify_go(&fixture.arguments).unwrap());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 12);
+
+        let mut changed_windows: serde_json::Value =
+            serde_json::from_slice(&fs::read(&fixture.windows_path).unwrap()).unwrap();
+        changed_windows["environment"] = serde_json::json!("substituted-windows-qa");
+        fs::write(
+            &fixture.windows_path,
+            serde_json::to_vec_pretty(&changed_windows).unwrap(),
+        )
+        .unwrap();
+        let changed_bytes = fs::read(&fixture.windows_path).unwrap();
+        write_test_attestation(
+            &fixture.windows_attestation_path,
+            "windows-package-qa",
+            &fixture.windows_signing_key,
+            &evidence_attestation_signing_payload(
+                EvidenceAttestationKind::WindowsPackage,
+                &changed_bytes,
+            )
+            .unwrap(),
+        );
+
+        let error = run_verify_go(&fixture.arguments).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not reproduce from the supplied archive inputs"));
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 12);
     }
 }
