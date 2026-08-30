@@ -928,6 +928,7 @@ async function deleteDebugCase(caseName: string) {
 async function runDebugCases() {
   if (!requireActiveMappingSnapshot('运行回归用例')) return
   if (draft.value.debugCases.length === 0) return
+  if (!window.confirm(`将按顺序执行 ${draft.value.debugCases.length} 个已批准用例，可能触发打印、写卡或设备动作。请确认正在使用测试设备和可回滚数据。`)) return
   await run(async () => {
     regressionResults.value = await invoke<DebugCaseRunResult[]>('run_local_mapping_debug_cases', {
       pluginId: draft.value.pluginId,
@@ -1091,7 +1092,7 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
 
         <fieldset v-if="method" class="debug-panel">
           <legend>现场调试</legend>
-          <p>请先保存映射，再输入测试参数。以 <code>$</code> 开头的输出参数无需输入；保存用例时只使用合成数据，不要录入患者、账号或生产密钥。</p>
+          <p>请先保存映射，再输入测试参数。以 <code>$</code> 开头的输出参数无需输入；保存用例时只使用合成数据，不要录入患者、账号或生产密钥。保存或删除用例会同步更新本机批准摘要；退出客户端后直接改写用例会隔离映射，重新扫描确认前不能执行回归。</p>
           <div class="debug-inputs">
             <label v-for="parameter in callableParameters" :key="parameter.name"><span>{{ parameter.name || '未命名参数' }} <small>{{ parameter.type }}</small></span><input v-model="debugValues[parameter.name]" :type="debugInputType(parameter.type)" /></label>
             <p v-if="callableParameters.length === 0">此方法没有输入参数。</p>

@@ -9,7 +9,9 @@ use webplus_plugin_config::{
     compare_public_api, validate_plugin_services, PluginManifest, ServiceDefinition,
 };
 
-const SCHEMA_VERSION: u8 = 3;
+use crate::local_mappings;
+
+const SCHEMA_VERSION: u8 = 4;
 const MAX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PLUGINS: usize = 1024;
 
@@ -37,6 +39,8 @@ struct PluginApiBaselineEntry {
     services: Vec<ServiceDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     local_mapping_integrity_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_mapping_definition_sha256: Option<String>,
     #[serde(default = "default_installed")]
     installed: bool,
 }
@@ -88,8 +92,11 @@ impl PluginApiBaselineStore {
             }
         };
         let recovered_transition = store.recover_pending_transition(&candidates)?;
-        if store.schema_version < SCHEMA_VERSION {
+        if store.schema_version < 3 {
             adopt_legacy_local_mappings(&mut store.entries, &candidates);
+            store.schema_version = SCHEMA_VERSION;
+        } else if store.schema_version == 3 {
+            adopt_schema_three_local_mapping_definitions(&mut store.entries, &candidates);
             store.schema_version = SCHEMA_VERSION;
         }
         let blocked_signed = store.breaking_plugin_ids(&candidates);
@@ -136,6 +143,20 @@ impl PluginApiBaselineStore {
     ) -> Result<BTreeSet<String>, String> {
         let candidates = entries_from_manifests(manifests, local_mapping_root)?;
         Ok(self.changed_local_mapping_ids(&candidates))
+    }
+
+    pub(crate) fn accepts_local_mapping_definition(
+        &self,
+        plugin_id: &str,
+        definition_sha256: &str,
+    ) -> bool {
+        self.pending_entries
+            .as_deref()
+            .unwrap_or(&self.entries)
+            .iter()
+            .find(|entry| entry.plugin_id.eq_ignore_ascii_case(plugin_id) && entry.installed)
+            .and_then(|entry| entry.local_mapping_definition_sha256.as_deref())
+            == Some(definition_sha256)
     }
 
     /// Persists the exact next accepted set before a plugin or project
@@ -320,11 +341,24 @@ fn entries_from_manifests(
         } else {
             None
         };
+        let local_mapping_definition_sha256 = if is_local_mapping {
+            let digest =
+                local_mappings::definition_sha256_for_manifest(manifest).map_err(|error| {
+                    format!("本地映射 [{}] 的定义摘要无效: {error}", manifest.plugin_id)
+                })?;
+            if !is_lowercase_sha256(&digest) {
+                return Err(format!("本地映射 [{}] 的定义摘要无效", manifest.plugin_id));
+            }
+            Some(digest)
+        } else {
+            None
+        };
         entries.push(PluginApiBaselineEntry {
             plugin_id: manifest.plugin_id.clone(),
             version: metadata.version.clone(),
             services: manifest.services.clone(),
             local_mapping_integrity_sha256,
+            local_mapping_definition_sha256,
             installed: true,
         });
     }
@@ -386,7 +420,7 @@ fn read_document(path: &Path) -> Result<Option<PluginApiBaselineDocument>, Strin
 }
 
 fn validate_document(document: &PluginApiBaselineDocument) -> Result<(), String> {
-    if !matches!(document.schema_version, 1 | 2 | SCHEMA_VERSION) {
+    if !matches!(document.schema_version, 1 | 2 | 3 | SCHEMA_VERSION) {
         return Err(format!(
             "不支持插件能力基线版本 {}",
             document.schema_version
@@ -402,10 +436,13 @@ fn validate_document(document: &PluginApiBaselineDocument) -> Result<(), String>
         if !identities.insert(normalized_id(&entry.plugin_id)) {
             return Err("插件能力基线包含重复或大小写冲突的插件 ID".into());
         }
-        if document.schema_version < SCHEMA_VERSION
-            && entry.local_mapping_integrity_sha256.is_some()
-        {
+        if document.schema_version < 3 && entry.local_mapping_integrity_sha256.is_some() {
             return Err("旧版插件契约基线不能声明本地映射完整性摘要".into());
+        }
+        if document.schema_version < SCHEMA_VERSION
+            && entry.local_mapping_definition_sha256.is_some()
+        {
+            return Err("旧版插件契约基线不能声明本地映射定义摘要".into());
         }
         if entry
             .local_mapping_integrity_sha256
@@ -413,6 +450,25 @@ fn validate_document(document: &PluginApiBaselineDocument) -> Result<(), String>
             .is_some_and(|digest| !is_lowercase_sha256(digest))
         {
             return Err("插件能力基线包含无效的本地映射完整性摘要".into());
+        }
+        if entry
+            .local_mapping_definition_sha256
+            .as_deref()
+            .is_some_and(|digest| !is_lowercase_sha256(digest))
+        {
+            return Err("插件能力基线包含无效的本地映射定义摘要".into());
+        }
+        if entry.local_mapping_definition_sha256.is_some()
+            && entry.local_mapping_integrity_sha256.is_none()
+        {
+            return Err("插件能力基线中的本地映射定义摘要缺少运行时完整性摘要".into());
+        }
+        if document.schema_version >= SCHEMA_VERSION
+            && entry.installed
+            && entry.local_mapping_integrity_sha256.is_some()
+            && entry.local_mapping_definition_sha256.is_none()
+        {
+            return Err("已安装本地映射缺少定义摘要".into());
         }
     }
     Ok(())
@@ -520,11 +576,47 @@ fn adopt_legacy_local_mappings(
     entries.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
 }
 
+fn adopt_schema_three_local_mapping_definitions(
+    entries: &mut [PluginApiBaselineEntry],
+    candidates: &[PluginApiBaselineEntry],
+) {
+    let candidates = candidates
+        .iter()
+        .map(|candidate| (normalized_id(&candidate.plugin_id), candidate))
+        .collect::<BTreeMap<_, _>>();
+    for entry in entries
+        .iter_mut()
+        .filter(|entry| entry.installed && entry.local_mapping_integrity_sha256.is_some())
+    {
+        let Some(candidate) = candidates.get(&normalized_id(&entry.plugin_id)) else {
+            continue;
+        };
+        if same_capability_for_schema(entry, candidate, 3) {
+            entry.local_mapping_definition_sha256 =
+                candidate.local_mapping_definition_sha256.clone();
+        }
+    }
+}
+
 fn same_capability(left: &PluginApiBaselineEntry, right: &PluginApiBaselineEntry) -> bool {
     left.plugin_id == right.plugin_id
         && left.version == right.version
         && left.services == right.services
         && left.local_mapping_integrity_sha256 == right.local_mapping_integrity_sha256
+        && left.local_mapping_definition_sha256 == right.local_mapping_definition_sha256
+}
+
+fn same_capability_for_schema(
+    left: &PluginApiBaselineEntry,
+    right: &PluginApiBaselineEntry,
+    schema_version: u8,
+) -> bool {
+    left.plugin_id == right.plugin_id
+        && left.version == right.version
+        && left.services == right.services
+        && left.local_mapping_integrity_sha256 == right.local_mapping_integrity_sha256
+        && (schema_version < SCHEMA_VERSION
+            || left.local_mapping_definition_sha256 == right.local_mapping_definition_sha256)
 }
 
 fn is_lowercase_sha256(value: &str) -> bool {
@@ -541,9 +633,7 @@ fn document_matches_candidates(
 ) -> bool {
     let candidates = candidates
         .iter()
-        .filter(|entry| {
-            schema_version >= SCHEMA_VERSION || entry.local_mapping_integrity_sha256.is_none()
-        })
+        .filter(|entry| schema_version >= 3 || entry.local_mapping_integrity_sha256.is_none())
         .collect::<Vec<_>>();
     let candidates = candidates
         .into_iter()
@@ -555,7 +645,10 @@ fn document_matches_candidates(
     document.iter().all(|entry| {
         let candidate = candidates.get(&normalized_id(&entry.plugin_id));
         if entry.installed {
-            candidate.is_some_and(|candidate| *candidate == entry)
+            candidate.is_some_and(|candidate| {
+                same_capability_for_schema(entry, candidate, schema_version)
+                    && candidate.installed == entry.installed
+            })
         } else {
             candidate.is_none()
         }
@@ -598,6 +691,19 @@ mod tests {
         metadata.version = Version::parse("0.0.0-local").unwrap();
         metadata.desktop_version_requirement = None;
         manifest.local_mapping_integrity_sha256 = Some(integrity.repeat(64));
+        fs::create_dir_all(&manifest.plugin_dir).unwrap();
+        let definition = serde_json::json!({
+            "schemaVersion": 2,
+            "pluginId": plugin_id,
+            "displayName": plugin_id,
+            "services": manifest.services.clone(),
+            "debugCases": []
+        });
+        fs::write(
+            manifest.plugin_dir.join("local-mapping.json"),
+            serde_json::to_vec_pretty(&definition).unwrap(),
+        )
+        .unwrap();
         manifest
     }
 
@@ -788,6 +894,163 @@ mod tests {
                 .unwrap()["localMappingIntegritySha256"],
             "1".repeat(64)
         );
+        assert!(migrated["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["pluginId"] == "printer")
+            .unwrap()["localMappingDefinitionSha256"]
+            .as_str()
+            .is_some_and(is_lowercase_sha256));
+    }
+
+    #[test]
+    fn schema_three_adopts_only_matching_existing_local_definition_once() {
+        let root = tempfile::tempdir().unwrap();
+        let local_root = root.path().join("local-mappings");
+        let path = root.path().join("plugin-api-baseline.json");
+        let mapping = local_manifest(
+            "printer",
+            local_root.join("printer"),
+            "1",
+            serde_json::json!({
+                "serviceId": "label.printer",
+                "mainClass": "printer.dll",
+                "methods": [{"name": "print"}]
+            }),
+        );
+        let schema_three = serde_json::json!({
+            "schemaVersion": 3,
+            "plugins": [{
+                "pluginId": "printer",
+                "version": "0.0.0-local",
+                "services": mapping.services.clone(),
+                "localMappingIntegritySha256": "1".repeat(64),
+                "installed": true
+            }]
+        });
+        fs::write(&path, serde_json::to_vec(&schema_three).unwrap()).unwrap();
+
+        let (_, signed_blocked, local_blocked, recovered) =
+            PluginApiBaselineStore::open(path.clone(), std::slice::from_ref(&mapping), &local_root)
+                .unwrap();
+        assert!(signed_blocked.is_empty());
+        assert!(local_blocked.is_empty());
+        assert!(!recovered);
+        let migrated: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(migrated["schemaVersion"], SCHEMA_VERSION);
+        assert!(migrated["plugins"][0]["localMappingDefinitionSha256"]
+            .as_str()
+            .is_some_and(is_lowercase_sha256));
+    }
+
+    #[test]
+    fn schema_four_blocks_offline_debug_case_drift_but_ignores_json_formatting() {
+        let root = tempfile::tempdir().unwrap();
+        let local_root = root.path().join("local-mappings");
+        let path = root.path().join("plugin-api-baseline.json");
+        seed_legacy_empty_baseline(&path);
+        let mapping = local_manifest(
+            "printer",
+            local_root.join("printer"),
+            "1",
+            serde_json::json!({
+                "serviceId": "label.printer",
+                "mainClass": "printer.dll",
+                "methods": [{"name": "print"}]
+            }),
+        );
+        PluginApiBaselineStore::open(path.clone(), std::slice::from_ref(&mapping), &local_root)
+            .unwrap();
+
+        let definition_path = local_root.join("printer/local-mapping.json");
+        let unchanged: serde_json::Value =
+            serde_json::from_slice(&fs::read(&definition_path).unwrap()).unwrap();
+        fs::write(&definition_path, serde_json::to_vec(&unchanged).unwrap()).unwrap();
+        let (_, _, formatting_blocked, _) =
+            PluginApiBaselineStore::open(path.clone(), std::slice::from_ref(&mapping), &local_root)
+                .unwrap();
+        assert!(formatting_blocked.is_empty());
+
+        let mut changed = unchanged;
+        changed["debugCases"] = serde_json::json!([{
+            "name": "print-live-label",
+            "serviceId": "label.printer",
+            "method": "print",
+            "parameters": {},
+            "expectedResCode": 0
+        }]);
+        fs::write(&definition_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        let (_, signed_blocked, local_blocked, recovered) =
+            PluginApiBaselineStore::open(path, &[mapping], &local_root).unwrap();
+        assert!(signed_blocked.is_empty());
+        assert_eq!(local_blocked, BTreeSet::from(["printer".to_owned()]));
+        assert!(!recovered);
+    }
+
+    #[test]
+    fn managed_transition_accepts_a_definition_only_debug_case_change() {
+        let root = tempfile::tempdir().unwrap();
+        let local_root = root.path().join("local-mappings");
+        let path = root.path().join("plugin-api-baseline.json");
+        seed_legacy_empty_baseline(&path);
+        let mapping = local_manifest(
+            "printer",
+            local_root.join("printer"),
+            "1",
+            serde_json::json!({
+                "serviceId": "label.printer",
+                "mainClass": "printer.dll",
+                "methods": [{"name": "print"}]
+            }),
+        );
+        let (mut store, _, _, _) =
+            PluginApiBaselineStore::open(path.clone(), std::slice::from_ref(&mapping), &local_root)
+                .unwrap();
+        let previous_definition_sha256 = store
+            .entries
+            .iter()
+            .find(|entry| entry.plugin_id == "printer")
+            .unwrap()
+            .local_mapping_definition_sha256
+            .clone()
+            .unwrap();
+
+        let definition_path = local_root.join("printer/local-mapping.json");
+        let mut changed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&definition_path).unwrap()).unwrap();
+        changed["debugCases"] = serde_json::json!([{
+            "name": "print-synthetic-label",
+            "serviceId": "label.printer",
+            "method": "print",
+            "parameters": {},
+            "expectedResCode": 0
+        }]);
+        fs::write(&definition_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert_eq!(
+            store
+                .changed_local_mapping_ids_for_manifests(
+                    std::slice::from_ref(&mapping),
+                    &local_root,
+                )
+                .unwrap(),
+            BTreeSet::from(["printer".to_owned()])
+        );
+        store
+            .prepare_transition(std::slice::from_ref(&mapping), &local_root)
+            .unwrap();
+        let next_definition_sha256 =
+            local_mappings::definition_sha256_for_manifest(&mapping).unwrap();
+        assert_ne!(previous_definition_sha256, next_definition_sha256);
+        assert!(store.accepts_local_mapping_definition("printer", &next_definition_sha256));
+        drop(store);
+
+        let (recovered, _, local_blocked, did_recover) =
+            PluginApiBaselineStore::open(path, std::slice::from_ref(&mapping), &local_root)
+                .unwrap();
+        assert!(local_blocked.is_empty());
+        assert!(did_recover);
+        assert!(recovered.accepts_local_mapping_definition("printer", &next_definition_sha256));
     }
 
     #[test]
@@ -867,6 +1130,12 @@ mod tests {
                 "methods": [{"name": "print"}]
             }),
         );
+        let (mut store, _, _, _) = PluginApiBaselineStore::open(
+            path.clone(),
+            std::slice::from_ref(&original),
+            &local_root,
+        )
+        .unwrap();
         let updated = local_manifest(
             "printer",
             local_root.join("printer"),
@@ -877,12 +1146,6 @@ mod tests {
                 "methods": [{"name": "print"}, {"name": "status"}]
             }),
         );
-        let (mut store, _, _, _) = PluginApiBaselineStore::open(
-            path.clone(),
-            std::slice::from_ref(&original),
-            &local_root,
-        )
-        .unwrap();
         store
             .prepare_transition(std::slice::from_ref(&updated), &local_root)
             .unwrap();
@@ -901,8 +1164,18 @@ mod tests {
             .unwrap();
         recovered.commit_transition().unwrap();
 
+        let reappeared_manifest = local_manifest(
+            "printer",
+            local_root.join("printer"),
+            "1",
+            serde_json::json!({
+                "serviceId": "label.printer",
+                "mainClass": "printer.dll",
+                "methods": [{"name": "print"}]
+            }),
+        );
         let (_, _, reappeared, _) =
-            PluginApiBaselineStore::open(path, &[original], &local_root).unwrap();
+            PluginApiBaselineStore::open(path, &[reappeared_manifest], &local_root).unwrap();
         assert_eq!(reappeared, BTreeSet::from(["printer".to_owned()]));
     }
 

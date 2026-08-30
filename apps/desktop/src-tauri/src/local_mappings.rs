@@ -66,6 +66,27 @@ pub(crate) struct DebugCaseDefinition {
     pub expected_res_data: serde_json::Value,
 }
 
+#[derive(Debug)]
+pub(crate) struct DebugCaseUpdate {
+    previous_cases: Vec<DebugCaseDefinition>,
+    current_cases: Vec<DebugCaseDefinition>,
+    definition_sha256: String,
+}
+
+impl DebugCaseUpdate {
+    pub(crate) fn previous_cases(&self) -> &[DebugCaseDefinition] {
+        &self.previous_cases
+    }
+
+    pub(crate) fn current_cases(&self) -> &[DebugCaseDefinition] {
+        &self.current_cases
+    }
+
+    pub(crate) fn definition_sha256(&self) -> &str {
+        &self.definition_sha256
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NativeComponentInspection {
@@ -768,13 +789,16 @@ pub(crate) fn load_definition(plugin_dir: &Path) -> Result<LocalMappingDefinitio
 pub(crate) fn upsert_debug_case(
     root: &Path,
     plugin_id: &str,
+    expected_definition_sha256: &str,
     debug_case: DebugCaseDefinition,
-) -> Result<Vec<DebugCaseDefinition>, String> {
+) -> Result<DebugCaseUpdate, String> {
     let plugin_dir = installed_mapping_dir(root, plugin_id)?;
     let mut definition = load_validated_stored_definition(&plugin_dir, plugin_id)?;
+    ensure_definition_sha256_matches(&definition, expected_definition_sha256)?;
     if definition.plugin_id != plugin_id {
         return Err("本地映射目录身份与映射定义不一致".into());
     }
+    let previous_cases = definition.debug_cases.clone();
     if let Some(existing) = definition
         .debug_cases
         .iter_mut()
@@ -785,17 +809,26 @@ pub(crate) fn upsert_debug_case(
         definition.debug_cases.push(debug_case);
     }
     validate_definition_header(&definition)?;
+    let definition_sha256 = semantic_definition_sha256(&definition)?;
+    let current_cases = definition.debug_cases.clone();
     write_json_atomic(plugin_dir.join(LOCAL_MAPPING_FILENAME), &definition)?;
-    Ok(definition.debug_cases)
+    Ok(DebugCaseUpdate {
+        previous_cases,
+        current_cases,
+        definition_sha256,
+    })
 }
 
 pub(crate) fn delete_debug_case(
     root: &Path,
     plugin_id: &str,
+    expected_definition_sha256: &str,
     case_name: &str,
-) -> Result<Vec<DebugCaseDefinition>, String> {
+) -> Result<DebugCaseUpdate, String> {
     let plugin_dir = installed_mapping_dir(root, plugin_id)?;
     let mut definition = load_validated_stored_definition(&plugin_dir, plugin_id)?;
+    ensure_definition_sha256_matches(&definition, expected_definition_sha256)?;
+    let previous_cases = definition.debug_cases.clone();
     let previous_len = definition.debug_cases.len();
     definition
         .debug_cases
@@ -804,17 +837,52 @@ pub(crate) fn delete_debug_case(
         return Err(format!("调试用例 [{case_name}] 不存在"));
     }
     validate_definition_header(&definition)?;
+    let definition_sha256 = semantic_definition_sha256(&definition)?;
+    let current_cases = definition.debug_cases.clone();
     write_json_atomic(plugin_dir.join(LOCAL_MAPPING_FILENAME), &definition)?;
-    Ok(definition.debug_cases)
+    Ok(DebugCaseUpdate {
+        previous_cases,
+        current_cases,
+        definition_sha256,
+    })
 }
 
-pub(crate) fn load_debug_cases(
+pub(crate) fn load_debug_case_snapshot(
     root: &Path,
     plugin_id: &str,
-) -> Result<Vec<DebugCaseDefinition>, String> {
+) -> Result<(Vec<DebugCaseDefinition>, String), String> {
     let plugin_dir = installed_mapping_dir(root, plugin_id)?;
     let definition = load_validated_stored_definition(&plugin_dir, plugin_id)?;
-    Ok(definition.debug_cases)
+    let definition_sha256 = semantic_definition_sha256(&definition)?;
+    Ok((definition.debug_cases, definition_sha256))
+}
+
+pub(crate) fn restore_debug_cases(
+    root: &Path,
+    plugin_id: &str,
+    expected_definition_sha256: &str,
+    previous_cases: Vec<DebugCaseDefinition>,
+) -> Result<(), String> {
+    let plugin_dir = installed_mapping_dir(root, plugin_id)?;
+    let mut definition = load_validated_stored_definition(&plugin_dir, plugin_id)?;
+    ensure_definition_sha256_matches(&definition, expected_definition_sha256)?;
+    definition.debug_cases = previous_cases;
+    validate_definition_header(&definition)?;
+    write_json_atomic(plugin_dir.join(LOCAL_MAPPING_FILENAME), &definition)
+}
+
+pub(crate) fn definition_sha256_for_manifest(manifest: &PluginManifest) -> Result<String, String> {
+    let definition = load_stored_definition(&manifest.plugin_dir)?;
+    validate_definition_header(&definition)?;
+    if definition.plugin_id != manifest.plugin_id {
+        return Err("本地映射目录身份与映射定义不一致".into());
+    }
+    if serde_json::to_value(&definition.services).map_err(|error| error.to_string())?
+        != serde_json::to_value(&manifest.services).map_err(|error| error.to_string())?
+    {
+        return Err("本地映射定义与已校验 API 不一致".into());
+    }
+    semantic_definition_sha256(&definition)
 }
 
 pub(crate) fn export_typescript(
@@ -1265,6 +1333,31 @@ fn validate_debug_cases(definition: &LocalMappingDefinition) -> Result<(), Strin
         .validate()
         .map_err(|error| format!("调试用例 [{}] 无效: {error}", debug_case.name))?;
         validate_expected_res_data(debug_case)?;
+    }
+    Ok(())
+}
+
+fn semantic_definition_sha256(definition: &LocalMappingDefinition) -> Result<String, String> {
+    let bytes = serde_json::to_vec(definition)
+        .map_err(|error| format!("无法生成本地映射定义摘要: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"SSDEV-LOCAL-MAPPING-DEFINITION\0");
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn ensure_definition_sha256_matches(
+    definition: &LocalMappingDefinition,
+    expected_definition_sha256: &str,
+) -> Result<(), String> {
+    let actual = semantic_definition_sha256(definition)?;
+    if actual != expected_definition_sha256 {
+        return Err("本地映射定义在调试用例操作期间发生变化，请重新读取映射后再试".into());
     }
     Ok(())
 }
@@ -2124,13 +2217,21 @@ mod tests {
             assert_res_data: true,
             expected_res_data: serde_json::json!({ "ReturnValue": 0 }),
         };
-        assert_eq!(
-            upsert_debug_case(active_root.path(), "reader.local", debug_case.clone()).unwrap(),
-            vec![debug_case]
-        );
+        let (_, initial_sha256) =
+            load_debug_case_snapshot(active_root.path(), "reader.local").unwrap();
+        let inserted = upsert_debug_case(
+            active_root.path(),
+            "reader.local",
+            &initial_sha256,
+            debug_case.clone(),
+        )
+        .unwrap();
+        assert_eq!(inserted.current_cases(), std::slice::from_ref(&debug_case));
+        assert_ne!(inserted.definition_sha256(), initial_sha256);
         assert!(upsert_debug_case(
             active_root.path(),
             "reader.local",
+            inserted.definition_sha256(),
             DebugCaseDefinition {
                 name: "invalid".into(),
                 service_id: "ReaderService".into(),
@@ -2143,11 +2244,32 @@ mod tests {
             }
         )
         .is_err());
-        assert!(
-            delete_debug_case(active_root.path(), "reader.local", "synthetic port")
-                .unwrap()
-                .is_empty()
-        );
+        assert!(upsert_debug_case(
+            active_root.path(),
+            "reader.local",
+            &initial_sha256,
+            debug_case,
+        )
+        .is_err());
+        let deleted = delete_debug_case(
+            active_root.path(),
+            "reader.local",
+            inserted.definition_sha256(),
+            "synthetic port",
+        )
+        .unwrap();
+        assert!(deleted.current_cases().is_empty());
+        restore_debug_cases(
+            active_root.path(),
+            "reader.local",
+            deleted.definition_sha256(),
+            deleted.previous_cases().to_vec(),
+        )
+        .unwrap();
+        let (restored, restored_sha256) =
+            load_debug_case_snapshot(active_root.path(), "reader.local").unwrap();
+        assert_eq!(restored, deleted.previous_cases());
+        assert_eq!(restored_sha256, inserted.definition_sha256());
     }
 
     #[test]

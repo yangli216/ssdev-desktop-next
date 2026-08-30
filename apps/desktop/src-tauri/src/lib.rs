@@ -5330,6 +5330,148 @@ async fn debug_plugin_invoke(
     })
 }
 
+struct ApprovedLocalMappingDebugContext {
+    manifests: Vec<PluginManifest>,
+    definition_sha256: String,
+}
+
+async fn approved_local_mapping_debug_context(
+    state: &BridgeState,
+    plugin_id: &str,
+) -> Result<ApprovedLocalMappingDebugContext, String> {
+    let inspected = inspect_all_plugins_for_state(state)?;
+    let manifest = inspected
+        .manifests
+        .iter()
+        .find(|manifest| {
+            manifest.plugin_id.eq_ignore_ascii_case(plugin_id)
+                && is_local_manifest(manifest, &state.local_mapping_root)
+        })
+        .ok_or_else(|| {
+            format!("本地映射 [{plugin_id}] 未处于已批准可调用状态；请恢复原内容或检查重新扫描影响")
+        })?;
+    if manifest.plugin_id != plugin_id {
+        return Err("本地映射身份大小写与已批准清单不一致，请重新读取映射".to_owned());
+    }
+    let active_matches = state
+        .controller
+        .manifests_match_active_routes(&inspected.manifests)
+        .await
+        .map_err(|error| format!("无法核对当前映射运行状态 ({})", error.diagnostic_code()))?;
+    if !active_matches {
+        return Err("当前活动路由与已批准映射不一致；请先重新扫描并处理隔离项".to_owned());
+    }
+    let definition_sha256 = local_mappings::definition_sha256_for_manifest(manifest)?;
+    if !local_mapping_definition_is_accepted(state, plugin_id, &definition_sha256)? {
+        return Err(
+            "本地映射调试用例与上次批准内容不一致；请重新读取映射并检查重新扫描影响".to_owned(),
+        );
+    }
+    Ok(ApprovedLocalMappingDebugContext {
+        manifests: inspected.manifests,
+        definition_sha256,
+    })
+}
+
+fn local_mapping_definition_is_accepted(
+    state: &BridgeState,
+    plugin_id: &str,
+    definition_sha256: &str,
+) -> Result<bool, String> {
+    state
+        .plugin_api_baseline
+        .lock()
+        .map_err(|_| "插件能力基线锁已损坏".to_owned())
+        .map(|baseline| baseline.accepts_local_mapping_definition(plugin_id, definition_sha256))
+}
+
+fn restore_debug_case_update(
+    root: &std::path::Path,
+    plugin_id: &str,
+    update: &local_mappings::DebugCaseUpdate,
+    operation_error: &str,
+) -> String {
+    match local_mappings::restore_debug_cases(
+        root,
+        plugin_id,
+        update.definition_sha256(),
+        update.previous_cases().to_vec(),
+    ) {
+        Ok(()) => format!("{operation_error}；调试用例已恢复到操作前状态"),
+        Err(_) => format!(
+            "{operation_error}；映射定义同时发生变化，未覆盖现场文件，当前内容保持未批准并会阻止回归执行"
+        ),
+    }
+}
+
+fn commit_debug_case_baseline_update(
+    state: &BridgeState,
+    approved_manifests: &[PluginManifest],
+    plugin_id: &str,
+    root: &std::path::Path,
+    update: &local_mappings::DebugCaseUpdate,
+) -> Result<(), String> {
+    if local_mapping_definition_is_accepted(state, plugin_id, update.definition_sha256())? {
+        return Ok(());
+    }
+    let previous_manifest = approved_manifests
+        .iter()
+        .find(|manifest| manifest.plugin_id == plugin_id && is_local_manifest(manifest, root))
+        .ok_or_else(|| {
+            restore_debug_case_update(root, plugin_id, update, "调试用例提交前已批准映射身份丢失")
+        })?;
+    let updated_manifest =
+        PluginManifest::load(plugin_id, &previous_manifest.plugin_dir).map_err(|_| {
+            restore_debug_case_update(
+                root,
+                plugin_id,
+                update,
+                "调试用例提交后无法重新读取映射清单",
+            )
+        })?;
+    local_mappings::validate_installed_manifest(&updated_manifest).map_err(|_| {
+        restore_debug_case_update(
+            root,
+            plugin_id,
+            update,
+            "调试用例提交后映射定义未通过一致性复核",
+        )
+    })?;
+    if updated_manifest != *previous_manifest
+        || local_mappings::definition_sha256_for_manifest(&updated_manifest).as_deref()
+            != Ok(update.definition_sha256())
+    {
+        return Err(restore_debug_case_update(
+            root,
+            plugin_id,
+            update,
+            "调试用例提交期间映射 API、运行时或定义发生变化",
+        ));
+    }
+
+    let mut candidates = approved_manifests.to_vec();
+    let target = candidates
+        .iter_mut()
+        .find(|manifest| manifest.plugin_id == plugin_id)
+        .ok_or_else(|| {
+            restore_debug_case_update(root, plugin_id, update, "调试用例提交前候选能力集合不完整")
+        })?;
+    *target = updated_manifest;
+    let mut transition = PluginCapabilityBaselineTransition::prepare(state, &candidates)
+        .map_err(|error| restore_debug_case_update(root, plugin_id, update, &error))?;
+    if !local_mapping_definition_is_accepted(state, plugin_id, update.definition_sha256())? {
+        transition.abort();
+        return Err(restore_debug_case_update(
+            root,
+            plugin_id,
+            update,
+            "调试用例提交记录未绑定本次映射定义",
+        ));
+    }
+    transition.commit();
+    Ok(())
+}
+
 #[tauri::command]
 async fn save_local_mapping_debug_case(
     caller: WebviewWindow,
@@ -5339,12 +5481,23 @@ async fn save_local_mapping_debug_case(
 ) -> Result<Vec<local_mappings::DebugCaseDefinition>, String> {
     desktop::require_control(&caller)?;
     let _install = state.install_lock.lock().await;
+    let approved = approved_local_mapping_debug_context(&state, &plugin_id).await?;
     let root = state.local_mapping_root.clone();
-    tokio::task::spawn_blocking(move || {
-        local_mappings::upsert_debug_case(&root, &plugin_id, debug_case)
+    let operation_root = root.clone();
+    let operation_plugin_id = plugin_id.clone();
+    let expected_definition_sha256 = approved.definition_sha256.clone();
+    let update = tokio::task::spawn_blocking(move || {
+        local_mappings::upsert_debug_case(
+            &operation_root,
+            &operation_plugin_id,
+            &expected_definition_sha256,
+            debug_case,
+        )
     })
     .await
-    .map_err(|_| "调试用例保存任务异常终止".to_owned())?
+    .map_err(|_| "调试用例保存任务异常终止".to_owned())??;
+    commit_debug_case_baseline_update(&state, &approved.manifests, &plugin_id, &root, &update)?;
+    Ok(update.current_cases().to_vec())
 }
 
 #[tauri::command]
@@ -5356,12 +5509,23 @@ async fn delete_local_mapping_debug_case(
 ) -> Result<Vec<local_mappings::DebugCaseDefinition>, String> {
     desktop::require_control(&caller)?;
     let _install = state.install_lock.lock().await;
+    let approved = approved_local_mapping_debug_context(&state, &plugin_id).await?;
     let root = state.local_mapping_root.clone();
-    tokio::task::spawn_blocking(move || {
-        local_mappings::delete_debug_case(&root, &plugin_id, &case_name)
+    let operation_root = root.clone();
+    let operation_plugin_id = plugin_id.clone();
+    let expected_definition_sha256 = approved.definition_sha256.clone();
+    let update = tokio::task::spawn_blocking(move || {
+        local_mappings::delete_debug_case(
+            &operation_root,
+            &operation_plugin_id,
+            &expected_definition_sha256,
+            &case_name,
+        )
     })
     .await
-    .map_err(|_| "调试用例删除任务异常终止".to_owned())?
+    .map_err(|_| "调试用例删除任务异常终止".to_owned())??;
+    commit_debug_case_baseline_update(&state, &approved.manifests, &plugin_id, &root, &update)?;
+    Ok(update.current_cases().to_vec())
 }
 
 #[tauri::command]
@@ -5373,11 +5537,22 @@ async fn run_local_mapping_debug_cases(
     desktop::require_control(&caller)?;
     let cases = {
         let _install = state.install_lock.lock().await;
+        let approved = approved_local_mapping_debug_context(&state, &plugin_id).await?;
         let root = state.local_mapping_root.clone();
-        let plugin_id = plugin_id.clone();
-        tokio::task::spawn_blocking(move || local_mappings::load_debug_cases(&root, &plugin_id))
-            .await
-            .map_err(|_| "调试用例读取任务异常终止".to_owned())??
+        let snapshot_plugin_id = plugin_id.clone();
+        let (cases, definition_sha256) = tokio::task::spawn_blocking(move || {
+            local_mappings::load_debug_case_snapshot(&root, &snapshot_plugin_id)
+        })
+        .await
+        .map_err(|_| "调试用例读取任务异常终止".to_owned())??;
+        if definition_sha256 != approved.definition_sha256
+            || !local_mapping_definition_is_accepted(&state, &plugin_id, &definition_sha256)?
+        {
+            return Err(
+                "本地映射调试用例与上次批准内容不一致；请重新读取映射并检查重新扫描影响".to_owned(),
+            );
+        }
+        cases
     };
     let mut results = Vec::with_capacity(cases.len());
     for debug_case in cases {

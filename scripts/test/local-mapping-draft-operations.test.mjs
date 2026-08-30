@@ -9,6 +9,9 @@ import {
 } from '../../apps/desktop/src/local-mapping-draft.js'
 
 const studioVue = new URL('../../apps/desktop/src/LocalMappingStudio.vue', import.meta.url)
+const desktopRust = new URL('../../apps/desktop/src-tauri/src/lib.rs', import.meta.url)
+const localMappingsRust = new URL('../../apps/desktop/src-tauri/src/local_mappings.rs', import.meta.url)
+const capabilityBaselineRust = new URL('../../apps/desktop/src-tauri/src/plugin_api_baseline.rs', import.meta.url)
 
 test('native mapping operations cannot silently use an older activated mapping', async () => {
   const source = await readFile(studioVue, 'utf8')
@@ -73,4 +76,26 @@ test('editing a mapping invalidates results produced by the previous activated s
   assert.match(source, /watch\(draftDirty, \(value\) => \{[\s\S]+debugResult\.value = null[\s\S]+suggestedExpectedDataText\.value = ''[\s\S]+regressionResults\.value = \[\]/)
   assert.match(source, /v-if="debugResult && !draftDirty"/)
   assert.match(source, /v-if="regressionResults\.length && !draftDirty"/)
+})
+
+test('saved regression parameters remain inside the approved mapping snapshot', async () => {
+  const [studio, desktop, mappings, baseline] = await Promise.all([
+    readFile(studioVue, 'utf8'),
+    readFile(desktopRust, 'utf8'),
+    readFile(localMappingsRust, 'utf8'),
+    readFile(capabilityBaselineRust, 'utf8'),
+  ])
+
+  assert.match(baseline, /const SCHEMA_VERSION: u8 = 4;/)
+  assert.match(baseline, /local_mapping_definition_sha256: Option<String>/)
+  assert.match(baseline, /adopt_schema_three_local_mapping_definitions/)
+  assert.match(baseline, /left\.local_mapping_definition_sha256 == right\.local_mapping_definition_sha256/)
+  assert.match(mappings, /SSDEV-LOCAL-MAPPING-DEFINITION\\0/)
+  assert.match(mappings, /ensure_definition_sha256_matches\(&definition, expected_definition_sha256\)/)
+  assert.match(desktop, /async fn approved_local_mapping_debug_context/)
+  assert.match(desktop, /commit_debug_case_baseline_update\(&state, &approved\.manifests/)
+  assert.match(desktop, /load_debug_case_snapshot\(&root, &snapshot_plugin_id\)/)
+  assert.match(desktop, /local_mapping_definition_is_accepted\(&state, &plugin_id, &definition_sha256\)/)
+  assert.match(studio, /可能触发打印、写卡或设备动作/)
+  assert.match(studio, /退出客户端后直接改写用例会隔离映射/)
 })
