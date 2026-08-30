@@ -12,6 +12,7 @@ serde_json.workspace = true
 sha2.workspace = true
 ssdev-config.workspace = true
 tempfile = "3"
+webplus-plugin-config.workspace = true
 webplus-plugin-trust.workspace = true
 zip.workspace = true
 

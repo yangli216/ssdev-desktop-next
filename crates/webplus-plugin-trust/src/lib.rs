@@ -560,18 +560,11 @@ fn read_signature_document(plugin_dir: &Path) -> Result<SignatureDocument, Trust
 
 fn validate_plugin_id(plugin_id: &str) -> Result<(), TrustError> {
     let path = Path::new(plugin_id);
-    if plugin_id.trim().is_empty()
-        || plugin_id.starts_with('.')
-        || plugin_id.chars().count() > 128
-        || plugin_id.chars().any(char::is_control)
-        || path.components().count() != 1
-        || !matches!(path.components().next(), Some(Component::Normal(_)))
-        || plugin_id.contains(['/', '\\'])
-    {
-        return Err(TrustError::Verification(
-            "plugin ID must be a safe single path component of 1 to 128 characters".into(),
-        ));
-    }
+    webplus_plugin_config::validate_portable_plugin_id(plugin_id).map_err(|_| {
+        TrustError::Verification(
+            "plugin ID must be a Windows-portable ASCII identifier of 1 to 128 characters".into(),
+        )
+    })?;
     portable_plugin_path(path)?;
     Ok(())
 }
@@ -898,6 +891,17 @@ mod tests {
             files.get("reader.dll"),
             Some(&sha256_file(&manifest.plugin_dir.join("reader.dll")).unwrap())
         );
+    }
+
+    #[test]
+    fn signing_rejects_windows_aliased_plugin_ids() {
+        let root = tempdir().unwrap();
+        for plugin_id in ["reader.", "CON", "com1.device", "读卡器"] {
+            assert!(
+                prepare_signing_material(root.path(), plugin_id, "test-key").is_err(),
+                "accepted {plugin_id}"
+            );
+        }
     }
 
     #[test]

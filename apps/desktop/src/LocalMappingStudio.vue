@@ -2,7 +2,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { mappingDeletionDiscardsDraft, mappingDraftTargetsPlugin, sameMappingPluginId } from './local-mapping-draft.js'
+import { isPortableMappingPluginId, mappingDeletionDiscardsDraft, mappingDraftTargetsPlugin, sameMappingPluginId } from './local-mapping-draft.js'
 
 type Architecture = 'x86' | 'x64'
 type MainType = 'dll' | 'com' | 'ocx' | 'exe' | 'bat'
@@ -647,6 +647,11 @@ function useExport(name: string) {
 
 async function saveMapping() {
   const definition = mappingForSave()
+  if (!isPortableMappingPluginId(definition.pluginId)) {
+    notice.value = ''
+    error.value = '映射 ID 必须是 1 到 128 位 ASCII 字母、数字、点、短横线或下划线，不能以点开头或结尾，也不能使用 CON、PRN、AUX、NUL、COM1–COM9、LPT1–LPT9 等 Windows 保留名。'
+    return
+  }
   const existingTarget = inventory.value.mappings.find((item) => sameMappingPluginId(item.pluginId, definition.pluginId))
   const editingTarget = sameMappingPluginId(savedMappingPluginId.value, definition.pluginId)
   if (existingTarget && !editingTarget && !window.confirm(`映射 ID「${definition.pluginId}」已经属于「${existingTarget.displayName || existingTarget.pluginId}」。继续将替换其原生组件、服务、方法和调试用例，确定继续吗？`)) return
@@ -985,6 +990,7 @@ function regressionDataSummary(item: DebugCaseRunResult): string {
         <label><span>映射 ID</span><input v-model.trim="draft.pluginId" :disabled="editingInstalledMapping" required pattern="[A-Za-z0-9._-]+" placeholder="hospital-device" /></label>
         <label><span>显示名称</span><input v-model.trim="draft.displayName" required placeholder="院内设备接口" /></label>
       </div>
+      <p v-if="!editingInstalledMapping" class="field-hint">ID 将成为 Windows 插件目录和 Web 路由身份；仅使用 ASCII 字母、数字、点、短横线或下划线，且不能使用 Windows 保留设备名。</p>
       <p v-if="editingInstalledMapping" class="field-hint">已保存映射的 ID 是稳定路由身份，不能直接改名；需要新身份时请新建映射，验证后再单独删除旧映射。</p>
 
       <div class="service-tabs">

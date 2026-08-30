@@ -1201,18 +1201,8 @@ pub(crate) fn mapping_target_exists(root: &Path, plugin_id: &str) -> Result<bool
 }
 
 fn validate_plugin_id(plugin_id: &str) -> Result<(), String> {
-    let path = Path::new(plugin_id);
-    if plugin_id.trim().is_empty()
-        || plugin_id.starts_with('.')
-        || plugin_id.chars().count() > 128
-        || plugin_id.chars().any(char::is_control)
-        || plugin_id.contains(['/', '\\'])
-        || path.components().count() != 1
-        || !matches!(path.components().next(), Some(Component::Normal(_)))
-    {
-        return Err("映射 ID 必须是 1 到 128 个字符的单段名称".into());
-    }
-    Ok(())
+    webplus_plugin_config::validate_portable_plugin_id(plugin_id)
+        .map_err(|_| "映射 ID 必须是 1 到 128 位 Windows 可移植 ASCII 标识".to_owned())
 }
 
 fn validate_definition_header(definition: &LocalMappingDefinition) -> Result<(), String> {
@@ -1864,6 +1854,9 @@ mod tests {
         assert!(bounded_plugin_target(Path::new("root"), "reader.local").is_ok());
         assert!(bounded_plugin_target(Path::new("root"), "../reader").is_err());
         assert!(bounded_plugin_target(Path::new("root"), ".hidden").is_err());
+        assert!(bounded_plugin_target(Path::new("root"), "reader.").is_err());
+        assert!(bounded_plugin_target(Path::new("root"), "CON").is_err());
+        assert!(bounded_plugin_target(Path::new("root"), "读卡器").is_err());
     }
 
     #[test]

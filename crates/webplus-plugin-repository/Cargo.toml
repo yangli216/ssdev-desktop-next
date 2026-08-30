@@ -15,6 +15,7 @@ tempfile = "3"
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
+webplus-plugin-config.workspace = true
 webplus-plugin-trust.workspace = true
 
 [dev-dependencies]

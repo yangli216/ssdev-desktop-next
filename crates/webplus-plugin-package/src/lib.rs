@@ -614,9 +614,7 @@ fn read_activation_journal(transaction: &Path) -> Result<ActivationJournal, Pack
 
 fn validated_plugin_target(plugin_root: &Path, plugin_id: &str) -> Result<PathBuf, PackageError> {
     let path = Path::new(plugin_id);
-    if plugin_id.trim().is_empty()
-        || plugin_id.starts_with('.')
-        || path.components().count() != 1
+    if webplus_plugin_config::validate_portable_plugin_id(plugin_id).is_err()
         || portable_plugin_path(path)? != plugin_id
     {
         return Err(PackageError::Invalid(format!(
@@ -1111,6 +1109,9 @@ mod tests {
     fn recovery_rejects_an_unsafe_plugin_id_without_touching_outside_data() {
         let root = tempdir().unwrap();
         let plugin_root = root.path().join("plugins");
+        for plugin_id in ["reader.", "CON", "com1.device", "读卡器"] {
+            assert!(validated_plugin_target(&plugin_root, plugin_id).is_err());
+        }
         let transaction = plugin_root.join(".activation-test");
         fs::create_dir_all(&transaction).unwrap();
         write_activation_journal(

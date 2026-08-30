@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use ssdev_config::DesktopConfig;
@@ -222,15 +222,7 @@ fn validate_members(members: &[ProjectActivationMember]) -> Result<(), String> {
     }
     let mut ids = HashSet::new();
     for member in members {
-        let path = Path::new(&member.plugin_id);
-        if member.plugin_id.trim().is_empty()
-            || member.plugin_id.starts_with('.')
-            || member.plugin_id.chars().count() > 128
-            || member.plugin_id.chars().any(char::is_control)
-            || member.plugin_id.contains(['/', '\\'])
-            || path.components().count() != 1
-            || !matches!(path.components().next(), Some(Component::Normal(_)))
-        {
+        if webplus_plugin_config::validate_portable_plugin_id(&member.plugin_id).is_err() {
             return Err("项目事务包含无效组件 ID".into());
         }
         if !ids.insert(member.plugin_id.to_ascii_lowercase()) {
@@ -486,6 +478,18 @@ mod tests {
             ],
         )
         .is_err());
+        for plugin_id in ["reader.", "CON", "lpt9.local", "读卡器"] {
+            assert!(ProjectActivation::begin(
+                &root.path().join(format!("unsafe-{plugin_id}")),
+                &config,
+                &config,
+                vec![ProjectActivationMember {
+                    plugin_id: plugin_id.into(),
+                    kind: ProjectActivationKind::SignedPlugin,
+                }],
+            )
+            .is_err());
+        }
         let error = match ProjectActivation::begin(
             &root.path().join("case-conflict"),
             &config,

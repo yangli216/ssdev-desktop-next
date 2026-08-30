@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import {
+  isPortableMappingPluginId,
   mappingDeletionDiscardsDraft,
   mappingDraftTargetsPlugin,
   sameMappingPluginId,
@@ -52,6 +53,18 @@ test('mapping identities use Windows-compatible ASCII case-insensitive compariso
   assert.equal(sameMappingPluginId('', ''), false)
   assert.equal(sameMappingPluginId('reader.local', 'reader-other.local'), false)
   assert.equal(mappingDraftTargetsPlugin({ dirty: true, savedPluginId: 'Reader.Local', currentPluginId: '' }, 'reader.local'), true)
+})
+
+test('mapping identities reject Windows aliases before native preflight', async () => {
+  assert.equal(isPortableMappingPluginId('reader.local'), true)
+  assert.equal(isPortableMappingPluginId('Reader_2-x64'), true)
+  for (const value of ['reader.', '.reader', 'CON', 'con.device', 'COM1', 'lpt9.local', '读卡器', 'reader local']) {
+    assert.equal(isPortableMappingPluginId(value), false, value)
+  }
+
+  const source = await readFile(studioVue, 'utf8')
+  assert.match(source, /if \(!isPortableMappingPluginId\(definition\.pluginId\)\)/)
+  assert.match(source, /不能使用 CON、PRN、AUX、NUL、COM1–COM9、LPT1–LPT9/)
 })
 
 test('editing a mapping invalidates results produced by the previous activated snapshot', async () => {

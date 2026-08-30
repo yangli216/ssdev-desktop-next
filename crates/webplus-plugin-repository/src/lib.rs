@@ -466,19 +466,12 @@ fn validate_withdrawal(withdrawal: &CatalogWithdrawal) -> Result<(), RepositoryE
 }
 
 fn validate_plugin_id(plugin_id: &str) -> Result<(), RepositoryError> {
-    if plugin_id.is_empty()
-        || plugin_id.len() > 128
-        || plugin_id.starts_with('.')
-        || !plugin_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        return Err(RepositoryError::Invalid(format!(
-            "catalog plugin ID [{}] is not portable",
+    webplus_plugin_config::validate_portable_plugin_id(plugin_id).map_err(|_| {
+        RepositoryError::Invalid(format!(
+            "catalog plugin ID [{}] is not Windows-portable",
             plugin_id
-        )));
-    }
-    Ok(())
+        ))
+    })
 }
 
 fn require_https(url: &Url) -> Result<(), RepositoryError> {
@@ -523,6 +516,17 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn catalog_rejects_windows_aliased_plugin_ids() {
+        assert!(validate_plugin_id("reader-plugin").is_ok());
+        for plugin_id in ["reader.", "CON", "com1.device", "读卡器"] {
+            assert!(
+                validate_plugin_id(plugin_id).is_err(),
+                "accepted {plugin_id}"
+            );
+        }
+    }
 
     fn signed_catalog(expires_at: u64) -> (TrustStore, Vec<u8>, Vec<u8>) {
         let root = tempdir().unwrap();

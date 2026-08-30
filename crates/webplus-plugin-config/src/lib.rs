@@ -614,7 +614,7 @@ impl PluginMetadata {
                 metadata.schema_version
             )));
         }
-        validate_plugin_id(&metadata.plugin_id)?;
+        validate_portable_plugin_id(&metadata.plugin_id)?;
         if metadata.display_name.chars().count() > 128 {
             return Err(ConfigError::Validation(
                 "plugin display name must not exceed 128 characters".into(),
@@ -1428,7 +1428,7 @@ pub fn validate_com_automation(service: &ServiceDefinition) -> Result<(), String
 }
 
 fn validate_manifest(plugin_id: &str, services: &[ServiceDefinition]) -> Result<(), ConfigError> {
-    validate_plugin_id(plugin_id)?;
+    validate_portable_plugin_id(plugin_id)?;
     if services.is_empty() {
         return Err(ConfigError::Validation(format!(
             "plugin [{plugin_id}] does not define any services"
@@ -1446,24 +1446,39 @@ fn validate_manifest(plugin_id: &str, services: &[ServiceDefinition]) -> Result<
     Ok(())
 }
 
-fn validate_plugin_id(plugin_id: &str) -> Result<(), ConfigError> {
-    let plugin_id_path = Path::new(plugin_id);
-    if plugin_id.trim().is_empty()
+pub fn validate_portable_plugin_id(plugin_id: &str) -> Result<(), ConfigError> {
+    if plugin_id.is_empty()
         || plugin_id.starts_with('.')
-        || plugin_id.chars().count() > 128
-        || plugin_id.chars().any(char::is_control)
-        || plugin_id.contains(['/', '\\'])
-        || plugin_id_path.components().count() != 1
-        || !matches!(
-            plugin_id_path.components().next(),
-            Some(Component::Normal(_))
-        )
+        || plugin_id.ends_with('.')
+        || plugin_id.len() > 128
+        || !plugin_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || is_windows_reserved_plugin_id(plugin_id)
     {
         return Err(ConfigError::Validation(
-            "plugin ID must contain 1 to 128 characters".into(),
+            "plugin ID must be a Windows-portable ASCII identifier of 1 to 128 characters".into(),
         ));
     }
     Ok(())
+}
+
+fn is_windows_reserved_plugin_id(plugin_id: &str) -> bool {
+    let stem = plugin_id
+        .split_once('.')
+        .map_or(plugin_id, |(stem, _)| stem)
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || matches!(
+            stem.strip_prefix("COM")
+                .and_then(|value| value.parse::<u8>().ok()),
+            Some(1..=9)
+        )
+        || matches!(
+            stem.strip_prefix("LPT")
+                .and_then(|value| value.parse::<u8>().ok()),
+            Some(1..=9)
+        )
 }
 
 fn validate_service<'a>(
@@ -1666,6 +1681,29 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn plugin_ids_are_portable_to_windows_filesystems() {
+        for plugin_id in ["reader", "reader.local", "Reader_2-x64"] {
+            validate_portable_plugin_id(plugin_id).unwrap();
+        }
+        for plugin_id in [
+            "",
+            ".reader",
+            "reader.",
+            "reader local",
+            "读卡器",
+            "CON",
+            "con.device",
+            "COM1",
+            "lpt9.local",
+        ] {
+            assert!(
+                validate_portable_plugin_id(plugin_id).is_err(),
+                "accepted {plugin_id}"
+            );
+        }
+    }
 
     fn write_integrity_fixture(root: &Path) -> Vec<ServiceDefinition> {
         fs::create_dir_all(root.join("components")).unwrap();

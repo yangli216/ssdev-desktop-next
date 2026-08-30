@@ -652,16 +652,8 @@ fn component_archive(plugin_id: &str, kind: ProjectComponentKind) -> String {
 }
 
 fn validate_plugin_id(plugin_id: &str) -> Result<(), String> {
-    if plugin_id.is_empty()
-        || plugin_id.len() > 128
-        || plugin_id.starts_with('.')
-        || !plugin_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        return Err(format!("项目组件 ID [{plugin_id}] 不可移植"));
-    }
-    Ok(())
+    webplus_plugin_config::validate_portable_plugin_id(plugin_id)
+        .map_err(|_| format!("项目组件 ID [{plugin_id}] 不是 Windows 可移植标识"))
 }
 
 fn validate_component_declaration(
@@ -1011,6 +1003,12 @@ mod tests {
         assert!(validate_manifest(&invalid_manifest)
             .unwrap_err()
             .contains("不是有效 SemVer"));
+        for plugin_id in ["reader.", "CON", "com1.device", "读卡器"] {
+            assert!(
+                validate_plugin_id(plugin_id).is_err(),
+                "accepted {plugin_id}"
+            );
+        }
     }
 
     #[test]
