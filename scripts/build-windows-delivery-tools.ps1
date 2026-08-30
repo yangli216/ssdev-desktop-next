@@ -199,6 +199,8 @@ try {
     }
 
     Copy-Item -LiteralPath (Join-Path $workspace "scripts/test-plugin-matrix.ps1") -Destination (Join-Path $staging "run-plugin-matrix.ps1")
+    Copy-Item -LiteralPath (Join-Path $workspace "scripts/test-windows-package.ps1") -Destination (Join-Path $staging "run-windows-package.ps1")
+    Copy-Item -LiteralPath (Join-Path $workspace "scripts/business-page-probe-server.mjs") -Destination (Join-Path $staging "business-page-probe-server.mjs")
     Copy-Item -LiteralPath (Join-Path $workspace "docs/windows-delivery-tools.md") -Destination (Join-Path $staging "README.md")
 
     $generatedSbomsOwned = $true

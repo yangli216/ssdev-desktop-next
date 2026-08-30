@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use ssdev_app_update::verify_update_artifact_files;
 use ssdev_release_manifest::{
     create_manifest, create_release_metadata, verify_manifest, verify_release_metadata,
     ReleaseMetadataOptions,
@@ -80,6 +81,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 verified.source_revision
             );
         }
+        "update-verify" => {
+            require_argument_count(&arguments, 4)?;
+            let verified_bytes = verify_update_artifact_files(
+                &path_argument(arguments.get(1), "application update policy")?,
+                &path_argument(arguments.get(2), "update artifact")?,
+                &path_argument(arguments.get(3), "update signature")?,
+            )?;
+            println!("application update signature verified for {verified_bytes} bytes");
+        }
         _ => return Err(usage().into()),
     }
     Ok(())
@@ -117,5 +127,5 @@ fn bool_argument(value: Option<&OsString>, label: &str) -> Result<bool, String> 
 }
 
 fn usage() -> &'static str {
-    "usage:\n  ssdev-release-manifest <create|verify> <bundle-root> <manifest-relative-path>\n  ssdev-release-manifest metadata-create <workspace-root> <output> <app-version> <product-name> <identifier> <authenticode-required> <synthetic-version-override> <allow-dirty-source>\n  ssdev-release-manifest metadata-verify <metadata-path> [current-workspace-root]"
+    "usage:\n  ssdev-release-manifest <create|verify> <bundle-root> <manifest-relative-path>\n  ssdev-release-manifest metadata-create <workspace-root> <output> <app-version> <product-name> <identifier> <authenticode-required> <synthetic-version-override> <allow-dirty-source>\n  ssdev-release-manifest metadata-verify <metadata-path> [current-workspace-root]\n  ssdev-release-manifest update-verify <app-update.json> <update-artifact> <update-artifact.sig>"
 }

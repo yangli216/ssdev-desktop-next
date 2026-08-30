@@ -97,12 +97,14 @@ test("Windows production bundles require project delivery signing trust", async 
     readFile(packageTestUrl, "utf8"),
   ]);
 
-  for (const script of [buildScript, packageTest]) {
-    assert.match(
-      script,
-      /--required-purposes plugin,origin-policy,project-bundle/,
-    );
-  }
+  assert.match(
+    buildScript,
+    /--required-purposes plugin,origin-policy,project-bundle/,
+  );
+  assert.match(
+    packageTest,
+    /"--required-purposes", "plugin,origin-policy,project-bundle"/,
+  );
 });
 
 test("CI publishes separate offline and online-light NSIS packages", async () => {

@@ -79,18 +79,44 @@ try {
     $matrixRunnerPath = Resolve-MatrixInput $MatrixRunner Leaf "matrix-runner-build-failed" "Restore and verify the approved Windows x64 delivery toolkit."
   } else {
     $adjacentRunner = Join-Path $PSScriptRoot "ssdev-plugin-matrix.exe"
+    $adjacentToolkitMarkerPresent = (
+      (Test-Path -LiteralPath (Join-Path $PSScriptRoot "artifacts.json") -PathType Leaf) -or
+      (Test-Path -LiteralPath (Join-Path $PSScriptRoot "release.json") -PathType Leaf) -or
+      (Test-Path -LiteralPath (Join-Path $PSScriptRoot "ssdev-release-manifest.exe") -PathType Leaf)
+    )
+    if ($adjacentToolkitMarkerPresent -and -not (Test-Path -LiteralPath $adjacentRunner -PathType Leaf)) {
+      Stop-Matrix "matrix-runner-build-failed" "Restore the complete approved Windows x64 delivery toolkit and its artifact manifest."
+    }
     if (Test-Path -LiteralPath $adjacentRunner -PathType Leaf) {
       $manifestVerifier = Join-Path $PSScriptRoot "ssdev-release-manifest.exe"
       $artifactManifest = Join-Path $PSScriptRoot "artifacts.json"
+      $toolkitReleasePath = Join-Path $PSScriptRoot "release.json"
       if (
         -not (Test-Path -LiteralPath $manifestVerifier -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $artifactManifest -PathType Leaf)
+        -not (Test-Path -LiteralPath $artifactManifest -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $toolkitReleasePath -PathType Leaf)
       ) {
         Stop-Matrix "matrix-runner-build-failed" "Restore the complete approved Windows x64 delivery toolkit and its artifact manifest."
       }
       & $manifestVerifier verify $PSScriptRoot "artifacts.json" | Out-Null
       if ($LASTEXITCODE -ne 0) {
         Stop-Matrix "matrix-runner-build-failed" "Restore and re-verify the approved Windows x64 delivery toolkit before running the matrix."
+      }
+      $toolkitRelease = Get-Content -Raw -LiteralPath $toolkitReleasePath | ConvertFrom-Json
+      $workspaceRevision = (& git -C $sourceWorkspace rev-parse HEAD | Out-String).Trim()
+      $revisionExitCode = $LASTEXITCODE
+      $workspaceChanges = @(& git -C $sourceWorkspace status --porcelain --untracked-files=normal)
+      $statusExitCode = $LASTEXITCODE
+      if (
+        $toolkitRelease.schemaVersion -ne 1 -or
+        $toolkitRelease.sourceDirty -ne $false -or
+        [string]$toolkitRelease.sourceRevision -notmatch '^[0-9a-f]{40}$' -or
+        $revisionExitCode -ne 0 -or
+        $statusExitCode -ne 0 -or
+        $workspaceChanges.Count -gt 0 -or
+        -not [String]::Equals([string]$toolkitRelease.sourceRevision, $workspaceRevision, [StringComparison]::Ordinal)
+      ) {
+        Stop-Matrix "matrix-release-inputs-invalid" "Use the clean source workspace from the same revision as the approved Windows delivery toolkit."
       }
       $matrixRunnerPath = (Resolve-Path -LiteralPath $adjacentRunner).Path
     } else {

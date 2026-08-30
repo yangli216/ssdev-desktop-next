@@ -4,6 +4,11 @@ import test from 'node:test'
 
 const buildScriptUrl = new URL('../build-windows-delivery-tools.ps1', import.meta.url)
 const matrixWrapperUrl = new URL('../test-plugin-matrix.ps1', import.meta.url)
+const packageWrapperUrl = new URL('../test-windows-package.ps1', import.meta.url)
+const releaseManifestMainUrl = new URL(
+  '../../crates/ssdev-release-manifest/src/main.rs',
+  import.meta.url,
+)
 const workflowUrl = new URL('../../.github/workflows/ci.yml', import.meta.url)
 const documentationUrl = new URL('../../docs/windows-delivery-tools.md', import.meta.url)
 const desktopBuildUrl = new URL('../build-windows.ps1', import.meta.url)
@@ -29,6 +34,8 @@ test('Windows delivery tools stay separate from the ordinary desktop installer',
   }
   assert.match(buildScript, /--example plugin_matrix/)
   assert.match(buildScript, /"ssdev-plugin-matrix\.exe"/)
+  assert.match(buildScript, /"run-windows-package\.ps1"/)
+  assert.match(buildScript, /"business-page-probe-server\.mjs"/)
   assert.match(buildScript, /cargo-cyclonedx 0\.5\.9/)
   assert.match(buildScript, /"ssdev-plugin-matrix\.cdx\.json"/)
   assert.match(buildScript, /"ssdev-desktop-doctor\.cdx\.json"/)
@@ -78,9 +85,36 @@ test('packaged matrix wrapper uses the verified adjacent runner but still binds 
   assert.match(wrapper, /Join-Path \$PSScriptRoot "ssdev-plugin-matrix\.exe"/)
   assert.match(wrapper, /Join-Path \$PSScriptRoot "ssdev-release-manifest\.exe"/)
   assert.match(wrapper, /& \$manifestVerifier verify \$PSScriptRoot "artifacts\.json" \| Out-Null/)
+  assert.match(wrapper, /toolkitRelease\.sourceRevision/)
+  assert.match(wrapper, /git -C \$sourceWorkspace rev-parse HEAD/)
+  assert.match(wrapper, /workspaceChanges\.Count -gt 0/)
+  assert.match(wrapper, /adjacentToolkitMarkerPresent -and -not/)
   assert.match(wrapper, /Supply -Workspace with the clean source workspace/)
   assert.match(wrapper, /cargo build --locked --release -p webplus-controller --example plugin_matrix/)
   assert.match(wrapper, /\$matrixPath \$sourceWorkspace \$evidenceOutputPath \$EvidenceEnvironment/)
+})
+
+test('packaged Windows package gate uses verified adjacent tools without Rust', async () => {
+  const [wrapper, releaseManifestMain] = await Promise.all([
+    readFile(packageWrapperUrl, 'utf8'),
+    readFile(releaseManifestMainUrl, 'utf8'),
+  ])
+
+  assert.match(wrapper, /\[string\]\$Workspace/)
+  assert.match(wrapper, /\[string\]\$ToolDirectory/)
+  assert.match(wrapper, /Join-Path \$script:DeliveryToolDirectory "ssdev-release-manifest\.exe"/)
+  assert.match(wrapper, /Join-Path \$script:DeliveryToolDirectory "ssdev-release-signing\.exe"/)
+  assert.match(wrapper, /Join-Path \$script:DeliveryToolDirectory "ssdev-cutover-evidence\.exe"/)
+  assert.match(wrapper, /& \$manifestVerifier verify \$script:DeliveryToolDirectory "artifacts\.json"/)
+  assert.match(wrapper, /toolkitRelease\.sourceRevision/)
+  assert.match(wrapper, /git -C \$workspace rev-parse HEAD/)
+  assert.match(wrapper, /workspaceChanges\.Count -gt 0/)
+  assert.match(wrapper, /\$ToolDirectory -or \$deliveryToolkitMarkerPresent/)
+  assert.match(wrapper, /Invoke-ReleaseManifestTool @\("update-verify"/)
+  assert.doesNotMatch(wrapper, /ssdev-desktop-core --example verify_update_artifact/)
+  assert.equal((wrapper.match(/cargo run --quiet --locked/g) ?? []).length, 3)
+  assert.match(releaseManifestMain, /"update-verify"/)
+  assert.match(releaseManifestMain, /verify_update_artifact_files/)
 })
 
 test('Windows CI publishes one x64 delivery toolkit without changing platform package defaults', async () => {
@@ -100,6 +134,8 @@ test('delivery toolkit documentation keeps unsigned CI output out of production'
   assert.match(documentation, /不会增加在线轻量版体积/)
   assert.match(documentation, /名称带 `unsigned` 的短期制品只用于验证构建链，不能进入生产交付/)
   assert.match(documentation, /验证机无需安装 Rust/)
+  assert.match(documentation, /无 Rust 的 Windows 包验收/)
+  assert.match(documentation, /相邻工具包模式不会执行 `cargo`/)
   assert.match(documentation, /仍必须提供与候选版本完全一致的干净源码工作区/)
   assert.match(documentation, /工具包不含私钥、令牌、业务材料/)
   assert.match(documentation, /8 个可执行入口对应的.*Windows x64 CycloneDX 1\.5 JSON/)
@@ -111,6 +147,7 @@ test('delivery toolkit documentation keeps unsigned CI output out of production'
   assert.match(documentation, /不会创建 WebView、访问网络或读取浏览器资料/)
   assert.match(documentation, /Microsoft Authenticode/)
   assert.match(documentation, /8 个可执行文件、Microsoft Loader/)
+  assert.match(documentation, /两个验收包装器、可选回环测试页/)
   assert.match(documentation, /只读取当前用户应用数据目录下固定的 `logs\/ssdev\.log\*`/)
   assert.match(documentation, /不读取配置、插件、账本、业务缓存或浏览器资料/)
   assert.match(documentation, /最多 16 种最新 WARN\/ERROR/)

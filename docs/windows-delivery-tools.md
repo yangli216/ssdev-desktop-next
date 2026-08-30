@@ -10,8 +10,9 @@
 - `ssdev-plugin-tool.exe`：插件源检查、客户端/fixture、签名准备、封包和发布集合；
 - `ssdev-release-signing.exe`：生成、完成和复验组织 detached 签名流程；
 - `ssdev-cutover-evidence.exe`：生产策略、证据预检、Go/No-Go 和当前部署授权复验；
-- `ssdev-release-manifest.exe`：创建或复验完整文件清单；
-- `ssdev-plugin-matrix.exe` 与 `run-plugin-matrix.ps1`：在 Windows x64 实机调用候选安装包中的 x86/x64 宿主并生成黄金矩阵证据。
+- `ssdev-release-manifest.exe`：创建或复验完整文件清单，并使用与 Desktop 相同的策略解析和流式 Minisign 实现复验 updater 产物；
+- `ssdev-plugin-matrix.exe` 与 `run-plugin-matrix.ps1`：在 Windows x64 实机调用候选安装包中的 x86/x64 宿主并生成黄金矩阵证据；
+- `run-windows-package.ps1`：无需 Rust 完成候选/上一版本 bundle 清单、策略、updater、NSIS 安装、升级、回退、状态保留和机器证据验收；可选的 `business-page-probe-server.mjs` 只服务 CI 的无脚本回环测试页。
 
 `sbom/` 还包含与上述 8 个可执行入口对应的、已移除工作区绝对路径和随机标识的 Windows x64 CycloneDX 1.5 JSON。它用于依赖审计和事件响应，不替代源码提交、二进制签名或最终归档签名。
 
@@ -24,7 +25,7 @@
 Get-Content .\release.json
 ```
 
-`artifacts.json` 覆盖 README、包装器、发布元数据、全部可执行文件、Microsoft WebView2 Loader 和 SBOM；任何缺失、增加或字节变化都会失败。`release.json` 记录工具版本、完整源码提交、目标架构、SBOM 数量、组织 EXE 签名和 Microsoft Loader 签名状态。生产工具包的所有 EXE 必须由组织 Windows 发布流程签名并显示 `authenticodeVerified: true`，最终目录归档还必须具有组织发布签名；未签名 JSON 清单本身不是发布信任根。GitHub Actions 中名称带 `unsigned` 的短期制品只用于验证构建链，不能进入生产交付。
+`artifacts.json` 覆盖 README、两个验收包装器、可选回环测试脚本、发布元数据、全部可执行文件、Microsoft WebView2 Loader 和 SBOM；任何缺失、增加或字节变化都会失败。`release.json` 记录工具版本、完整源码提交、目标架构、SBOM 数量、组织 EXE 签名和 Microsoft Loader 签名状态。生产工具包的所有 EXE 必须由组织 Windows 发布流程签名并显示 `authenticodeVerified: true`，最终目录归档还必须具有组织发布签名；未签名 JSON 清单本身不是发布信任根。GitHub Actions 中名称带 `unsigned` 的短期制品只用于验证构建链，不能进入生产交付。
 
 工具包不含私钥、令牌、业务材料、插件包、黄金矩阵、信任库或 Windows 客户端安装包。组织公开信任库仍应从受保护发布渠道提供，KMS/HSM 私钥不得复制到工具目录。
 
@@ -54,14 +55,14 @@ Get-Content .\release.json
 2. 用 `ssdev-migration-audit.exe` 从同一已复验集合生成正式迁移报告和证据；
 3. 用 `ssdev-plugin-tool.exe` 完成生产组件发布集合、Web 接入包和定稿矩阵；
 4. 在批准的 Windows x64 设备运行黄金矩阵；
-5. 用真实上一生产 bundle 完成 Windows 安装、升级、回退和目标业务页面深度检查；
+5. 用 `run-windows-package.ps1` 和真实上一生产 bundle 完成 Windows 安装、升级、回退和目标业务页面深度检查；
 6. 用 `ssdev-release-signing.exe` 和 `ssdev-cutover-evidence.exe` 完成职责分离签名与 Go/No-Go。
 
 各命令的输入、输出和信任边界以仓库中的 `docs/pilot-readiness.md`、`docs/migration-audit.md`、`docs/plugin-release.md`、`docs/release-signing.md` 与 `docs/cutover-evidence.md` 为准。工具包减少 Rust 工具链安装，不缩减任何正式门禁。
 
 ## 无 Rust 的黄金矩阵
 
-`run-plugin-matrix.ps1` 会先用同目录清单工具自动复验完整 `artifacts.json`，再使用同目录的 `ssdev-plugin-matrix.exe`，因此验证机无需安装 Rust。仍必须提供与候选版本完全一致的干净源码工作区：机器证据会绑定它的 Git 提交和 dirty 状态，不能只信任工具文件名。
+`run-plugin-matrix.ps1` 会先用同目录清单工具自动复验完整 `artifacts.json`，并要求工具包 `release.json` 的源码提交等于干净源码工作区，再使用同目录的 `ssdev-plugin-matrix.exe`，因此验证机无需安装 Rust。仍必须提供与候选版本完全一致的干净源码工作区：机器证据会再次绑定它的 Git 提交和 dirty 状态，不能只信任工具文件名。
 
 ```powershell
 .\run-plugin-matrix.ps1 `
@@ -77,6 +78,25 @@ Get-Content .\release.json
 ```
 
 插件根目录必须由已批准发布集合重新物化；两个宿主必须来自本次待交付 Windows bundle。运行器会在调用硬件前复验发布集合、插件签名、全方法覆盖和输入摘要，运行后再次复验全部输入。失败时不写证据，也不输出用例名称、参数、期望值或实际设备响应。
+
+## 无 Rust 的 Windows 包验收
+
+`run-windows-package.ps1` 会自动复验同目录完整 `artifacts.json`，要求工具包 `release.json` 与干净源码工作区使用同一提交，并仅调用相邻的 `ssdev-release-manifest.exe`、`ssdev-release-signing.exe` 和 `ssdev-cutover-evidence.exe`；验证机无需安装 Rust 或重新编译 Desktop。仍必须通过 `-Workspace` 提供与候选 bundle 精确一致的干净源码工作区，因为候选发布元数据与最终机器证据都会再次绑定 Git 提交、锁文件和构建输入。候选及上一版本必须是包含 `metadata/artifacts.json` 的完整 bundle，不能只提供单独 NSIS 文件。
+
+```powershell
+.\run-windows-package.ps1 `
+  -Workspace D:\controlled\ssdev-desktop-next `
+  -BundleRoot D:\candidate\bundle `
+  -PreviousBundleRoot D:\previous\bundle `
+  -DeploymentCheckRecord D:\field-evidence\deployment-check.json `
+  -ExpectedAppUpdatePublicKey D:\trust\app-update.pub `
+  -EvidenceOutput D:\field-evidence\windows-package.json `
+  -EvidenceEnvironment hospital-a-windows-qa `
+  -RequireAuthenticode `
+  -ExpectedSignerSubject "CN=Approved Publisher"
+```
+
+正式验收应先在目标网络打开实际业务页面并导出同版本深度检查记录。`-ServeBusinessProbePage` 仅供构建链使用：它还需要验证机具有 Node.js，且只允许精确的 `http://127.0.0.1:<port>/`；它不证明目标网络、账号或真实业务可用。工具包脚本保留源码模式回退，仓库 CI 仍可直接运行 `scripts/test-windows-package.ps1`，但相邻工具包模式不会执行 `cargo`。
 
 ## 构建与签名
 
@@ -97,4 +117,4 @@ Get-Content .\release.json
   -ExpectedSignerSubject 'CN=Example Organization'
 ```
 
-所有模式都要求 clean commit，输出目录必须位于源码工作区之外且尚不存在，脚本不会覆盖已有工具包。`artifacts.json` 覆盖 8 个可执行文件、Microsoft Loader、README、包装器、发布元数据和 8 份 SBOM。生产发布系统必须对最终目录归档建立组织级发布签名；逐文件清单和 Authenticode 不能替代归档签名或发布渠道访问控制。
+所有模式都要求 clean commit，输出目录必须位于源码工作区之外且尚不存在，脚本不会覆盖已有工具包。`artifacts.json` 覆盖 8 个可执行文件、Microsoft Loader、README、两个验收包装器、可选回环测试页、发布元数据和 8 份 SBOM。生产发布系统必须对最终目录归档建立组织级发布签名；逐文件清单和 Authenticode 不能替代归档签名或发布渠道访问控制。

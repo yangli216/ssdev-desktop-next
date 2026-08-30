@@ -13,13 +13,13 @@ tauri-build.workspace = true
 
 [dependencies]
 base64.workspace = true
-minisign-verify = "0.2.5"
 reqwest.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 ssdev-config.workspace = true
+ssdev-app-update.workspace = true
 ssdev-diagnostics.workspace = true
 ssdev-invocation-ledger.workspace = true
 ssdev-origin-policy.workspace = true

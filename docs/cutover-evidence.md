@@ -62,7 +62,8 @@ cargo run --locked -p ssdev-release-signing -- finalize `
 Windows 包 QA 在目标网络中先启动实际业务环境，等待首页显示业务页面“已连接”，再从“安全与诊断”导出深度检查 JSON。随后把该文件传给包验收：
 
 ```powershell
-scripts/test-windows-package.ps1 `
+.\run-windows-package.ps1 `
+  -Workspace D:\controlled\ssdev-desktop-next `
   -BundleRoot D:\candidate\bundle `
   -PreviousBundleRoot D:\previous\bundle `
   -DeploymentCheckRecord D:\field-evidence\deployment-check.json `
@@ -72,6 +73,8 @@ scripts/test-windows-package.ps1 `
   -RequireAuthenticode `
   -ExpectedSignerSubject "CN=Approved Publisher"
 ```
+
+上述入口来自独立 Windows 项目交付工具包，会先复验工具包完整清单并使用相邻 EXE，不要求目标验证机安装 Rust。若在源码构建机直接执行，可继续使用 `scripts/test-windows-package.ps1`；两种入口运行同一验收逻辑且都必须绑定候选对应的干净源码工作区。
 
 工具只接受 schema 1、`unsigned-local-record`、Windows、候选版本一致、13 个固定检查项齐全且 `business-frontend` 为 `pass` 的深度记录；记录必须在包证据生成前一小时内产生。它会在读取前后复算摘要并把摘要及生成时间写入待签名的 schema 7 包证据，原始记录仍应随 QA 归档保存。未传参数时脚本显式写入空绑定，适用于普通 CI，但最终判定不会把它当作现场验收。
 

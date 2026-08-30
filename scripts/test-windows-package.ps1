@@ -1,6 +1,8 @@
 param(
   [string]$BundleRoot,
   [string]$PreviousBundleRoot,
+  [string]$Workspace,
+  [string]$ToolDirectory,
   [ValidateSet("x86_64-pc-windows-msvc", "i686-pc-windows-msvc")]
   [string]$DesktopTarget = "x86_64-pc-windows-msvc",
   [ValidateSet("OfflineInstaller", "DownloadBootstrapper")]
@@ -33,7 +35,97 @@ if (-not $PreviousExpectedWebViewInstallMode) {
   $PreviousExpectedWebViewInstallMode = $ExpectedWebViewInstallMode
 }
 
-$workspace = Split-Path -Parent $PSScriptRoot
+$workspaceCandidate = if ($Workspace) { $Workspace } else { Split-Path -Parent $PSScriptRoot }
+if (-not (Test-Path -LiteralPath $workspaceCandidate -PathType Container)) {
+  throw "Workspace must be the clean source workspace for the approved candidate revision."
+}
+$workspace = (Resolve-Path -LiteralPath $workspaceCandidate).Path
+if (-not (Test-Path -LiteralPath (Join-Path $workspace "Cargo.toml") -PathType Leaf)) {
+  throw "Workspace must contain Cargo.toml; packaged use requires an explicit -Workspace."
+}
+
+$script:DeliveryToolDirectory = $null
+$toolDirectoryCandidate = if ($ToolDirectory) { $ToolDirectory } else { $PSScriptRoot }
+$requiredDeliveryToolFiles = @(
+  "ssdev-release-manifest.exe",
+  "ssdev-release-signing.exe",
+  "ssdev-cutover-evidence.exe",
+  "artifacts.json",
+  "release.json"
+)
+$adjacentDeliveryToolsComplete = $true
+foreach ($toolFile in $requiredDeliveryToolFiles) {
+  if (-not (Test-Path -LiteralPath (Join-Path $toolDirectoryCandidate $toolFile) -PathType Leaf)) {
+    $adjacentDeliveryToolsComplete = $false
+    break
+  }
+}
+$deliveryToolkitMarkerPresent = (
+  (Test-Path -LiteralPath (Join-Path $toolDirectoryCandidate "artifacts.json") -PathType Leaf) -or
+  (Test-Path -LiteralPath (Join-Path $toolDirectoryCandidate "release.json") -PathType Leaf) -or
+  (Test-Path -LiteralPath (Join-Path $toolDirectoryCandidate "ssdev-release-manifest.exe") -PathType Leaf)
+)
+if (($ToolDirectory -or $deliveryToolkitMarkerPresent) -and -not $adjacentDeliveryToolsComplete) {
+  throw "ToolDirectory must contain the complete Windows delivery toolkit and artifacts.json."
+}
+if ($adjacentDeliveryToolsComplete) {
+  $script:DeliveryToolDirectory = (Resolve-Path -LiteralPath $toolDirectoryCandidate).Path
+  $manifestVerifier = Join-Path $script:DeliveryToolDirectory "ssdev-release-manifest.exe"
+  & $manifestVerifier verify $script:DeliveryToolDirectory "artifacts.json" | Out-Host
+  if ($LASTEXITCODE -ne 0) {
+    throw "The Windows delivery toolkit does not match its artifact manifest."
+  }
+  $toolkitRelease = Get-Content -Raw -LiteralPath (Join-Path $script:DeliveryToolDirectory "release.json") | ConvertFrom-Json
+  $workspaceRevision = (& git -C $workspace rev-parse HEAD | Out-String).Trim()
+  $revisionExitCode = $LASTEXITCODE
+  $workspaceChanges = @(& git -C $workspace status --porcelain --untracked-files=normal)
+  $statusExitCode = $LASTEXITCODE
+  if (
+    $toolkitRelease.schemaVersion -ne 1 -or
+    $toolkitRelease.sourceDirty -ne $false -or
+    [string]$toolkitRelease.sourceRevision -notmatch '^[0-9a-f]{40}$' -or
+    $revisionExitCode -ne 0 -or
+    $statusExitCode -ne 0 -or
+    $workspaceChanges.Count -gt 0 -or
+    -not [String]::Equals([string]$toolkitRelease.sourceRevision, $workspaceRevision, [StringComparison]::Ordinal)
+  ) {
+    throw "The Windows delivery toolkit must match the clean candidate source workspace revision."
+  }
+}
+
+function Invoke-ReleaseManifestTool {
+  param([Parameter(Mandatory = $true)][string[]]$Arguments)
+  if ($script:DeliveryToolDirectory) {
+    & (Join-Path $script:DeliveryToolDirectory "ssdev-release-manifest.exe") @Arguments | Out-Host
+  } else {
+    & cargo run --quiet --locked --manifest-path (Join-Path $workspace "Cargo.toml") `
+      -p ssdev-release-manifest -- @Arguments | Out-Host
+  }
+  return $LASTEXITCODE
+}
+
+function Invoke-ReleaseSigningTool {
+  param([Parameter(Mandatory = $true)][string[]]$Arguments)
+  if ($script:DeliveryToolDirectory) {
+    & (Join-Path $script:DeliveryToolDirectory "ssdev-release-signing.exe") @Arguments | Out-Host
+  } else {
+    & cargo run --quiet --locked --manifest-path (Join-Path $workspace "Cargo.toml") `
+      -p ssdev-release-signing -- @Arguments | Out-Host
+  }
+  return $LASTEXITCODE
+}
+
+function Invoke-CutoverEvidenceTool {
+  param([Parameter(Mandatory = $true)][string[]]$Arguments)
+  if ($script:DeliveryToolDirectory) {
+    & (Join-Path $script:DeliveryToolDirectory "ssdev-cutover-evidence.exe") @Arguments | Out-Host
+  } else {
+    & cargo run --quiet --locked --manifest-path (Join-Path $workspace "Cargo.toml") `
+      -p ssdev-cutover-evidence -- @Arguments | Out-Host
+  }
+  return $LASTEXITCODE
+}
+
 if (-not $BundleRoot) {
   $BundleRoot = Join-Path $workspace "target/$DesktopTarget/release/bundle"
 }
@@ -301,19 +393,12 @@ function Get-ReleaseMetadata {
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
     throw "Release bundle is missing metadata/release.json."
   }
-  $verificationArguments = @(
-    "run", "--quiet", "--locked", "--manifest-path", (Join-Path $workspace "Cargo.toml"),
-    "-p", "ssdev-release-manifest", "--", "metadata-verify", $path
-  )
+  $verificationArguments = @("metadata-verify", $path)
   if ($VerifyCurrentSource) {
     $verificationArguments += $workspace
   }
-  # Native stdout is part of a PowerShell function's return stream. Send the
-  # verifier's diagnostic output directly to the host so callers receive only
-  # the parsed release metadata object below.
-  & cargo @verificationArguments | Out-Host
-  if ($LASTEXITCODE -ne 0) {
-    throw "Release provenance metadata failed Rust verification."
+  if ((Invoke-ReleaseManifestTool $verificationArguments) -ne 0) {
+    throw "Release provenance metadata verification failed."
   }
   $metadata = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
   if ($metadata.schemaVersion -ne 2 -or -not $metadata.appVersion -or -not $metadata.productName -or -not $metadata.identifier -or -not $metadata.sourceRevision) {
@@ -338,11 +423,12 @@ function Assert-TrustKeyLifecycle {
     [Parameter(Mandatory = $true)][string]$TrustStorePath,
     [Parameter(Mandatory = $true)][string]$Label
   )
-  & cargo run --quiet --locked --manifest-path (Join-Path $workspace "Cargo.toml") `
-    -p ssdev-release-signing -- verify-trust-store `
-    --trust-store $TrustStorePath `
-    --required-purposes plugin,origin-policy,project-bundle
-  if ($LASTEXITCODE -ne 0) {
+  $arguments = @(
+    "verify-trust-store",
+    "--trust-store", $TrustStorePath,
+    "--required-purposes", "plugin,origin-policy,project-bundle"
+  )
+  if ((Invoke-ReleaseSigningTool $arguments) -ne 0) {
     throw "$Label trust store is not ready for plugin, origin-policy, and project-bundle issuance."
   }
 }
@@ -522,13 +608,14 @@ function Test-ReleaseTrustPolicies {
     }
   }
   Assert-TrustKeyLifecycle $trustStore "Release"
-  & cargo run --quiet --locked --manifest-path (Join-Path $workspace "Cargo.toml") `
-    -p ssdev-release-signing -- verify `
-    --kind origin-policy `
-    --document $originPolicy `
-    --envelope $originSignature `
-    --trust-store $trustStore
-  if ($LASTEXITCODE -ne 0) {
+  $originArguments = @(
+    "verify",
+    "--kind", "origin-policy",
+    "--document", $originPolicy,
+    "--envelope", $originSignature,
+    "--trust-store", $trustStore
+  )
+  if ((Invoke-ReleaseSigningTool $originArguments) -ne 0) {
     throw "Release origin policy is not signed by an active origin-policy key."
   }
 
@@ -538,13 +625,14 @@ function Test-ReleaseTrustPolicies {
     throw "Release process policy and signature must either both exist or both be absent."
   }
   if (Test-Path -LiteralPath $processPolicy -PathType Leaf) {
-    & cargo run --quiet --locked --manifest-path (Join-Path $workspace "Cargo.toml") `
-      -p ssdev-release-signing -- verify `
-      --kind process-policy `
-      --document $processPolicy `
-      --envelope $processSignature `
-      --trust-store $trustStore
-    if ($LASTEXITCODE -ne 0) {
+    $processArguments = @(
+      "verify",
+      "--kind", "process-policy",
+      "--document", $processPolicy,
+      "--envelope", $processSignature,
+      "--trust-store", $trustStore
+    )
+    if ((Invoke-ReleaseSigningTool $processArguments) -ne 0) {
       throw "Release process policy is not signed by an active process-policy key."
     }
   }
@@ -577,10 +665,7 @@ function Test-UpdaterSignatures {
     if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
       throw "Updater signature [$($signature.FullName)] does not have a matching package."
     }
-    & cargo run --quiet --locked --manifest-path (Join-Path $workspace "Cargo.toml") `
-      -p ssdev-desktop-core --example verify_update_artifact -- `
-      $policy $artifact $signature.FullName
-    if ($LASTEXITCODE -ne 0) {
+    if ((Invoke-ReleaseManifestTool @("update-verify", $policy, $artifact, $signature.FullName)) -ne 0) {
       throw "Updater Minisign verification failed for [$artifact]."
     }
   }
@@ -606,15 +691,10 @@ function Test-ReleaseArtifactManifest {
   if (-not [String]::Equals(([string]$updatePolicy.pubkey).Trim(), $ExpectedPublicKeyText, [StringComparison]::Ordinal)) {
     throw "Release artifact manifest is not anchored to the independently supplied application update public key."
   }
-  & cargo run --quiet --locked --manifest-path (Join-Path $workspace "Cargo.toml") `
-    -p ssdev-desktop-core --example verify_update_artifact -- `
-    $policy $manifest $signature
-  if ($LASTEXITCODE -ne 0) {
+  if ((Invoke-ReleaseManifestTool @("update-verify", $policy, $manifest, $signature)) -ne 0) {
     throw "Release artifact manifest signature verification failed."
   }
-  & cargo run --quiet --locked --manifest-path (Join-Path $workspace "Cargo.toml") `
-    -p ssdev-release-manifest -- verify $ReleaseBundleRoot $manifestRelative
-  if ($LASTEXITCODE -ne 0) {
+  if ((Invoke-ReleaseManifestTool @("verify", $ReleaseBundleRoot, $manifestRelative)) -ne 0) {
     throw "Release artifact manifest does not exactly match the release bundle."
   }
 
@@ -1120,8 +1200,7 @@ if ($PreviousBundleRoot -and -not $script:ApplicationStatePreservationVerified) 
 }
 $deploymentCheckEvidenceArgument = if ($DeploymentCheckRecord) { $DeploymentCheckRecord } else { "none" }
 $evidenceArguments = @(
-  "run", "--quiet", "--locked", "--manifest-path", (Join-Path $workspace "Cargo.toml"),
-  "-p", "ssdev-cutover-evidence", "--", "windows-package",
+  "windows-package",
   $workspace,
   (Join-Path $metadataDirectory "release.json"),
   (Join-Path $metadataDirectory "artifacts.json"),
@@ -1140,8 +1219,7 @@ $evidenceArguments = @(
 if ($PreviousBundleRoot) {
   $evidenceArguments += (Join-Path $previousMetadataDirectory "release.json")
 }
-& cargo @evidenceArguments
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $EvidenceOutput -PathType Leaf)) {
+if ((Invoke-CutoverEvidenceTool $evidenceArguments) -ne 0 -or -not (Test-Path -LiteralPath $EvidenceOutput -PathType Leaf)) {
   throw "Windows package smoke passed, but its machine-verifiable evidence was not created."
 }
 

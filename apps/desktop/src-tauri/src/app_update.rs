@@ -4,11 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use base64::Engine as _;
-use minisign_verify::{PublicKey, Signature};
-use reqwest::{Client, Url};
-use serde::{Deserialize, Serialize};
+use reqwest::Client;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
+use ssdev_app_update::{decode_public_key, decode_signature, require_https_url, AppUpdatePolicy};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State, WebviewWindow};
 use tauri_plugin_updater::{Update, UpdaterExt};
@@ -16,10 +15,6 @@ use tempfile::{Builder as TempBuilder, NamedTempFile};
 use tokio::io::AsyncWriteExt;
 
 const POLICY_FILENAME: &str = "app-update.json";
-const MAX_POLICY_BYTES: u64 = 64 * 1024;
-const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
-const HARD_MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_ENDPOINTS: usize = 4;
 const MAX_NOTES_CHARS: usize = 4096;
 const UPDATE_TEMP_PREFIX: &str = ".app-update-";
 
@@ -58,69 +53,6 @@ impl AppUpdateState {
             error: self.policy_error.clone(),
         }
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AppUpdatePolicy {
-    schema_version: u8,
-    enabled: bool,
-    #[serde(default)]
-    endpoints: Vec<Url>,
-    #[serde(default)]
-    pubkey: String,
-    #[serde(default = "default_max_download_bytes")]
-    max_download_bytes: u64,
-}
-
-impl AppUpdatePolicy {
-    fn load(path: &Path) -> Result<Self, String> {
-        let metadata = fs::symlink_metadata(path)
-            .map_err(|_| "无法读取应用更新策略文件（app-update-policy-read）".to_owned())?;
-        if !metadata.is_file() || metadata.len() > MAX_POLICY_BYTES {
-            return Err(format!(
-                "应用更新策略必须是普通文件且不超过 {MAX_POLICY_BYTES} 字节"
-            ));
-        }
-        let bytes = fs::read(path)
-            .map_err(|_| "无法读取应用更新策略文件（app-update-policy-read）".to_owned())?;
-        let policy: Self = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("应用更新策略不是有效 JSON: {error}"))?;
-        policy.validate()?;
-        Ok(policy)
-    }
-
-    fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 1 {
-            return Err(format!("不支持应用更新策略版本 {}", self.schema_version));
-        }
-        if !(16 * 1024 * 1024..=HARD_MAX_DOWNLOAD_BYTES).contains(&self.max_download_bytes) {
-            return Err(format!(
-                "应用更新包上限必须在 16 MiB 到 {} MiB 之间",
-                HARD_MAX_DOWNLOAD_BYTES / 1024 / 1024
-            ));
-        }
-        if !self.enabled {
-            if !self.endpoints.is_empty() || !self.pubkey.trim().is_empty() {
-                return Err("关闭应用更新时不得保留端点或公钥".into());
-            }
-            return Ok(());
-        }
-        if self.endpoints.is_empty() || self.endpoints.len() > MAX_ENDPOINTS {
-            return Err(format!(
-                "启用应用更新时必须配置 1 到 {MAX_ENDPOINTS} 个端点"
-            ));
-        }
-        for endpoint in &self.endpoints {
-            require_https_url(endpoint, "应用更新端点")?;
-        }
-        decode_public_key(&self.pubkey)?;
-        Ok(())
-    }
-}
-
-fn default_max_download_bytes() -> u64 {
-    DEFAULT_MAX_DOWNLOAD_BYTES
 }
 
 #[derive(Debug, Serialize)]
@@ -641,88 +573,12 @@ fn prepare_update_temporary_directory(directory: &Path) -> Result<usize, String>
     Ok(removed)
 }
 
-fn decode_public_key(encoded: &str) -> Result<PublicKey, String> {
-    let decoded = decode_base64_text(encoded, "应用更新公钥")?;
-    PublicKey::decode(&decoded).map_err(|error| format!("应用更新公钥无效: {error}"))
-}
-
-fn decode_signature(encoded: &str) -> Result<Signature, String> {
-    let decoded = decode_base64_text(encoded, "应用更新签名")?;
-    Signature::decode(&decoded).map_err(|error| format!("应用更新签名无效: {error}"))
-}
-
 pub fn verify_update_artifact_files(
     policy_path: &Path,
     package_path: &Path,
     signature_path: &Path,
 ) -> Result<u64, String> {
-    let policy = AppUpdatePolicy::load(policy_path)?;
-    if !policy.enabled {
-        return Err("应用更新策略未启用".into());
-    }
-    let metadata =
-        fs::metadata(package_path).map_err(|error| format!("无法读取更新产物元数据: {error}"))?;
-    if !metadata.is_file() || metadata.len() > policy.max_download_bytes {
-        return Err("更新产物不是普通文件或超过策略上限".into());
-    }
-    let signature_metadata =
-        fs::metadata(signature_path).map_err(|error| format!("无法读取更新签名元数据: {error}"))?;
-    if !signature_metadata.is_file() || signature_metadata.len() > 16 * 1024 {
-        return Err("更新签名不是普通文件或超过安全上限".into());
-    }
-    let encoded_signature =
-        fs::read_to_string(signature_path).map_err(|error| format!("无法读取更新签名: {error}"))?;
-    let public_key = decode_public_key(&policy.pubkey)?;
-    let signature = decode_signature(encoded_signature.trim())?;
-    let mut verifier = public_key
-        .verify_stream(&signature)
-        .map_err(|error| format!("更新签名必须使用现代预哈希格式: {error}"))?;
-    let mut package =
-        fs::File::open(package_path).map_err(|error| format!("无法打开更新产物: {error}"))?;
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut verified_bytes = 0_u64;
-    loop {
-        let read = package
-            .read(&mut buffer)
-            .map_err(|error| format!("无法读取更新产物: {error}"))?;
-        if read == 0 {
-            break;
-        }
-        verified_bytes = verified_bytes.saturating_add(read as u64);
-        if verified_bytes > policy.max_download_bytes {
-            return Err("更新产物在读取期间超过策略上限".into());
-        }
-        verifier.update(&buffer[..read]);
-    }
-    if verified_bytes != metadata.len() {
-        return Err("更新产物在验证期间发生变化".into());
-    }
-    verifier
-        .finalize()
-        .map_err(|error| format!("更新产物签名验证失败: {error}"))?;
-    Ok(verified_bytes)
-}
-
-fn decode_base64_text(encoded: &str, label: &str) -> Result<String, String> {
-    if encoded.trim().is_empty() || encoded.len() > 16 * 1024 {
-        return Err(format!("{label}为空或过长"));
-    }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|error| format!("{label}不是有效 Base64: {error}"))?;
-    String::from_utf8(bytes).map_err(|error| format!("{label}不是 UTF-8 文本: {error}"))
-}
-
-fn require_https_url(url: &Url, label: &str) -> Result<(), String> {
-    if url.scheme() != "https"
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(format!("{label}必须是无凭据、无片段的 HTTPS URL"));
-    }
-    Ok(())
+    ssdev_app_update::verify_update_artifact_files(policy_path, package_path, signature_path)
 }
 
 fn truncate_notes(value: &str) -> String {
@@ -737,9 +593,12 @@ fn truncate_notes(value: &str) -> String {
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
+    use ssdev_app_update::{DEFAULT_MAX_DOWNLOAD_BYTES, MAX_POLICY_BYTES};
     use tempfile::tempdir;
+    use url::Url;
     use webplus_plugin_config::{PluginManifest, API_FILENAME};
     use webplus_plugin_trust::{
         encode_signature_document, prepare_signing_material, SIGNATURE_FILENAME,

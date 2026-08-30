@@ -4387,6 +4387,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssdev-app-update"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "minisign-verify",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "url",
+]
+
+[[package]]
 name = "ssdev-config"
 version = "0.1.0"
 dependencies = [
@@ -4423,12 +4435,12 @@ dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
  "image",
- "minisign-verify",
  "reqwest",
  "semver",
  "serde",
  "serde_json",
  "sha2",
+ "ssdev-app-update",
  "ssdev-config",
  "ssdev-cutover-evidence",
  "ssdev-diagnostics",
@@ -4600,10 +4612,13 @@ dependencies = [
 name = "ssdev-release-manifest"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "semver",
  "serde",
  "serde_json",
  "sha2",
+ "ssdev-app-update",
+ "tempfile",
  "thiserror 2.0.20",
 ]
 

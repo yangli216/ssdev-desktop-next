@@ -1,18 +1,16 @@
 [package]
-name = "ssdev-release-manifest"
+name = "ssdev-app-update"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-semver.workspace = true
+base64.workspace = true
+minisign-verify = "0.2.5"
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-ssdev-app-update.workspace = true
-thiserror.workspace = true
+url.workspace = true
 
 [dev-dependencies]
-base64.workspace = true
 tempfile = "3"
